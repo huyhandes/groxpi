@@ -1,0 +1,24 @@
+<h1>Links for {{.PackageName}}</h1>
+
+{{if .Files}}
+<div class="package-list">
+    {{range .Files}}
+    <div class="package-item">
+        <a href="/index/{{$.PackageName}}/{{.Name}}" 
+           {{if .RequiresPython}}data-requires-python="{{.RequiresPython}}"{{end}}
+           {{if .Hash}}data-hash="{{.Hash}}"{{end}}
+           {{if .Yanked}}data-yanked="{{.Yanked}}"{{end}}>
+            {{.Name}}
+        </a>
+        {{if .RequiresPython}}<br><small>Requires Python: {{.RequiresPython}}</small>{{end}}
+        {{if .Yanked}}<br><small style="color: #dc3545;">⚠️ Yanked: {{.Yanked}}</small>{{end}}
+    </div>
+    {{end}}
+</div>
+{{else}}
+<div class="meta-info">
+    <p><strong>No files found for package "{{.PackageName}}"</strong></p>
+    <p>This package may not exist or may not have any files available.</p>
+    <p><a href="/index/">← Back to package index</a></p>
+</div>
+{{end}}

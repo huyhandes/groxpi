@@ -1,0 +1,25 @@
+<h1>{{.Title}}</h1>
+
+<p>Simple Index - PyPI Package Repository</p>
+
+{{if .Packages}}
+<div class="package-list">
+    {{range .Packages}}
+    <div class="package-item">
+        <a href="/index/{{.}}/">{{.}}</a>
+    </div>
+    {{end}}
+</div>
+{{else}}
+<div class="meta-info">
+    <p><strong>No packages available</strong></p>
+    <p>This could mean:</p>
+    <ul>
+        <li>The upstream PyPI index is not reachable</li>
+        <li>The cache is empty and hasn't been populated yet</li>
+        <li>There was an error fetching the package list</li>
+    </ul>
+    <p>Try installing a package to populate the cache:</p>
+    <pre><code>pip install --index-url http://{{.Host}}/index/ numpy</code></pre>
+</div>
+{{end}}

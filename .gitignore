@@ -1,0 +1,54 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+groxpi
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Docker compose files with sensitive data
+docker-compose.yml
+docker-compose.*.yml
+!docker-compose.example.yml
+
+# Task folder
+tasks/
+
+# Cache and temporary files
+/cache/
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Benchmark results
+benchmarks/results/
+
+# Local storage
+/storage/
+/data/

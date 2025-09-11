@@ -1,0 +1,50 @@
+<h1>{{.Title}}</h1>
+
+<p>High-performance PyPI caching proxy server written in Go.</p>
+
+<div class="meta-info">
+    <h3>Server Information</h3>
+    <ul>
+        <li><strong>Version:</strong> {{.Version}}</li>
+        <li><strong>Upstream Index:</strong> <a href="{{.IndexURL}}">{{.IndexURL}}</a></li>
+        <li><strong>Cache Size:</strong> {{.CacheSize}}</li>
+        <li><strong>Index TTL:</strong> {{.IndexTTL}}</li>
+    </ul>
+</div>
+
+<h2>Features</h2>
+<ul>
+    <li>✅ Fast JSON serialization with <a href="https://github.com/bytedance/sonic">Sonic</a></li>
+    <li>✅ High-performance web framework with <a href="https://gofiber.io/">Fiber</a></li>
+    <li>✅ In-memory index caching with TTL</li>
+    <li>✅ File caching with LRU eviction</li>
+    <li>✅ Content compression (gzip/deflate)</li>
+    <li>✅ Both JSON and HTML API support</li>
+    <li>✅ Compatible with pip, poetry, pipenv</li>
+</ul>
+
+<h2>Quick Start</h2>
+<div class="meta-info">
+    <h4>Install packages via groxpi:</h4>
+    <pre><code>pip install --index-url http://localhost:5002/index/ your-package</code></pre>
+    
+    <h4>Browse packages:</h4>
+    <p><a href="/index/">View Package Index</a></p>
+    
+    <h4>Cache Management:</h4>
+    <ul>
+        <li>Clear package list cache: <code>curl -X DELETE http://localhost:5002/cache/list</code></li>
+        <li>Clear specific package cache: <code>curl -X DELETE http://localhost:5002/cache/PACKAGE_NAME</code></li>
+    </ul>
+</div>
+
+<h2>API Endpoints</h2>
+<ul>
+    <li><code>GET /</code> - This home page</li>
+    <li><code>GET /index/</code> - List all packages (JSON/HTML)</li>
+    <li><code>GET /index/{package}/</code> - List package files (JSON/HTML)</li>
+    <li><code>GET /index/{package}/{file}</code> - Download package file</li>
+    <li><code>DELETE /cache/list</code> - Invalidate package list cache</li>
+    <li><code>DELETE /cache/{package}</code> - Invalidate package cache</li>
+    <li><code>GET /health</code> - Health check endpoint</li>
+</ul>
