@@ -81,8 +81,19 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		cfg.Region = "us-east-1"
 	}
 
+	// Normalize endpoint URL - remove protocol if present
+	endpoint := cfg.Endpoint
+	if strings.HasPrefix(endpoint, "https://") {
+		endpoint = strings.TrimPrefix(endpoint, "https://")
+		cfg.UseSSL = true
+	} else if strings.HasPrefix(endpoint, "http://") {
+		endpoint = strings.TrimPrefix(endpoint, "http://")
+		cfg.UseSSL = false
+	}
+
 	log.Debug().
-		Str("endpoint", cfg.Endpoint).
+		Str("original_endpoint", cfg.Endpoint).
+		Str("normalized_endpoint", endpoint).
 		Str("bucket", cfg.Bucket).
 		Str("region", cfg.Region).
 		Bool("ssl", cfg.UseSSL).
@@ -111,7 +122,7 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		opts.BucketLookup = minio.BucketLookupPath
 	}
 
-	client, err := minio.New(cfg.Endpoint, opts)
+	client, err := minio.New(endpoint, opts)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create S3 client")
 		return nil, fmt.Errorf("failed to create S3 client: %w", err)
@@ -499,6 +510,189 @@ func (s *S3Storage) GetPresignedURL(ctx context.Context, key string, expiry time
 	}
 
 	return url.String(), nil
+}
+
+// StreamingPut stores an object with streaming support and concurrent reads
+func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+	fullKey := s.buildKey(key)
+	
+	log.Debug().
+		Str("key", key).
+		Str("full_key", fullKey).
+		Int64("size", size).
+		Str("content_type", contentType).
+		Msg("Streaming put to S3")
+
+	// Use multipart upload for better streaming performance
+	if size > s.partSize {
+		return s.streamingMultipartPut(ctx, fullKey, reader, size, contentType)
+	}
+
+	// For smaller objects, use regular put with buffer optimization
+	opts := minio.PutObjectOptions{
+		ContentType: contentType,
+	}
+
+	// Use pooled buffer for streaming
+	bufReader := &bufferedReader{
+		reader: reader,
+		buffer: s3BufferPool.Get().([]byte),
+		pool:   &s3BufferPool,
+	}
+	defer bufReader.Close()
+
+	start := time.Now()
+	info, err := s.client.PutObject(ctx, s.bucket, fullKey, bufReader, size, opts)
+	duration := time.Since(start)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key", key).
+			Int64("size", size).
+			Dur("duration", duration).
+			Msg("Failed to put object to S3")
+		return nil, fmt.Errorf("failed to put object %s: %w", key, err)
+	}
+
+	log.Info().
+		Str("key", key).
+		Str("etag", info.ETag).
+		Int64("size", info.Size).
+		Dur("duration", duration).
+		Float64("speed_mbps", float64(info.Size)/duration.Seconds()/(1024*1024)).
+		Msg("Successfully put object to S3")
+
+	return &ObjectInfo{
+		Key:         key,
+		Size:        info.Size,
+		ETag:        info.ETag,
+		ContentType: contentType,
+	}, nil
+}
+
+// streamingMultipartPut uses multipart upload for large objects
+func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+	opts := minio.PutObjectOptions{
+		ContentType: contentType,
+		PartSize:    uint64(s.partSize),
+	}
+
+	start := time.Now()
+	info, err := s.client.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
+	duration := time.Since(start)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("full_key", fullKey).
+			Int64("size", size).
+			Dur("duration", duration).
+			Msg("Failed multipart upload to S3")
+		return nil, fmt.Errorf("failed multipart upload: %w", err)
+	}
+
+	log.Info().
+		Str("full_key", fullKey).
+		Str("etag", info.ETag).
+		Int64("size", info.Size).
+		Dur("duration", duration).
+		Float64("speed_mbps", float64(info.Size)/duration.Seconds()/(1024*1024)).
+		Msg("Successfully completed multipart upload to S3")
+
+	return &ObjectInfo{
+		Size:        info.Size,
+		ETag:        info.ETag,
+		ContentType: contentType,
+	}, nil
+}
+
+// StreamingGet retrieves an object with streaming optimizations
+func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
+	fullKey := s.buildKey(key)
+
+	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Streaming get from S3")
+
+	// Get object info first for metadata
+	objInfo, err := s.client.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat object %s: %w", key, err)
+	}
+
+	// Get object stream
+	object, err := s.client.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
+	}
+	defer object.Close()
+
+	// Use pooled buffer for optimized streaming
+	copyBuf := s3BufferPool.Get().([]byte)
+	defer s3BufferPool.Put(copyBuf)
+
+	start := time.Now()
+	written, err := io.CopyBuffer(writer, object, copyBuf)
+	duration := time.Since(start)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key", key).
+			Int64("bytes_written", written).
+			Dur("duration", duration).
+			Msg("Failed to stream from S3")
+		return nil, fmt.Errorf("failed to stream object %s: %w", key, err)
+	}
+
+	log.Debug().
+		Str("key", key).
+		Int64("bytes_streamed", written).
+		Dur("duration", duration).
+		Float64("speed_mbps", float64(written)/duration.Seconds()/(1024*1024)).
+		Msg("Successfully streamed from S3")
+
+	return &ObjectInfo{
+		Key:          key,
+		Size:         objInfo.Size,
+		LastModified: objInfo.LastModified,
+		ETag:         objInfo.ETag,
+		ContentType:  objInfo.ContentType,
+	}, nil
+}
+
+// GetFilePath returns empty path as S3 doesn't support local file paths
+func (s *S3Storage) GetFilePath(ctx context.Context, key string) (string, error) {
+	return "", fmt.Errorf("S3 storage doesn't support local file paths")
+}
+
+// SupportsZeroCopy indicates if the backend supports zero-copy operations
+func (s *S3Storage) SupportsZeroCopy() bool {
+	return false // S3 requires network transfer, no zero-copy possible
+}
+
+// bufferedReader wraps a reader with pooled buffer for streaming optimization
+type bufferedReader struct {
+	reader io.Reader
+	buffer []byte
+	pool   *sync.Pool
+	closed bool
+}
+
+func (br *bufferedReader) Read(p []byte) (n int, err error) {
+	return br.reader.Read(p)
+}
+
+func (br *bufferedReader) Close() error {
+	if !br.closed && br.buffer != nil {
+		br.pool.Put(br.buffer)
+		br.buffer = nil
+		br.closed = true
+	}
+	
+	if closer, ok := br.reader.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // Close releases any resources held by the storage backend

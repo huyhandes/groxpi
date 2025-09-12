@@ -56,6 +56,23 @@ type Storage interface {
 	Close() error
 }
 
+// StreamingStorage extends Storage with streaming-specific methods
+type StreamingStorage interface {
+	Storage
+
+	// StreamingPut stores an object with streaming support and concurrent reads
+	StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error)
+
+	// StreamingGet retrieves an object with zero-copy optimizations when possible
+	StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error)
+
+	// GetFilePath returns the local file path for zero-copy operations (local storage only)
+	GetFilePath(ctx context.Context, key string) (string, error)
+
+	// SupportsZeroCopy indicates if the backend supports zero-copy operations
+	SupportsZeroCopy() bool
+}
+
 // StorageType represents the type of storage backend
 type StorageType string
 

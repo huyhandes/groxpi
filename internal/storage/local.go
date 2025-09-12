@@ -6,12 +6,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 )
 
-// LocalStorage implements Storage interface for local filesystem
+// LocalStorage implements StreamingStorage interface for local filesystem
 type LocalStorage struct {
-	baseDir string
+	baseDir     string
+	copyBufPool *sync.Pool
 }
 
 // NewLocalStorage creates a new local filesystem storage backend
@@ -23,6 +26,11 @@ func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 
 	return &LocalStorage{
 		baseDir: baseDir,
+		copyBufPool: &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 64*1024) // 64KB buffer
+			},
+		},
 	}, nil
 }
 
@@ -264,6 +272,176 @@ func (l *LocalStorage) GetPresignedURL(ctx context.Context, key string, expiry t
 
 // Close releases any resources (no-op for local storage)
 func (l *LocalStorage) Close() error {
+	return nil
+}
+
+// StreamingPut stores an object with streaming support and concurrent reads
+func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+	// For local storage, streaming put is same as regular put but with optimized copy
+	path := l.buildPath(key)
+
+	// Ensure directory exists
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Create temporary file first
+	tmpFile, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	// Ensure cleanup on error
+	defer func() {
+		if tmpFile != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// Use pooled buffer for optimized copy
+	copyBuf := l.copyBufPool.Get().([]byte)
+	defer l.copyBufPool.Put(copyBuf)
+
+	// Copy data with pooled buffer
+	written, err := io.CopyBuffer(tmpFile, reader, copyBuf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write file: %w", err)
+	}
+
+	// Close temp file
+	if err := tmpFile.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close temp file: %w", err)
+	}
+	tmpFile = nil // Prevent defer cleanup
+
+	// Move to final location
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to move file: %w", err)
+	}
+
+	return &ObjectInfo{
+		Key:         key,
+		Size:        written,
+		ContentType: contentType,
+	}, nil
+}
+
+// StreamingGet retrieves an object with zero-copy optimizations
+func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
+	path := l.buildPath(key)
+
+	// Get file info first
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("object not found: %s", key)
+		}
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	info := &ObjectInfo{
+		Key:          key,
+		Size:         stat.Size(),
+		LastModified: stat.ModTime(),
+	}
+
+	// Try sendfile optimization if writer supports it
+	if l.trySendfile(writer, path, stat.Size()) == nil {
+		return info, nil
+	}
+
+	// Fall back to optimized copy
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	// Use pooled buffer for optimized copy
+	copyBuf := l.copyBufPool.Get().([]byte)
+	defer l.copyBufPool.Put(copyBuf)
+
+	_, err = io.CopyBuffer(writer, file, copyBuf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	return info, nil
+}
+
+// GetFilePath returns the local file path for zero-copy operations
+func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, error) {
+	path := l.buildPath(key)
+	
+	// Check if file exists
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("object not found: %s", key)
+		}
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	return path, nil
+}
+
+// SupportsZeroCopy indicates if the backend supports zero-copy operations
+func (l *LocalStorage) SupportsZeroCopy() bool {
+	return true // Local storage supports sendfile and direct file serving
+}
+
+// trySendfile attempts to use sendfile for zero-copy transfer
+func (l *LocalStorage) trySendfile(writer io.Writer, filepath string, size int64) error {
+	// Try to get file descriptor from writer (e.g., net.Conn)
+	type fdWriter interface {
+		File() (*os.File, error)
+	}
+
+	if fdWriter, ok := writer.(fdWriter); ok {
+		connFile, err := fdWriter.File()
+		if err != nil {
+			return err // Fall back to regular copy
+		}
+		defer connFile.Close()
+
+		srcFile, err := os.Open(filepath)
+		if err != nil {
+			return err
+		}
+		defer srcFile.Close()
+
+		// Use sendfile syscall
+		return l.sendfile(int(connFile.Fd()), int(srcFile.Fd()), size)
+	}
+
+	return fmt.Errorf("writer doesn't support sendfile")
+}
+
+// sendfile performs the actual sendfile syscall
+func (l *LocalStorage) sendfile(dst, src int, size int64) error {
+	var offset int64 = 0
+	remaining := size
+
+	for remaining > 0 {
+		n, err := syscall.Sendfile(dst, src, &offset, int(remaining))
+		if err != nil {
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				continue // Retry on would-block
+			}
+			return fmt.Errorf("sendfile failed: %w", err)
+		}
+
+		if n == 0 {
+			break // EOF
+		}
+
+		remaining -= int64(n)
+		offset += int64(n)
+	}
+
 	return nil
 }
 
