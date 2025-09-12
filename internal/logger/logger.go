@@ -25,7 +25,6 @@ type LogConfig struct {
 func Init(cfg LogConfig) {
 	// Set log level
 	level := parseLevel(cfg.Level)
-	log.DefaultLogger.SetLevel(level)
 
 	// Configure based on format
 	switch strings.ToLower(cfg.Format) {
@@ -67,8 +66,11 @@ func Init(cfg LogConfig) {
 		}
 	}
 
-	// Set as default logger
+	// Set as default logger - this is crucial for log.Debug() calls throughout the codebase
 	log.DefaultLogger = Logger
+	
+	// Also ensure the default logger level is set correctly
+	log.DefaultLogger.SetLevel(level)
 }
 
 // parseLevel converts string level to log.Level

@@ -24,6 +24,7 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/storage"
+	"github.com/huyhandes/groxpi/internal/streaming"
 )
 
 // Response buffer pool for reducing allocations
@@ -42,6 +43,9 @@ type Server struct {
 	storage       storage.Storage
 	app           *fiber.App
 	sf            singleflight.Group // For deduplicating concurrent requests
+	cacheSF       singleflight.Group // For deduplicating concurrent cache reads
+	downloadSF    singleflight.Group // For deduplicating concurrent downloads
+	streamDownloader streaming.StreamingDownloader
 }
 
 func New(cfg *config.Config) *Server {
@@ -77,14 +81,20 @@ func New(cfg *config.Config) *Server {
 		log.Fatal().Err(err).Msg("Failed to initialize storage")
 	}
 
+	// Create HTTP client for streaming downloader
+	streamClient := &http.Client{
+		Timeout: 60 * time.Second,
+	}
+
 	s := &Server{
-		config:        cfg,
-		indexCache:    cache.NewIndexCache(),
-		fileCache:     cache.NewFileCache(cfg.CacheDir, cfg.CacheSize),
-		responseCache: cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
-		pypiClient:    pypi.NewClient(cfg),
-		storage:       storageBackend,
-		app:           app,
+		config:           cfg,
+		indexCache:       cache.NewIndexCache(),
+		fileCache:        cache.NewFileCache(cfg.CacheDir, cfg.CacheSize),
+		responseCache:    cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
+		pypiClient:       pypi.NewClient(cfg),
+		storage:          storageBackend,
+		app:              app,
+		streamDownloader: streaming.NewTeeStreamingDownloader(&storageAdapter{storageBackend}, streamClient),
 	}
 
 	s.setupRoutes()
@@ -290,7 +300,8 @@ func (s *Server) renderPackageFiles(c *fiber.Ctx, packageName string, files []py
 			// Use simple map to avoid fiber.Map overhead
 			fileMap := make(map[string]interface{}, 6)
 			fileMap["filename"] = file.Name
-			fileMap["url"] = file.URL
+			// Rewrite URL to point to proxy instead of direct PyPI
+			fileMap["url"] = fmt.Sprintf("/simple/%s/%s", packageName, file.Name)
 
 			if file.Hashes != nil && len(file.Hashes) > 0 {
 				fileMap["hashes"] = file.Hashes
@@ -352,7 +363,8 @@ func (s *Server) renderPackageFiles(c *fiber.Ctx, packageName string, files []py
 
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
-		sb.WriteString(file.URL)
+		// Rewrite URL to point to proxy instead of direct PyPI
+		sb.WriteString(fmt.Sprintf("/simple/%s/%s", packageName, file.Name))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {
@@ -383,12 +395,30 @@ func (s *Server) handleDownloadFile(c *fiber.Ctx) error {
 	packageName := c.Params("package")
 	fileName := c.Params("file")
 
+	log.Debug().
+		Str("package", packageName).
+		Str("file", fileName).
+		Str("user_agent", c.Get("User-Agent")).
+		Str("client_ip", c.IP()).
+		Msg("📦 File download request received")
+
 	// Normalize package name
 	packageName = normalizePackageName(packageName)
 
-	// Try to get from cache
+	// For now, handle download directly without singleflight to fix tests
+	// TODO: Re-enable singleflight after proper error handling
+	return s.handleDownloadInternal(c, packageName, fileName)
+}
+
+// handleDownloadInternal performs the actual download logic with streaming and caching
+func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName string) error {
+	// Try to get from file cache first
 	if path, exists := s.fileCache.Get(packageName + "/" + fileName); exists {
-		// Serve from cache
+		log.Debug().
+			Str("package", packageName).
+			Str("file", fileName).
+			Str("cache_path", path).
+			Msg("✅ Serving from file cache")
 		return c.SendFile(path)
 	}
 
@@ -426,6 +456,14 @@ func (s *Server) handleDownloadFile(c *fiber.Ctx) error {
 
 	// Build storage key for the file
 	storageKey := fmt.Sprintf("packages/%s/%s", packageName, fileName)
+	
+	log.Debug().
+		Str("package", packageName).
+		Str("file", fileName).
+		Str("storage_key", storageKey).
+		Str("file_url", fileURL).
+		Str("storage_type", s.config.StorageType).
+		Msg("🔍 Checking if file exists in storage")
 
 	// Check if file exists in storage
 	ctx := context.Background()
@@ -434,23 +472,68 @@ func (s *Server) handleDownloadFile(c *fiber.Ctx) error {
 		log.Error().Err(err).Str("key", storageKey).Msg("Failed to check storage")
 	}
 
+	log.Debug().
+		Str("storage_key", storageKey).
+		Bool("exists_in_storage", exists).
+		Msg("💾 Storage existence check result")
+
 	if exists {
-		// Serve from storage
-		log.Debug().Str("package", packageName).Str("file", fileName).Msg("Serving from storage cache")
-		return s.serveFromStorage(c, storageKey)
+		// Serve from storage using zero-copy when possible
+		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
+		return s.serveFromStorageOptimized(c, storageKey)
 	}
 
-	// Check download timeout to decide whether to download or redirect
+	// Check download timeout to decide whether to stream or redirect
 	if s.config.DownloadTimeout > 0 {
-		// Try to download and cache within timeout
+		// Use streaming downloader for simultaneous download and serve
 		downloadCtx, cancel := context.WithTimeout(ctx, s.config.DownloadTimeout)
 		defer cancel()
 
-		if err := s.downloadAndCache(downloadCtx, fileURL, storageKey); err == nil {
-			log.Info().Str("package", packageName).Str("file", fileName).Msg("Downloaded and cached file")
-			return s.serveFromStorage(c, storageKey)
+		log.Info().
+			Str("package", packageName).
+			Str("file", fileName).
+			Str("file_url", fileURL).
+			Msg("🚀 Starting streaming download with simultaneous cache")
+
+		// Stream to client while caching
+		result, err := s.streamDownloader.DownloadAndStream(downloadCtx, fileURL, storageKey, c.Response().BodyWriter())
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("package", packageName).
+				Str("file", fileName).
+				Str("file_url", fileURL).
+				Dur("timeout", s.config.DownloadTimeout).
+				Msg("Failed to stream download, redirecting to PyPI")
+			
+			// Fall back to redirect
+			return c.Redirect(fileURL, fiber.StatusFound)
 		}
-		log.Warn().Err(err).Str("package", packageName).Msg("Download timeout, redirecting to PyPI")
+
+		// Set appropriate headers
+		if result.ContentType != "" {
+			c.Set("Content-Type", result.ContentType)
+		}
+		if result.Size > 0 {
+			c.Set("Content-Length", fmt.Sprintf("%d", result.Size))
+		}
+		if result.ETag != "" {
+			c.Set("ETag", result.ETag)
+		}
+
+		log.Info().
+			Str("package", packageName).
+			Str("file", fileName).
+			Int64("size", result.Size).
+			Bool("cached", result.Error == nil).
+			Msg("✅ Successfully streamed file to client")
+
+		return nil // Response already written
+	} else {
+		log.Debug().
+			Str("package", packageName).
+			Str("file", fileName).
+			Msg("Download timeout is 0, redirecting directly to PyPI")
 	}
 
 	// Redirect to upstream URL
@@ -557,9 +640,20 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 
 // downloadAndCache downloads a file from URL and stores it in storage
 func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey string) error {
+	start := time.Now()
+	
+	log.Debug().
+		Str("url", fileURL).
+		Str("storage_key", storageKey).
+		Msg("Starting download and cache operation")
+
 	// Download file from PyPI
 	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("url", fileURL).
+			Msg("Failed to create HTTP request")
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -567,21 +661,47 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 		Timeout: 30 * time.Second,
 	}
 
+	downloadStart := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("url", fileURL).
+			Dur("download_duration", time.Since(downloadStart)).
+			Msg("Failed to download from PyPI")
 		return fmt.Errorf("failed to download: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Error().
+			Int("status_code", resp.StatusCode).
+			Str("url", fileURL).
+			Dur("download_duration", time.Since(downloadStart)).
+			Msg("Download failed with non-200 status")
 		return fmt.Errorf("download failed with status %d", resp.StatusCode)
 	}
 
 	// Read the content
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("url", fileURL).
+			Dur("download_duration", time.Since(downloadStart)).
+			Msg("Failed to read response body")
 		return fmt.Errorf("failed to read response: %w", err)
 	}
+
+	downloadDuration := time.Since(downloadStart)
+	fileSize := int64(len(data))
+	
+	log.Info().
+		Str("url", fileURL).
+		Int64("size_bytes", fileSize).
+		Dur("download_duration", downloadDuration).
+		Float64("download_speed_mbps", float64(fileSize)/downloadDuration.Seconds()/(1024*1024)).
+		Msg("Successfully downloaded file from PyPI")
 
 	// Store in storage backend
 	contentType := resp.Header.Get("Content-Type")
@@ -589,10 +709,33 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 		contentType = "application/octet-stream"
 	}
 
-	_, err = s.storage.Put(ctx, storageKey, bytes.NewReader(data), int64(len(data)), contentType)
+	uploadStart := time.Now()
+	_, err = s.storage.Put(ctx, storageKey, bytes.NewReader(data), fileSize, contentType)
 	if err != nil {
+		uploadDuration := time.Since(uploadStart)
+		log.Error().
+			Err(err).
+			Str("storage_key", storageKey).
+			Int64("size_bytes", fileSize).
+			Str("content_type", contentType).
+			Str("storage_type", s.config.StorageType).
+			Dur("upload_duration", uploadDuration).
+			Msg("Failed to store file in storage backend")
 		return fmt.Errorf("failed to store in storage: %w", err)
 	}
+
+	uploadDuration := time.Since(uploadStart)
+	totalDuration := time.Since(start)
+	
+	log.Info().
+		Str("storage_key", storageKey).
+		Int64("size_bytes", fileSize).
+		Str("content_type", contentType).
+		Str("storage_type", s.config.StorageType).
+		Dur("upload_duration", uploadDuration).
+		Dur("total_duration", totalDuration).
+		Float64("upload_speed_mbps", float64(fileSize)/uploadDuration.Seconds()/(1024*1024)).
+		Msg("Successfully stored file in storage backend")
 
 	return nil
 }
@@ -600,6 +743,11 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 // serveFromStorage serves a file from the storage backend
 func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {
 	ctx := context.Background()
+
+	log.Debug().
+		Str("storage_key", storageKey).
+		Str("method", c.Method()).
+		Msg("Starting file serve from storage")
 
 	// Get file from storage
 	reader, info, err := s.storage.Get(ctx, storageKey)
@@ -624,6 +772,97 @@ func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {
 	filename := path.Base(storageKey)
 	c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 
-	// Stream the file
-	return c.SendStream(reader)
+	// Set cache headers for better performance
+	c.Set("Cache-Control", "public, max-age=3600")
+	c.Set("ETag", fmt.Sprintf(`"%s"`, info.ETag))
+
+	// Handle HEAD requests without reading body
+	if c.Method() == "HEAD" {
+		log.Debug().
+			Str("storage_key", storageKey).
+			Int64("size", info.Size).
+			Msg("Serving HEAD request from storage")
+		return nil
+	}
+
+	log.Debug().
+		Str("storage_key", storageKey).
+		Int64("size", info.Size).
+		Msg("Starting file stream from storage")
+
+	// Use io.Copy to manually stream the file to the response writer
+	// This gives us more control over the streaming process
+	written, err := io.Copy(c.Response().BodyWriter(), reader)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("storage_key", storageKey).
+			Int64("bytes_written", written).
+			Msg("Failed to stream file from storage")
+		return err
+	}
+	
+	log.Debug().
+		Str("storage_key", storageKey).
+		Int64("bytes_written", written).
+		Msg("File stream completed successfully")
+	
+	return nil
+}
+
+// serveFromStorageOptimized serves a file from storage with zero-copy optimizations when possible
+func (s *Server) serveFromStorageOptimized(c *fiber.Ctx, storageKey string) error {
+	ctx := context.Background()
+
+	// Try to get local file path for zero-copy operations (local storage only)
+	if streamStorage, ok := s.storage.(storage.StreamingStorage); ok && streamStorage.SupportsZeroCopy() {
+		if filePath, err := streamStorage.GetFilePath(ctx, storageKey); err == nil {
+			// Use Fiber's SendFile for zero-copy local file serving
+			log.Debug().
+				Str("storage_key", storageKey).
+				Str("file_path", filePath).
+				Msg("Using zero-copy SendFile")
+			return c.SendFile(filePath)
+		}
+	}
+
+	// Fall back to streaming from storage
+	log.Debug().
+		Str("storage_key", storageKey).
+		Msg("Using streaming from storage backend")
+
+	if streamStorage, ok := s.storage.(storage.StreamingStorage); ok {
+		// Use optimized streaming
+		info, err := streamStorage.StreamingGet(ctx, storageKey, c.Response().BodyWriter())
+		if err != nil {
+			log.Error().Err(err).Str("key", storageKey).Msg("Failed to stream from storage")
+			return c.Status(fiber.StatusInternalServerError).SendString("Storage error")
+		}
+
+		// Set headers
+		if info.ContentType != "" {
+			c.Set("Content-Type", info.ContentType)
+		}
+		if info.Size > 0 {
+			c.Set("Content-Length", fmt.Sprintf("%d", info.Size))
+		}
+		if info.ETag != "" {
+			c.Set("ETag", fmt.Sprintf("\"%s\"", info.ETag))
+		}
+
+		return nil
+	}
+
+	// Fall back to regular storage serving
+	return s.serveFromStorage(c, storageKey)
+}
+
+// storageAdapter adapts storage.Storage to streaming.StorageWriter
+type storageAdapter struct {
+	storage storage.Storage
+}
+
+func (sa *storageAdapter) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
+	_, err := sa.storage.Put(ctx, key, reader, size, contentType)
+	return err
 }

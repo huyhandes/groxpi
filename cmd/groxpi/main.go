@@ -25,6 +25,13 @@ func main() {
 		Color:  cfg.LogColor,
 	})
 
+	// Test debug logging immediately after logger init
+	log.Debug().
+		Str("log_level", cfg.LogLevel).
+		Str("log_format", cfg.LogFormat).
+		Bool("log_color", cfg.LogColor).
+		Msg("🔧 Logger initialized and debug logging is working")
+
 	// Log startup info
 	log.Info().
 		Str("version", "1.0.0").
