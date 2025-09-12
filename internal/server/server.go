@@ -497,10 +497,14 @@ func (s *Server) handleCachePackage(c *fiber.Ctx) error {
 
 func (s *Server) handleHealth(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
-		"status": "success",
+		"status":    "success",
+		"timestamp": time.Now().Unix(),
 		"data": fiber.Map{
-			"cache_dir": s.config.CacheDir,
-			"index_url": s.config.IndexURL,
+			"cache_dir":          s.config.CacheDir,
+			"index_url":          s.config.IndexURL,
+			"cache_size":         s.config.CacheSize,
+			"index_ttl_seconds":  int(s.config.IndexTTL.Seconds()),
+			"storage_type":       s.config.StorageType,
 		},
 	})
 }

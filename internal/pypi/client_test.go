@@ -664,3 +664,206 @@ func BenchmarkClient_GetPackageFiles_WithSingleflight(b *testing.B) {
 		}
 	})
 }
+
+// TestFileInfo_IsYanked tests the IsYanked method with different yanked values
+func TestFileInfo_IsYanked(t *testing.T) {
+	testCases := []struct {
+		name     string
+		yanked   interface{}
+		expected bool
+	}{
+		{"nil yanked", nil, false},
+		{"false bool yanked", false, false},
+		{"true bool yanked", true, true},
+		{"empty string yanked", "", false},
+		{"non-empty string yanked", "security issue", true},
+		{"invalid type yanked", 123, false},
+		{"float type yanked", 1.23, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fileInfo := &FileInfo{Yanked: tc.yanked}
+			result := fileInfo.IsYanked()
+			if result != tc.expected {
+				t.Errorf("IsYanked() = %v, expected %v for yanked value %v", result, tc.expected, tc.yanked)
+			}
+		})
+	}
+}
+
+// TestFileInfo_GetYankedReason tests the GetYankedReason method
+func TestFileInfo_GetYankedReason(t *testing.T) {
+	testCases := []struct {
+		name         string
+		yanked       interface{}
+		yankedReason string
+		expected     string
+	}{
+		{"reason from YankedReason field", false, "explicit reason", "explicit reason"},
+		{"reason from string yanked", "implicit reason", "", "implicit reason"},
+		{"YankedReason takes precedence", "implicit", "explicit", "explicit"},
+		{"empty reason", false, "", ""},
+		{"nil yanked", nil, "", ""},
+		{"bool true yanked no reason", true, "", ""},
+		{"empty string yanked", "", "", ""},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fileInfo := &FileInfo{
+				Yanked:       tc.yanked,
+				YankedReason: tc.yankedReason,
+			}
+			result := fileInfo.GetYankedReason()
+			if result != tc.expected {
+				t.Errorf("GetYankedReason() = %q, expected %q", result, tc.expected)
+			}
+		})
+	}
+}
+
+// TestClient_ParseHTMLPackageList tests HTML parsing fallback
+func TestClient_ParseHTMLPackageList(t *testing.T) {
+	client := &Client{}
+
+	testCases := []struct {
+		name     string
+		html     string
+		expected []string
+	}{
+		{
+			name: "simple HTML with packages",
+			html: `<!DOCTYPE html>
+<html>
+<body>
+	<a href="numpy/">numpy</a><br/>
+	<a href="scipy/">scipy</a><br/>
+	<a href="matplotlib/">matplotlib</a><br/>
+</body>
+</html>`,
+			expected: []string{"numpy", "scipy", "matplotlib"},
+		},
+		{
+			name: "HTML with mixed case and extra attributes",
+			html: `<html>
+<body>
+<a href="Django/" class="package">Django</a>
+<a href="flask/">flask</a>
+<a href="requests/" title="HTTP library">requests</a>
+</body>
+</html>`,
+			expected: []string{"Django", "flask", "requests"},
+		},
+		{
+			name: "empty HTML",
+			html: `<html><body></body></html>`,
+			expected: []string{},
+		},
+		{
+			name: "HTML with non-package links",
+			html: `<html>
+<body>
+<a href="../">Parent Directory</a>
+<a href="numpy/">numpy</a>
+<a href="scipy/">scipy</a>
+</body>
+</html>`,
+			expected: []string{"Parent Directory", "numpy", "scipy"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := client.parseHTMLPackageList(strings.NewReader(tc.html))
+			if err != nil {
+				t.Fatalf("parseHTMLPackageList failed: %v", err)
+			}
+			
+			if len(result) != len(tc.expected) {
+				t.Errorf("Expected %d packages, got %d", len(tc.expected), len(result))
+				return
+			}
+
+			for i, pkg := range result {
+				if pkg != tc.expected[i] {
+					t.Errorf("Package %d: expected %q, got %q", i, tc.expected[i], pkg)
+				}
+			}
+		})
+	}
+}
+
+// TestClient_ParseHTMLPackageFiles tests HTML parsing for package files
+func TestClient_ParseHTMLPackageFiles(t *testing.T) {
+	client := &Client{}
+
+	testCases := []struct {
+		name     string
+		html     string
+		expected []FileInfo
+	}{
+		{
+			name: "simple package files",
+			html: `<!DOCTYPE html>
+<html>
+<body>
+	<a href="numpy-1.21.0.tar.gz">numpy-1.21.0.tar.gz</a><br/>
+	<a href="numpy-1.21.0-py3-none-any.whl">numpy-1.21.0-py3-none-any.whl</a><br/>
+</body>
+</html>`,
+			expected: []FileInfo{
+				{Name: "numpy-1.21.0.tar.gz", URL: "numpy-1.21.0.tar.gz"},
+				{Name: "numpy-1.21.0-py3-none-any.whl", URL: "numpy-1.21.0-py3-none-any.whl"},
+			},
+		},
+		{
+			name: "files with hashes in URL",
+			html: `<html>
+<body>
+<a href="package-1.0.tar.gz#sha256=abc123">package-1.0.tar.gz</a>
+<a href="package-1.0.whl#md5=def456">package-1.0.whl</a>
+</body>
+</html>`,
+			expected: []FileInfo{
+				{
+					Name: "package-1.0.tar.gz",
+					URL:  "package-1.0.tar.gz#sha256=abc123",
+				},
+				{
+					Name: "package-1.0.whl", 
+					URL:  "package-1.0.whl#md5=def456",
+				},
+			},
+		},
+		{
+			name: "empty package page",
+			html: `<html><body><h1>No files found</h1></body></html>`,
+			expected: []FileInfo{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html))
+			if err != nil {
+				t.Fatalf("parseHTMLPackageFiles failed: %v", err)
+			}
+			
+			if len(result) != len(tc.expected) {
+				t.Errorf("Expected %d files, got %d", len(tc.expected), len(result))
+				return
+			}
+
+			for i, file := range result {
+				expected := tc.expected[i]
+				if file.Name != expected.Name {
+					t.Errorf("File %d name: expected %q, got %q", i, expected.Name, file.Name)
+				}
+				if file.URL != expected.URL {
+					t.Errorf("File %d URL: expected %q, got %q", i, expected.URL, file.URL)
+				}
+			}
+		})
+	}
+}
