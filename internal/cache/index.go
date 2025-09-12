@@ -24,23 +24,23 @@ func NewIndexCache() *IndexCache {
 func (c *IndexCache) Get(key string) (interface{}, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	entry, exists := c.entries[key]
 	if !exists {
 		return nil, false
 	}
-	
+
 	if time.Now().After(entry.ExpiresAt) {
 		return nil, false
 	}
-	
+
 	return entry.Data, true
 }
 
 func (c *IndexCache) Set(key string, data interface{}, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	c.entries[key] = &IndexEntry{
 		Data:      data,
 		ExpiresAt: time.Now().Add(ttl),
@@ -50,14 +50,14 @@ func (c *IndexCache) Set(key string, data interface{}, ttl time.Duration) {
 func (c *IndexCache) InvalidateList() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	delete(c.entries, "package-list")
 }
 
 func (c *IndexCache) InvalidatePackage(packageName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	delete(c.entries, "package:"+packageName)
 }
 

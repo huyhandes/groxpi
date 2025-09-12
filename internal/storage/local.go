@@ -34,7 +34,7 @@ func (l *LocalStorage) buildPath(key string) string {
 // Get retrieves an object from local filesystem
 func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
 	path := l.buildPath(key)
-	
+
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -61,7 +61,7 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 // GetRange retrieves a byte range from a file
 func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
 	path := l.buildPath(key)
-	
+
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -106,7 +106,7 @@ func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length 
 // Put stores an object in local filesystem
 func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	path := l.buildPath(key)
-	
+
 	// Ensure directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -119,7 +119,7 @@ func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, si
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	
+
 	// Ensure cleanup on error
 	defer func() {
 		if tmpFile != nil {
@@ -161,7 +161,7 @@ func (l *LocalStorage) PutMultipart(ctx context.Context, key string, reader io.R
 // Delete removes an object from local filesystem
 func (l *LocalStorage) Delete(ctx context.Context, key string) error {
 	path := l.buildPath(key)
-	
+
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete file: %w", err)
@@ -173,7 +173,7 @@ func (l *LocalStorage) Delete(ctx context.Context, key string) error {
 // Exists checks if an object exists in local filesystem
 func (l *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 	path := l.buildPath(key)
-	
+
 	_, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -188,7 +188,7 @@ func (l *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 // Stat retrieves object metadata without opening the file
 func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
 	path := l.buildPath(key)
-	
+
 	stat, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -207,7 +207,7 @@ func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error
 // List returns a list of objects matching the options
 func (l *LocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
 	pattern := filepath.Join(l.baseDir, opts.Prefix+"*")
-	
+
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files: %w", err)
@@ -215,7 +215,7 @@ func (l *LocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInf
 
 	var objects []*ObjectInfo
 	count := 0
-	
+
 	for _, path := range matches {
 		if opts.MaxKeys > 0 && count >= opts.MaxKeys {
 			break

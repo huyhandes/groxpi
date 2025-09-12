@@ -39,13 +39,13 @@ func TestS3Storage(t *testing.T) {
 	t.Run("PutAndGet", func(t *testing.T) {
 		key := "test/file.txt"
 		content := []byte("Hello, S3!")
-		
+
 		// Put object
 		info, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
 		if err != nil {
 			t.Fatalf("Failed to put object: %v", err)
 		}
-		
+
 		if info.Size != int64(len(content)) {
 			t.Errorf("Expected size %d, got %d", len(content), info.Size)
 		}
@@ -73,7 +73,7 @@ func TestS3Storage(t *testing.T) {
 	t.Run("GetRange", func(t *testing.T) {
 		key := "test/range-file.txt"
 		content := []byte("0123456789ABCDEF")
-		
+
 		// Put object
 		_, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
 		if err != nil {
@@ -231,7 +231,7 @@ func TestS3Storage(t *testing.T) {
 // TestLocalStorage runs unit tests for local storage
 func TestLocalStorage(t *testing.T) {
 	tmpDir := t.TempDir()
-	
+
 	storage, err := NewLocalStorage(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to create local storage: %v", err)
@@ -243,13 +243,13 @@ func TestLocalStorage(t *testing.T) {
 	t.Run("PutAndGet", func(t *testing.T) {
 		key := "test/file.txt"
 		content := []byte("Hello, Local!")
-		
+
 		// Put object
 		info, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
 		if err != nil {
 			t.Fatalf("Failed to put object: %v", err)
 		}
-		
+
 		if info.Size != int64(len(content)) {
 			t.Errorf("Expected size %d, got %d", len(content), info.Size)
 		}
@@ -274,7 +274,7 @@ func TestLocalStorage(t *testing.T) {
 	t.Run("GetRange", func(t *testing.T) {
 		key := "test/range-file.txt"
 		content := []byte("0123456789ABCDEF")
-		
+
 		// Put object
 		_, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
 		if err != nil {

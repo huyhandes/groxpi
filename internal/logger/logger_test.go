@@ -173,7 +173,7 @@ func TestInit_LevelFiltering(t *testing.T) {
 	if strings.Contains(output, "info message") {
 		t.Error("Info message should be filtered out at WARN level")
 	}
-	
+
 	// Should contain warn and error messages
 	if !strings.Contains(output, "warn message") {
 		t.Error("Warn message should be included at WARN level")
@@ -254,7 +254,7 @@ func TestInit_DefaultFormat(t *testing.T) {
 		Format: "",
 		Color:  false,
 	}
-	
+
 	// Should not panic
 	Init(cfg)
 
@@ -271,13 +271,13 @@ func TestInit_ColorConfiguration(t *testing.T) {
 		Format: "console",
 		Color:  true,
 	}
-	
+
 	// Should not panic
 	Init(cfg)
-	
+
 	// Test color disabled
 	cfg.Color = false
 	Init(cfg)
-	
+
 	// Both configurations should work without errors
 }

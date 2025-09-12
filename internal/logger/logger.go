@@ -26,7 +26,7 @@ func Init(cfg LogConfig) {
 	// Set log level
 	level := parseLevel(cfg.Level)
 	log.DefaultLogger.SetLevel(level)
-	
+
 	// Configure based on format
 	switch strings.ToLower(cfg.Format) {
 	case "json":

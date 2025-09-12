@@ -32,44 +32,44 @@ func NewFileCache(cacheDir string, maxSize int64) *FileCache {
 func (c *FileCache) Get(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	elem, exists := c.entries[key]
 	if !exists {
 		return "", false
 	}
-	
+
 	// Move to front (most recently used)
 	c.lru.MoveToFront(elem)
 	entry := elem.Value.(*FileEntry)
-	
+
 	return entry.Path, true
 }
 
 func (c *FileCache) Set(key string, path string, size int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	// Cannot cache anything if max size is 0
 	if c.maxSize == 0 {
 		return
 	}
-	
+
 	// Check if already exists
 	if elem, exists := c.entries[key]; exists {
 		c.lru.MoveToFront(elem)
 		return
 	}
-	
+
 	// Evict if necessary
 	for c.curSize+size > c.maxSize && c.lru.Len() > 0 {
 		c.evict()
 	}
-	
+
 	// Don't add if still too big after eviction
 	if c.curSize+size > c.maxSize {
 		return
 	}
-	
+
 	// Add new entry
 	entry := &FileEntry{
 		Path: path,
@@ -85,10 +85,10 @@ func (c *FileCache) evict() {
 	if elem == nil {
 		return
 	}
-	
+
 	c.lru.Remove(elem)
 	entry := elem.Value.(*FileEntry)
-	
+
 	// Find and remove from map
 	for key, e := range c.entries {
 		if e == elem {
@@ -96,7 +96,7 @@ func (c *FileCache) evict() {
 			break
 		}
 	}
-	
+
 	c.curSize -= entry.Size
 }
 

@@ -8,7 +8,7 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 
 ## ✨ Features
 
-### 🚀 **Proven Performance** (Benchmarked vs Proxpi)
+### 🚀 **Not Proven Performance** (Benchmarked vs Proxpi) -- The benchmark will be updated
 - **16,000x faster** package index queries (40,707 vs 2.52 requests/sec)
 - **300x faster** response times (25ms vs 8.4s for package index)
 - **Sub-millisecond** latency for cached requests
@@ -87,28 +87,6 @@ index-url = http://localhost:5000/simple/
 
 **✅ Drop-in replacement - no client changes needed**
 
-## 📊 Performance Benchmarks
-
-Real-world benchmark results comparing groxpi vs proxpi:
-
-### API Performance (WRK Load Testing)
-```
-Package Index (/index/)
-├── groxpi: 40,707 requests/sec (25ms avg latency)
-└── proxpi:     2.52 requests/sec (8.4s avg latency)
-    └── 16,000x faster 🚀
-
-Package Details (/index/requests)
-├── groxpi:    990 requests/sec (52ms avg latency)
-└── proxpi:  1,590 requests/sec (382ms avg latency)
-```
-
-### Key Performance Advantages
-- **Package Index**: 16,000x faster request handling
-- **Response Time**: 300x faster for index queries (25ms vs 8,400ms)
-- **Concurrent Handling**: Maintains performance under load
-- **Memory Efficient**: Minimal resource usage with Go
-
 ### Running Benchmarks
 
 ```bash
@@ -123,20 +101,20 @@ cd benchmarks
 
 ## 📋 Installation
 
-### Binary Installation
+### Binary Installation -- Release soon
 
 Download the latest binary from the [releases page](https://github.com/yourusername/groxpi/releases).
 
 ### From Source
 
 ```bash
-go install github.com/yourusername/groxpi/cmd/groxpi@latest
+go install github.com/huyhandes/groxpi/cmd/groxpi@latest
 ```
 
-### Docker
+### Docker -- Release soon
 
 ```bash
-docker pull groxpi:latest
+docker pull huyhandes/proxpi
 ```
 
 ## ⚙️ Configuration
@@ -288,38 +266,6 @@ This sets up:
 - groxpi configured to use MinIO
 - Web UI at http://localhost:9001
 
-## 📊 Performance
-
-groxpi delivers exceptional performance compared to the original proxpi. **Real benchmark results** from Docker container testing:
-
-### 🏆 Benchmark Results (Container-based Testing)
-
-| Metric | groxpi (Go) | proxpi (Python) | Improvement |
-|--------|-------------|-----------------|-------------|
-| **Average Response Time** | **1.0ms** | **4.0ms** | **4.0x faster** |
-| **Memory Usage** | **2.57MB** | **34.23MB** | **13x less memory** |
-| **Throughput** | **2,418 req/sec** | **1,244 req/sec** | **1.9x higher** |
-| **Performance Gain** | - | - | **70% improvement** |
-
-### 📈 Detailed Package Response Times
-
-| Package | groxpi | proxpi | Speedup |
-|---------|--------|--------|---------|
-| numpy | 1.0ms | 5.0ms | **5.0x** |
-| django | 1.0ms | 5.0ms | **5.0x** |
-| pandas | 1.0ms | 5.0ms | **5.0x** |
-| polars | 1.0ms | 6.0ms | **6.0x** |
-| flask | 3.0ms | 4.0ms | **1.3x** |
-| requests | 3.0ms | 3.0ms | **1.0x** |
-
-### ⚡ Key Performance Advantages
-
-- **🚀 4x Faster Response Times**: Sub-millisecond responses vs multi-millisecond
-- **💾 13x Less Memory**: 2.57MB vs 34.23MB - incredibly efficient
-- **🔥 2x Higher Throughput**: Nearly 2,500 req/sec vs 1,200 req/sec
-- **📦 Smaller Container**: Minimal Go binary vs full Python runtime
-- **⚡ Instant Startup**: Go binary starts immediately vs Python initialization
-
 ### 🛠️ Technology Stack Benefits
 
 - **Go + Fiber Framework**: 2x faster HTTP server than Flask/Gunicorn
@@ -342,18 +288,15 @@ Want to verify these performance claims? Run the included benchmark suite:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/groxpi.git
-cd groxpi/benchmark-comparison
+git clone https://github.com/huyhandes/groxpi.git
+cd groxpi/benchmark
 
 # Start both services
 docker-compose -f docker-compose/groxpi-simple.yml up -d
 docker-compose -f docker-compose/proxpi.yml up -d
 
-# Run the quick benchmark (takes ~30 seconds)
-./scripts/quick-benchmark.sh
-
-# Or test just groxpi
-./scripts/test-groxpi-only.sh
+# Run the benchmark
+./scripts/benchmarks.sh
 ```
 
 The benchmark tests:
@@ -392,15 +335,25 @@ priority = "primary"
 # In Pipfile
 [[source]]
 url = "http://localhost:5000/simple/"
-verify_ssl = true
+verify_ssl = false
 name = "groxpi"
+```
+
+### uv
+
+```bash
+# In pyproject.toml
+[[tool.uv.index]]
+name = "groxpi"
+url = "http://localhost:5000/simple/"
+default = true
 ```
 
 ## 🏗️ Development
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.24+
 - Docker & Docker Compose (optional)
 
 ### Building
@@ -441,7 +394,7 @@ groxpi is designed as a drop-in replacement with zero client changes:
 - **Features**: All original proxpi functionality
 - **Configuration**: Same environment variables (just change prefix)
 
-### ⚡ **What Gets Better**
+### ⚡ **What Gets Better** -- Will be updated
 - **4x faster** response times (1ms vs 4ms)
 - **13x less memory** usage (2.57MB vs 34.23MB) 
 - **2x higher throughput** (2,400 vs 1,200 req/sec)
@@ -513,9 +466,9 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## 📞 Support
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/yourusername/groxpi/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/yourusername/groxpi/discussions)
-- 📖 **Documentation**: [Wiki](https://github.com/yourusername/groxpi/wiki)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/huyhandes/groxpi/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/huyhandes/groxpi/discussions)
+- 📖 **Documentation**: [READNE.md](https://github.com/yourusername/groxpi/README.md)
 
 ---
 

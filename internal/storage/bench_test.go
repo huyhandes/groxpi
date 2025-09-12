@@ -41,22 +41,22 @@ func BenchmarkS3Storage(b *testing.B) {
 
 	// Generate test data
 	sizes := []int{
-		1 * 1024,        // 1KB
-		100 * 1024,      // 100KB
-		1024 * 1024,     // 1MB
+		1 * 1024,         // 1KB
+		100 * 1024,       // 100KB
+		1024 * 1024,      // 1MB
 		10 * 1024 * 1024, // 10MB
 	}
 
 	for _, size := range sizes {
 		sizeName := formatSize(size)
-		
+
 		b.Run(fmt.Sprintf("Put_%s", sizeName), func(b *testing.B) {
 			data := make([]byte, size)
 			rand.Read(data)
-			
+
 			b.SetBytes(int64(size))
 			b.ResetTimer()
-			
+
 			for i := 0; i < b.N; i++ {
 				key := fmt.Sprintf("bench/put_%d_%d", size, i)
 				_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
@@ -78,10 +78,10 @@ func BenchmarkS3Storage(b *testing.B) {
 				b.Fatalf("Failed to setup: %v", err)
 			}
 			defer storage.Delete(ctx, key)
-			
+
 			b.SetBytes(int64(size))
 			b.ResetTimer()
-			
+
 			for i := 0; i < b.N; i++ {
 				reader, _, err := storage.Get(ctx, key)
 				if err != nil {
@@ -91,16 +91,16 @@ func BenchmarkS3Storage(b *testing.B) {
 				reader.Close()
 			}
 		})
-		
+
 		// Benchmark multipart for large files
 		if size >= 10*1024*1024 {
 			b.Run(fmt.Sprintf("Multipart_%s", sizeName), func(b *testing.B) {
 				data := make([]byte, size)
 				rand.Read(data)
-				
+
 				b.SetBytes(int64(size))
 				b.ResetTimer()
-				
+
 				for i := 0; i < b.N; i++ {
 					key := fmt.Sprintf("bench/multipart_%d_%d", size, i)
 					_, err := storage.PutMultipart(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream", 5*1024*1024)
@@ -124,11 +124,11 @@ func BenchmarkS3Storage(b *testing.B) {
 			b.Fatalf("Failed to setup: %v", err)
 		}
 		defer storage.Delete(ctx, key)
-		
+
 		rangeSize := int64(1024 * 1024) // 1MB ranges
 		b.SetBytes(rangeSize)
 		b.ResetTimer()
-		
+
 		for i := 0; i < b.N; i++ {
 			offset := rand.Int63n(int64(size) - rangeSize)
 			reader, _, err := storage.GetRange(ctx, key, offset, rangeSize)
@@ -154,9 +154,9 @@ func BenchmarkS3Storage(b *testing.B) {
 				storage.Delete(ctx, key)
 			}
 		}()
-		
+
 		b.ResetTimer()
-		
+
 		for i := 0; i < b.N; i++ {
 			_, err := storage.List(ctx, ListOptions{
 				Prefix:  "bench/list/",
@@ -177,9 +177,9 @@ func BenchmarkS3Storage(b *testing.B) {
 			b.Fatalf("Failed to setup: %v", err)
 		}
 		defer storage.Delete(ctx, key)
-		
+
 		b.ResetTimer()
-		
+
 		for i := 0; i < b.N; i++ {
 			_, err := storage.GetPresignedURL(ctx, key, 1*time.Hour)
 			if err != nil {
@@ -192,7 +192,7 @@ func BenchmarkS3Storage(b *testing.B) {
 // BenchmarkLocalStorage benchmarks local storage operations
 func BenchmarkLocalStorage(b *testing.B) {
 	tmpDir := b.TempDir()
-	
+
 	storage, err := NewLocalStorage(tmpDir)
 	if err != nil {
 		b.Fatalf("Failed to create local storage: %v", err)
@@ -211,14 +211,14 @@ func BenchmarkLocalStorage(b *testing.B) {
 
 	for _, size := range sizes {
 		sizeName := formatSize(size)
-		
+
 		b.Run(fmt.Sprintf("Put_%s", sizeName), func(b *testing.B) {
 			data := make([]byte, size)
 			rand.Read(data)
-			
+
 			b.SetBytes(int64(size))
 			b.ResetTimer()
-			
+
 			for i := 0; i < b.N; i++ {
 				key := fmt.Sprintf("bench/put_%d_%d", size, i)
 				_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
@@ -237,10 +237,10 @@ func BenchmarkLocalStorage(b *testing.B) {
 			if err != nil {
 				b.Fatalf("Failed to setup: %v", err)
 			}
-			
+
 			b.SetBytes(int64(size))
 			b.ResetTimer()
-			
+
 			for i := 0; i < b.N; i++ {
 				reader, _, err := storage.Get(ctx, key)
 				if err != nil {
@@ -262,11 +262,11 @@ func BenchmarkLocalStorage(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to setup: %v", err)
 		}
-		
+
 		rangeSize := int64(1024 * 1024) // 1MB ranges
 		b.SetBytes(rangeSize)
 		b.ResetTimer()
-		
+
 		for i := 0; i < b.N; i++ {
 			offset := rand.Int63n(int64(size) - rangeSize)
 			reader, _, err := storage.GetRange(ctx, key, offset, rangeSize)
@@ -286,9 +286,9 @@ func BenchmarkLocalStorage(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to setup: %v", err)
 		}
-		
+
 		b.ResetTimer()
-		
+
 		for i := 0; i < b.N; i++ {
 			_, err := storage.Exists(ctx, key)
 			if err != nil {

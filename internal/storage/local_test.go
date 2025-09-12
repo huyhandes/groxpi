@@ -371,7 +371,7 @@ func TestLocalStorage_List(t *testing.T) {
 
 	t.Run("limits_results_with_max_keys", func(t *testing.T) {
 		opts := ListOptions{
-			Prefix:  "package1",  // More specific prefix that should match
+			Prefix:  "package1", // More specific prefix that should match
 			MaxKeys: 1,
 		}
 
@@ -470,15 +470,15 @@ func TestLocalStorage_ConcurrentAccess(t *testing.T) {
 	// Test concurrent Put operations
 	var wg sync.WaitGroup
 	numGoroutines := 10
-	
+
 	wg.Add(numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
-			
+
 			key := fmt.Sprintf("concurrent-%d.txt", id)
 			content := fmt.Sprintf("content-%d", id)
-			
+
 			_, err := storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 			if err != nil {
 				t.Errorf("Concurrent Put failed for %s: %v", key, err)
@@ -507,7 +507,7 @@ func TestLocalStorage_ErrorConditions(t *testing.T) {
 	t.Run("put_with_read_error", func(t *testing.T) {
 		// Create a reader that will error
 		errorReader := &errorReader{err: io.ErrUnexpectedEOF}
-		
+
 		_, err := storage.Put(ctx, "error-test.txt", errorReader, 10, "text/plain")
 		if err == nil {
 			t.Error("Expected error from Put with error reader")
