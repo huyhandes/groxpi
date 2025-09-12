@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1256,6 +1257,132 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 			if resp.StatusCode != http.StatusOK {
 				b.Fatalf("Expected status 200, got %d", resp.StatusCode)
 			}
+		}
+	})
+}
+
+// Test URL rewriting functionality to ensure packages are downloaded through proxy
+func TestServer_URLRewriting(t *testing.T) {
+	packageName := "test-package"
+	
+	// Mock PyPI server that returns original PyPI URLs
+	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+		w.WriteHeader(http.StatusOK)
+		response := `{
+			"meta": {"api-version": "1.0"},
+			"name": "` + packageName + `",
+			"files": [
+				{
+					"filename": "test-package-1.0.0.tar.gz",
+					"url": "https://files.pythonhosted.org/packages/a1/b2/c3/test-package-1.0.0.tar.gz"
+				},
+				{
+					"filename": "test-package-1.0.0-py3-none-any.whl",
+					"url": "https://files.pythonhosted.org/packages/d4/e5/f6/test-package-1.0.0-py3-none-any.whl"
+				}
+			]
+		}`
+		w.Write([]byte(response))
+	}))
+	defer mockPyPI.Close()
+
+	cfg := &config.Config{
+		IndexURL: mockPyPI.URL,
+		CacheDir: "/tmp/test-cache",
+		IndexTTL: 1 * time.Hour,
+	}
+
+	server := New(cfg)
+	app := server.App()
+
+	t.Run("JSON response URLs rewritten to proxy", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/index/"+packageName, nil)
+		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
+
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
+		}
+
+		var response map[string]interface{}
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatalf("Failed to parse JSON response: %v", err)
+		}
+
+		files, ok := response["files"].([]interface{})
+		if !ok {
+			t.Fatal("Expected files array")
+		}
+
+		if len(files) != 2 {
+			t.Fatalf("Expected 2 files, got %d", len(files))
+		}
+
+		// Verify URLs are rewritten to point to proxy
+		for _, file := range files {
+			fileMap := file.(map[string]interface{})
+			filename := fileMap["filename"].(string)
+			url := fileMap["url"].(string)
+			
+			expectedURL := fmt.Sprintf("/simple/%s/%s", packageName, filename)
+			if url != expectedURL {
+				t.Errorf("Expected URL '%s', got '%s'", expectedURL, url)
+			}
+			
+			// Ensure URL does not point to PyPI directly
+			if strings.Contains(url, "files.pythonhosted.org") {
+				t.Errorf("URL should not contain files.pythonhosted.org, got '%s'", url)
+			}
+		}
+	})
+
+	t.Run("HTML response URLs rewritten to proxy", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/index/"+packageName, nil)
+		req.Header.Set("Accept", "text/html")
+
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
+		}
+
+		bodyStr := string(body)
+		
+		// Verify HTML contains proxy URLs, not PyPI URLs
+		expectedURLs := []string{
+			fmt.Sprintf(`href="/simple/%s/test-package-1.0.0.tar.gz"`, packageName),
+			fmt.Sprintf(`href="/simple/%s/test-package-1.0.0-py3-none-any.whl"`, packageName),
+		}
+		
+		for _, expectedURL := range expectedURLs {
+			if !strings.Contains(bodyStr, expectedURL) {
+				t.Errorf("Expected HTML to contain '%s', got: %s", expectedURL, bodyStr)
+			}
+		}
+		
+		// Ensure HTML does not contain direct PyPI URLs
+		if strings.Contains(bodyStr, "files.pythonhosted.org") {
+			t.Errorf("HTML should not contain files.pythonhosted.org URLs, got: %s", bodyStr)
 		}
 	})
 }
