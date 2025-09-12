@@ -2,7 +2,7 @@
 
 A high-performance PyPI caching proxy server written in Go, reimplemented from the Python-based [proxpi](https://github.com/EpicWink/proxpi) project using Fiber framework and Sonic JSON.
 
-[![Go Version](https://img.shields.io/badge/go-1.21+-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.24+-blue.svg)](https://golang.org)
 [![Fiber](https://img.shields.io/badge/fiber-v2.52+-green.svg)](https://gofiber.io/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
