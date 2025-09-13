@@ -17,13 +17,14 @@ func TestNewLocalStorage(t *testing.T) {
 		tmpDir := t.TempDir()
 		baseDir := filepath.Join(tmpDir, "test-storage")
 
-		storage, err := NewLocalStorage(baseDir)
+		localStorage, err := NewLocalStorage(baseDir)
 		if err != nil {
 			t.Fatalf("NewLocalStorage failed: %v", err)
 		}
 
-		if storage.baseDir != baseDir {
-			t.Errorf("Expected baseDir %s, got %s", baseDir, storage.baseDir)
+		// Now we can test internal fields since we're in the same package
+		if localStorage.baseDir != baseDir {
+			t.Errorf("Expected baseDir %s, got %s", baseDir, localStorage.baseDir)
 		}
 
 		// Verify directory was created

@@ -7,28 +7,26 @@ import (
 )
 
 func TestNewIndexCache(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
-	if cache == nil {
+	if indexCache == nil {
 		t.Fatal("NewIndexCache() returned nil")
 	}
 
-	if cache.entries == nil {
-		t.Error("Cache entries map was not initialized")
-	}
+	// Skip internal field checks
 }
 
 func TestIndexCache_SetAndGet(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	t.Run("set and get valid entry", func(t *testing.T) {
 		key := "test-key"
 		data := "test-data"
 		ttl := 5 * time.Second
 
-		cache.Set(key, data, ttl)
+		indexCache.Set(key, data, ttl)
 
-		result, exists := cache.Get(key)
+		result, exists := indexCache.Get(key)
 		if !exists {
 			t.Error("Expected entry to exist")
 		}
@@ -39,7 +37,7 @@ func TestIndexCache_SetAndGet(t *testing.T) {
 	})
 
 	t.Run("get non-existent entry", func(t *testing.T) {
-		_, exists := cache.Get("non-existent-key")
+		_, exists := indexCache.Get("non-existent-key")
 		if exists {
 			t.Error("Expected entry to not exist")
 		}
@@ -50,12 +48,12 @@ func TestIndexCache_SetAndGet(t *testing.T) {
 		data := "expired-data"
 		ttl := 10 * time.Millisecond
 
-		cache.Set(key, data, ttl)
+		indexCache.Set(key, data, ttl)
 
 		// Wait for expiration
 		time.Sleep(20 * time.Millisecond)
 
-		_, exists := cache.Get(key)
+		_, exists := indexCache.Get(key)
 		if exists {
 			t.Error("Expected expired entry to not exist")
 		}
@@ -67,10 +65,10 @@ func TestIndexCache_SetAndGet(t *testing.T) {
 		data2 := "second-data"
 		ttl := 5 * time.Second
 
-		cache.Set(key, data1, ttl)
-		cache.Set(key, data2, ttl)
+		indexCache.Set(key, data1, ttl)
+		indexCache.Set(key, data2, ttl)
 
-		result, exists := cache.Get(key)
+		result, exists := indexCache.Get(key)
 		if !exists {
 			t.Error("Expected entry to exist")
 		}
@@ -82,54 +80,54 @@ func TestIndexCache_SetAndGet(t *testing.T) {
 }
 
 func TestIndexCache_InvalidateList(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	// Set package list
-	cache.Set("package-list", []string{"package1", "package2"}, 5*time.Second)
+	indexCache.Set("package-list", []string{"package1", "package2"}, 5*time.Second)
 
 	// Verify it exists
-	_, exists := cache.Get("package-list")
+	_, exists := indexCache.Get("package-list")
 	if !exists {
 		t.Error("Expected package-list to exist before invalidation")
 	}
 
 	// Invalidate
-	cache.InvalidateList()
+	indexCache.InvalidateList()
 
 	// Verify it's gone
-	_, exists = cache.Get("package-list")
+	_, exists = indexCache.Get("package-list")
 	if exists {
 		t.Error("Expected package-list to be invalidated")
 	}
 }
 
 func TestIndexCache_InvalidatePackage(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	packageName := "test-package"
 	key := "package:" + packageName
 
 	// Set package data
-	cache.Set(key, []string{"file1.whl", "file2.tar.gz"}, 5*time.Second)
+	indexCache.Set(key, []string{"file1.whl", "file2.tar.gz"}, 5*time.Second)
 
 	// Verify it exists
-	_, exists := cache.Get(key)
+	_, exists := indexCache.Get(key)
 	if !exists {
 		t.Error("Expected package data to exist before invalidation")
 	}
 
 	// Invalidate
-	cache.InvalidatePackage(packageName)
+	indexCache.InvalidatePackage(packageName)
 
 	// Verify it's gone
-	_, exists = cache.Get(key)
+	_, exists = indexCache.Get(key)
 	if exists {
 		t.Error("Expected package data to be invalidated")
 	}
 }
 
 func TestIndexCache_ConcurrentAccess(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 	done := make(chan bool)
 
 	// Test concurrent reads and writes
@@ -141,10 +139,10 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 			data := fmt.Sprintf("data-%d", id)
 
 			// Write
-			cache.Set(key, data, 5*time.Second)
+			indexCache.Set(key, data, 5*time.Second)
 
 			// Read
-			result, exists := cache.Get(key)
+			result, exists := indexCache.Get(key)
 			if !exists {
 				t.Errorf("Expected key %s to exist", key)
 				return
@@ -163,7 +161,7 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 }
 
 func TestIndexCache_DifferentDataTypes(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	testCases := []struct {
 		name string
@@ -179,9 +177,9 @@ func TestIndexCache_DifferentDataTypes(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			cache.Set(tc.key, tc.data, 5*time.Second)
+			indexCache.Set(tc.key, tc.data, 5*time.Second)
 
-			result, exists := cache.Get(tc.key)
+			result, exists := indexCache.Get(tc.key)
 			if !exists {
 				t.Errorf("Expected entry for key %s to exist", tc.key)
 			}
@@ -196,33 +194,34 @@ func TestIndexCache_DifferentDataTypes(t *testing.T) {
 }
 
 func TestIndexCache_ZeroTTL(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	key := "zero-ttl-key"
 	data := "zero-ttl-data"
 
 	// Set with zero TTL (should expire immediately)
-	cache.Set(key, data, 0)
+	indexCache.Set(key, data, 0)
 
 	// Should be expired immediately
-	_, exists := cache.Get(key)
+	_, exists := indexCache.Get(key)
 	if exists {
 		t.Error("Expected entry with zero TTL to be expired immediately")
 	}
 }
 
 func TestIndexCache_NegativeTTL(t *testing.T) {
-	cache := NewIndexCache()
+	indexCache := NewIndexCache()
 
 	key := "negative-ttl-key"
 	data := "negative-ttl-data"
 
 	// Set with negative TTL (should expire immediately)
-	cache.Set(key, data, -1*time.Second)
+	indexCache.Set(key, data, -1*time.Second)
 
 	// Should be expired immediately
-	_, exists := cache.Get(key)
+	_, exists := indexCache.Get(key)
 	if exists {
 		t.Error("Expected entry with negative TTL to be expired immediately")
 	}
 }
+

@@ -50,25 +50,26 @@ const (
 
 // createTestS3Storage creates an S3 storage instance for integration testing
 func createTestS3Storage(t *testing.T, customPrefix ...string) *S3Storage {
-	// Load configuration from environment variables only
+	// Load configuration from environment variables with MinIO defaults
 	endpoint := os.Getenv("TEST_S3_ENDPOINT")
 	if endpoint == "" {
-		t.Skip("S3 integration tests require TEST_S3_ENDPOINT environment variable")
+		endpoint = "localhost:9000" // Default MinIO endpoint
+		t.Log("Using default MinIO endpoint: localhost:9000 (ensure MinIO is running with 'docker-compose -f docker-compose.test.yml up -d')")
 	}
 
 	accessKey := os.Getenv("TEST_S3_ACCESS_KEY")
 	if accessKey == "" {
-		t.Skip("S3 integration tests require TEST_S3_ACCESS_KEY environment variable")
+		accessKey = "minioadmin" // Default MinIO access key
 	}
 
 	secretKey := os.Getenv("TEST_S3_SECRET_KEY")
 	if secretKey == "" {
-		t.Skip("S3 integration tests require TEST_S3_SECRET_KEY environment variable")
+		secretKey = "minioadmin" // Default MinIO secret key
 	}
 
 	bucket := os.Getenv("TEST_S3_BUCKET")
 	if bucket == "" {
-		t.Skip("S3 integration tests require TEST_S3_BUCKET environment variable")
+		bucket = "groxpi-test" // Default test bucket
 	}
 
 	// Use defaults for optional configuration
@@ -82,14 +83,14 @@ func createTestS3Storage(t *testing.T, customPrefix ...string) *S3Storage {
 		prefix = customPrefix[0]
 	}
 
-	// Check for SSL configuration (defaults to true)
-	useSSL := true
+	// Check for SSL configuration (defaults to false for local MinIO)
+	useSSL := false
 	if sslEnv := os.Getenv("TEST_S3_USE_SSL"); sslEnv != "" {
-		useSSL = sslEnv != "false"
+		useSSL = sslEnv == "true"
 	}
 
-	// Check for path style configuration (defaults to false for AWS S3)
-	forcePathStyle := false
+	// Check for path style configuration (defaults to true for MinIO)
+	forcePathStyle := true
 	if pathStyleEnv := os.Getenv("TEST_S3_FORCE_PATH_STYLE"); pathStyleEnv != "" {
 		forcePathStyle = pathStyleEnv == "true"
 	}

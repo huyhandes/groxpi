@@ -32,7 +32,7 @@ func TestParseLevel(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.input, func(t *testing.T) {
-			result := parseLevel(tc.input)
+			result := ParseLevel(tc.input)
 			if result != tc.expected {
 				t.Errorf("parseLevel(%q) = %v, want %v", tc.input, result, tc.expected)
 			}
@@ -43,7 +43,7 @@ func TestParseLevel(t *testing.T) {
 func TestIsTerminal(t *testing.T) {
 	// This test is environment dependent, so we just ensure the function doesn't panic
 	// and returns a boolean value
-	result := isTerminal()
+	result := IsTerminal()
 	if result != true && result != false {
 		t.Error("isTerminal() should return a boolean value")
 	}
