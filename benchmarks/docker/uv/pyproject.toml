@@ -13,5 +13,5 @@ dependencies = []
 # Index configuration for proxpi
 [[tool.uv.index]]
 name = "proxpi"
-url = "http://proxpi-bench:8080/simple/"
+url = "http://<index_endpoint>/simple/"
 default = true
