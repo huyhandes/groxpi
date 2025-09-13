@@ -81,9 +81,13 @@ func New(cfg *config.Config) *Server {
 		log.Fatal().Err(err).Msg("Failed to initialize storage")
 	}
 
-	// Create HTTP client for streaming downloader
+	// Create HTTP client for streaming downloader with configured timeout
+	streamTimeout := cfg.DownloadTimeout
+	if streamTimeout <= 0 {
+		streamTimeout = 5 * time.Minute // Default 5 minutes for large files
+	}
 	streamClient := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: streamTimeout,
 	}
 
 	s := &Server{
@@ -658,7 +662,7 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 	}
 
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 5 * time.Minute, // Use 5 minute timeout for large files
 	}
 
 	downloadStart := time.Now()

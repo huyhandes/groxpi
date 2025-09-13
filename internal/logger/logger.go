@@ -24,7 +24,7 @@ type LogConfig struct {
 // Init initializes the global logger
 func Init(cfg LogConfig) {
 	// Set log level
-	level := parseLevel(cfg.Level)
+	level := ParseLevel(cfg.Level)
 
 	// Configure based on format
 	switch strings.ToLower(cfg.Format) {
@@ -39,7 +39,7 @@ func Init(cfg LogConfig) {
 		}
 	default:
 		// Console format with optional color
-		if cfg.Color || (cfg.Color && isTerminal()) {
+		if cfg.Color || (cfg.Color && IsTerminal()) {
 			// Color console output
 			Logger = log.Logger{
 				Level:      level,
@@ -74,7 +74,7 @@ func Init(cfg LogConfig) {
 }
 
 // parseLevel converts string level to log.Level
-func parseLevel(level string) log.Level {
+func ParseLevel(level string) log.Level {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
 		return log.DebugLevel
@@ -92,7 +92,7 @@ func parseLevel(level string) log.Level {
 }
 
 // isTerminal checks if stdout is a terminal
-func isTerminal() bool {
+func IsTerminal() bool {
 	fileInfo, err := os.Stdout.Stat()
 	if err != nil {
 		return false

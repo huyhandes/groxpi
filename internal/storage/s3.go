@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -99,14 +100,20 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		Bool("ssl", cfg.UseSSL).
 		Msg("Creating S3 storage backend")
 
-	// Configure HTTP transport for performance
+	// Configure HTTP transport for performance with extended timeouts
 	transport := &http.Transport{
-		MaxIdleConns:          cfg.MaxConnections,
-		MaxIdleConnsPerHost:   cfg.MaxConnections,
-		MaxConnsPerHost:       cfg.MaxConnections,
-		IdleConnTimeout:       90 * time.Second,
-		DisableCompression:    true, // S3 already handles compression
-		ResponseHeaderTimeout: cfg.RequestTimeout,
+		MaxIdleConns:           cfg.MaxConnections,
+		MaxIdleConnsPerHost:    cfg.MaxConnections,
+		MaxConnsPerHost:        cfg.MaxConnections,
+		IdleConnTimeout:        90 * time.Second,
+		DisableCompression:     true, // S3 already handles compression
+		ResponseHeaderTimeout:  cfg.RequestTimeout,    // 5 minutes for response headers
+		TLSHandshakeTimeout:   cfg.ConnectTimeout,      // TLS handshake timeout
+		ExpectContinueTimeout: 1 * time.Second,        // 100-continue timeout
+		DialContext: (&net.Dialer{
+			Timeout:   cfg.ConnectTimeout, // Connection establishment timeout
+			KeepAlive: 30 * time.Second,   // Keep-alive timeout
+		}).DialContext,
 	}
 
 	// Initialize MinIO client
@@ -167,27 +174,16 @@ func (s *S3Storage) buildKey(key string) string {
 
 // Get retrieves an object from S3 with singleflight deduplication
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
-	// Use singleflight to deduplicate concurrent requests for the same object
-	result, err, _ := s.getSF.Do(key, func() (interface{}, error) {
-		return s.getInternal(ctx, key)
-	})
-
-	if err != nil {
-		return nil, nil, err
-	}
-
-	getResult := result.(getResult)
-	return getResult.reader, getResult.info, nil
+	// For S3, we cannot safely share readers between goroutines since each reader
+	// can only be read once. Instead of using singleflight for Get operations,
+	// we'll get fresh readers for each request. Singleflight is still useful for
+	// metadata operations like Stat and Exists.
+	return s.getInternal(ctx, key)
 }
 
-// getResult holds the result of a Get operation for singleflight
-type getResult struct {
-	reader io.ReadCloser
-	info   *ObjectInfo
-}
 
 // getInternal performs the actual S3 Get operation
-func (s *S3Storage) getInternal(ctx context.Context, key string) (getResult, error) {
+func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
 	fullKey := s.buildKey(key)
 
 	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Getting object from S3")
@@ -196,40 +192,7 @@ func (s *S3Storage) getInternal(ctx context.Context, key string) (getResult, err
 	object, err := s.client.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object")
-		return getResult{}, fmt.Errorf("failed to get object %s: %w", key, err)
-	}
-
-	// Get object info
-	stat, err := object.Stat()
-	if err != nil {
-		object.Close()
-		return getResult{}, fmt.Errorf("failed to stat object %s: %w", key, err)
-	}
-
-	info := &ObjectInfo{
-		Key:          key,
-		Size:         stat.Size,
-		LastModified: stat.LastModified,
-		ETag:         stat.ETag,
-		ContentType:  stat.ContentType,
-		Metadata:     stat.UserMetadata,
-	}
-
-	return getResult{reader: object, info: info}, nil
-}
-
-// GetRange retrieves a byte range from an object with zero-copy optimization
-func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	opts := minio.GetObjectOptions{}
-	if offset >= 0 && length > 0 {
-		opts.SetRange(offset, offset+length-1)
-	}
-
-	object, err := s.client.GetObject(ctx, s.bucket, fullKey, opts)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get object range %s: %w", key, err)
+		return nil, nil, fmt.Errorf("failed to get object %s: %w", key, err)
 	}
 
 	// Get object info
@@ -247,6 +210,61 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 		ContentType:  stat.ContentType,
 		Metadata:     stat.UserMetadata,
 	}
+
+	return object, info, nil
+}
+
+// GetRange retrieves a byte range from an object with zero-copy optimization
+func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
+	fullKey := s.buildKey(key)
+
+	log.Debug().
+		Str("key", key).
+		Str("full_key", fullKey).
+		Int64("offset", offset).
+		Int64("length", length).
+		Msg("Getting object range from S3")
+
+	opts := minio.GetObjectOptions{}
+	if offset >= 0 && length > 0 {
+		// Set the range header for partial content
+		opts.SetRange(offset, offset+length-1)
+		log.Debug().
+			Int64("range_start", offset).
+			Int64("range_end", offset+length-1).
+			Msg("Setting range header for S3 request")
+	}
+
+	object, err := s.client.GetObject(ctx, s.bucket, fullKey, opts)
+	if err != nil {
+		log.Error().Err(err).Str("key", key).Msg("Failed to get object range from S3")
+		return nil, nil, fmt.Errorf("failed to get object range %s: %w", key, err)
+	}
+
+	// For range requests, we need to get object info without consuming the reader
+	// First get the full object info using a separate Stat call
+	fullObjectInfo, err := s.Stat(ctx, key)
+	if err != nil {
+		object.Close()
+		log.Error().Err(err).Str("key", key).Msg("Failed to get object info for range request")
+		return nil, nil, fmt.Errorf("failed to get object info for range %s: %w", key, err)
+	}
+
+	// Create object info for the range request
+	info := &ObjectInfo{
+		Key:          key,
+		Size:         length, // Size is the requested range length
+		LastModified: fullObjectInfo.LastModified,
+		ETag:         fullObjectInfo.ETag,
+		ContentType:  fullObjectInfo.ContentType,
+		Metadata:     fullObjectInfo.Metadata,
+	}
+
+	log.Debug().
+		Str("key", key).
+		Int64("requested_length", length).
+		Int64("object_size", fullObjectInfo.Size).
+		Msg("S3 range request prepared")
 
 	// For small ranges, use buffer pool to potentially reduce allocations
 	if length > 0 && length <= 64*1024 {

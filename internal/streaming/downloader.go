@@ -27,7 +27,7 @@ type streamingDownloader struct {
 func NewStreamingDownloader(storage StorageWriter, client *http.Client) StreamingDownloader {
 	if client == nil {
 		client = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 5 * time.Minute, // Use 5 minute timeout for large files
 		}
 	}
 
@@ -154,7 +154,7 @@ type teeStreamingDownloader struct {
 func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) StreamingDownloader {
 	if client == nil {
 		client = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 5 * time.Minute, // Use 5 minute timeout for large files
 		}
 	}
 

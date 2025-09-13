@@ -44,7 +44,7 @@ func main() {
 	log.Info().
 		Str("index_url", cfg.IndexURL).
 		Int64("cache_size_bytes", cfg.CacheSize).
-		Str("cache_size_human", formatBytes(cfg.CacheSize)).
+		Str("cache_size_human", FormatBytes(cfg.CacheSize)).
 		Dur("index_ttl", cfg.IndexTTL).
 		Str("port", cfg.Port).
 		Msg("📋 Configuration loaded")
@@ -97,7 +97,7 @@ func main() {
 }
 
 // formatBytes converts bytes to human readable format
-func formatBytes(bytes int64) string {
+func FormatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
