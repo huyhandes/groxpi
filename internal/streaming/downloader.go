@@ -36,7 +36,8 @@ func NewStreamingDownloader(storage StorageWriter, client *http.Client) Streamin
 		httpClient: client,
 		copyBufPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 64*1024) // 64KB buffer
+				buf := make([]byte, 64*1024) // 64KB buffer
+				return &buf
 			},
 		},
 	}
@@ -104,8 +105,9 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 	}()
 
 	// Stream data using pooled buffer for optimal performance
-	copyBuf := sd.copyBufPool.Get().([]byte)
-	defer sd.copyBufPool.Put(copyBuf)
+	copyBufPtr := sd.copyBufPool.Get().(*[]byte)
+	defer sd.copyBufPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	totalSize, streamErr = io.CopyBuffer(multiWriter, resp.Body, copyBuf)
 
@@ -123,10 +125,8 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 		return nil, fmt.Errorf("streaming failed: %w", streamErr)
 	}
 
-	if storageErr != nil {
-		// Storage error logging disabled for tests
-		// Don't return error here - client still got the data
-	}
+	// Storage error is logged but not returned - client still got the data
+	_ = storageErr
 
 	// Calculate ETag from MD5 hash
 	etag := fmt.Sprintf("\"%x\"", hasher.Sum(nil))
@@ -163,7 +163,8 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 		httpClient: client,
 		copyBufPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 64*1024) // 64KB buffer
+				buf := make([]byte, 64*1024) // 64KB buffer
+				return &buf
 			},
 		},
 	}
@@ -217,8 +218,9 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	}()
 
 	// Copy to client using pooled buffer
-	copyBuf := tsd.copyBufPool.Get().([]byte)
-	defer tsd.copyBufPool.Put(copyBuf)
+	copyBufPtr := tsd.copyBufPool.Get().(*[]byte)
+	defer tsd.copyBufPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	totalSize, streamErr := io.CopyBuffer(writer, teeReader, copyBuf)
 

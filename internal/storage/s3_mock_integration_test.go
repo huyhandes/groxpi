@@ -67,7 +67,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 
 	t.Run("GetRange", func(t *testing.T) {
@@ -98,7 +98,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 
 	t.Run("Exists", func(t *testing.T) {
@@ -130,7 +130,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 
 	t.Run("List", func(t *testing.T) {
@@ -184,7 +184,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 
 	t.Run("Multipart", func(t *testing.T) {
@@ -224,7 +224,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 }
 

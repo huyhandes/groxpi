@@ -275,7 +275,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		badWriter := &mockWriter{writeErrors: []error{errors.New("write failed")}}
 
 		_ = bw.AddWriter(goodWriter)
-		bw.AddWriter(badWriter)
+		_ = bw.AddWriter(badWriter)
 
 		testData := []byte("test with error")
 		n, err := bw.Write(testData)
@@ -512,7 +512,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 		bw := NewAsyncBroadcastWriter(2) // Small buffer
 		slowWriter := &mockWriter{slowWrite: true}
 
-		bw.AddWriter(slowWriter)
+		_ = bw.AddWriter(slowWriter)
 
 		// Write more data than buffer can hold
 		for i := 0; i < 10; i++ {

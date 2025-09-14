@@ -496,7 +496,7 @@ func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		fiberCtx := &mockFiberContext{}
-		server.ServeFile(ctx, fiberCtx, filename)
+		_ = server.ServeFile(ctx, fiberCtx, filename)
 	}
 }
 

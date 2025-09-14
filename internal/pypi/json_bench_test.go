@@ -15,7 +15,8 @@ import (
 // Buffer pool for testing zero-copy optimizations
 var testBufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 64*1024) // 64KB buffers
+		buf := make([]byte, 64*1024) // 64KB buffers
+		return &buf
 	},
 }
 
@@ -120,9 +121,9 @@ func BenchmarkBufferCopy_PooledCopyBuffer(b *testing.B) {
 		var buf bytes.Buffer
 
 		// Use pooled buffer for copy operations
-		copyBuf := testBufferPool.Get().([]byte)
-		_, err := io.CopyBuffer(&buf, reader, copyBuf)
-		testBufferPool.Put(copyBuf[:])
+		copyBufPtr := testBufferPool.Get().(*[]byte)
+		_, err := io.CopyBuffer(&buf, reader, *copyBufPtr)
+		testBufferPool.Put(copyBufPtr)
 
 		if err != nil {
 			b.Fatal(err)

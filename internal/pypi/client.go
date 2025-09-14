@@ -81,7 +81,8 @@ var bufferPool = sync.Pool{
 // Copy buffer pool for zero-copy optimizations
 var copyBufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 32*1024) // 32KB copy buffers
+		buf := make([]byte, 32*1024) // 32KB copy buffers
+		return &buf
 	},
 }
 
@@ -89,8 +90,9 @@ var copyBufferPool = sync.Pool{
 
 // copyToBuffer copies from reader to buffer using pooled copy buffer for zero-copy optimization
 func copyToBuffer(dst *bytes.Buffer, src io.Reader) error {
-	copyBuf := copyBufferPool.Get().([]byte)
-	defer copyBufferPool.Put(copyBuf[:])
+	copyBufPtr := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	_, err := io.CopyBuffer(dst, src, copyBuf)
 	return err

@@ -22,7 +22,8 @@ func NewZeroCopyServer() ZeroCopyServer {
 	return &zeroCopyServer{
 		copyBufPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 64*1024) // 64KB buffer
+				buf := make([]byte, 64*1024) // 64KB buffer
+				return &buf
 			},
 		},
 	}
@@ -48,8 +49,9 @@ func (zcs *zeroCopyServer) ServeFile(ctx context.Context, writer io.Writer, file
 // ServeReader serves data from reader using optimized copy techniques
 func (zcs *zeroCopyServer) ServeReader(ctx context.Context, writer io.Writer, reader io.Reader, size int64) error {
 	// Use pooled buffer for efficient copying
-	copyBuf := zcs.copyBufPool.Get().([]byte)
-	defer zcs.copyBufPool.Put(copyBuf)
+	copyBufPtr := zcs.copyBufPool.Get().(*[]byte)
+	defer zcs.copyBufPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	// Check context for cancellation
 	select {
@@ -143,7 +145,8 @@ func NewFiberZeroCopyServer() ZeroCopyServer {
 	return &fiberZeroCopyServer{
 		copyBufPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 64*1024)
+				buf := make([]byte, 64*1024)
+				return &buf
 			},
 		},
 	}
@@ -172,8 +175,9 @@ func (fzcs *fiberZeroCopyServer) ServeReader(ctx context.Context, writer io.Writ
 	}); ok {
 		// Use Fiber's streaming for better performance
 		return fiberCtx.Stream(func(w *io.Writer) error {
-			copyBuf := fzcs.copyBufPool.Get().([]byte)
-			defer fzcs.copyBufPool.Put(copyBuf)
+			copyBufPtr := fzcs.copyBufPool.Get().(*[]byte)
+			defer fzcs.copyBufPool.Put(copyBufPtr)
+			copyBuf := *copyBufPtr
 
 			_, err := io.CopyBuffer(*w, reader, copyBuf)
 			return err

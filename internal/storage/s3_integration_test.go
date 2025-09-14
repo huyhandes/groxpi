@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -111,7 +112,13 @@ func createTestS3Storage(t *testing.T, customPrefix ...string) *S3Storage {
 	}
 
 	storage, err := NewS3Storage(cfg)
-	require.NoError(t, err, "Failed to create S3 storage for integration test")
+	if err != nil {
+		// Check if it's a connection error (MinIO not running)
+		if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "connect: connection refused") {
+			t.Skipf("MinIO not available (connection refused), skipping S3 integration test: %v", err)
+		}
+		require.NoError(t, err, "Failed to create S3 storage for integration test")
+	}
 
 	return storage
 }

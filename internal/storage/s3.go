@@ -38,7 +38,8 @@ type S3Config struct {
 // Buffer pools for zero-copy optimizations
 var s3BufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 64*1024) // 64KB buffers for S3 streaming
+		buf := make([]byte, 64*1024) // 64KB buffers for S3 streaming
+		return &buf
 	},
 }
 
@@ -266,12 +267,14 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 
 	// For small ranges, use buffer pool to potentially reduce allocations
 	if length > 0 && length <= 64*1024 {
-		buf := s3BufferPool.Get().([]byte)
+		bufPtr := s3BufferPool.Get().(*[]byte)
+		buf := *bufPtr
 
 		// Create a buffered reader that returns buffer to pool when closed
 		bufferedReader := &s3BufferedReader{
 			Reader: object,
 			buffer: buf,
+			bufPtr: bufPtr,
 			pool:   &s3BufferPool,
 		}
 
@@ -285,13 +288,15 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 type s3BufferedReader struct {
 	io.Reader
 	buffer []byte
+	bufPtr *[]byte // pointer to buffer for proper pool management
 	pool   *sync.Pool
 }
 
 // Close returns the buffer to the pool and closes the underlying reader
 func (r *s3BufferedReader) Close() error {
-	if r.pool != nil && r.buffer != nil {
-		r.pool.Put(r.buffer)
+	if r.pool != nil && r.bufPtr != nil {
+		r.pool.Put(r.bufPtr)
+		r.bufPtr = nil
 		r.buffer = nil
 		r.pool = nil
 	}
@@ -324,8 +329,9 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 	// For small files, use buffer pool for potential zero-copy optimization
 	var actualReader io.Reader = reader
 	if size > 0 && size <= 64*1024 {
-		buf := s3BufferPool.Get().([]byte)
-		defer s3BufferPool.Put(buf)
+		bufPtr := s3BufferPool.Get().(*[]byte)
+		defer s3BufferPool.Put(bufPtr)
+		buf := *bufPtr
 
 		if size <= int64(len(buf)) {
 			// Read into pooled buffer for zero-copy optimization
@@ -550,9 +556,11 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 	}
 
 	// Use pooled buffer for streaming
+	bufPtr := s3BufferPool.Get().(*[]byte)
 	bufReader := &bufferedReader{
 		reader: reader,
-		buffer: s3BufferPool.Get().([]byte),
+		buffer: *bufPtr,
+		bufPtr: bufPtr,
 		pool:   &s3BufferPool,
 	}
 	defer bufReader.Close()
@@ -643,8 +651,9 @@ func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writ
 	defer object.Close()
 
 	// Use pooled buffer for optimized streaming
-	copyBuf := s3BufferPool.Get().([]byte)
-	defer s3BufferPool.Put(copyBuf)
+	copyBufPtr := s3BufferPool.Get().(*[]byte)
+	defer s3BufferPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	start := time.Now()
 	written, err := io.CopyBuffer(writer, object, copyBuf)
@@ -690,6 +699,7 @@ func (s *S3Storage) SupportsZeroCopy() bool {
 type bufferedReader struct {
 	reader io.Reader
 	buffer []byte
+	bufPtr *[]byte // pointer to buffer for proper pool management
 	pool   *sync.Pool
 	closed bool
 }
@@ -699,8 +709,9 @@ func (br *bufferedReader) Read(p []byte) (n int, err error) {
 }
 
 func (br *bufferedReader) Close() error {
-	if !br.closed && br.buffer != nil {
-		br.pool.Put(br.buffer)
+	if !br.closed && br.bufPtr != nil {
+		br.pool.Put(br.bufPtr)
+		br.bufPtr = nil
 		br.buffer = nil
 		br.closed = true
 	}

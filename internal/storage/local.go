@@ -28,7 +28,8 @@ func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 		baseDir: baseDir,
 		copyBufPool: &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 64*1024) // 64KB buffer
+				buf := make([]byte, 64*1024) // 64KB buffer
+				return &buf
 			},
 		},
 	}, nil
@@ -302,8 +303,9 @@ func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.R
 	}()
 
 	// Use pooled buffer for optimized copy
-	copyBuf := l.copyBufPool.Get().([]byte)
-	defer l.copyBufPool.Put(copyBuf[:])
+	copyBufPtr := l.copyBufPool.Get().(*[]byte)
+	defer l.copyBufPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	// Copy data with pooled buffer
 	written, err := io.CopyBuffer(tmpFile, reader, copyBuf)
@@ -362,8 +364,9 @@ func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.W
 	defer file.Close()
 
 	// Use pooled buffer for optimized copy
-	copyBuf := l.copyBufPool.Get().([]byte)
-	defer l.copyBufPool.Put(copyBuf[:])
+	copyBufPtr := l.copyBufPool.Get().(*[]byte)
+	defer l.copyBufPool.Put(copyBufPtr)
+	copyBuf := *copyBufPtr
 
 	_, err = io.CopyBuffer(writer, file, copyBuf)
 	if err != nil {

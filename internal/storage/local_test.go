@@ -342,7 +342,7 @@ func TestLocalStorage_List(t *testing.T) {
 	}
 
 	for key, content := range testFiles {
-		storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "application/octet-stream")
+		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "application/octet-stream")
 	}
 
 	t.Run("lists_files_with_prefix", func(t *testing.T) {
@@ -410,7 +410,7 @@ func TestLocalStorage_GetPresignedURL(t *testing.T) {
 
 	key := "presigned-test.txt"
 	content := "presigned content"
-	storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
+	_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 
 	url, err := storage.GetPresignedURL(ctx, key, time.Hour)
 	if err != nil {

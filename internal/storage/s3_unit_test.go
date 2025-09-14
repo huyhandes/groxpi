@@ -161,13 +161,15 @@ func TestS3BufferedReader(t *testing.T) {
 	buf := make([]byte, 64*1024)
 	pool := &sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 64*1024)
+			buf := make([]byte, 64*1024)
+			return &buf
 		},
 	}
 
 	reader := &s3BufferedReader{
 		Reader: bytes.NewReader(testData),
 		buffer: buf,
+		bufPtr: &buf,
 		pool:   pool,
 	}
 
@@ -182,14 +184,16 @@ func TestS3BufferedReader(t *testing.T) {
 		reader := &s3BufferedReader{
 			Reader: bytes.NewReader(testData),
 			buffer: buf,
+			bufPtr: &buf,
 			pool:   pool,
 		}
 
 		err := reader.Close()
 		assert.NoError(t, err)
 
-		// Verify buffer and pool were cleared
+		// Verify buffer, bufPtr and pool were cleared
 		assert.Nil(t, reader.buffer)
+		assert.Nil(t, reader.bufPtr)
 		assert.Nil(t, reader.pool)
 	})
 
@@ -316,7 +320,8 @@ func TestS3Storage_SingleflightDeduplication(t *testing.T) {
 func TestS3Storage_BufferPool(t *testing.T) {
 	t.Run("Buffer pool reuse", func(t *testing.T) {
 		// Test buffer reuse
-		buf1 := s3BufferPool.Get().([]byte)
+		bufPtr1 := s3BufferPool.Get().(*[]byte)
+		buf1 := *bufPtr1
 		assert.Len(t, buf1, 64*1024, "Buffer should be 64KB")
 
 		// Use the buffer
@@ -324,10 +329,11 @@ func TestS3Storage_BufferPool(t *testing.T) {
 		copy(buf1, testData)
 
 		// Return to pool
-		s3BufferPool.Put(buf1)
+		s3BufferPool.Put(bufPtr1)
 
 		// Get another buffer (should reuse the same one)
-		buf2 := s3BufferPool.Get().([]byte)
+		bufPtr2 := s3BufferPool.Get().(*[]byte)
+		buf2 := *bufPtr2
 		assert.Len(t, buf2, 64*1024, "Second buffer should also be 64KB")
 
 		// The buffer should contain the previous data (demonstrating reuse)
@@ -335,7 +341,7 @@ func TestS3Storage_BufferPool(t *testing.T) {
 			t.Log("Buffer was reused successfully")
 		}
 
-		s3BufferPool.Put(buf2)
+		s3BufferPool.Put(bufPtr2)
 	})
 
 	t.Run("Response buffer pool", func(t *testing.T) {
@@ -470,10 +476,11 @@ func BenchmarkS3Storage_BufferPool(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			buf := s3BufferPool.Get().([]byte)
+			bufPtr := s3BufferPool.Get().(*[]byte)
+			buf := *bufPtr
 			copy(buf[:len(testData)], testData)
 			_ = bytes.NewReader(buf[:len(testData)])
-			s3BufferPool.Put(buf)
+			s3BufferPool.Put(bufPtr)
 		}
 	})
 
