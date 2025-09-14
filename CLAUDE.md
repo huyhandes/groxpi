@@ -70,6 +70,7 @@ groxpi/
 3. **Testing**: Write tests alongside implementation, always follow TDD
 4. **Review**: Self-review for simplicity and performance, update the `tasks/<task_name>.md` before done task
 5. **Finish**: Make sure code functionality do not break by running test. Then make documents up-to-date with the codebase.
+    6. **Commit**: Before commit, run `gofmt`, `go vet` and `golangci-lint` to ensure the code is well formarted and no linting error
 
 ## Core Features ✅
 

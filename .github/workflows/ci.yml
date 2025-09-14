@@ -66,7 +66,7 @@ jobs:
       run: staticcheck ./...
 
     - name: Run tests
-      run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      run: go test -short -race -coverprofile=coverage.out -covermode=atomic ./...
 
     - name: Upload coverage to Codecov
       if: matrix.os == 'ubuntu-latest'
@@ -128,10 +128,62 @@ jobs:
         version: latest
         args: --timeout=10m
 
+  integration-test:
+    name: Integration Tests with S3
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: groxpi-test
+        ports:
+          - 9000:9000
+        options: >
+          --health-cmd "curl -f http://localhost:9000/minio/health/ready || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_S3_ENDPOINT: localhost:9000
+      TEST_S3_ACCESS_KEY: minioadmin
+      TEST_S3_SECRET_KEY: minioadmin
+      TEST_S3_BUCKET: groxpi-test
+      TEST_S3_USE_SSL: false
+      TEST_S3_FORCE_PATH_STYLE: true
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.x'
+        cache: true
+        cache-dependency-path: go.sum
+
+    - name: Wait for MinIO
+      run: |
+        echo "Waiting for MinIO to be ready..."
+        for i in {1..30}; do
+          if curl -f http://localhost:9000/minio/health/ready 2>/dev/null; then
+            echo "MinIO is ready!"
+            break
+          fi
+          echo "Attempt $i: MinIO not ready yet..."
+          sleep 2
+        done
+
+    - name: Run integration tests
+      run: go test -race -v ./internal/storage/... ./internal/server/...
+
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [test, security, lint]
+    needs: [test, integration-test, security, lint]
 
     steps:
     - name: Checkout code

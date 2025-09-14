@@ -282,37 +282,65 @@ func TestS3Storage_SingleflightDeduplication(t *testing.T) {
 	})
 
 	t.Run("Stat operations are deduplicated", func(t *testing.T) {
-		var callCount int64
+		var statCallCount int64
+		var existsCallCount int64
 
 		// Start multiple concurrent operations for different singleflight keys
-		const numGoroutines = 6
+		const numGoroutinesPerKey = 3
 		var wg sync.WaitGroup
 
-		wg.Add(numGoroutines)
-		for i := 0; i < numGoroutines; i++ {
-			sfKey := "stat:test-key"
-			if i%2 == 1 {
-				sfKey = "exists:test-key"
-			}
+		// Use channels to ensure all goroutines start at roughly the same time
+		startCh := make(chan struct{})
 
-			go func(key string) {
+		// Start goroutines for "stat:" prefix
+		wg.Add(numGoroutinesPerKey)
+		for i := 0; i < numGoroutinesPerKey; i++ {
+			go func() {
 				defer wg.Done()
+				<-startCh // Wait for signal to start
 
-				_, err, _ := s.statSF.Do(key, func() (interface{}, error) {
-					atomic.AddInt64(&callCount, 1)
-					time.Sleep(5 * time.Millisecond)
+				_, err, _ := s.statSF.Do("stat:test-key", func() (interface{}, error) {
+					atomic.AddInt64(&statCallCount, 1)
+					time.Sleep(10 * time.Millisecond)
 					return &ObjectInfo{Key: "test-key"}, nil
 				})
 
 				assert.NoError(t, err)
-			}(sfKey)
+			}()
 		}
+
+		// Start goroutines for "exists:" prefix
+		wg.Add(numGoroutinesPerKey)
+		for i := 0; i < numGoroutinesPerKey; i++ {
+			go func() {
+				defer wg.Done()
+				<-startCh // Wait for signal to start
+
+				_, err, _ := s.statSF.Do("exists:test-key", func() (interface{}, error) {
+					atomic.AddInt64(&existsCallCount, 1)
+					time.Sleep(10 * time.Millisecond)
+					return &ObjectInfo{Key: "test-key"}, nil
+				})
+
+				assert.NoError(t, err)
+			}()
+		}
+
+		// Give goroutines time to reach the wait point
+		time.Sleep(10 * time.Millisecond)
+
+		// Start all goroutines simultaneously
+		close(startCh)
 
 		wg.Wait()
 
-		// Should have 2 calls - one for stat: and one for exists: prefixes
-		finalCount := atomic.LoadInt64(&callCount)
-		assert.Equal(t, int64(2), finalCount, "Expected 2 calls for 2 different singleflight keys")
+		// Should have exactly 1 call for each key due to singleflight deduplication
+		finalStatCount := atomic.LoadInt64(&statCallCount)
+		finalExistsCount := atomic.LoadInt64(&existsCallCount)
+
+		assert.Equal(t, int64(1), finalStatCount, "Expected 1 call for stat: prefix (got %d)", finalStatCount)
+		assert.Equal(t, int64(1), finalExistsCount, "Expected 1 call for exists: prefix (got %d)", finalExistsCount)
+		assert.Equal(t, int64(2), finalStatCount+finalExistsCount, "Expected 2 total calls for 2 different singleflight keys")
 	})
 }
 
