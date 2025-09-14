@@ -183,7 +183,7 @@ start_resource_monitoring() {
     local proxpi_container="proxpi-bench"
 
     # Start monitoring in background
-    "$monitor_script" start "$groxpi_container" "$proxpi_container" "$resource_file" 2 &
+    "$monitor_script" "$resource_file" "$groxpi_container" "$proxpi_container" 2 &
     local monitor_pid=$!
 
     # Wait a moment to ensure monitoring started

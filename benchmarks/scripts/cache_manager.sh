@@ -185,9 +185,17 @@ verify_cache_clear() {
 
     log_info "Verifying cache state for $name..."
 
+    # Use different endpoints for groxpi vs proxpi
+    local endpoint
+    if [[ "$name" == "groxpi" ]]; then
+        endpoint="/simple/"
+    else
+        endpoint="/index/"
+    fi
+
     # Make a simple request to see if cache is cold
     local start_time=$(date +%s%N)
-    if curl -sf --connect-timeout 10 --max-time $TIMEOUT "$url/simple/" >/dev/null 2>&1; then
+    if curl -sf --connect-timeout 10 --max-time $TIMEOUT "$url$endpoint" >/dev/null 2>&1; then
         local end_time=$(date +%s%N)
         local duration_ms=$(( (end_time - start_time) / 1000000 ))
 
