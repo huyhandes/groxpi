@@ -1,0 +1,8 @@
+# UV test container for download benchmarks
+version: '3.8'
+
+services:
+  uv-test:
+    image: ghcr.io/astral-sh/uv:latest
+    container_name: uv-test
+    restart: unless-stopped

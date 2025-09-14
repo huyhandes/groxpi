@@ -1,0 +1,97 @@
+# Docker Compose configuration for groxpi with MinIO S3 storage
+# Usage: docker-compose -f docker-compose.minio.yml up
+
+version: '3.8'
+
+services:
+  # MinIO S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: groxpi-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - groxpi-network
+
+  # MinIO Client for bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: groxpi-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc config host add minio http://minio:9000 minioadmin minioadmin;
+      mc mb -p minio/groxpi;
+      mc policy set public minio/groxpi;
+      exit 0;
+      "
+    networks:
+      - groxpi-network
+
+  # groxpi with S3 storage
+  groxpi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: groxpi:latest
+    container_name: groxpi
+    restart: unless-stopped
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "5000:5000"
+    environment:
+      # PyPI Configuration
+      GROXPI_INDEX_URL: https://pypi.org/simple/
+      GROXPI_INDEX_TTL: 1800
+      GROXPI_CACHE_SIZE: 10737418240  # 10GB
+      GROXPI_DOWNLOAD_TIMEOUT: 30.0  # 30 seconds for download and cache
+      GROXPI_LOGGING_LEVEL: INFO
+      
+      # S3 Storage Configuration
+      GROXPI_STORAGE_TYPE: s3
+      AWS_ENDPOINT_URL: minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      GROXPI_S3_BUCKET: groxpi
+      GROXPI_S3_PREFIX: packages
+      GROXPI_S3_USE_SSL: "false"
+      GROXPI_S3_FORCE_PATH_STYLE: "true"
+      GROXPI_S3_PART_SIZE: 10485760  # 10MB
+      GROXPI_S3_MAX_CONNECTIONS: 100
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - groxpi-network
+
+volumes:
+  minio_data:
+    driver: local
+
+networks:
+  groxpi-network:
+    driver: bridge

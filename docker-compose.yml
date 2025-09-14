@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  groxpi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: groxpi:latest
+    container_name: groxpi
+    restart: unless-stopped
+    ports:
+      - "5005:5000"
+    environment:
+      # PyPI Configuration
+      - GROXPI_INDEX_URL=https://pypi.org/simple/
+      - GROXPI_CACHE_SIZE=5368709120 # 5GB
+      - GROXPI_INDEX_TTL=1800 # 30 minutes
+      - GROXPI_CACHE_DIR=/cache
+      - GROXPI_DOWNLOAD_TIMEOUT=300.0 # 5 minutes for download and cache (large packages)
+      - GROXPI_LOGGING_LEVEL=DEBUG
+
+      # Storage Configuration (default: local)
+      - GROXPI_STORAGE_TYPE=local
+      # Uncomment for S3/MinIO storage:
+      # - GROXPI_STORAGE_TYPE=s3
+      # - AWS_ENDPOINT_URL=s3.amazonaws.com
+      # - AWS_ACCESS_KEY_ID=YOUR-ACCESS-KEY-ID
+      # - AWS_SECRET_ACCESS_KEY=YOUR-SECRET-ACCESS-KEY
+      # - AWS_REGION=us-east-1
+      # - GROXPI_S3_BUCKET=your-bucket-name
+      # - GROXPI_S3_PREFIX=groxpi
+      # - GROXPI_S3_USE_SSL=true
+      # - GROXPI_S3_FORCE_PATH_STYLE=true
+    volumes:
+      - groxpi_cache:/cache
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "com.example.description=groxpi PyPI caching proxy"
+      - "com.example.service=groxpi"
+
+volumes:
+  groxpi_cache:
+    driver: local
+
+networks:
+  default:
+    name: groxpi-network

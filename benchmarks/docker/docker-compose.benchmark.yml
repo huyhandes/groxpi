@@ -1,0 +1,73 @@
+# Docker Compose configuration for benchmarking groxpi vs proxpi
+# Usage: docker-compose -f benchmarks/docker/docker-compose.benchmark.yml up
+
+version: '3.8'
+
+services:
+  # groxpi service for benchmarking
+  groxpi-bench:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: groxpi:latest
+    container_name: groxpi-bench
+    restart: unless-stopped
+    ports:
+      - "5005:5000"
+    environment:
+      # PyPI Configuration
+      GROXPI_INDEX_URL: https://pypi.org/simple/
+      GROXPI_CACHE_SIZE: 5368709120 # 5GB
+      GROXPI_INDEX_TTL: 1800 # 30 minutes
+      GROXPI_CACHE_DIR: /cache
+      GROXPI_LOGGING_LEVEL: INFO
+      GROXPI_STORAGE_TYPE: local
+    volumes:
+      - groxpi_bench_cache:/cache
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "benchmark.service=groxpi"
+    networks:
+      - benchmark-network
+
+  # proxpi service for comparison
+  proxpi-bench:
+    image: epicwink/proxpi:latest
+    container_name: proxpi-bench
+    restart: unless-stopped
+    ports:
+      - "5006:5000"
+    environment:
+      # PyPI Configuration (matching groxpi settings)
+      PROXPI_INDEX_URL: https://pypi.org/simple/
+      PROXPI_CACHE_SIZE: 5368709120 # 5GB
+      PROXPI_INDEX_TTL: 1800 # 30 minutes
+      PROXPI_CACHE_DIR: /var/cache/proxpi
+      PROXPI_LOGGING_LEVEL: INFO
+    volumes:
+      - proxpi_bench_cache:/var/cache/proxpi
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "benchmark.service=proxpi"
+    networks:
+      - benchmark-network
+
+volumes:
+  groxpi_bench_cache:
+    driver: local
+  proxpi_bench_cache:
+    driver: local
+
+networks:
+  benchmark-network:
+    driver: bridge

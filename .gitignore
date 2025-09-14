@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-./groxpi
+
 
 # Test binary, built with `go test -c`
 *.test
@@ -28,11 +28,6 @@ go.work
 # Environment variables
 .env
 .env.local
-
-# Docker compose files with sensitive data
-docker-compose.yml
-docker-compose.*.yml
-!docker-compose.example.yml
 
 # Task folder
 tasks/
