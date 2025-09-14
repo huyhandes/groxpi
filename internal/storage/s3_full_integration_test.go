@@ -21,12 +21,22 @@ func TestS3BackendWithPackageManagers(t *testing.T) {
 		t.Skip("Skipping S3 package manager integration test in short mode")
 	}
 
+	// Check if S3 testing is configured (set in CI)
+	if os.Getenv("TEST_S3_ENDPOINT") == "" {
+		t.Skip("Skipping S3 package manager integration test: TEST_S3_ENDPOINT not set")
+	}
+
 	// Check if groxpi binary exists
-	groxpiBinary := "../groxpi"
-	if _, err := os.Stat(groxpiBinary); os.IsNotExist(err) {
+	groxpiBinary := filepath.Join("..", "..", "groxpi")
+	absGroxpiBinary, err := filepath.Abs(groxpiBinary)
+	if err != nil {
+		t.Skipf("Failed to get absolute path for groxpi binary: %v", err)
+	}
+
+	if _, err := os.Stat(absGroxpiBinary); os.IsNotExist(err) {
 		// Try to build the binary
 		t.Log("Building groxpi binary for testing...")
-		cmd := exec.Command("go", "build", "-o", groxpiBinary, "../cmd/groxpi/main.go")
+		cmd := exec.Command("go", "build", "-o", absGroxpiBinary, filepath.Join("..", "..", "cmd", "groxpi", "main.go"))
 		if err := cmd.Run(); err != nil {
 			t.Skipf("Failed to build groxpi binary, skipping integration test: %v", err)
 		}
@@ -37,7 +47,7 @@ func TestS3BackendWithPackageManagers(t *testing.T) {
 	t.Logf("Using test directory: %s", testDir)
 
 	// Start groxpi with S3 backend
-	server := startGroxpiWithS3(t, testDir)
+	server := startGroxpiWithS3(t, testDir, absGroxpiBinary)
 	defer server.Stop()
 
 	// Wait for server to be ready
@@ -73,7 +83,7 @@ func (gp *groxpiProcess) Stop() {
 	}
 }
 
-func startGroxpiWithS3(t *testing.T, testDir string) *groxpiProcess {
+func startGroxpiWithS3(t *testing.T, testDir string, groxpiBinary string) *groxpiProcess {
 	// Set up S3 environment variables for MinIO
 	env := []string{
 		"GROXPI_STORAGE_TYPE=s3",
@@ -91,7 +101,7 @@ func startGroxpiWithS3(t *testing.T, testDir string) *groxpiProcess {
 	// Add current environment
 	env = append(env, os.Environ()...)
 
-	cmd := exec.Command("../groxpi")
+	cmd := exec.Command(groxpiBinary)
 	cmd.Env = env
 	cmd.Dir = testDir
 
