@@ -7,7 +7,7 @@ Groxpi uses GitHub Actions for automated CI/CD, building, testing, and releasing
 ### CI/CD Pipeline (`ci.yml`)
 - **Triggers**: Push to main/develop, pull requests
 - **Purpose**: Continuous integration with testing, linting, and security scanning
-- **Platforms**: Ubuntu, macOS, Windows
+- **Platforms**: Ubuntu, macOS
 - **Features**: Go testing, security scanning, code quality checks
 
 ### Release Automation (`release.yml`)
@@ -47,7 +47,7 @@ docker run -p 5000:5000 ghcr.io/huyhandes/groxpi:v1.2.3
 ## Release Artifacts
 
 Each release includes:
-- **Binaries**: Linux, macOS, Windows (amd64, arm64)
+- **Binaries**: Linux, macOS (amd64, arm64)
 - **Checksums**: SHA256 for all binaries
 - **Docker Images**: Multi-architecture containers
 - **Source Code**: Automated GitHub release

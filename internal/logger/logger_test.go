@@ -74,7 +74,7 @@ func TestInit_JSONFormat(t *testing.T) {
 	// Close writer and read output
 	w.Close()
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	// Restore stdout
@@ -115,7 +115,7 @@ func TestInit_ConsoleFormat(t *testing.T) {
 	// Close writer and read output
 	w.Close()
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	// Restore stdout
@@ -160,7 +160,7 @@ func TestInit_LevelFiltering(t *testing.T) {
 	// Close writer and read output
 	w.Close()
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	// Restore stdout
@@ -212,7 +212,7 @@ func TestConvenienceFunctions(t *testing.T) {
 	// Close writer and read output
 	w.Close()
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	// Restore stdout

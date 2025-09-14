@@ -56,9 +56,6 @@ jobs:
           - goos: darwin
             goarch: arm64
             suffix: ""
-          - goos: windows
-            goarch: amd64
-            suffix: ".exe"
 
     steps:
     - name: Checkout code
@@ -84,11 +81,7 @@ jobs:
           cmd/groxpi/main.go
 
         # Generate checksum
-        if [ "${{ matrix.goos }}" = "windows" ]; then
-          sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
-        else
-          shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
-        fi
+        shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
 
         # Show file info
         ls -la "${BINARY_NAME}"*
@@ -184,7 +177,7 @@ jobs:
 
         echo "" >> release_notes.md
         echo "## Release Assets" >> release_notes.md
-        echo "- **Binaries**: Available for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64)" >> release_notes.md
+        echo "- **Binaries**: Available for Linux (amd64/arm64) and macOS (amd64/arm64)" >> release_notes.md
         echo "- **Docker Images**: \`ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.tag }}\`" >> release_notes.md
         echo "- **Multi-architecture**: Both amd64 and arm64 supported" >> release_notes.md
         echo "" >> release_notes.md

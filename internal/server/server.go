@@ -43,8 +43,6 @@ type Server struct {
 	storage          storage.Storage
 	app              *fiber.App
 	sf               singleflight.Group // For deduplicating concurrent requests
-	cacheSF          singleflight.Group // For deduplicating concurrent cache reads
-	downloadSF       singleflight.Group // For deduplicating concurrent downloads
 	streamDownloader streaming.StreamingDownloader
 }
 
@@ -307,7 +305,7 @@ func (s *Server) renderPackageFiles(c *fiber.Ctx, packageName string, files []py
 			// Rewrite URL to point to proxy instead of direct PyPI
 			fileMap["url"] = fmt.Sprintf("/simple/%s/%s", packageName, file.Name)
 
-			if file.Hashes != nil && len(file.Hashes) > 0 {
+			if len(file.Hashes) > 0 {
 				fileMap["hashes"] = file.Hashes
 			}
 			if file.RequiresPython != "" {
@@ -642,107 +640,6 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 	return storage.NewLocalStorage(cfg.CacheDir)
 }
 
-// downloadAndCache downloads a file from URL and stores it in storage
-func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey string) error {
-	start := time.Now()
-
-	log.Debug().
-		Str("url", fileURL).
-		Str("storage_key", storageKey).
-		Msg("Starting download and cache operation")
-
-	// Download file from PyPI
-	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("url", fileURL).
-			Msg("Failed to create HTTP request")
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	client := &http.Client{
-		Timeout: 5 * time.Minute, // Use 5 minute timeout for large files
-	}
-
-	downloadStart := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("url", fileURL).
-			Dur("download_duration", time.Since(downloadStart)).
-			Msg("Failed to download from PyPI")
-		return fmt.Errorf("failed to download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Error().
-			Int("status_code", resp.StatusCode).
-			Str("url", fileURL).
-			Dur("download_duration", time.Since(downloadStart)).
-			Msg("Download failed with non-200 status")
-		return fmt.Errorf("download failed with status %d", resp.StatusCode)
-	}
-
-	// Read the content
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("url", fileURL).
-			Dur("download_duration", time.Since(downloadStart)).
-			Msg("Failed to read response body")
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	downloadDuration := time.Since(downloadStart)
-	fileSize := int64(len(data))
-
-	log.Info().
-		Str("url", fileURL).
-		Int64("size_bytes", fileSize).
-		Dur("download_duration", downloadDuration).
-		Float64("download_speed_mbps", float64(fileSize)/downloadDuration.Seconds()/(1024*1024)).
-		Msg("Successfully downloaded file from PyPI")
-
-	// Store in storage backend
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	uploadStart := time.Now()
-	_, err = s.storage.Put(ctx, storageKey, bytes.NewReader(data), fileSize, contentType)
-	if err != nil {
-		uploadDuration := time.Since(uploadStart)
-		log.Error().
-			Err(err).
-			Str("storage_key", storageKey).
-			Int64("size_bytes", fileSize).
-			Str("content_type", contentType).
-			Str("storage_type", s.config.StorageType).
-			Dur("upload_duration", uploadDuration).
-			Msg("Failed to store file in storage backend")
-		return fmt.Errorf("failed to store in storage: %w", err)
-	}
-
-	uploadDuration := time.Since(uploadStart)
-	totalDuration := time.Since(start)
-
-	log.Info().
-		Str("storage_key", storageKey).
-		Int64("size_bytes", fileSize).
-		Str("content_type", contentType).
-		Str("storage_type", s.config.StorageType).
-		Dur("upload_duration", uploadDuration).
-		Dur("total_duration", totalDuration).
-		Float64("upload_speed_mbps", float64(fileSize)/uploadDuration.Seconds()/(1024*1024)).
-		Msg("Successfully stored file in storage backend")
-
-	return nil
-}
 
 // serveFromStorage serves a file from the storage backend
 func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {

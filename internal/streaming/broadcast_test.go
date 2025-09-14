@@ -178,11 +178,11 @@ func TestBroadcastWriter_RemoveWriter(t *testing.T) {
 		writer1 := &mockWriter{}
 		writer2 := &mockWriter{}
 
-		bw.AddWriter(writer1)
-		bw.AddWriter(writer2)
+		_ = bw.AddWriter(writer1)
+		_ = bw.AddWriter(writer2)
 
 		// Write initial data
-		bw.Write([]byte("first"))
+		_, _ = bw.Write([]byte("first"))
 		if writer1.String() != "first" || writer2.String() != "first" {
 			t.Error("Both writers should have received first data")
 		}
@@ -194,7 +194,7 @@ func TestBroadcastWriter_RemoveWriter(t *testing.T) {
 		}
 
 		// Write more data
-		bw.Write([]byte("second"))
+		_, _ = bw.Write([]byte("second"))
 		if writer1.String() != "first" {
 			t.Error("Removed writer should not receive new data")
 		}
@@ -216,7 +216,7 @@ func TestBroadcastWriter_RemoveWriter(t *testing.T) {
 	t.Run("remove writer after close returns error", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 		bw.Close()
 
 		err := bw.RemoveWriter(writer)
@@ -390,7 +390,7 @@ func TestBroadcastWriter_ConcurrentOperations(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				data := []byte(fmt.Sprintf("write_%02d_", i)) // Zero-pad for consistent ordering
-				bw.Write(data)
+				_, _ = bw.Write(data)
 				writeDone <- i
 			}(i)
 		}
@@ -521,7 +521,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 		}
 
 		bw.Close()
-		bw.Wait()
+		_ = bw.Wait()
 
 		// Should not panic, some writes may be dropped due to buffer overflow
 	})
