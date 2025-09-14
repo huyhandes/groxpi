@@ -54,7 +54,7 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 
 	stat, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
@@ -81,7 +81,7 @@ func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length 
 
 	stat, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
@@ -89,7 +89,7 @@ func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length 
 	if offset > 0 {
 		_, err = file.Seek(offset, io.SeekStart)
 		if err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, nil, fmt.Errorf("failed to seek: %w", err)
 		}
 	}
@@ -132,8 +132,8 @@ func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, si
 	// Ensure cleanup on error
 	defer func() {
 		if tmpFile != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -151,7 +151,7 @@ func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, si
 
 	// Move to final location
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("failed to move file: %w", err)
 	}
 
@@ -297,8 +297,8 @@ func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.R
 	// Ensure cleanup on error
 	defer func() {
 		if tmpFile != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -321,7 +321,7 @@ func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.R
 
 	// Move to final location
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("failed to move file: %w", err)
 	}
 
@@ -361,7 +361,7 @@ func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.W
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Use pooled buffer for optimized copy
 	copyBufPtr := l.copyBufPool.Get().(*[]byte)
@@ -408,13 +408,23 @@ func (l *LocalStorage) trySendfile(writer io.Writer, filepath string, size int64
 		if err != nil {
 			return err // Fall back to regular copy
 		}
-		defer connFile.Close()
+		defer func() {
+			if err := connFile.Close(); err != nil {
+				// Log error but continue
+				_ = err
+			}
+		}()
 
 		srcFile, err := os.Open(filepath)
 		if err != nil {
 			return err
 		}
-		defer srcFile.Close()
+		defer func() {
+			if err := srcFile.Close(); err != nil {
+				// Log error but continue
+				_ = err
+			}
+		}()
 
 		// Use sendfile syscall
 		return l.sendfile(int(connFile.Fd()), int(srcFile.Fd()), size)

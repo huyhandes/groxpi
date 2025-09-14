@@ -64,7 +64,7 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 	if err != nil {
 		return nil, fmt.Errorf("failed to download from %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
@@ -99,7 +99,12 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 	// Use goroutine to store data to storage backend
 	storageErrCh := make(chan error, 1)
 	go func() {
-		defer storageReader.Close()
+		defer func() {
+			if err := storageReader.Close(); err != nil {
+				// Log error but continue
+				_ = err
+			}
+		}()
 		err := sd.storage.Put(ctx, storageKey, storageReader, contentLength, contentType)
 		storageErrCh <- err
 	}()
@@ -112,7 +117,10 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 	totalSize, streamErr = io.CopyBuffer(multiWriter, resp.Body, copyBuf)
 
 	// Close storage writer to signal completion
-	storageWriter.Close()
+	if err := storageWriter.Close(); err != nil {
+		// Log error but continue
+		_ = err
+	}
 
 	// Wait for storage operation to complete
 	storageErr := <-storageErrCh
@@ -189,7 +197,7 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	if err != nil {
 		return nil, fmt.Errorf("failed to download from %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
@@ -212,7 +220,12 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	// Start storage goroutine
 	storageErrCh := make(chan error, 1)
 	go func() {
-		defer storageReader.Close()
+		defer func() {
+			if err := storageReader.Close(); err != nil {
+				// Log error but continue
+				_ = err
+			}
+		}()
 		err := tsd.storage.Put(ctx, storageKey, storageReader, resp.ContentLength, contentType)
 		storageErrCh <- err
 	}()
@@ -225,7 +238,10 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	totalSize, streamErr := io.CopyBuffer(writer, teeReader, copyBuf)
 
 	// Close storage writer
-	storageWriter.Close()
+	if err := storageWriter.Close(); err != nil {
+		// Log error but continue
+		_ = err
+	}
 
 	// Wait for storage completion
 	storageErr := <-storageErrCh

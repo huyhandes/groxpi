@@ -56,7 +56,7 @@ func TestServer_HandleHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -96,7 +96,7 @@ func TestServer_HandleHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -147,7 +147,7 @@ func TestServer_HandleListPackages_HTML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -186,7 +186,7 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -243,7 +243,7 @@ func TestServer_HandleListFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Should return 404 since package doesn't exist
 	if resp.StatusCode != http.StatusNotFound {
@@ -266,7 +266,7 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Should return 404 since file is not cached
 	if resp.StatusCode != http.StatusNotFound {
@@ -289,7 +289,7 @@ func TestServer_HandleCacheList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -310,7 +310,7 @@ func TestServer_HandleCacheList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("Expected status 405, got %d", resp.StatusCode)
@@ -332,7 +332,7 @@ func TestServer_HandleCachePackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -362,7 +362,7 @@ func TestServer_Handle404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("Expected status 404, got %d", resp.StatusCode)
@@ -388,7 +388,7 @@ func TestServer_ContentNegotiation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		contentType := resp.Header.Get("Content-Type")
 		if !strings.Contains(contentType, "json") {
@@ -404,7 +404,7 @@ func TestServer_ContentNegotiation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		contentType := resp.Header.Get("Content-Type")
 		if !strings.Contains(contentType, "html") {
@@ -472,7 +472,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status 404, got %d", resp.StatusCode)
@@ -485,7 +485,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle path traversal safely
 		if resp.StatusCode != http.StatusNotFound {
@@ -512,7 +512,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle special characters in package names
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
@@ -526,7 +526,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle empty package names gracefully
 		if resp.StatusCode == http.StatusInternalServerError {
@@ -568,7 +568,7 @@ func TestServer_WantsJSON(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 
 			contentType := resp.Header.Get("Content-Type")
 			isJSON := strings.Contains(contentType, "json")
@@ -607,7 +607,7 @@ func TestServer_NormalizePackageName(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			// Should handle normalization without errors
 			if resp.StatusCode == http.StatusInternalServerError {
@@ -634,7 +634,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusMethodNotAllowed {
 				t.Errorf("Method %s should return 405, got %d", method, resp.StatusCode)
@@ -650,7 +650,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
 				t.Errorf("DELETE /cache/%s should return 200, got %d", pkg, resp.StatusCode)
@@ -676,7 +676,7 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var response map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
@@ -718,7 +718,7 @@ func TestServer_ErrorHandling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle network errors gracefully without crashing
 		if resp.StatusCode == http.StatusInternalServerError {
@@ -753,7 +753,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 				{"name": "test-package-2"}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -806,7 +806,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 		}
 
 		body, err := io.ReadAll(responses[i].Body)
-		responses[i].Body.Close()
+		_ = responses[i].Body.Close()
 		if err != nil {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
@@ -871,7 +871,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -924,7 +924,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 		}
 
 		body, err := io.ReadAll(responses[i].Body)
-		responses[i].Body.Close()
+		_ = responses[i].Body.Close()
 		if err != nil {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
@@ -980,7 +980,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Internal Server Error"))
+		_, _ = w.Write([]byte("Internal Server Error"))
 	}))
 	defer mockPyPI.Close()
 
@@ -1034,7 +1034,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 		}
 
 		body, err := io.ReadAll(responses[i].Body)
-		responses[i].Body.Close()
+		_ = responses[i].Body.Close()
 		if err != nil {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
@@ -1083,7 +1083,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -1138,7 +1138,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 		}
 
 		body, err := io.ReadAll(responses[i].Body)
-		responses[i].Body.Close()
+		_ = responses[i].Body.Close()
 		if err != nil {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
@@ -1187,7 +1187,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 			"meta": {"api-version": "1.0"},
 			"projects": [{"name": "benchmark-package"}]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -1210,7 +1210,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 			if err != nil {
 				b.Fatalf("Request failed: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
 				b.Fatalf("Expected status 200, got %d", resp.StatusCode)
@@ -1233,7 +1233,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -1256,7 +1256,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 			if err != nil {
 				b.Fatalf("Request failed: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
 				b.Fatalf("Expected status 200, got %d", resp.StatusCode)
@@ -1287,7 +1287,7 @@ func TestServer_URLRewriting(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer mockPyPI.Close()
 
@@ -1308,7 +1308,7 @@ func TestServer_URLRewriting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
@@ -1359,7 +1359,7 @@ func TestServer_URLRewriting(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)

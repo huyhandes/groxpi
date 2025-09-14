@@ -655,7 +655,7 @@ func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {
 		log.Error().Err(err).Str("key", storageKey).Msg("Failed to get from storage")
 		return c.Status(fiber.StatusInternalServerError).SendString("Storage error")
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	// Set headers
 	if info.ContentType != "" {

@@ -130,7 +130,7 @@ func TestS3Storage_IntegrationBasic(t *testing.T) {
 	}
 
 	storage := createTestS3Storage(t)
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -150,7 +150,7 @@ func TestS3Storage_IntegrationBasic(t *testing.T) {
 		// Get object
 		reader, getInfo, err := storage.Get(ctx, key)
 		require.NoError(t, err, "Failed to get object")
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		assert.Equal(t, key, getInfo.Key)
 		assert.Equal(t, int64(len(content)), getInfo.Size)
@@ -192,7 +192,7 @@ func TestS3Storage_IntegrationBasic(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				reader, info, err := storage.GetRange(ctx, key, tc.offset, tc.length)
 				require.NoError(t, err, "Failed to get range")
-				defer reader.Close()
+				defer func() { _ = reader.Close() }()
 
 				assert.Equal(t, key, info.Key)
 
@@ -215,7 +215,7 @@ func TestS3Storage_IntegrationAdvanced(t *testing.T) {
 	}
 
 	storage := createTestS3Storage(t)
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -239,7 +239,7 @@ func TestS3Storage_IntegrationAdvanced(t *testing.T) {
 		// Verify we can read it back
 		reader, getInfo, err := storage.Get(ctx, key)
 		require.NoError(t, err, "Failed to get multipart object")
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		assert.Equal(t, int64(size), getInfo.Size)
 
@@ -372,7 +372,7 @@ func TestS3Storage_IntegrationConcurrency(t *testing.T) {
 	}
 
 	storage := createTestS3Storage(t)
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -444,7 +444,7 @@ func TestS3Storage_IntegrationConcurrency(t *testing.T) {
 					atomic.AddInt64(&errors, 1)
 					return
 				}
-				defer reader.Close()
+				defer func() { _ = reader.Close() }()
 
 				data, err := io.ReadAll(reader)
 				if err != nil {
@@ -521,7 +521,7 @@ func TestS3Storage_IntegrationErrorHandling(t *testing.T) {
 	}
 
 	storage := createTestS3Storage(t)
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -572,7 +572,7 @@ func BenchmarkS3Storage_IntegrationOperations(b *testing.B) {
 	// Create a dummy *testing.T for createTestS3Storage
 	t := &testing.T{}
 	storage := createTestS3Storage(t)
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 	content := make([]byte, 1024) // 1KB test content
@@ -615,7 +615,7 @@ func BenchmarkS3Storage_IntegrationOperations(b *testing.B) {
 				b.Fatal(err)
 			}
 			_, _ = io.ReadAll(reader)
-			reader.Close()
+			_ = reader.Close()
 		}
 
 		// Clean up

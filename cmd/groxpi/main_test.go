@@ -101,16 +101,16 @@ func TestMainConfiguration(t *testing.T) {
 
 	// Clean environment for test
 	for _, key := range envVars {
-		os.Unsetenv(key)
+		_ = os.Unsetenv(key)
 	}
 
 	t.Cleanup(func() {
 		// Restore original environment
 		for _, key := range envVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -162,10 +162,10 @@ func TestMainConfigurationWithEnv(t *testing.T) {
 	t.Cleanup(func() {
 		// Restore original environment
 		for _, key := range envVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -178,7 +178,7 @@ func TestMainConfigurationWithEnv(t *testing.T) {
 	}
 
 	for key, val := range testValues {
-		os.Setenv(key, val)
+		_ = os.Setenv(key, val)
 	}
 
 	// Load configuration with environment variables
@@ -223,10 +223,10 @@ func TestS3Configuration(t *testing.T) {
 	t.Cleanup(func() {
 		// Restore original environment
 		for _, key := range s3EnvVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -242,7 +242,7 @@ func TestS3Configuration(t *testing.T) {
 	}
 
 	for key, val := range s3TestValues {
-		os.Setenv(key, val)
+		_ = os.Setenv(key, val)
 	}
 
 	// Load configuration with S3 settings
@@ -283,10 +283,10 @@ func TestConfigurationEdgeCases(t *testing.T) {
 
 	t.Cleanup(func() {
 		for _, key := range envVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -334,12 +334,12 @@ func TestConfigurationEdgeCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Clear environment
 			for _, key := range envVars {
-				os.Unsetenv(key)
+				_ = os.Unsetenv(key)
 			}
 
 			// Set test environment
 			for key, val := range tc.envVars {
-				os.Setenv(key, val)
+				_ = os.Setenv(key, val)
 			}
 
 			cfg := config.Load()
@@ -385,16 +385,16 @@ func TestApplicationLifecycle(t *testing.T) {
 	// without actually starting the server (which would require network resources)
 
 	// Set minimal valid configuration
-	os.Setenv("PORT", "0") // Port 0 for testing
-	os.Setenv("GROXPI_INDEX_URL", "https://pypi.org/simple/")
-	os.Setenv("GROXPI_CACHE_DIR", t.TempDir())
-	os.Setenv("GROXPI_LOGGING_LEVEL", "ERROR") // Reduce log noise
+	_ = os.Setenv("PORT", "0") // Port 0 for testing
+	_ = os.Setenv("GROXPI_INDEX_URL", "https://pypi.org/simple/")
+	_ = os.Setenv("GROXPI_CACHE_DIR", t.TempDir())
+	_ = os.Setenv("GROXPI_LOGGING_LEVEL", "ERROR") // Reduce log noise
 
 	t.Cleanup(func() {
-		os.Unsetenv("PORT")
-		os.Unsetenv("GROXPI_INDEX_URL")
-		os.Unsetenv("GROXPI_CACHE_DIR")
-		os.Unsetenv("GROXPI_LOGGING_LEVEL")
+		_ = os.Unsetenv("PORT")
+		_ = os.Unsetenv("GROXPI_INDEX_URL")
+		_ = os.Unsetenv("GROXPI_CACHE_DIR")
+		_ = os.Unsetenv("GROXPI_LOGGING_LEVEL")
 	})
 
 	cfg := config.Load()
@@ -458,18 +458,18 @@ func TestBooleanEnvironmentVariables(t *testing.T) {
 			originalVal, exists := os.LookupEnv(tt.envVar)
 			t.Cleanup(func() {
 				if exists {
-					os.Setenv(tt.envVar, originalVal)
+					_ = os.Setenv(tt.envVar, originalVal)
 				} else {
-					os.Unsetenv(tt.envVar)
+					_ = os.Unsetenv(tt.envVar)
 				}
 			})
 
 			for envVal, expectedResult := range tt.values {
 				t.Run(fmt.Sprintf("value_%s", envVal), func(t *testing.T) {
 					if envVal == "" {
-						os.Unsetenv(tt.envVar)
+						_ = os.Unsetenv(tt.envVar)
 					} else {
-						os.Setenv(tt.envVar, envVal)
+						_ = os.Setenv(tt.envVar, envVal)
 					}
 
 					cfg := config.Load()
@@ -593,16 +593,16 @@ func TestConfigLoadingWithAllDefaults(t *testing.T) {
 	for _, key := range allVars {
 		if val, exists := os.LookupEnv(key); exists {
 			originalEnv[key] = val
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 	}
 
 	t.Cleanup(func() {
 		for _, key := range allVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -634,15 +634,15 @@ func TestMultiIndexConfiguration(t *testing.T) {
 		if val, exists := os.LookupEnv(key); exists {
 			originalEnv[key] = val
 		}
-		os.Unsetenv(key)
+		_ = os.Unsetenv(key)
 	}
 
 	t.Cleanup(func() {
 		for _, key := range envVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -676,15 +676,15 @@ func TestMultiIndexConfiguration(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.urls != "" {
-				os.Setenv("GROXPI_EXTRA_INDEX_URLS", tc.urls)
+				_ = os.Setenv("GROXPI_EXTRA_INDEX_URLS", tc.urls)
 			} else {
-				os.Unsetenv("GROXPI_EXTRA_INDEX_URLS")
+				_ = os.Unsetenv("GROXPI_EXTRA_INDEX_URLS")
 			}
 
 			if tc.ttls != "" {
-				os.Setenv("GROXPI_EXTRA_INDEX_TTLS", tc.ttls)
+				_ = os.Setenv("GROXPI_EXTRA_INDEX_TTLS", tc.ttls)
 			} else {
-				os.Unsetenv("GROXPI_EXTRA_INDEX_TTLS")
+				_ = os.Unsetenv("GROXPI_EXTRA_INDEX_TTLS")
 			}
 
 			cfg := config.Load()
@@ -710,15 +710,15 @@ func TestTimeoutConfigurations(t *testing.T) {
 		if val, exists := os.LookupEnv(key); exists {
 			originalEnv[key] = val
 		}
-		os.Unsetenv(key)
+		_ = os.Unsetenv(key)
 	}
 
 	t.Cleanup(func() {
 		for _, key := range timeoutVars {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 		for key, val := range originalEnv {
-			os.Setenv(key, val)
+			_ = os.Setenv(key, val)
 		}
 	})
 
@@ -758,12 +758,12 @@ func TestTimeoutConfigurations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Clear all timeout vars
 			for _, key := range timeoutVars {
-				os.Unsetenv(key)
+				_ = os.Unsetenv(key)
 			}
 
 			// Set test values
 			for key, val := range tc.envVars {
-				os.Setenv(key, val)
+				_ = os.Setenv(key, val)
 			}
 
 			cfg := config.Load()

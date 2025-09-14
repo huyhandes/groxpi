@@ -70,7 +70,7 @@ func TestClient_MakeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("makeRequest failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -489,7 +489,7 @@ func TestClient_SingleflightErrorPropagation(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Server Error"))
+		_, _ = w.Write([]byte("Server Error"))
 	}))
 	defer server.Close()
 

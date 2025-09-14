@@ -102,7 +102,7 @@ func TestZeroCopyServer_ServeFile(t *testing.T) {
 	t.Run("serve existing file", func(t *testing.T) {
 		content := "test file content for zero-copy serving"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewZeroCopyServer()
 		writer := &mockZeroCopyWriter{}
@@ -132,7 +132,7 @@ func TestZeroCopyServer_ServeFile(t *testing.T) {
 	t.Run("context cancellation", func(t *testing.T) {
 		content := "content for cancellation test"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewZeroCopyServer()
 		writer := &mockZeroCopyWriter{slowWrite: true}
@@ -148,7 +148,7 @@ func TestZeroCopyServer_ServeFile(t *testing.T) {
 		// This test is more conceptual since we can't easily test real sendfile
 		content := "sendfile test content"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewZeroCopyServer()
 		writer := &mockZeroCopyWriter{sendFile: true}
@@ -166,7 +166,7 @@ func TestZeroCopyServer_ServeFile(t *testing.T) {
 		// Create a larger file for testing
 		content := strings.Repeat("LARGE FILE CONTENT ", 1000) // ~19KB
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewZeroCopyServer()
 		writer := &mockZeroCopyWriter{}
@@ -243,7 +243,7 @@ func TestFiberZeroCopyServer_ServeFile(t *testing.T) {
 	t.Run("serve file with fiber context", func(t *testing.T) {
 		content := "fiber test content"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewFiberZeroCopyServer()
 		fiberCtx := &mockFiberContext{}
@@ -262,7 +262,7 @@ func TestFiberZeroCopyServer_ServeFile(t *testing.T) {
 	t.Run("fiber sendfile error falls back to regular", func(t *testing.T) {
 		content := "fallback test content"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewFiberZeroCopyServer()
 		fiberCtx := &mockFiberContext{sendFileErr: errors.New("sendfile failed")}
@@ -278,7 +278,7 @@ func TestFiberZeroCopyServer_ServeFile(t *testing.T) {
 	t.Run("non-fiber writer uses regular server", func(t *testing.T) {
 		content := "regular writer test"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewFiberZeroCopyServer()
 		writer := &mockZeroCopyWriter{}
@@ -324,7 +324,7 @@ func TestMemoryMappedServer_ServeFile(t *testing.T) {
 	t.Run("serve file with memory mapping", func(t *testing.T) {
 		content := "memory mapped test content"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewMemoryMappedServer()
 		writer := &mockZeroCopyWriter{}
@@ -342,7 +342,7 @@ func TestMemoryMappedServer_ServeFile(t *testing.T) {
 
 	t.Run("empty file handling", func(t *testing.T) {
 		filename := createTempFile(t, "")
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewMemoryMappedServer()
 		writer := &mockZeroCopyWriter{}
@@ -372,7 +372,7 @@ func TestOptimalServer_ServeFile(t *testing.T) {
 	t.Run("small file uses regular serving", func(t *testing.T) {
 		content := "small file"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewOptimalServer()
 		writer := &mockZeroCopyWriter{}
@@ -392,7 +392,7 @@ func TestOptimalServer_ServeFile(t *testing.T) {
 		// Create file larger than 100MB threshold (simulated with smaller file for test)
 		content := strings.Repeat("LARGE FILE CONTENT ", 5000) // ~95KB for testing
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewOptimalServer()
 		writer := &mockZeroCopyWriter{}
@@ -411,7 +411,7 @@ func TestOptimalServer_ServeFile(t *testing.T) {
 	t.Run("fiber writer uses fiber optimization", func(t *testing.T) {
 		content := "fiber optimization test"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewOptimalServer()
 		fiberCtx := &mockFiberContext{}
@@ -430,7 +430,7 @@ func TestOptimalServer_ServeFile(t *testing.T) {
 	t.Run("sendfile compatible writer", func(t *testing.T) {
 		content := "sendfile compatible test"
 		filename := createTempFile(t, content)
-		defer os.Remove(filename)
+		defer func() { _ = os.Remove(filename) }()
 
 		server := NewOptimalServer()
 		writer := &mockZeroCopyWriter{sendFile: true}
@@ -458,7 +458,7 @@ func (sr *slowReader) Read(p []byte) (n int, err error) {
 func BenchmarkZeroCopyServer_SmallFile(b *testing.B) {
 	content := "small benchmark file content"
 	filename := createTempFileForBench(content)
-	defer os.Remove(filename)
+	defer func() { _ = os.Remove(filename) }()
 
 	server := NewZeroCopyServer()
 	ctx := context.Background()
@@ -473,7 +473,7 @@ func BenchmarkZeroCopyServer_SmallFile(b *testing.B) {
 func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
 	content := strings.Repeat("LARGE BENCHMARK CONTENT ", 1000) // ~24KB
 	filename := createTempFileForBench(content)
-	defer os.Remove(filename)
+	defer func() { _ = os.Remove(filename) }()
 
 	server := NewZeroCopyServer()
 	ctx := context.Background()
@@ -488,7 +488,7 @@ func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
 func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
 	content := "fiber benchmark content"
 	filename := createTempFileForBench(content)
-	defer os.Remove(filename)
+	defer func() { _ = os.Remove(filename) }()
 
 	server := NewFiberZeroCopyServer()
 	ctx := context.Background()
@@ -503,7 +503,7 @@ func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
 func BenchmarkOptimalServer_AutoSelection(b *testing.B) {
 	content := "optimal server benchmark"
 	filename := createTempFileForBench(content)
-	defer os.Remove(filename)
+	defer func() { _ = os.Remove(filename) }()
 
 	server := NewOptimalServer()
 	ctx := context.Background()

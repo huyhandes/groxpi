@@ -197,7 +197,7 @@ func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser,
 	// Get object info
 	stat, err := object.Stat()
 	if err != nil {
-		object.Close()
+		_ = object.Close()
 		return nil, nil, fmt.Errorf("failed to stat object %s: %w", key, err)
 	}
 
@@ -244,7 +244,7 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 	// First get the full object info using a separate Stat call
 	fullObjectInfo, err := s.Stat(ctx, key)
 	if err != nil {
-		object.Close()
+		_ = object.Close()
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object info for range request")
 		return nil, nil, fmt.Errorf("failed to get object info for range %s: %w", key, err)
 	}
@@ -327,7 +327,7 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 	}
 
 	// For small files, use buffer pool for potential zero-copy optimization
-	var actualReader io.Reader = reader
+	actualReader := reader
 	if size > 0 && size <= 64*1024 {
 		bufPtr := s3BufferPool.Get().(*[]byte)
 		defer s3BufferPool.Put(bufPtr)
@@ -563,7 +563,12 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 		bufPtr: bufPtr,
 		pool:   &s3BufferPool,
 	}
-	defer bufReader.Close()
+	defer func() {
+		if err := bufReader.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	start := time.Now()
 	info, err := s.client.PutObject(ctx, s.bucket, fullKey, bufReader, size, opts)
@@ -648,7 +653,12 @@ func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writ
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
 	}
-	defer object.Close()
+	defer func() {
+		if err := object.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	// Use pooled buffer for optimized streaming
 	copyBufPtr := s3BufferPool.Get().(*[]byte)

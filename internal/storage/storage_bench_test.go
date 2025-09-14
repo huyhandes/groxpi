@@ -36,7 +36,7 @@ func BenchmarkS3Storage(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create S3 storage: %v", err)
 	}
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -65,7 +65,7 @@ func BenchmarkS3Storage(b *testing.B) {
 					b.Fatalf("Failed to put: %v", err)
 				}
 				// Clean up immediately to avoid filling storage
-				storage.Delete(ctx, key)
+				_ = storage.Delete(ctx, key)
 			}
 		})
 
@@ -78,7 +78,7 @@ func BenchmarkS3Storage(b *testing.B) {
 			if err != nil {
 				b.Fatalf("Failed to setup: %v", err)
 			}
-			defer storage.Delete(ctx, key)
+			defer func() { _ = storage.Delete(ctx, key) }()
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -89,7 +89,7 @@ func BenchmarkS3Storage(b *testing.B) {
 					b.Fatalf("Failed to get: %v", err)
 				}
 				_, _ = io.Copy(io.Discard, reader)
-				reader.Close()
+				_ = reader.Close()
 			}
 		})
 
@@ -108,7 +108,7 @@ func BenchmarkS3Storage(b *testing.B) {
 					if err != nil {
 						b.Fatalf("Failed to put multipart: %v", err)
 					}
-					storage.Delete(ctx, key)
+					_ = storage.Delete(ctx, key)
 				}
 			})
 		}
@@ -124,7 +124,7 @@ func BenchmarkS3Storage(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to setup: %v", err)
 		}
-		defer storage.Delete(ctx, key)
+		defer func() { _ = storage.Delete(ctx, key) }()
 
 		rangeSize := int64(1024 * 1024) // 1MB ranges
 		b.SetBytes(rangeSize)
@@ -137,7 +137,7 @@ func BenchmarkS3Storage(b *testing.B) {
 				b.Fatalf("Failed to get range: %v", err)
 			}
 			_, _ = io.Copy(io.Discard, reader)
-			reader.Close()
+			_ = reader.Close()
 		}
 	})
 
@@ -152,7 +152,7 @@ func BenchmarkS3Storage(b *testing.B) {
 			// Cleanup
 			for i := 0; i < 100; i++ {
 				key := fmt.Sprintf("bench/list/item_%03d", i)
-				storage.Delete(ctx, key)
+				_ = storage.Delete(ctx, key)
 			}
 		}()
 
@@ -177,7 +177,7 @@ func BenchmarkS3Storage(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to setup: %v", err)
 		}
-		defer storage.Delete(ctx, key)
+		defer func() { _ = storage.Delete(ctx, key) }()
 
 		b.ResetTimer()
 
@@ -198,7 +198,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Failed to create local storage: %v", err)
 	}
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -248,7 +248,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 					b.Fatalf("Failed to get: %v", err)
 				}
 				_, _ = io.Copy(io.Discard, reader)
-				reader.Close()
+				_ = reader.Close()
 			}
 		})
 	}
@@ -275,7 +275,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 				b.Fatalf("Failed to get range: %v", err)
 			}
 			_, _ = io.Copy(io.Discard, reader)
-			reader.Close()
+			_ = reader.Close()
 		}
 	})
 

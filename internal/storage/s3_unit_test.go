@@ -269,7 +269,7 @@ func TestS3Storage_SingleflightDeduplication(t *testing.T) {
 				if err == nil {
 					assert.Contains(t, string(data), "test data")
 				}
-				mockReader.Close()
+				_ = mockReader.Close()
 			}(i)
 		}
 

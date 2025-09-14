@@ -32,7 +32,7 @@ func TestS3Storage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create S3 storage: %v", err)
 	}
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -55,7 +55,7 @@ func TestS3Storage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get object: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		data, err := io.ReadAll(reader)
 		if err != nil {
@@ -85,7 +85,7 @@ func TestS3Storage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get range: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		data, err := io.ReadAll(reader)
 		if err != nil {
@@ -159,7 +159,7 @@ func TestS3Storage(t *testing.T) {
 
 		// Clean up
 		for _, key := range keys {
-			storage.Delete(ctx, key)
+			_ = storage.Delete(ctx, key)
 		}
 	})
 
@@ -211,7 +211,7 @@ func TestS3Storage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get multipart object: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		// Read first 1KB to verify
 		buffer := make([]byte, 1024)
@@ -236,7 +236,7 @@ func TestLocalStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create local storage: %v", err)
 	}
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
 
@@ -259,7 +259,7 @@ func TestLocalStorage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get object: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		data, err := io.ReadAll(reader)
 		if err != nil {
@@ -286,7 +286,7 @@ func TestLocalStorage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to get range: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		data, err := io.ReadAll(reader)
 		if err != nil {

@@ -116,12 +116,12 @@ func waitForServer(t *testing.T, url string) {
 	for i := 0; i < 30; i++ {
 		resp, err := client.Get(url + "/health")
 		if err == nil && resp.StatusCode == 200 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			t.Log("Server is ready")
 			return
 		}
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		time.Sleep(1 * time.Second)
 	}

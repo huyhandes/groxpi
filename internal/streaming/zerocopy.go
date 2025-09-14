@@ -41,7 +41,12 @@ func (zcs *zeroCopyServer) ServeFile(ctx context.Context, writer io.Writer, file
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", filepath, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	return zcs.ServeReader(ctx, writer, file, -1)
 }
@@ -72,14 +77,24 @@ func (zcs *zeroCopyServer) serveFileWithSendfile(ctx context.Context, conn inter
 		log.Debug().Err(err).Msg("Failed to get connection file descriptor, falling back to regular copy")
 		return zcs.serveFileRegular(ctx, conn.(io.Writer), filepath)
 	}
-	defer connFile.Close()
+	defer func() {
+		if err := connFile.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	// Open the source file
 	srcFile, err := os.Open(filepath)
 	if err != nil {
 		return fmt.Errorf("failed to open source file: %w", err)
 	}
-	defer srcFile.Close()
+	defer func() {
+		if err := srcFile.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	// Get file info for size
 	stat, err := srcFile.Stat()
@@ -97,7 +112,12 @@ func (zcs *zeroCopyServer) serveFileRegular(ctx context.Context, writer io.Write
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	return zcs.ServeReader(ctx, writer, file, -1)
 }
@@ -203,7 +223,12 @@ func (mms *memoryMappedServer) ServeFile(ctx context.Context, writer io.Writer, 
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			// Log error but continue
+			_ = err
+		}
+	}()
 
 	stat, err := file.Stat()
 	if err != nil {

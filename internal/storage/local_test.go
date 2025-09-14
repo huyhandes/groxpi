@@ -131,7 +131,7 @@ func TestLocalStorage_Get(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		if info.Key != key {
 			t.Errorf("Expected key %s, got %s", key, info.Key)
@@ -179,7 +179,7 @@ func TestLocalStorage_GetRange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRange failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		if info.Size != int64(len(originalContent)) {
 			t.Errorf("Expected original size %d, got %d", len(originalContent), info.Size)
@@ -202,7 +202,7 @@ func TestLocalStorage_GetRange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRange with zero length failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 
 		// Should read entire file
 		content, err := io.ReadAll(reader)

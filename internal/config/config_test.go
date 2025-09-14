@@ -27,16 +27,16 @@ func TestLoad(t *testing.T) {
 
 	for _, env := range envVars {
 		originalEnv[env] = os.Getenv(env)
-		os.Unsetenv(env)
+		_ = os.Unsetenv(env)
 	}
 
 	// Restore environment after test
 	defer func() {
 		for _, env := range envVars {
 			if val, ok := originalEnv[env]; ok && val != "" {
-				os.Setenv(env, val)
+				_ = os.Setenv(env, val)
 			} else {
-				os.Unsetenv(env)
+				_ = os.Unsetenv(env)
 			}
 		}
 	}()
@@ -78,15 +78,15 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("custom environment variables", func(t *testing.T) {
-		os.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
-		os.Setenv("GROXPI_INDEX_TTL", "600")
-		os.Setenv("GROXPI_CACHE_SIZE", "1073741824") // 1GB
-		os.Setenv("GROXPI_CACHE_DIR", "/custom/cache")
-		os.Setenv("GROXPI_DOWNLOAD_TIMEOUT", "2.5")
-		os.Setenv("PORT", "8080")
-		os.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
-		os.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
-		os.Setenv("GROXPI_BINARY_FILE_MIME_TYPE", "1")
+			_ = os.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
+		_ = os.Setenv("GROXPI_INDEX_TTL", "600")
+		_ = os.Setenv("GROXPI_CACHE_SIZE", "1073741824") // 1GB
+		_ = os.Setenv("GROXPI_CACHE_DIR", "/custom/cache")
+		_ = os.Setenv("GROXPI_DOWNLOAD_TIMEOUT", "2.5")
+		_ = os.Setenv("PORT", "8080")
+		_ = os.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
+		_ = os.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
+		_ = os.Setenv("GROXPI_BINARY_FILE_MIME_TYPE", "1")
 
 		cfg := Load()
 
@@ -128,8 +128,8 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("extra indices configuration", func(t *testing.T) {
-		os.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://extra1.example.com,https://extra2.example.com")
-		os.Setenv("GROXPI_EXTRA_INDEX_TTLS", "120,240")
+		_ = os.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://extra1.example.com,https://extra2.example.com")
+		_ = os.Setenv("GROXPI_EXTRA_INDEX_TTLS", "120,240")
 
 		cfg := Load()
 
@@ -157,8 +157,8 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("timeout configuration", func(t *testing.T) {
-		os.Setenv("GROXPI_CONNECT_TIMEOUT", "5.0")
-		os.Setenv("GROXPI_READ_TIMEOUT", "30.0")
+		_ = os.Setenv("GROXPI_CONNECT_TIMEOUT", "5.0")
+		_ = os.Setenv("GROXPI_READ_TIMEOUT", "30.0")
 
 		cfg := Load()
 

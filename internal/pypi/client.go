@@ -169,7 +169,12 @@ func (c *Client) getPackageListInternal() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package list: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			// Log error but don't fail the operation
+			_ = err
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
@@ -207,7 +212,12 @@ func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package files for %s: %w", packageName, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			// Log error but don't fail the operation
+			_ = err
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("package %s not found", packageName)
@@ -232,7 +242,12 @@ func (c *Client) DownloadFile(url string, dest string) error {
 	if err != nil {
 		return fmt.Errorf("failed to download %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			// Log error but don't fail the operation
+			_ = err
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)

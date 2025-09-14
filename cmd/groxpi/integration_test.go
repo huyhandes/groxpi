@@ -22,13 +22,13 @@ func TestMainIntegration(t *testing.T) {
 	os.Args = []string{"groxpi-test"}
 
 	// Set minimal required environment for testing
-	os.Setenv("GROXPI_INDEX_URL", "https://pypi.org/simple/")
-	os.Setenv("GROXPI_CACHE_DIR", "/tmp/groxpi-test")
-	os.Setenv("GROXPI_LOGGING_LEVEL", "ERROR") // Reduce log noise during tests
+	_ = os.Setenv("GROXPI_INDEX_URL", "https://pypi.org/simple/")
+	_ = os.Setenv("GROXPI_CACHE_DIR", "/tmp/groxpi-test")
+	_ = os.Setenv("GROXPI_LOGGING_LEVEL", "ERROR") // Reduce log noise during tests
 	defer func() {
-		os.Unsetenv("GROXPI_INDEX_URL")
-		os.Unsetenv("GROXPI_CACHE_DIR")
-		os.Unsetenv("GROXPI_LOGGING_LEVEL")
+		_ = os.Unsetenv("GROXPI_INDEX_URL")
+		_ = os.Unsetenv("GROXPI_CACHE_DIR")
+		_ = os.Unsetenv("GROXPI_LOGGING_LEVEL")
 	}()
 
 	// Test that main function can be called without panicking

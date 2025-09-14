@@ -162,7 +162,7 @@ func TestBroadcastWriter_AddWriter(t *testing.T) {
 
 	t.Run("add writer after close returns error", func(t *testing.T) {
 		bw := NewBroadcastWriter()
-		bw.Close()
+		_ = bw.Close()
 
 		writer := &mockWriter{}
 		err := bw.AddWriter(writer)
@@ -217,7 +217,7 @@ func TestBroadcastWriter_RemoveWriter(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
 		_ = bw.AddWriter(writer)
-		bw.Close()
+		_ = bw.Close()
 
 		err := bw.RemoveWriter(writer)
 		if err == nil {
@@ -292,7 +292,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
 		_ = bw.AddWriter(writer)
-		bw.Close()
+		_ = bw.Close()
 
 		_, err := bw.Write([]byte("test"))
 		if err == nil {
@@ -520,7 +520,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 			_, _ = bw.Write(data)
 		}
 
-		bw.Close()
+		_ = bw.Close()
 		_ = bw.Wait()
 
 		// Should not panic, some writes may be dropped due to buffer overflow
@@ -570,6 +570,6 @@ func BenchmarkAsyncBroadcastWriter_SingleWriter(b *testing.B) {
 		_, _ = bw.Write(data)
 	}
 
-	bw.Close()
+	_ = bw.Close()
 	_ = bw.Wait()
 }
