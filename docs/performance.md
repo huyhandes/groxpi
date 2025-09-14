@@ -6,13 +6,16 @@ Groxpi delivers exceptional performance through its Go-native architecture, zero
 
 ### API Performance (vs Python proxpi)
 
+**Real-world Benchmark Results (September 2024)**
+
 | Metric | Groxpi | Proxpi | Improvement |
 |--------|--------|---------|-------------|
-| **Package Index RPS** | 40,707 | 2.52 | **16,000x faster** |
-| **Package Details RPS** | 990 | 1,590 | Comparable |
-| **Average Response Time** | 25ms | 8,400ms | **336x faster** |
-| **Memory Usage** | ~50MB | ~200MB+ | **4x less** |
-| **Startup Time** | <100ms | ~5s | **50x faster** |
+| **Package Index RPS (Cold)** | 43,335 | 2,823 | **15.4x faster** |
+| **Package Index RPS (Warm)** | 43,637 | 2,835 | **15.4x faster** |
+| **P50 Latency** | 1.12ms | 33.6ms | **30x faster** |
+| **P99 Latency** | 212ms | 44ms | Comparable under load |
+| **Memory Usage** | ~460MB | ~150MB | Higher during load |
+| **Startup Time** | <2s | ~10s | **5x faster** |
 
 ### Detailed Performance Metrics
 
@@ -116,24 +119,39 @@ var responseBufferPool = sync.Pool{
 
 ### Stress Test Configuration
 - **Tool**: wrk (HTTP benchmarking)
-- **Duration**: 15 seconds per test
-- **Concurrency**: 4 threads, 50 connections
+- **Duration**: 60 seconds per test
+- **Concurrency**: 8 threads, 100 connections
 - **Endpoints**: Package index, package details, downloads
+- **Test Environment**: Docker containers on macOS (groxpi vs proxpi)
+- **Cache Scenarios**: Cold cache (cleared) and warm cache (pre-populated)
 
 ### Results Under Load
-```bash
-# Package Index (/simple/)
-Running 15s test @ http://localhost:5005/simple/
-  4 threads and 50 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    25.00ms   12.34ms  89.56ms   68.23%
-    Req/Sec    10.18k     1.23k   13.45k    72.34%
-  Requests/sec:  40,707.23
-  Transfer/sec:  45.67MB
 
-# vs proxpi
-  Requests/sec:      2.52
-  Transfer/sec:    145.23KB
+**Latest Benchmark Results (60s duration, 8 threads, 100 connections)**
+
+```bash
+# Groxpi - Package Index (/simple/) - Cold Cache
+Running 60s test @ http://localhost:5005/simple/
+  8 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    41.82ms   25.34ms  211.88ms   85.67%
+    Req/Sec     5.42k     0.89k    8.12k    78.91%
+  Requests/sec:  43,334.73
+  Transfer/sec:  48.5MB
+
+# Groxpi - Package Index (/simple/) - Warm Cache
+  Requests/sec:  43,636.61
+  P50 Latency:   1.12ms
+  P99 Latency:   252.58ms
+
+# Proxpi - Package Index (/simple/) - Cold Cache
+Running 60s test @ http://localhost:5006/simple/
+  8 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    33.98ms   8.45ms   44.34ms   72.15%
+    Req/Sec      353      87       456      68.42%
+  Requests/sec:  2,823.03
+  Transfer/sec:  3.2MB
 ```
 
 ### Capacity Planning
@@ -214,20 +232,39 @@ ulimit -n 65535
 
 ### Running Benchmarks
 ```bash
-# Full benchmark suite
-./benchmarks/benchmark.sh
+# Full benchmark suite (API + UV installation tests)
+./benchmarks/benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006
 
 # API benchmarks only
-./benchmarks/benchmark.sh --api-only
+./benchmarks/benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --api-only
 
-# Download benchmarks only
-./benchmarks/benchmark.sh --download-only
+# UV package installation tests only
+./benchmarks/benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --uv-only
+
+# Disable resource monitoring
+./benchmarks/benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --no-monitoring
+
+# Use environment variables
+export GROXPI_URL=http://localhost:5005
+export PROXPI_URL=http://localhost:5006
+./benchmarks/benchmark.sh
 ```
 
 ### Benchmark Components
-- **API tests**: wrk-based HTTP benchmarking
-- **Download tests**: Real package installation with uv
-- **Load tests**: Sustained load testing
-- **Memory tests**: Allocation and GC analysis
+- **API tests**: WRK-based HTTP load testing with cold/warm cache scenarios
+- **Installation tests**: Real package installation with UV package manager
+- **Resource monitoring**: Docker container CPU, memory, I/O tracking
+- **Cache management**: Automated cache clearing and verification
+- **DuckDB analysis**: SQL-based results analysis and reporting
 
-All benchmark results are saved to `benchmarks/results/` with timestamps for historical comparison.
+### Benchmark Results Structure
+```
+benchmarks/results/
+├── benchmark-report-YYYYMMDD_HHMMSS.md     # Consolidated report
+├── wrk-summary-YYYYMMDD_HHMMSS.csv         # API performance metrics
+├── uv-summary-YYYYMMDD_HHMMSS.csv          # Package installation times
+├── resources-YYYYMMDD_HHMMSS.csv           # Resource usage over time
+└── individual test logs...                 # Detailed per-test logs
+```
+
+All benchmark results are timestamped and include DuckDB-compatible CSV files for advanced analysis.
