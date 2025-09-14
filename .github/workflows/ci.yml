@@ -140,11 +140,7 @@ jobs:
           MINIO_DEFAULT_BUCKETS: groxpi-test
         ports:
           - 9000:9000
-        options: >
-          --health-cmd "curl -f http://localhost:9000/minio/health/ready || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+        options: --health-cmd "curl -f http://localhost:9000/minio/health/ready || exit 1" --health-interval 10s --health-timeout 5s --health-retries 5
 
     env:
       TEST_S3_ENDPOINT: localhost:9000
