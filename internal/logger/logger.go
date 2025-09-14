@@ -68,7 +68,7 @@ func Init(cfg LogConfig) {
 
 	// Set as default logger - this is crucial for log.Debug() calls throughout the codebase
 	log.DefaultLogger = Logger
-	
+
 	// Also ensure the default logger level is set correctly
 	log.DefaultLogger.SetLevel(level)
 }

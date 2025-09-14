@@ -1266,7 +1266,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 // Test URL rewriting functionality to ensure packages are downloaded through proxy
 func TestServer_URLRewriting(t *testing.T) {
 	packageName := "test-package"
-	
+
 	// Mock PyPI server that returns original PyPI URLs
 	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
@@ -1336,12 +1336,12 @@ func TestServer_URLRewriting(t *testing.T) {
 			fileMap := file.(map[string]interface{})
 			filename := fileMap["filename"].(string)
 			url := fileMap["url"].(string)
-			
+
 			expectedURL := fmt.Sprintf("/simple/%s/%s", packageName, filename)
 			if url != expectedURL {
 				t.Errorf("Expected URL '%s', got '%s'", expectedURL, url)
 			}
-			
+
 			// Ensure URL does not point to PyPI directly
 			if strings.Contains(url, "files.pythonhosted.org") {
 				t.Errorf("URL should not contain files.pythonhosted.org, got '%s'", url)
@@ -1369,19 +1369,19 @@ func TestServer_URLRewriting(t *testing.T) {
 		}
 
 		bodyStr := string(body)
-		
+
 		// Verify HTML contains proxy URLs, not PyPI URLs
 		expectedURLs := []string{
 			fmt.Sprintf(`href="/simple/%s/test-package-1.0.0.tar.gz"`, packageName),
 			fmt.Sprintf(`href="/simple/%s/test-package-1.0.0-py3-none-any.whl"`, packageName),
 		}
-		
+
 		for _, expectedURL := range expectedURLs {
 			if !strings.Contains(bodyStr, expectedURL) {
 				t.Errorf("Expected HTML to contain '%s', got: %s", expectedURL, bodyStr)
 			}
 		}
-		
+
 		// Ensure HTML does not contain direct PyPI URLs
 		if strings.Contains(bodyStr, "files.pythonhosted.org") {
 			t.Errorf("HTML should not contain files.pythonhosted.org URLs, got: %s", bodyStr)

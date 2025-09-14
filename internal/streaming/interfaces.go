@@ -22,16 +22,16 @@ type StreamingDownloader interface {
 // BroadcastWriter allows multiple writers to receive the same data stream
 type BroadcastWriter interface {
 	io.Writer
-	
+
 	// AddWriter adds a writer to receive broadcasted data
 	AddWriter(w io.Writer) error
-	
+
 	// RemoveWriter removes a writer from broadcast
 	RemoveWriter(w io.Writer) error
-	
+
 	// Close closes all writers and stops broadcasting
 	Close() error
-	
+
 	// Wait waits for all writers to finish
 	Wait() error
 }
@@ -40,7 +40,7 @@ type BroadcastWriter interface {
 type ZeroCopyServer interface {
 	// ServeFile serves a file using zero-copy techniques when possible
 	ServeFile(ctx context.Context, writer io.Writer, filepath string) error
-	
+
 	// ServeReader serves data from reader using optimized copy techniques
 	ServeReader(ctx context.Context, writer io.Writer, reader io.Reader, size int64) error
 }

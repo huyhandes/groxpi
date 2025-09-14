@@ -746,8 +746,8 @@ func TestClient_ParseHTMLPackageList(t *testing.T) {
 			expected: []string{"Django", "flask", "requests"},
 		},
 		{
-			name: "empty HTML",
-			html: `<html><body></body></html>`,
+			name:     "empty HTML",
+			html:     `<html><body></body></html>`,
 			expected: []string{},
 		},
 		{
@@ -769,7 +769,7 @@ func TestClient_ParseHTMLPackageList(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseHTMLPackageList failed: %v", err)
 			}
-			
+
 			if len(result) != len(tc.expected) {
 				t.Errorf("Expected %d packages, got %d", len(tc.expected), len(result))
 				return
@@ -821,14 +821,14 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 					URL:  "package-1.0.tar.gz#sha256=abc123",
 				},
 				{
-					Name: "package-1.0.whl", 
+					Name: "package-1.0.whl",
 					URL:  "package-1.0.whl#md5=def456",
 				},
 			},
 		},
 		{
-			name: "empty package page",
-			html: `<html><body><h1>No files found</h1></body></html>`,
+			name:     "empty package page",
+			html:     `<html><body><h1>No files found</h1></body></html>`,
 			expected: []FileInfo{},
 		},
 	}
@@ -839,7 +839,7 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseHTMLPackageFiles failed: %v", err)
 			}
-			
+
 			if len(result) != len(tc.expected) {
 				t.Errorf("Expected %d files, got %d", len(tc.expected), len(result))
 				return

@@ -77,15 +77,15 @@ func createTempFile(t *testing.T, content string) string {
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	
+
 	if _, err := tmpfile.Write([]byte(content)); err != nil {
 		t.Fatalf("Failed to write temp file: %v", err)
 	}
-	
+
 	if err := tmpfile.Close(); err != nil {
 		t.Fatalf("Failed to close temp file: %v", err)
 	}
-	
+
 	return tmpfile.Name()
 }
 
@@ -521,14 +521,14 @@ func createTempFileForBench(content string) string {
 	if err != nil {
 		panic(err)
 	}
-	
+
 	if _, err := tmpfile.Write([]byte(content)); err != nil {
 		panic(err)
 	}
-	
+
 	if err := tmpfile.Close(); err != nil {
 		panic(err)
 	}
-	
+
 	return tmpfile.Name()
 }

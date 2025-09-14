@@ -50,11 +50,11 @@ func TestMainIntegration(t *testing.T) {
 		// This would normally start the server, but we'll let it timeout
 		// The main function sets up configuration, logging, and server initialization
 		// which is what we're actually testing here
-		
+
 		// Since we can't easily test the full main() without starting a server,
 		// we'll test the components that main() uses
 		t.Log("Testing main function components")
-		
+
 		// Test that we can import and use the packages main() depends on
 		// This ensures the basic structure and imports work
 	}()

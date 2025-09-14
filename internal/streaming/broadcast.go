@@ -130,10 +130,10 @@ func (bw *broadcastWriter) Wait() error {
 
 // AsyncBroadcastWriter provides asynchronous broadcasting with buffered channels
 type asyncBroadcastWriter struct {
-	mu        sync.RWMutex
-	writers   []chan []byte
-	closed    bool
-	wg        sync.WaitGroup
+	mu         sync.RWMutex
+	writers    []chan []byte
+	closed     bool
+	wg         sync.WaitGroup
 	bufferSize int
 }
 
@@ -142,7 +142,7 @@ func NewAsyncBroadcastWriter(bufferSize int) BroadcastWriter {
 	if bufferSize <= 0 {
 		bufferSize = 1024 // Default buffer size
 	}
-	
+
 	return &asyncBroadcastWriter{
 		writers:    make([]chan []byte, 0),
 		bufferSize: bufferSize,

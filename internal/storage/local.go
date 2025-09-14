@@ -376,7 +376,7 @@ func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.W
 // GetFilePath returns the local file path for zero-copy operations
 func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, error) {
 	path := l.buildPath(key)
-	
+
 	// Check if file exists
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {

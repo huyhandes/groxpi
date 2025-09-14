@@ -16,9 +16,9 @@ import (
 
 // Mock storage writer for testing
 type mockStorageWriter struct {
-	storage map[string][]byte
-	mu      sync.RWMutex
-	putErr  error
+	storage  map[string][]byte
+	mu       sync.RWMutex
+	putErr   error
 	putDelay time.Duration
 }
 
@@ -88,7 +88,7 @@ func TestNewStreamingDownloader(t *testing.T) {
 	t.Run("creates downloader with custom client", func(t *testing.T) {
 		storage := newMockStorageWriter()
 		client := &http.Client{Timeout: 5 * time.Second}
-		
+
 		downloader := NewStreamingDownloader(storage, client)
 		if downloader == nil {
 			t.Fatal("NewStreamingDownloader returned nil")
@@ -97,7 +97,7 @@ func TestNewStreamingDownloader(t *testing.T) {
 
 	t.Run("creates downloader with default client", func(t *testing.T) {
 		storage := newMockStorageWriter()
-		
+
 		downloader := NewStreamingDownloader(storage, nil)
 		if downloader == nil {
 			t.Fatal("NewStreamingDownloader returned nil")
@@ -113,10 +113,10 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
-		
+
 		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
 		if err != nil {
 			t.Fatalf("DownloadAndStream failed: %v", err)
@@ -155,16 +155,16 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		storage.SetError(errors.New("storage write failed"))
-		
+
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
-		
+
 		// This test expects the downloader to handle storage errors gracefully
 		// The client stream should still work even if storage fails
 		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
-		
+
 		// The streaming may fail due to pipe closure, which is expected behavior
 		// when storage fails immediately
 		if err != nil {
@@ -196,10 +196,10 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
-		
+
 		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
 		if err == nil {
 			t.Error("Expected error for HTTP 404")
@@ -215,11 +215,11 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
-		
+
 		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
 		if err == nil {
 			t.Error("Expected context cancellation error")
@@ -234,10 +234,10 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 10 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
-		
+
 		result, err := downloader.DownloadAndStream(ctx, server.URL, "large-file", &clientBuffer)
 		if err != nil {
 			t.Fatalf("DownloadAndStream failed for large file: %v", err)
@@ -247,7 +247,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		if int64(clientBuffer.Len()) != result.Size {
 			t.Errorf("Client buffer size mismatch: expected %d, got %d", result.Size, clientBuffer.Len())
 		}
-		
+
 		// Verify data integrity
 		if clientBuffer.String() != testData {
 			t.Error("Large file data integrity check failed")
@@ -261,26 +261,26 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var wg sync.WaitGroup
 		concurrency := 10
 		wg.Add(concurrency)
 
 		ctx := context.Background()
 		errors := make(chan error, concurrency)
-		
+
 		for i := 0; i < concurrency; i++ {
 			go func(id int) {
 				defer wg.Done()
 				var buffer bytes.Buffer
 				key := fmt.Sprintf("concurrent-key-%d", id)
-				
+
 				_, err := downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
 				if err != nil {
 					errors <- err
 					return
 				}
-				
+
 				if buffer.String() != testData {
 					errors <- fmt.Errorf("data mismatch for goroutine %d", id)
 				}
@@ -315,10 +315,10 @@ func TestTeeStreamingDownloader_DownloadAndStream(t *testing.T) {
 
 		storage := newMockStorageWriter()
 		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-		
+
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
-		
+
 		result, err := downloader.DownloadAndStream(ctx, server.URL, "tee-key", &clientBuffer)
 		if err != nil {
 			t.Fatalf("TeeStreamingDownloader failed: %v", err)
@@ -378,16 +378,16 @@ func TestHashingWriter(t *testing.T) {
 
 		// Simulate partial write
 		testData := []byte("partial write test")
-		
+
 		// Mock writer that only writes half the data
 		partialWriter := &partialWriter{underlying: &buffer, writeRatio: 0.5}
 		hw = NewHashingWriter(partialWriter, hasher)
-		
+
 		n, err := hw.Write(testData)
 		if err != nil {
 			t.Fatalf("Partial write failed: %v", err)
 		}
-		
+
 		// Hash should only include the actually written data
 		expectedWritten := len(testData) / 2
 		if n != expectedWritten {

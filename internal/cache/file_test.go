@@ -247,4 +247,3 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
-

@@ -35,16 +35,16 @@ var responseBufferPool = sync.Pool{
 }
 
 type Server struct {
-	config        *config.Config
-	indexCache    *cache.IndexCache
-	fileCache     *cache.FileCache
-	responseCache *cache.ResponseCache
-	pypiClient    *pypi.Client
-	storage       storage.Storage
-	app           *fiber.App
-	sf            singleflight.Group // For deduplicating concurrent requests
-	cacheSF       singleflight.Group // For deduplicating concurrent cache reads
-	downloadSF    singleflight.Group // For deduplicating concurrent downloads
+	config           *config.Config
+	indexCache       *cache.IndexCache
+	fileCache        *cache.FileCache
+	responseCache    *cache.ResponseCache
+	pypiClient       *pypi.Client
+	storage          storage.Storage
+	app              *fiber.App
+	sf               singleflight.Group // For deduplicating concurrent requests
+	cacheSF          singleflight.Group // For deduplicating concurrent cache reads
+	downloadSF       singleflight.Group // For deduplicating concurrent downloads
 	streamDownloader streaming.StreamingDownloader
 }
 
@@ -460,7 +460,7 @@ func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName stri
 
 	// Build storage key for the file
 	storageKey := fmt.Sprintf("packages/%s/%s", packageName, fileName)
-	
+
 	log.Debug().
 		Str("package", packageName).
 		Str("file", fileName).
@@ -509,7 +509,7 @@ func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName stri
 				Str("file_url", fileURL).
 				Dur("timeout", s.config.DownloadTimeout).
 				Msg("Failed to stream download, redirecting to PyPI")
-			
+
 			// Fall back to redirect
 			return c.Redirect(fileURL, fiber.StatusFound)
 		}
@@ -587,11 +587,11 @@ func (s *Server) handleHealth(c *fiber.Ctx) error {
 		"status":    "success",
 		"timestamp": time.Now().Unix(),
 		"data": fiber.Map{
-			"cache_dir":          s.config.CacheDir,
-			"index_url":          s.config.IndexURL,
-			"cache_size":         s.config.CacheSize,
-			"index_ttl_seconds":  int(s.config.IndexTTL.Seconds()),
-			"storage_type":       s.config.StorageType,
+			"cache_dir":         s.config.CacheDir,
+			"index_url":         s.config.IndexURL,
+			"cache_size":        s.config.CacheSize,
+			"index_ttl_seconds": int(s.config.IndexTTL.Seconds()),
+			"storage_type":      s.config.StorageType,
 		},
 	})
 }
@@ -645,7 +645,7 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 // downloadAndCache downloads a file from URL and stores it in storage
 func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey string) error {
 	start := time.Now()
-	
+
 	log.Debug().
 		Str("url", fileURL).
 		Str("storage_key", storageKey).
@@ -699,7 +699,7 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 
 	downloadDuration := time.Since(downloadStart)
 	fileSize := int64(len(data))
-	
+
 	log.Info().
 		Str("url", fileURL).
 		Int64("size_bytes", fileSize).
@@ -730,7 +730,7 @@ func (s *Server) downloadAndCache(ctx context.Context, fileURL, storageKey strin
 
 	uploadDuration := time.Since(uploadStart)
 	totalDuration := time.Since(start)
-	
+
 	log.Info().
 		Str("storage_key", storageKey).
 		Int64("size_bytes", fileSize).
@@ -805,12 +805,12 @@ func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {
 			Msg("Failed to stream file from storage")
 		return err
 	}
-	
+
 	log.Debug().
 		Str("storage_key", storageKey).
 		Int64("bytes_written", written).
 		Msg("File stream completed successfully")
-	
+
 	return nil
 }
 

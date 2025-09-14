@@ -89,7 +89,7 @@ func TestNewBroadcastWriter(t *testing.T) {
 	t.Run("initial state has no writers", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		testData := []byte("test")
-		
+
 		n, err := bw.Write(testData)
 		if err != nil {
 			t.Errorf("Write with no writers should not error, got: %v", err)
@@ -273,7 +273,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		bw := NewBroadcastWriter()
 		goodWriter := &mockWriter{}
 		badWriter := &mockWriter{writeErrors: []error{errors.New("write failed")}}
-		
+
 		bw.AddWriter(goodWriter)
 		bw.AddWriter(badWriter)
 
@@ -418,12 +418,12 @@ func TestBroadcastWriter_ConcurrentOperations(t *testing.T) {
 
 	t.Run("concurrent add/remove writers", func(t *testing.T) {
 		bw := NewBroadcastWriter()
-		
+
 		var wg sync.WaitGroup
 		operations := 5 // Reduce to make test more reliable
 
 		writers := make([]*mockWriter, operations)
-		
+
 		// Add writers concurrently
 		wg.Add(operations)
 		for i := 0; i < operations; i++ {
@@ -475,7 +475,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 	t.Run("write to async broadcast writer", func(t *testing.T) {
 		bw := NewAsyncBroadcastWriter(10)
 		writer := &mockWriter{}
-		
+
 		err := bw.AddWriter(writer)
 		if err != nil {
 			t.Fatalf("AddWriter failed: %v", err)
@@ -511,7 +511,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 	t.Run("async writer handles channel overflow", func(t *testing.T) {
 		bw := NewAsyncBroadcastWriter(2) // Small buffer
 		slowWriter := &mockWriter{slowWrite: true}
-		
+
 		bw.AddWriter(slowWriter)
 
 		// Write more data than buffer can hold
@@ -532,9 +532,9 @@ func BenchmarkBroadcastWriter_SingleWriter(b *testing.B) {
 	bw := NewBroadcastWriter()
 	writer := &bytes.Buffer{}
 	bw.AddWriter(writer)
-	
+
 	data := []byte("benchmark test data")
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bw.Write(data)
@@ -543,15 +543,15 @@ func BenchmarkBroadcastWriter_SingleWriter(b *testing.B) {
 
 func BenchmarkBroadcastWriter_MultipleWriters(b *testing.B) {
 	bw := NewBroadcastWriter()
-	
+
 	// Add multiple writers
 	for i := 0; i < 5; i++ {
 		writer := &bytes.Buffer{}
 		bw.AddWriter(writer)
 	}
-	
+
 	data := []byte("benchmark test data")
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bw.Write(data)
@@ -562,15 +562,14 @@ func BenchmarkAsyncBroadcastWriter_SingleWriter(b *testing.B) {
 	bw := NewAsyncBroadcastWriter(1000)
 	writer := &bytes.Buffer{}
 	bw.AddWriter(writer)
-	
+
 	data := []byte("async benchmark test data")
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bw.Write(data)
 	}
-	
+
 	bw.Close()
 	bw.Wait()
 }
-

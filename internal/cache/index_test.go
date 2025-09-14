@@ -224,4 +224,3 @@ func TestIndexCache_NegativeTTL(t *testing.T) {
 		t.Error("Expected entry with negative TTL to be expired immediately")
 	}
 }
-

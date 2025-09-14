@@ -102,14 +102,14 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 
 	// Configure HTTP transport for performance with extended timeouts
 	transport := &http.Transport{
-		MaxIdleConns:           cfg.MaxConnections,
-		MaxIdleConnsPerHost:    cfg.MaxConnections,
-		MaxConnsPerHost:        cfg.MaxConnections,
-		IdleConnTimeout:        90 * time.Second,
-		DisableCompression:     true, // S3 already handles compression
-		ResponseHeaderTimeout:  cfg.RequestTimeout,    // 5 minutes for response headers
-		TLSHandshakeTimeout:   cfg.ConnectTimeout,      // TLS handshake timeout
-		ExpectContinueTimeout: 1 * time.Second,        // 100-continue timeout
+		MaxIdleConns:          cfg.MaxConnections,
+		MaxIdleConnsPerHost:   cfg.MaxConnections,
+		MaxConnsPerHost:       cfg.MaxConnections,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    true,               // S3 already handles compression
+		ResponseHeaderTimeout: cfg.RequestTimeout, // 5 minutes for response headers
+		TLSHandshakeTimeout:   cfg.ConnectTimeout, // TLS handshake timeout
+		ExpectContinueTimeout: 1 * time.Second,    // 100-continue timeout
 		DialContext: (&net.Dialer{
 			Timeout:   cfg.ConnectTimeout, // Connection establishment timeout
 			KeepAlive: 30 * time.Second,   // Keep-alive timeout
@@ -180,7 +180,6 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *Object
 	// metadata operations like Stat and Exists.
 	return s.getInternal(ctx, key)
 }
-
 
 // getInternal performs the actual S3 Get operation
 func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
@@ -533,7 +532,7 @@ func (s *S3Storage) GetPresignedURL(ctx context.Context, key string, expiry time
 // StreamingPut stores an object with streaming support and concurrent reads
 func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
-	
+
 	log.Debug().
 		Str("key", key).
 		Str("full_key", fullKey).
@@ -706,7 +705,7 @@ func (br *bufferedReader) Close() error {
 		br.buffer = nil
 		br.closed = true
 	}
-	
+
 	if closer, ok := br.reader.(io.Closer); ok {
 		return closer.Close()
 	}

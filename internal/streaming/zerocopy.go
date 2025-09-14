@@ -174,7 +174,7 @@ func (fzcs *fiberZeroCopyServer) ServeReader(ctx context.Context, writer io.Writ
 		return fiberCtx.Stream(func(w *io.Writer) error {
 			copyBuf := fzcs.copyBufPool.Get().([]byte)
 			defer fzcs.copyBufPool.Put(copyBuf)
-			
+
 			_, err := io.CopyBuffer(*w, reader, copyBuf)
 			return err
 		})
@@ -269,15 +269,15 @@ func (os *optimalServer) ServeFile(ctx context.Context, writer io.Writer, filepa
 	case size > 100*1024*1024: // Files > 100MB - use memory mapping
 		log.Debug().Str("file", filepath).Int64("size", size).Msg("Using memory-mapped serving")
 		return os.mmapServer.ServeFile(ctx, writer, filepath)
-		
+
 	case isFiberWriter(writer): // Fiber context - use Fiber optimizations
 		log.Debug().Str("file", filepath).Msg("Using Fiber optimized serving")
 		return os.fiberServer.ServeFile(ctx, writer, filepath)
-		
+
 	case supportsSendfile(writer): // TCP connection - use sendfile
 		log.Debug().Str("file", filepath).Msg("Using sendfile serving")
 		return os.sendfileServer.ServeFile(ctx, writer, filepath)
-		
+
 	default: // Regular optimized copy
 		log.Debug().Str("file", filepath).Msg("Using regular optimized serving")
 		return os.regularServer.ServeFile(ctx, writer, filepath)

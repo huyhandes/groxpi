@@ -81,10 +81,10 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 
 	// Create a pipe for storing to storage
 	storageReader, storageWriter := io.Pipe()
-	
+
 	// Create a hash writer for integrity checking
 	hasher := md5.New()
-	
+
 	// Create multi-writer that writes to:
 	// 1. Client (writer parameter)
 	// 2. Storage (via pipe)
@@ -108,7 +108,7 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 	defer sd.copyBufPool.Put(copyBuf)
 
 	totalSize, streamErr = io.CopyBuffer(multiWriter, resp.Body, copyBuf)
-	
+
 	// Close storage writer to signal completion
 	storageWriter.Close()
 
@@ -117,7 +117,7 @@ func (sd *streamingDownloader) DownloadAndStream(ctx context.Context, url, stora
 
 	// duration calculation for logging (disabled in tests)
 	_ = time.Since(start)
-	
+
 	if streamErr != nil {
 		// Error logging disabled for tests
 		return nil, fmt.Errorf("streaming failed: %w", streamErr)
@@ -201,10 +201,10 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 
 	// Create hash calculator
 	hasher := md5.New()
-	
+
 	// Create storage writer
 	storageReader, storageWriter := io.Pipe()
-	
+
 	// Create TeeReader that sends data to both client and storage
 	teeReader := io.TeeReader(resp.Body, io.MultiWriter(storageWriter, hasher))
 
@@ -221,7 +221,7 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	defer tsd.copyBufPool.Put(copyBuf)
 
 	totalSize, streamErr := io.CopyBuffer(writer, teeReader, copyBuf)
-	
+
 	// Close storage writer
 	storageWriter.Close()
 
