@@ -218,13 +218,13 @@ func (s *Server) handleListPackages(c *fiber.Ctx) error {
 		// Cache the JSON response
 		jsonData := buf.Bytes()
 		cacheKey := "json:package-list"
-		// Make a copy for cache since buf will be reused
-		cachedData := make([]byte, len(jsonData))
-		copy(cachedData, jsonData)
-		s.responseCache.Set(cacheKey, cachedData, s.config.IndexTTL)
+		// Make a copy for cache and response since buf will be reused
+		responseData := make([]byte, len(jsonData))
+		copy(responseData, jsonData)
+		s.responseCache.Set(cacheKey, responseData, s.config.IndexTTL)
 
 		c.Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		return c.Send(jsonData)
+		return c.Send(responseData)
 	}
 
 	// Return simple HTML for packages
@@ -339,13 +339,13 @@ func (s *Server) renderPackageFiles(c *fiber.Ctx, packageName string, files []py
 		// Cache the JSON response
 		jsonData := buf.Bytes()
 		cacheKey := "json:package:" + packageName
-		// Make a copy for cache since buf will be reused
-		cachedData := make([]byte, len(jsonData))
-		copy(cachedData, jsonData)
-		s.responseCache.Set(cacheKey, cachedData, s.config.IndexTTL)
+		// Make a copy for cache and response since buf will be reused
+		responseData := make([]byte, len(jsonData))
+		copy(responseData, jsonData)
+		s.responseCache.Set(cacheKey, responseData, s.config.IndexTTL)
 
 		c.Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		return c.Send(jsonData)
+		return c.Send(responseData)
 	}
 
 	// Return HTML for package files using string builder for efficiency
@@ -639,7 +639,6 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 	// Default to local storage
 	return storage.NewLocalStorage(cfg.CacheDir)
 }
-
 
 // serveFromStorage serves a file from the storage backend
 func (s *Server) serveFromStorage(c *fiber.Ctx, storageKey string) error {

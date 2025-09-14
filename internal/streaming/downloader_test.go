@@ -80,7 +80,7 @@ func createTestServer(responseData string, statusCode int, delay time.Duration) 
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(statusCode)
-		w.Write([]byte(responseData))
+		_, _ = w.Write([]byte(responseData))
 	}))
 }
 
@@ -374,14 +374,13 @@ func TestHashingWriter(t *testing.T) {
 	t.Run("partial write updates hash correctly", func(t *testing.T) {
 		var buffer bytes.Buffer
 		hasher := newMD5Hasher()
-		hw := NewHashingWriter(&buffer, hasher)
 
 		// Simulate partial write
 		testData := []byte("partial write test")
 
 		// Mock writer that only writes half the data
 		partialWriter := &partialWriter{underlying: &buffer, writeRatio: 0.5}
-		hw = NewHashingWriter(partialWriter, hasher)
+		hw := NewHashingWriter(partialWriter, hasher)
 
 		n, err := hw.Write(testData)
 		if err != nil {
@@ -459,7 +458,7 @@ func BenchmarkStreamingDownloader_SmallFile(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var buffer bytes.Buffer
 		key := fmt.Sprintf("bench-key-%d", i)
-		downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
+		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
 	}
 }
 
@@ -476,7 +475,7 @@ func BenchmarkStreamingDownloader_LargeFile(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var buffer bytes.Buffer
 		key := fmt.Sprintf("bench-large-key-%d", i)
-		downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
+		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
 	}
 }
 
@@ -493,6 +492,6 @@ func BenchmarkTeeStreamingDownloader_Comparison(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var buffer bytes.Buffer
 		key := fmt.Sprintf("tee-bench-key-%d", i)
-		downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
+		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
 	}
 }

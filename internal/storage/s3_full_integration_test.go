@@ -68,8 +68,8 @@ type groxpiProcess struct {
 func (gp *groxpiProcess) Stop() {
 	if gp.cmd != nil && gp.cmd.Process != nil {
 		gp.t.Log("Stopping groxpi server...")
-		gp.cmd.Process.Kill()
-		gp.cmd.Wait()
+		_ = gp.cmd.Process.Kill()
+		_ = gp.cmd.Wait()
 	}
 }
 

@@ -51,7 +51,7 @@ func TestS3Storage(t *testing.T) {
 		}
 
 		// Get object
-		reader, info, err := storage.Get(ctx, key)
+		reader, _, err := storage.Get(ctx, key)
 		if err != nil {
 			t.Fatalf("Failed to get object: %v", err)
 		}
@@ -255,7 +255,7 @@ func TestLocalStorage(t *testing.T) {
 		}
 
 		// Get object
-		reader, info, err := storage.Get(ctx, key)
+		reader, _, err := storage.Get(ctx, key)
 		if err != nil {
 			t.Fatalf("Failed to get object: %v", err)
 		}

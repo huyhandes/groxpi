@@ -584,7 +584,7 @@ func BenchmarkS3Storage_IntegrationOperations(b *testing.B) {
 			}
 
 			// Clean up immediately to avoid storage costs
-			storage.Delete(ctx, key)
+			_ = storage.Delete(ctx, key)
 		}
 	})
 
@@ -607,13 +607,13 @@ func BenchmarkS3Storage_IntegrationOperations(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			io.ReadAll(reader)
+			_, _ = io.ReadAll(reader)
 			reader.Close()
 		}
 
 		// Clean up
 		for _, key := range keys {
-			storage.Delete(ctx, key)
+			_ = storage.Delete(ctx, key)
 		}
 	})
 
@@ -637,6 +637,6 @@ func BenchmarkS3Storage_IntegrationOperations(b *testing.B) {
 		}
 
 		// Clean up
-		storage.Delete(ctx, key)
+		_ = storage.Delete(ctx, key)
 	})
 }

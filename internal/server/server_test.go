@@ -426,6 +426,7 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 		// Test that server was created successfully even with invalid storage type
 		if srv == nil {
 			t.Error("Server should not be nil even with invalid storage type")
+			return
 		}
 
 		// Now we can test internal fields since we're in the same package
@@ -445,6 +446,7 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 		// Test that server was created successfully with local storage
 		if srv == nil {
 			t.Error("Server should not be nil with local storage config")
+			return
 		}
 
 		// Now we can test internal fields since we're in the same package

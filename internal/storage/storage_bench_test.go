@@ -3,9 +3,10 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
+	mathrand "math/rand/v2"
 	"os"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ func BenchmarkS3Storage(b *testing.B) {
 
 		b.Run(fmt.Sprintf("Put_%s", sizeName), func(b *testing.B) {
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -71,7 +72,7 @@ func BenchmarkS3Storage(b *testing.B) {
 		b.Run(fmt.Sprintf("Get_%s", sizeName), func(b *testing.B) {
 			// Setup: upload test data
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 			key := fmt.Sprintf("bench/get_%d", size)
 			_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 			if err != nil {
@@ -87,7 +88,7 @@ func BenchmarkS3Storage(b *testing.B) {
 				if err != nil {
 					b.Fatalf("Failed to get: %v", err)
 				}
-				io.Copy(io.Discard, reader)
+				_, _ = io.Copy(io.Discard, reader)
 				reader.Close()
 			}
 		})
@@ -96,7 +97,7 @@ func BenchmarkS3Storage(b *testing.B) {
 		if size >= 10*1024*1024 {
 			b.Run(fmt.Sprintf("Multipart_%s", sizeName), func(b *testing.B) {
 				data := make([]byte, size)
-				rand.Read(data)
+				_, _ = rand.Read(data)
 
 				b.SetBytes(int64(size))
 				b.ResetTimer()
@@ -117,7 +118,7 @@ func BenchmarkS3Storage(b *testing.B) {
 		// Setup: upload 10MB file
 		size := 10 * 1024 * 1024
 		data := make([]byte, size)
-		rand.Read(data)
+		_, _ = rand.Read(data)
 		key := "bench/range"
 		_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 		if err != nil {
@@ -130,12 +131,12 @@ func BenchmarkS3Storage(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			offset := rand.Int63n(int64(size) - rangeSize)
+			offset := mathrand.Int64N(int64(size) - rangeSize)
 			reader, _, err := storage.GetRange(ctx, key, offset, rangeSize)
 			if err != nil {
 				b.Fatalf("Failed to get range: %v", err)
 			}
-			io.Copy(io.Discard, reader)
+			_, _ = io.Copy(io.Discard, reader)
 			reader.Close()
 		}
 	})
@@ -214,7 +215,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 
 		b.Run(fmt.Sprintf("Put_%s", sizeName), func(b *testing.B) {
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -231,7 +232,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 		b.Run(fmt.Sprintf("Get_%s", sizeName), func(b *testing.B) {
 			// Setup: write test data
 			data := make([]byte, size)
-			rand.Read(data)
+			_, _ = rand.Read(data)
 			key := fmt.Sprintf("bench/get_%d", size)
 			_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 			if err != nil {
@@ -246,7 +247,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 				if err != nil {
 					b.Fatalf("Failed to get: %v", err)
 				}
-				io.Copy(io.Discard, reader)
+				_, _ = io.Copy(io.Discard, reader)
 				reader.Close()
 			}
 		})
@@ -256,7 +257,7 @@ func BenchmarkLocalStorage(b *testing.B) {
 		// Setup: write 10MB file
 		size := 10 * 1024 * 1024
 		data := make([]byte, size)
-		rand.Read(data)
+		_, _ = rand.Read(data)
 		key := "bench/range"
 		_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 		if err != nil {
@@ -268,12 +269,12 @@ func BenchmarkLocalStorage(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			offset := rand.Int63n(int64(size) - rangeSize)
+			offset := mathrand.Int64N(int64(size) - rangeSize)
 			reader, _, err := storage.GetRange(ctx, key, offset, rangeSize)
 			if err != nil {
 				b.Fatalf("Failed to get range: %v", err)
 			}
-			io.Copy(io.Discard, reader)
+			_, _ = io.Copy(io.Discard, reader)
 			reader.Close()
 		}
 	})

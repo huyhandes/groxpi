@@ -303,7 +303,7 @@ func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.R
 
 	// Use pooled buffer for optimized copy
 	copyBuf := l.copyBufPool.Get().([]byte)
-	defer l.copyBufPool.Put(copyBuf)
+	defer l.copyBufPool.Put(copyBuf[:])
 
 	// Copy data with pooled buffer
 	written, err := io.CopyBuffer(tmpFile, reader, copyBuf)
@@ -363,7 +363,7 @@ func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.W
 
 	// Use pooled buffer for optimized copy
 	copyBuf := l.copyBufPool.Get().([]byte)
-	defer l.copyBufPool.Put(copyBuf)
+	defer l.copyBufPool.Put(copyBuf[:])
 
 	_, err = io.CopyBuffer(writer, file, copyBuf)
 	if err != nil {

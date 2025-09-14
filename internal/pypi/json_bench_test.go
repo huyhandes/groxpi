@@ -122,7 +122,7 @@ func BenchmarkBufferCopy_PooledCopyBuffer(b *testing.B) {
 		// Use pooled buffer for copy operations
 		copyBuf := testBufferPool.Get().([]byte)
 		_, err := io.CopyBuffer(&buf, reader, copyBuf)
-		testBufferPool.Put(copyBuf)
+		testBufferPool.Put(copyBuf[:])
 
 		if err != nil {
 			b.Fatal(err)

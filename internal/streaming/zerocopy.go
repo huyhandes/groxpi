@@ -216,7 +216,7 @@ func (mms *memoryMappedServer) ServeFile(ctx context.Context, writer io.Writer, 
 	if err != nil {
 		return fmt.Errorf("failed to mmap file: %w", err)
 	}
-	defer syscall.Munmap(data)
+	defer func() { _ = syscall.Munmap(data) }()
 
 	// Write memory-mapped data directly
 	ptr := uintptr(unsafe.Pointer(&data[0]))

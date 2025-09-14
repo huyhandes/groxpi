@@ -90,7 +90,7 @@ var copyBufferPool = sync.Pool{
 // copyToBuffer copies from reader to buffer using pooled copy buffer for zero-copy optimization
 func copyToBuffer(dst *bytes.Buffer, src io.Reader) error {
 	copyBuf := copyBufferPool.Get().([]byte)
-	defer copyBufferPool.Put(copyBuf)
+	defer copyBufferPool.Put(copyBuf[:])
 
 	_, err := io.CopyBuffer(dst, src, copyBuf)
 	return err

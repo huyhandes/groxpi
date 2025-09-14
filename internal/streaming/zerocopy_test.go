@@ -141,7 +141,7 @@ func TestZeroCopyServer_ServeFile(t *testing.T) {
 
 		// This might or might not error depending on timing
 		// The main point is it shouldn't panic
-		server.ServeFile(ctx, writer, filename)
+		_ = server.ServeFile(ctx, writer, filename)
 	})
 
 	t.Run("sendfile with compatible writer", func(t *testing.T) {
@@ -225,7 +225,7 @@ func TestZeroCopyServer_ServeReader(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 		defer cancel()
 
-		server.ServeReader(ctx, writer, reader, int64(len(content)))
+		_ = server.ServeReader(ctx, writer, reader, int64(len(content)))
 		// Should handle cancellation gracefully
 	})
 }
@@ -466,7 +466,7 @@ func BenchmarkZeroCopyServer_SmallFile(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		writer := &mockZeroCopyWriter{}
-		server.ServeFile(ctx, writer, filename)
+		_ = server.ServeFile(ctx, writer, filename)
 	}
 }
 
@@ -481,7 +481,7 @@ func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		writer := &mockZeroCopyWriter{}
-		server.ServeFile(ctx, writer, filename)
+		_ = server.ServeFile(ctx, writer, filename)
 	}
 }
 
@@ -511,7 +511,7 @@ func BenchmarkOptimalServer_AutoSelection(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		writer := &mockZeroCopyWriter{}
-		server.ServeFile(ctx, writer, filename)
+		_ = server.ServeFile(ctx, writer, filename)
 	}
 }
 

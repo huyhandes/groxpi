@@ -59,7 +59,7 @@ func TestClient_MakeRequest(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"test": "response"}`))
+		_, _ = w.Write([]byte(`{"test": "response"}`))
 	}))
 	defer server.Close()
 
@@ -181,7 +181,7 @@ func TestClient_GetPackageList(t *testing.T) {
 				{"name": "urllib3"}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -228,7 +228,7 @@ func TestClient_GetPackageFiles(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -373,7 +373,7 @@ func TestClient_SingleflightPackageList(t *testing.T) {
 			"meta": {"api-version": "1.0"},
 			"projects": [{"name": "test-package"}]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -437,7 +437,7 @@ func TestClient_SingleflightPackageFiles(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -552,7 +552,7 @@ func TestClient_SingleflightDifferentPackages(t *testing.T) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -605,7 +605,7 @@ func BenchmarkClient_GetPackageList_WithSingleflight(b *testing.B) {
 			"meta": {"api-version": "1.0"},
 			"projects": [{"name": "benchmark-package"}]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 
@@ -637,7 +637,7 @@ func BenchmarkClient_GetPackageFiles_WithSingleflight(b *testing.B) {
 				}
 			]
 		}`
-		w.Write([]byte(response))
+		_, _ = w.Write([]byte(response))
 	}))
 	defer server.Close()
 

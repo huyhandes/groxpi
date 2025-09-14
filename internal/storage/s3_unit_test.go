@@ -84,21 +84,21 @@ func TestNewS3Storage(t *testing.T) {
 			if tc.config.PartSize == 0 {
 				expectedPartSize := int64(10 * 1024 * 1024)
 				if tc.config.PartSize != expectedPartSize {
-					// This would be set by NewS3Storage
+					t.Logf("PartSize would be set to %d by NewS3Storage", expectedPartSize)
 				}
 			}
 
 			if tc.config.MaxConnections == 0 {
 				expectedMaxConns := 100
 				if tc.config.MaxConnections != expectedMaxConns {
-					// This would be set by NewS3Storage
+					t.Logf("MaxConnections would be set to %d by NewS3Storage", expectedMaxConns)
 				}
 			}
 
 			if tc.config.Region == "" {
 				expectedRegion := "us-east-1"
 				if tc.config.Region != expectedRegion {
-					// This would be set by NewS3Storage
+					t.Logf("Region would be set to %s by NewS3Storage", expectedRegion)
 				}
 			}
 

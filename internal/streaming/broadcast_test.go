@@ -230,7 +230,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 	t.Run("write to single writer", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 
 		testData := []byte("single writer test")
 		n, err := bw.Write(testData)
@@ -249,7 +249,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writers := createMockWriters(5)
 		for _, writer := range writers {
-			bw.AddWriter(writer)
+			_ = bw.AddWriter(writer)
 		}
 
 		testData := []byte("concurrent write test")
@@ -274,7 +274,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		goodWriter := &mockWriter{}
 		badWriter := &mockWriter{writeErrors: []error{errors.New("write failed")}}
 
-		bw.AddWriter(goodWriter)
+		_ = bw.AddWriter(goodWriter)
 		bw.AddWriter(badWriter)
 
 		testData := []byte("test with error")
@@ -291,7 +291,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 	t.Run("write after close returns error", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 		bw.Close()
 
 		_, err := bw.Write([]byte("test"))
@@ -304,7 +304,7 @@ func TestBroadcastWriter_Write(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writers := createMockWriters(3)
 		for _, writer := range writers {
-			bw.AddWriter(writer)
+			_ = bw.AddWriter(writer)
 		}
 
 		testData := createTestData(10000) // 10KB test data
@@ -329,7 +329,7 @@ func TestBroadcastWriter_Close(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writers := createMockWriters(3)
 		for _, writer := range writers {
-			bw.AddWriter(writer)
+			_ = bw.AddWriter(writer)
 		}
 
 		err := bw.Close()
@@ -348,7 +348,7 @@ func TestBroadcastWriter_Close(t *testing.T) {
 	t.Run("close with non-closeable writers", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &bytes.Buffer{} // Buffer doesn't implement Close()
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 
 		err := bw.Close()
 		if err != nil {
@@ -359,7 +359,7 @@ func TestBroadcastWriter_Close(t *testing.T) {
 	t.Run("multiple close calls are safe", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 
 		err1 := bw.Close()
 		err2 := bw.Close()
@@ -377,7 +377,7 @@ func TestBroadcastWriter_ConcurrentOperations(t *testing.T) {
 	t.Run("concurrent writes", func(t *testing.T) {
 		bw := NewBroadcastWriter()
 		writer := &mockWriter{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 
 		var wg sync.WaitGroup
 		writes := 10 // Reduce to make test more reliable
@@ -517,7 +517,7 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 		// Write more data than buffer can hold
 		for i := 0; i < 10; i++ {
 			data := []byte(fmt.Sprintf("data_%d", i))
-			bw.Write(data)
+			_, _ = bw.Write(data)
 		}
 
 		bw.Close()
@@ -531,13 +531,13 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 func BenchmarkBroadcastWriter_SingleWriter(b *testing.B) {
 	bw := NewBroadcastWriter()
 	writer := &bytes.Buffer{}
-	bw.AddWriter(writer)
+	_ = bw.AddWriter(writer)
 
 	data := []byte("benchmark test data")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bw.Write(data)
+		_, _ = bw.Write(data)
 	}
 }
 
@@ -547,29 +547,29 @@ func BenchmarkBroadcastWriter_MultipleWriters(b *testing.B) {
 	// Add multiple writers
 	for i := 0; i < 5; i++ {
 		writer := &bytes.Buffer{}
-		bw.AddWriter(writer)
+		_ = bw.AddWriter(writer)
 	}
 
 	data := []byte("benchmark test data")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bw.Write(data)
+		_, _ = bw.Write(data)
 	}
 }
 
 func BenchmarkAsyncBroadcastWriter_SingleWriter(b *testing.B) {
 	bw := NewAsyncBroadcastWriter(1000)
 	writer := &bytes.Buffer{}
-	bw.AddWriter(writer)
+	_ = bw.AddWriter(writer)
 
 	data := []byte("async benchmark test data")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bw.Write(data)
+		_, _ = bw.Write(data)
 	}
 
 	bw.Close()
-	bw.Wait()
+	_ = bw.Wait()
 }

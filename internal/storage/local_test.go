@@ -124,7 +124,7 @@ func TestLocalStorage_Get(t *testing.T) {
 	// Setup: Create a test file
 	key := "test-get.txt"
 	originalContent := "test content for get"
-	storage.Put(ctx, key, strings.NewReader(originalContent), int64(len(originalContent)), "text/plain")
+	_, _ = storage.Put(ctx, key, strings.NewReader(originalContent), int64(len(originalContent)), "text/plain")
 
 	t.Run("retrieves_file_successfully", func(t *testing.T) {
 		reader, info, err := storage.Get(ctx, key)
@@ -169,7 +169,7 @@ func TestLocalStorage_GetRange(t *testing.T) {
 	// Setup: Create a larger test file
 	key := "test-range.txt"
 	originalContent := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	storage.Put(ctx, key, strings.NewReader(originalContent), int64(len(originalContent)), "text/plain")
+	_, _ = storage.Put(ctx, key, strings.NewReader(originalContent), int64(len(originalContent)), "text/plain")
 
 	t.Run("retrieves_range_successfully", func(t *testing.T) {
 		offset := int64(5)
@@ -230,7 +230,7 @@ func TestLocalStorage_Delete(t *testing.T) {
 	t.Run("deletes_existing_file", func(t *testing.T) {
 		key := "delete-me.txt"
 		content := "delete this content"
-		storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
+		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 
 		// Verify file exists
 		path := filepath.Join(storage.baseDir, key)
@@ -266,7 +266,7 @@ func TestLocalStorage_Exists(t *testing.T) {
 	t.Run("returns_true_for_existing_file", func(t *testing.T) {
 		key := "exists-test.txt"
 		content := "exists test"
-		storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
+		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 
 		exists, err := storage.Exists(ctx, key)
 		if err != nil {
@@ -298,7 +298,7 @@ func TestLocalStorage_Stat(t *testing.T) {
 		key := "stat-test.txt"
 		content := "stat test content"
 		putTime := time.Now()
-		storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
+		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 
 		info, err := storage.Stat(ctx, key)
 		if err != nil {

@@ -55,7 +55,6 @@ type S3Storage struct {
 	prefix    string
 	partSize  int64
 	transport *http.Transport
-	mu        sync.RWMutex
 
 	// Singleflight groups for deduplicating concurrent operations
 	getSF  singleflight.Group // For Get operations
@@ -227,7 +226,7 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 	opts := minio.GetObjectOptions{}
 	if offset >= 0 && length > 0 {
 		// Set the range header for partial content
-		opts.SetRange(offset, offset+length-1)
+		_ = opts.SetRange(offset, offset+length-1)
 		log.Debug().
 			Int64("range_start", offset).
 			Int64("range_end", offset+length-1).
