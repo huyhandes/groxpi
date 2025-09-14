@@ -24,7 +24,7 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func TestformatBytes(t *testing.T) {
+func TestFormatBytes(t *testing.T) {
 	testCases := []struct {
 		name     string
 		bytes    int64
@@ -349,7 +349,7 @@ func TestConfigurationEdgeCases(t *testing.T) {
 }
 
 // Test helper function to verify that formatBytes handles edge cases correctly
-func TestformatBytesEdgeCases(t *testing.T) {
+func TestFormatBytesEdgeCases(t *testing.T) {
 	edgeCases := []struct {
 		input    int64
 		expected string
@@ -493,7 +493,7 @@ func TestBooleanEnvironmentVariables(t *testing.T) {
 }
 
 // Test format bytes with all possible units to achieve better coverage
-func TestformatBytesAllUnits(t *testing.T) {
+func TestFormatBytesAllUnits(t *testing.T) {
 	// Test each unit type to ensure complete coverage
 	units := []struct {
 		name  string
@@ -527,7 +527,7 @@ func TestformatBytesAllUnits(t *testing.T) {
 	}
 }
 
-func TestformatBytesInternalLogic(t *testing.T) {
+func TestFormatBytesInternalLogic(t *testing.T) {
 	// Test the internal logic paths to achieve better coverage
 	testCases := []struct {
 		name    string
