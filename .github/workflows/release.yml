@@ -1,0 +1,219 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - 'release-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+    - name: Extract version from branch or input
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          # Extract version from branch name (e.g., release-1.2.3 -> 1.2.3)
+          VERSION=$(echo "${GITHUB_REF#refs/heads/release-}" | sed 's/^v//')
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+        echo "Extracted version: ${VERSION}"
+        echo "Tag: v${VERSION}"
+
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: ""
+          - goos: linux
+            goarch: arm64
+            suffix: ""
+          - goos: darwin
+            goarch: amd64
+            suffix: ""
+          - goos: darwin
+            goarch: arm64
+            suffix: ""
+          - goos: windows
+            goarch: amd64
+            suffix: ".exe"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.x'
+        cache: true
+
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+        CGO_ENABLED: 0
+      run: |
+        BINARY_NAME="groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+        go build \
+          -ldflags="-s -w -X main.version=${{ needs.prepare.outputs.version }}" \
+          -a -installsuffix cgo \
+          -o "${BINARY_NAME}" \
+          cmd/groxpi/main.go
+
+        # Generate checksum
+        if [ "${{ matrix.goos }}" = "windows" ]; then
+          sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+        else
+          shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+        fi
+
+        # Show file info
+        ls -la "${BINARY_NAME}"*
+
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: groxpi-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: |
+          groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}.sha256
+        retention-days: 7
+
+  build-docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository }}
+        tags: |
+          type=raw,value=${{ needs.prepare.outputs.tag }}
+          type=raw,value=latest
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          VERSION=${{ needs.prepare.outputs.version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build-binaries, build-docker]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        find artifacts -name "groxpi-*" -type f -exec cp {} release-assets/ \;
+        ls -la release-assets/
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        # Get the latest tag (if any) for generating changelog
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "## Changes since $PREVIOUS_TAG" > release_notes.md
+          git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD >> release_notes.md
+        else
+          echo "## Initial Release" > release_notes.md
+          echo "First release of groxpi - Go PyPI caching proxy server." >> release_notes.md
+        fi
+
+        echo "" >> release_notes.md
+        echo "## Release Assets" >> release_notes.md
+        echo "- **Binaries**: Available for Linux (amd64/arm64), macOS (amd64/arm64), and Windows (amd64)" >> release_notes.md
+        echo "- **Docker Images**: \`ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.tag }}\`" >> release_notes.md
+        echo "- **Multi-architecture**: Both amd64 and arm64 supported" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "### Installation" >> release_notes.md
+        echo "\`\`\`bash" >> release_notes.md
+        echo "# Docker" >> release_notes.md
+        echo "docker run -p 5000:5000 ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.tag }}" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "# Binary (Linux/macOS)" >> release_notes.md
+        echo "wget https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/groxpi-${{ needs.prepare.outputs.version }}-linux-amd64" >> release_notes.md
+        echo "chmod +x groxpi-${{ needs.prepare.outputs.version }}-linux-amd64" >> release_notes.md
+        echo "./groxpi-${{ needs.prepare.outputs.version }}-linux-amd64" >> release_notes.md
+        echo "\`\`\`" >> release_notes.md
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ needs.prepare.outputs.tag }}
+        name: "Groxpi ${{ needs.prepare.outputs.tag }}"
+        body_path: release_notes.md
+        files: release-assets/*
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        make_latest: true
+
+    - name: Clean up release branch (optional)
+      if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')
+      run: |
+        echo "Release created successfully!"
+        echo "You may now delete the release branch if desired:"
+        echo "git push origin --delete ${GITHUB_REF#refs/heads/}"
