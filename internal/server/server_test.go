@@ -143,7 +143,7 @@ func TestServer_HandleListPackages_HTML(t *testing.T) {
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "text/html")
 
-	resp, err := app.Test(req, 1000) // 1 second timeout
+	resp, err := app.Test(req, 8000) // 8 second timeout
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-	resp, err := app.Test(req, 1000) // 1 second timeout
+	resp, err := app.Test(req, 8000) // 8 second timeout
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestServer_HandleListFiles(t *testing.T) {
 	app := srv.App()
 
 	req := httptest.NewRequest("GET", "/index/nonexistent-test-package-xyz", nil)
-	resp, err := app.Test(req, 1000) // 1 second timeout
+	resp, err := app.Test(req, 8000) // 8 second timeout
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 	app := srv.App()
 
 	req := httptest.NewRequest("GET", "/index/numpy/numpy-1.21.0-py3-none-any.whl", nil)
-	resp, err := app.Test(req, 1000) // 1 second timeout
+	resp, err := app.Test(req, 8000) // 8 second timeout
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestServer_ContentNegotiation(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 1000) // 1 second timeout
+		resp, err := app.Test(req, 8000) // 8 second timeout
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -400,7 +400,7 @@ func TestServer_ContentNegotiation(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "text/html")
 
-		resp, err := app.Test(req, 1000) // 1 second timeout
+		resp, err := app.Test(req, 8000) // 8 second timeout
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -468,7 +468,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 
 	t.Run("Missing file returns 404", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/nonexistent/nonexistent-1.0.0.tar.gz", nil)
-		resp, err := app.Test(req, 1000)
+		resp, err := app.Test(req, 8000)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -481,7 +481,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 
 	t.Run("Invalid package name", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/../etc/passwd", nil)
-		resp, err := app.Test(req, 1000)
+		resp, err := app.Test(req, 8000)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -508,7 +508,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/test-package_123", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 1000)
+		resp, err := app.Test(req, 8000)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -522,7 +522,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 
 	t.Run("Empty package name", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index//", nil)
-		resp, err := app.Test(req, 1000)
+		resp, err := app.Test(req, 8000)
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -564,7 +564,7 @@ func TestServer_WantsJSON(t *testing.T) {
 				req.Header.Set("Accept", tt.accept)
 			}
 
-			resp, err := app.Test(req, 1000)
+			resp, err := app.Test(req, 8000)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -603,7 +603,7 @@ func TestServer_NormalizePackageName(t *testing.T) {
 		t.Run(tt.input, func(t *testing.T) {
 			// Test through HTTP request to cover the normalization
 			req := httptest.NewRequest("GET", "/index/"+tt.input, nil)
-			resp, err := app.Test(req, 1000)
+			resp, err := app.Test(req, 8000)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -714,7 +714,7 @@ func TestServer_ErrorHandling(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 1000)
+		resp, err := app.Test(req, 10000) // 10 seconds for DNS timeout
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}

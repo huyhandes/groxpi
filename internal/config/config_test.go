@@ -78,7 +78,7 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("custom environment variables", func(t *testing.T) {
-			_ = os.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
+		_ = os.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
 		_ = os.Setenv("GROXPI_INDEX_TTL", "600")
 		_ = os.Setenv("GROXPI_CACHE_SIZE", "1073741824") // 1GB
 		_ = os.Setenv("GROXPI_CACHE_DIR", "/custom/cache")
