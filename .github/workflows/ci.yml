@@ -179,7 +179,7 @@ jobs:
     - name: Run S3 integration tests
       run: |
         # Run only S3-specific integration tests
-        go test -race -v ./internal/storage/s3_*test.go
+        go test -race -v -run "TestS3" ./internal/storage/
 
   uv-integration-test:
     name: UV Package Manager Integration Tests

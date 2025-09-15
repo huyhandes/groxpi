@@ -125,18 +125,25 @@ test_uv_install() {
     local project_dir="${TEST_DIR}/${test_name}"
     mkdir -p "$project_dir"
 
-    # Create pyproject.toml
-    cat > "${project_dir}/pyproject.toml" <<EOF
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+    # Don't create pyproject.toml manually, let uv init handle it
+    # We'll configure the index after initialization
 
-[project]
-name = "test-${test_name}"
-version = "0.1.0"
-description = "Test project for groxpi with uv"
-requires-python = ">=3.8"
-dependencies = []
+    # Initialize uv project first, then add package
+    log_info "Initializing uv project..."
+
+    if ! docker run --rm \
+        --network host \
+        -v "${project_dir}:/workspace" \
+        -w /workspace \
+        ghcr.io/astral-sh/uv:latest \
+        uv init --no-readme --name "test-${test_name}"; then
+        log_error "Failed to initialize uv project"
+        return 1
+    fi
+
+    # Configure groxpi as index in pyproject.toml
+    log_info "Configuring groxpi index..."
+    cat >> "${project_dir}/pyproject.toml" <<EOF
 
 [[tool.uv.index]]
 name = "groxpi"
