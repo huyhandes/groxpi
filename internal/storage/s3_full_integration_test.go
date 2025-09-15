@@ -51,7 +51,7 @@ func TestS3BackendWithPackageManagers(t *testing.T) {
 	defer server.Stop()
 
 	// Wait for server to be ready
-	waitForServer(t, "http://localhost:5000")
+	waitForServer(t, "http://127.0.0.1:5000")
 
 	// Test with pip
 	t.Run("pip_install_requests", func(t *testing.T) {
@@ -87,7 +87,7 @@ func startGroxpiWithS3(t *testing.T, testDir string, groxpiBinary string) *groxp
 	// Set up S3 environment variables for MinIO
 	env := []string{
 		"GROXPI_STORAGE_TYPE=s3",
-		"AWS_ENDPOINT_URL=http://localhost:9000",
+		"AWS_ENDPOINT_URL=http://127.0.0.1:9000",
 		"AWS_ACCESS_KEY_ID=minioadmin",
 		"AWS_SECRET_ACCESS_KEY=minioadmin",
 		"GROXPI_S3_BUCKET=groxpi-test",
@@ -161,8 +161,8 @@ func testPipInstall(t *testing.T, testDir, packageSpec string) {
 	// Install package using groxpi as index
 	t.Logf("Installing %s via groxpi...", packageSpec)
 	cmd = exec.Command(pipPath, "install",
-		"--index-url", "http://localhost:5000/simple/",
-		"--trusted-host", "localhost",
+		"--index-url", "http://127.0.0.1:5000/simple/",
+		"--trusted-host", "127.0.0.1",
 		packageSpec)
 
 	var stdout, stderr bytes.Buffer
@@ -218,8 +218,8 @@ func testConcurrentPipInstalls(t *testing.T, testDir string) {
 
 			// Install package
 			cmd = exec.Command(pipPath, "install",
-				"--index-url", "http://localhost:5000/simple/",
-				"--trusted-host", "localhost",
+				"--index-url", "http://127.0.0.1:5000/simple/",
+				"--trusted-host", "127.0.0.1",
 				packageSpec)
 
 			if err := cmd.Run(); err != nil {
