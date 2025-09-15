@@ -136,7 +136,7 @@ test_uv_install() {
         -v "${project_dir}:/workspace" \
         -w /workspace \
         ghcr.io/astral-sh/uv:latest \
-        uv init --no-readme --name "test-${test_name}"; then
+        init --no-readme --name "test-${test_name}"; then
         log_error "Failed to initialize uv project"
         return 1
     fi
@@ -159,7 +159,7 @@ EOF
         -v "${project_dir}:/workspace" \
         -w /workspace \
         ghcr.io/astral-sh/uv:latest \
-        uv add "$package_name" --no-cache; then
+        add "$package_name" --no-cache; then
 
         log_success "Successfully installed $package_name"
 
