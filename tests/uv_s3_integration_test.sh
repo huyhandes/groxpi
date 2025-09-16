@@ -125,8 +125,8 @@ test_uv_install() {
     local project_dir="${TEST_DIR}/${test_name}"
     mkdir -p "$project_dir"
 
-    # Don't create pyproject.toml manually, let uv init handle it
-    # We'll configure the index after initialization
+    # Set proper permissions for the directories
+    chmod 755 "$project_dir"
 
     # Initialize uv project first, then add package
     log_info "Initializing uv project..."
@@ -137,22 +137,12 @@ test_uv_install() {
         -v "${project_dir}:/workspace" \
         -w /workspace \
         ghcr.io/astral-sh/uv:latest \
-        init --python 3.12 --no-readme --name "test-${test_name}"; then
+        init --no-readme --name "test-${test_name}"; then
         log_error "Failed to initialize uv project"
         return 1
     fi
 
-    # Configure groxpi as index in pyproject.toml
-    log_info "Configuring groxpi index..."
-    cat >> "${project_dir}/pyproject.toml" <<EOF
-
-[[tool.uv.index]]
-name = "groxpi"
-url = "${GROXPI_URL}/simple/"
-default = true
-EOF
-
-    # Run uv in Docker container
+    # Run uv in Docker container with groxpi index configuration via environment
     log_info "Running uv add ${package_name} in Docker..."
 
     if docker run --rm \
@@ -161,7 +151,7 @@ EOF
         -v "${project_dir}:/workspace" \
         -w /workspace \
         ghcr.io/astral-sh/uv:latest \
-        add "$package_name" --no-cache; then
+        add "$package_name" --no-cache --default-index "${GROXPI_URL}/simple/"; then
 
         log_success "Successfully installed $package_name"
 
