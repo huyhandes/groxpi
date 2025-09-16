@@ -132,11 +132,12 @@ test_uv_install() {
     log_info "Initializing uv project..."
 
     if ! docker run --rm \
+        --platform linux/amd64 \
         --network host \
         -v "${project_dir}:/workspace" \
         -w /workspace \
         ghcr.io/astral-sh/uv:latest \
-        init --no-readme --name "test-${test_name}"; then
+        init --python 3.12 --no-readme --name "test-${test_name}"; then
         log_error "Failed to initialize uv project"
         return 1
     fi
@@ -155,6 +156,7 @@ EOF
     log_info "Running uv add ${package_name} in Docker..."
 
     if docker run --rm \
+        --platform linux/amd64 \
         --network host \
         -v "${project_dir}:/workspace" \
         -w /workspace \
