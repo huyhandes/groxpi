@@ -43,11 +43,6 @@ var s3BufferPool = sync.Pool{
 	},
 }
 
-var s3ResponsePool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
 
 // S3Storage implements Storage interface for S3-compatible backends
 type S3Storage struct {
@@ -58,7 +53,6 @@ type S3Storage struct {
 	transport *http.Transport
 
 	// Singleflight groups for deduplicating concurrent operations
-	getSF  singleflight.Group // For Get operations
 	statSF singleflight.Group // For Stat/Exists operations
 	listSF singleflight.Group // For List operations
 }

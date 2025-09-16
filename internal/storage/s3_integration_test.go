@@ -115,7 +115,7 @@ func createTestS3Storage(t *testing.T) *S3Storage {
 		SecretAccessKey: secretKey,
 		Region:          "us-east-1",
 		Bucket:          bucket,
-		Prefix:          "integration-test",
+		Prefix:          "client-test",
 		UseSSL:          false,
 		ForcePathStyle:  true,
 		PartSize:        5 * 1024 * 1024,
