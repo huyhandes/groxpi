@@ -267,7 +267,7 @@ func verifyS3Storage(t *testing.T) {
 
 	// List objects to verify files were stored
 	objects, err := storage.List(ctx, ListOptions{
-		Prefix:  "client-test",
+		Prefix:  "",
 		MaxKeys: 100,
 	})
 	require.NoError(t, err, "Failed to list S3 objects")

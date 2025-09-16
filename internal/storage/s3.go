@@ -43,7 +43,6 @@ var s3BufferPool = sync.Pool{
 	},
 }
 
-
 // S3Storage implements Storage interface for S3-compatible backends
 type S3Storage struct {
 	client    *minio.Client
