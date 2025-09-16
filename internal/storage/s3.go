@@ -165,6 +165,60 @@ func (s *S3Storage) buildKey(key string) string {
 	return fmt.Sprintf("%s/%s", s.prefix, key)
 }
 
+// calculateOptimalPartSize calculates the optimal part size for multipart uploads based on file size
+func (s *S3Storage) calculateOptimalPartSize(fileSize int64) int64 {
+	// AWS S3 limits: min 5MB, max 5GB per part, max 10,000 parts total
+	const (
+		minPartSize = int64(5 * 1024 * 1024)        // 5MB minimum
+		maxPartSize = int64(5 * 1024 * 1024 * 1024) // 5GB maximum (but we'll use smaller)
+		maxParts    = 10000
+	)
+
+	// For very large files, calculate part size to stay under 10,000 parts
+	calculatedPartSize := fileSize / maxParts
+	if calculatedPartSize < minPartSize {
+		calculatedPartSize = minPartSize
+	}
+
+	// Use larger parts for better throughput, but not too large
+	// Scale part size based on file size:
+	// - Files < 100MB: use 10MB parts (default)
+	// - Files 100MB-1GB: use 32MB parts
+	// - Files 1GB-10GB: use 64MB parts
+	// - Files > 10GB: use 128MB parts
+	var optimalPartSize int64
+
+	switch {
+	case fileSize < int64(100*1024*1024): // < 100MB
+		optimalPartSize = int64(10 * 1024 * 1024) // 10MB
+	case fileSize < int64(1*1024*1024*1024): // < 1GB
+		optimalPartSize = int64(32 * 1024 * 1024) // 32MB
+	case fileSize < int64(10*1024*1024*1024): // < 10GB
+		optimalPartSize = int64(64 * 1024 * 1024) // 64MB
+	default: // > 10GB
+		optimalPartSize = int64(128 * 1024 * 1024) // 128MB
+	}
+
+	// Use the larger of calculated and optimal part size
+	if calculatedPartSize > optimalPartSize {
+		optimalPartSize = calculatedPartSize
+	}
+
+	// Cap at reasonable maximum for memory efficiency
+	maxReasonablePartSize := int64(256 * 1024 * 1024) // 256MB
+	if optimalPartSize > maxReasonablePartSize {
+		optimalPartSize = maxReasonablePartSize
+	}
+
+	log.Debug().
+		Int64("file_size", fileSize).
+		Int64("calculated_part_size", calculatedPartSize).
+		Int64("optimal_part_size", optimalPartSize).
+		Msg("Calculated optimal multipart size")
+
+	return optimalPartSize
+}
+
 // Get retrieves an object from S3 with singleflight deduplication
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
 	// For S3, we cannot safely share readers between goroutines since each reader
@@ -314,9 +368,14 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 		ContentType: contentType,
 	}
 
-	// Use multipart for large files
+	// Use optimized multipart for large files
 	if size > s.partSize {
-		opts.PartSize = uint64(s.partSize)
+		partSize := s.calculateOptimalPartSize(size)
+		opts.PartSize = uint64(partSize)
+		log.Debug().
+			Int64("file_size", size).
+			Int64("part_size", partSize).
+			Msg("Using optimized multipart upload")
 	}
 
 	// For small files, use buffer pool for potential zero-copy optimization
@@ -540,7 +599,8 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 
 	// Use multipart upload for better streaming performance
 	if size > s.partSize {
-		return s.streamingMultipartPut(ctx, fullKey, reader, size, contentType)
+		optimalPartSize := s.calculateOptimalPartSize(size)
+		return s.streamingMultipartPut(ctx, fullKey, reader, size, contentType, optimalPartSize)
 	}
 
 	// For smaller objects, use regular put with buffer optimization
@@ -594,11 +654,17 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 }
 
 // streamingMultipartPut uses multipart upload for large objects
-func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
 	opts := minio.PutObjectOptions{
 		ContentType: contentType,
-		PartSize:    uint64(s.partSize),
+		PartSize:    uint64(partSize),
 	}
+
+	log.Debug().
+		Str("full_key", fullKey).
+		Int64("size", size).
+		Int64("part_size", partSize).
+		Msg("Starting multipart upload with optimal part size")
 
 	start := time.Now()
 	info, err := s.client.PutObject(ctx, s.bucket, fullKey, reader, size, opts)

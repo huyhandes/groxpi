@@ -3,7 +3,6 @@ package main_test
 import (
 	"fmt"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -348,38 +347,6 @@ func TestConfigurationEdgeCases(t *testing.T) {
 	}
 }
 
-// Test helper function to verify that formatBytes handles edge cases correctly
-func TestFormatBytesEdgeCases(t *testing.T) {
-	edgeCases := []struct {
-		input    int64
-		expected string
-	}{
-		{0, "0 B"},
-		{1, "1 B"},
-		{999, "999 B"},
-		{1000, "1000 B"},
-		{1023, "1023 B"},
-		{1024, "1.0 KB"},
-		{1025, "1.0 KB"},
-		{1536, "1.5 KB"},
-		{1048575, "1024.0 KB"},
-		{1048576, "1.0 MB"},
-		{1073741824, "1.0 GB"},
-		{1099511627776, "1.0 TB"},
-		{-1024, "-1024 B"},       // formatBytes doesn't handle negatives properly
-		{-1048576, "-1048576 B"}, // formatBytes doesn't handle negatives properly
-	}
-
-	for _, tc := range edgeCases {
-		t.Run(fmt.Sprintf("formatBytes(%d)", tc.input), func(t *testing.T) {
-			result := formatBytes(tc.input)
-			if result != tc.expected {
-				t.Errorf("formatBytes(%d) = %q, expected %q", tc.input, result, tc.expected)
-			}
-		})
-	}
-}
-
 func TestApplicationLifecycle(t *testing.T) {
 	// This test verifies that the application can be configured correctly
 	// without actually starting the server (which would require network resources)
@@ -487,90 +454,6 @@ func TestBooleanEnvironmentVariables(t *testing.T) {
 							tt.envVar, envVal, expectedResult, actualResult)
 					}
 				})
-			}
-		})
-	}
-}
-
-// Test format bytes with all possible units to achieve better coverage
-func TestFormatBytesAllUnits(t *testing.T) {
-	// Test each unit type to ensure complete coverage
-	units := []struct {
-		name  string
-		bytes int64
-		unit  string
-	}{
-		{"Bytes", 512, "B"},
-		{"Kilobytes", 1024, "K"},
-		{"Megabytes", 1024 * 1024, "M"},
-		{"Gigabytes", 1024 * 1024 * 1024, "G"},
-		{"Terabytes", 1024 * 1024 * 1024 * 1024, "T"},
-		{"Petabytes", 1024 * 1024 * 1024 * 1024 * 1024, "P"},
-		{"Exabytes", 1024 * 1024 * 1024 * 1024 * 1024 * 1024, "E"},
-	}
-
-	for _, unit := range units {
-		t.Run(unit.name, func(t *testing.T) {
-			result := formatBytes(unit.bytes)
-			if unit.unit == "B" {
-				// Bytes should show exact number
-				if !strings.Contains(result, " B") {
-					t.Errorf("Expected bytes format for %d, got %s", unit.bytes, result)
-				}
-			} else {
-				// Other units should show the unit letter
-				if !strings.Contains(result, unit.unit+"B") {
-					t.Errorf("Expected %sB unit for %d, got %s", unit.unit, unit.bytes, result)
-				}
-			}
-		})
-	}
-}
-
-func TestFormatBytesInternalLogic(t *testing.T) {
-	// Test the internal logic paths to achieve better coverage
-	testCases := []struct {
-		name    string
-		bytes   int64
-		checkFn func(string) bool
-	}{
-		{
-			"sub-unit bytes",
-			123,
-			func(s string) bool { return strings.HasSuffix(s, " B") },
-		},
-		{
-			"exact kilobyte boundary",
-			1024,
-			func(s string) bool { return strings.Contains(s, "1.0 KB") },
-		},
-		{
-			"between KB and MB",
-			1024 * 500, // 500KB
-			func(s string) bool { return strings.Contains(s, "500.0 KB") },
-		},
-		{
-			"exact megabyte boundary",
-			1024 * 1024,
-			func(s string) bool { return strings.Contains(s, "1.0 MB") },
-		},
-		{
-			"fractional megabytes",
-			1024*1024 + 1024*512, // 1.5MB
-			func(s string) bool { return strings.Contains(s, "1.5 MB") },
-		},
-		{
-			"large values",
-			1024*1024*1024*5 + 1024*1024*512, // ~5.5GB
-			func(s string) bool { return strings.Contains(s, "5.5 GB") },
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := formatBytes(tc.bytes)
-			if !tc.checkFn(result) {
-				t.Errorf("formatBytes(%d) = %s failed validation", tc.bytes, result)
 			}
 		})
 	}

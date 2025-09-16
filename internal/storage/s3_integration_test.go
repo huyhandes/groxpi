@@ -193,7 +193,7 @@ func waitForServer(t *testing.T, url string) {
 
 	for i := 0; i < 30; i++ {
 		if resp, err := client.Get(url + "/health"); err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				t.Log("Groxpi server is ready")
 				return

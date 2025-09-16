@@ -34,6 +34,64 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
+// downloadStatus represents the status of an ongoing download
+type downloadStatus struct {
+	mu         sync.RWMutex
+	inProgress bool
+	completed  bool
+	storageKey string
+	startTime  time.Time
+	waitGroup  sync.WaitGroup
+	error      error
+}
+
+// downloadCoordinator manages concurrent downloads of the same file
+type downloadCoordinator struct {
+	mu        sync.RWMutex
+	downloads map[string]*downloadStatus
+}
+
+// newDownloadCoordinator creates a new download coordinator
+func newDownloadCoordinator() *downloadCoordinator {
+	return &downloadCoordinator{
+		downloads: make(map[string]*downloadStatus),
+	}
+}
+
+// calculateDynamicTimeout calculates appropriate timeout based on file size
+func (s *Server) calculateDynamicTimeout(expectedSize int64) time.Duration {
+	if expectedSize <= 0 {
+		// Use default timeout for unknown sizes
+		return s.config.DownloadTimeout
+	}
+
+	// Calculate timeout based on minimum transfer speed
+	// Use 100 KB/s as minimum acceptable speed for S3 uploads
+	const minSpeedBytesPerSec = 100 * 1024
+
+	// Calculate base timeout: file_size / min_speed
+	baseTimeout := time.Duration(expectedSize/minSpeedBytesPerSec) * time.Second
+
+	// Add minimum timeout of 2 minutes for network overhead
+	minTimeout := 2 * time.Minute
+	if baseTimeout < minTimeout {
+		baseTimeout = minTimeout
+	}
+
+	// Cap maximum timeout at 1 hour to prevent indefinite waits
+	maxTimeout := 60 * time.Minute
+	if baseTimeout > maxTimeout {
+		baseTimeout = maxTimeout
+	}
+
+	log.Debug().
+		Int64("expected_size", expectedSize).
+		Dur("calculated_timeout", baseTimeout).
+		Msg("🕐 Calculated dynamic timeout for download")
+
+	return baseTimeout
+}
+
 type Server struct {
 	config           *config.Config
 	indexCache       *cache.IndexCache
@@ -44,6 +102,7 @@ type Server struct {
 	app              *fiber.App
 	sf               singleflight.Group // For deduplicating concurrent requests
 	streamDownloader streaming.StreamingDownloader
+	downloadCoord    *downloadCoordinator // For coordinating concurrent downloads
 }
 
 func New(cfg *config.Config) *Server {
@@ -97,6 +156,7 @@ func New(cfg *config.Config) *Server {
 		storage:          storageBackend,
 		app:              app,
 		streamDownloader: streaming.NewTeeStreamingDownloader(&storageAdapter{storageBackend}, streamClient),
+		downloadCoord:    newDownloadCoordinator(),
 	}
 
 	s.setupRoutes()
@@ -407,9 +467,90 @@ func (s *Server) handleDownloadFile(c *fiber.Ctx) error {
 	// Normalize package name
 	packageName = normalizePackageName(packageName)
 
-	// For now, handle download directly without singleflight to fix tests
-	// TODO: Re-enable singleflight after proper error handling
-	return s.handleDownloadInternal(c, packageName, fileName)
+	return s.handleDownloadWithCoordination(c, packageName, fileName)
+}
+
+// handleDownloadWithCoordination coordinates concurrent downloads of the same file
+func (s *Server) handleDownloadWithCoordination(c *fiber.Ctx, packageName, fileName string) error {
+	downloadKey := fmt.Sprintf("%s/%s", packageName, fileName)
+	storageKey := fmt.Sprintf("packages/%s/%s", packageName, fileName)
+
+	// Check if file already exists in storage - fast path
+	ctx := context.Background()
+	if exists, _ := s.storage.Exists(ctx, storageKey); exists {
+		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
+		return s.serveFromStorageOptimized(c, storageKey)
+	}
+
+	// Get or create download status
+	s.downloadCoord.mu.Lock()
+	status, exists := s.downloadCoord.downloads[downloadKey]
+	if !exists {
+		status = &downloadStatus{
+			storageKey: storageKey,
+			startTime:  time.Now(),
+		}
+		s.downloadCoord.downloads[downloadKey] = status
+		status.waitGroup.Add(1)
+		status.inProgress = true
+		s.downloadCoord.mu.Unlock()
+
+		// First request - handle the download
+		log.Info().Str("package", packageName).Str("file", fileName).Msg("🚀 Starting coordinated download")
+
+		// Perform the actual download
+		err := s.handleDownloadInternal(c, packageName, fileName)
+
+		// Update status and wake up waiting requests
+		status.mu.Lock()
+		status.inProgress = false
+		status.completed = true
+		status.error = err
+		status.mu.Unlock()
+		status.waitGroup.Done()
+
+		// Clean up after a delay
+		go func() {
+			time.Sleep(30 * time.Second)
+			s.downloadCoord.mu.Lock()
+			delete(s.downloadCoord.downloads, downloadKey)
+			s.downloadCoord.mu.Unlock()
+		}()
+
+		return err
+	} else {
+		s.downloadCoord.mu.Unlock()
+
+		// Subsequent requests - wait for the download to complete
+		log.Debug().Str("package", packageName).Str("file", fileName).Msg("🔄 Waiting for ongoing download")
+
+		// Wait for the download to complete
+		status.waitGroup.Wait()
+
+		status.mu.RLock()
+		downloadErr := status.error
+		status.mu.RUnlock()
+
+		// If the original download succeeded, serve from storage
+		if downloadErr == nil {
+			if exists, _ := s.storage.Exists(ctx, storageKey); exists {
+				log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage after coordinated download")
+				return s.serveFromStorageOptimized(c, storageKey)
+			}
+		}
+
+		// If download failed, try to get file URL and redirect
+		if files, err := s.pypiClient.GetPackageFiles(packageName); err == nil {
+			for _, file := range files {
+				if file.Name == fileName {
+					log.Debug().Str("package", packageName).Str("file", fileName).Msg("⏭️ Redirecting to PyPI after download coordination")
+					return c.Redirect(file.URL, fiber.StatusFound)
+				}
+			}
+		}
+
+		return c.Status(fiber.StatusNotFound).SendString("File not found")
+	}
 }
 
 // handleDownloadInternal performs the actual download logic with streaming and caching
@@ -443,11 +584,13 @@ func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName stri
 		s.indexCache.SetPackage(packageName, files, s.config.IndexTTL)
 	}
 
-	// Find the file URL
+	// Find the file URL and size
 	var fileURL string
+	var fileSize int64
 	for _, file := range files {
 		if file.Name == fileName {
 			fileURL = file.URL
+			fileSize = file.Size
 			break
 		}
 	}
@@ -487,14 +630,19 @@ func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName stri
 
 	// Check download timeout to decide whether to stream or redirect
 	if s.config.DownloadTimeout > 0 {
+		// Calculate dynamic timeout based on file size
+		dynamicTimeout := s.calculateDynamicTimeout(fileSize)
+
 		// Use streaming downloader for simultaneous download and serve
-		downloadCtx, cancel := context.WithTimeout(ctx, s.config.DownloadTimeout)
+		downloadCtx, cancel := context.WithTimeout(ctx, dynamicTimeout)
 		defer cancel()
 
 		log.Info().
 			Str("package", packageName).
 			Str("file", fileName).
 			Str("file_url", fileURL).
+			Int64("file_size", fileSize).
+			Dur("timeout", dynamicTimeout).
 			Msg("🚀 Starting streaming download with simultaneous cache")
 
 		// Stream to client while caching
@@ -505,7 +653,8 @@ func (s *Server) handleDownloadInternal(c *fiber.Ctx, packageName, fileName stri
 				Str("package", packageName).
 				Str("file", fileName).
 				Str("file_url", fileURL).
-				Dur("timeout", s.config.DownloadTimeout).
+				Int64("file_size", fileSize).
+				Dur("timeout", dynamicTimeout).
 				Msg("Failed to stream download, redirecting to PyPI")
 
 			// Fall back to redirect

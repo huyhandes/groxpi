@@ -209,7 +209,8 @@ jobs:
     - name: Build binary
       run: |
         go build -ldflags="-s -w" -o groxpi cmd/groxpi/main.go
-        ./groxpi --version || echo "Version check not available"
+        ls -la groxpi
+        echo "Binary built successfully"
 
     - name: Test Docker build
       run: docker build -t groxpi:test .
