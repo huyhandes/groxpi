@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phuslu/log"
 )
 
 // Mock writer for zero-copy testing
@@ -456,6 +458,11 @@ func (sr *slowReader) Read(p []byte) (n int, err error) {
 
 // Benchmark tests
 func BenchmarkZeroCopyServer_SmallFile(b *testing.B) {
+	// Set log level to ERROR to suppress debug output during benchmarks
+	originalLogger := log.DefaultLogger
+	log.DefaultLogger.SetLevel(log.ErrorLevel)
+	defer func() { log.DefaultLogger = originalLogger }()
+
 	content := "small benchmark file content"
 	filename := createTempFileForBench(content)
 	defer func() { _ = os.Remove(filename) }()
@@ -471,6 +478,11 @@ func BenchmarkZeroCopyServer_SmallFile(b *testing.B) {
 }
 
 func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
+	// Set log level to ERROR to suppress debug output during benchmarks
+	originalLogger := log.DefaultLogger
+	log.DefaultLogger.SetLevel(log.ErrorLevel)
+	defer func() { log.DefaultLogger = originalLogger }()
+
 	content := strings.Repeat("LARGE BENCHMARK CONTENT ", 1000) // ~24KB
 	filename := createTempFileForBench(content)
 	defer func() { _ = os.Remove(filename) }()
@@ -486,6 +498,11 @@ func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
 }
 
 func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
+	// Set log level to ERROR to suppress debug output during benchmarks
+	originalLogger := log.DefaultLogger
+	log.DefaultLogger.SetLevel(log.ErrorLevel)
+	defer func() { log.DefaultLogger = originalLogger }()
+
 	content := "fiber benchmark content"
 	filename := createTempFileForBench(content)
 	defer func() { _ = os.Remove(filename) }()
@@ -501,6 +518,11 @@ func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
 }
 
 func BenchmarkOptimalServer_AutoSelection(b *testing.B) {
+	// Set log level to ERROR to suppress debug output during benchmarks
+	originalLogger := log.DefaultLogger
+	log.DefaultLogger.SetLevel(log.ErrorLevel)
+	defer func() { log.DefaultLogger = originalLogger }()
+
 	content := "optimal server benchmark"
 	filename := createTempFileForBench(content)
 	defer func() { _ = os.Remove(filename) }()

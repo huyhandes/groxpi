@@ -27,16 +27,21 @@ func BenchmarkDownloadCoordination_SingleFile(b *testing.B) {
 	downloadAttempts := int64(0)
 
 	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/simple/") {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head><title>Links for %s</title></head>
-<body>
-<h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
-</body>
-</html>`, packageName, packageName, fileName, fileName)
+		if strings.Contains(r.URL.Path, fmt.Sprintf("/%s/", packageName)) {
+			// Return package file list (JSON format expected by pypi client)
+			w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+			baseURL := fmt.Sprintf("http://%s", r.Host)
+			_, _ = fmt.Fprintf(w, `{
+  "meta": {"api-version": "1.0"},
+  "name": "%s",
+  "files": [
+    {
+      "filename": "%s",
+      "url": "%s/files/%s",
+      "size": %d
+    }
+  ]
+}`, packageName, fileName, baseURL, fileName, len(fileContent))
 		} else if strings.Contains(r.URL.Path, "/files/") {
 			atomic.AddInt64(&downloadAttempts, 1)
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -99,16 +104,21 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 	downloadAttempts := int64(0)
 
 	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/simple/") {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head><title>Links for %s</title></head>
-<body>
-<h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
-</body>
-</html>`, packageName, packageName, fileName, fileName)
+		if strings.Contains(r.URL.Path, fmt.Sprintf("/%s/", packageName)) {
+			// Return package file list (JSON format expected by pypi client)
+			w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+			baseURL := fmt.Sprintf("http://%s", r.Host)
+			_, _ = fmt.Fprintf(w, `{
+  "meta": {"api-version": "1.0"},
+  "name": "%s",
+  "files": [
+    {
+      "filename": "%s",
+      "url": "%s/files/%s",
+      "size": %d
+    }
+  ]
+}`, packageName, fileName, baseURL, fileName, len(fileContent))
 		} else if strings.Contains(r.URL.Path, "/files/") {
 			atomic.AddInt64(&downloadAttempts, 1)
 			// Simulate download time
@@ -239,16 +249,21 @@ func BenchmarkDownloadCoordination_LargeFile(b *testing.B) {
 	}
 
 	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/simple/") {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head><title>Links for %s</title></head>
-<body>
-<h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
-</body>
-</html>`, packageName, packageName, fileName, fileName)
+		if strings.Contains(r.URL.Path, fmt.Sprintf("/%s/", packageName)) {
+			// Return package file list (JSON format expected by pypi client)
+			w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+			baseURL := fmt.Sprintf("http://%s", r.Host)
+			_, _ = fmt.Fprintf(w, `{
+  "meta": {"api-version": "1.0"},
+  "name": "%s",
+  "files": [
+    {
+      "filename": "%s",
+      "url": "%s/files/%s",
+      "size": %d
+    }
+  ]
+}`, packageName, fileName, baseURL, fileName, len(fileContent))
 		} else if strings.Contains(r.URL.Path, "/files/") {
 			// Simulate network bandwidth limitation
 			w.Header().Set("Content-Type", "application/octet-stream")
