@@ -222,6 +222,18 @@ jobs:
     - name: Pull UV Docker image
       run: docker pull --platform linux/amd64 ghcr.io/astral-sh/uv:latest
 
+    - name: Build custom UV image with Python
+      run: |
+        # Create a Dockerfile for UV with Python base
+        cat > Dockerfile.uv << 'EOF'
+        FROM python:3.12-slim
+        COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+        ENV UV_PYTHON_DOWNLOADS=never
+        WORKDIR /workspace
+        EOF
+        # Build the custom image
+        docker build -f Dockerfile.uv -t groxpi-uv:ci .
+
     - name: Wait for MinIO
       run: |
         echo "Waiting for MinIO to be ready..."
@@ -241,6 +253,7 @@ jobs:
       run: |
         export CI=1
         export GROXPI_BINARY=./groxpi
+        export UV_IMAGE=groxpi-uv:ci
         ./tests/uv_s3_integration_test.sh
 
   build:

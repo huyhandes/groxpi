@@ -22,9 +22,11 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 if [ -n "${CI:-}" ]; then
     log_info "Running in CI environment"
     GROXPI_HOST="127.0.0.1"
+    DOCKER_PLATFORM="--platform linux/amd64"
 else
     log_info "Running locally"
     GROXPI_HOST="127.0.0.1"
+    DOCKER_PLATFORM=""
 fi
 
 # Configuration
@@ -32,6 +34,7 @@ GROXPI_PORT="${PORT:-5000}"
 GROXPI_URL="http://${GROXPI_HOST}:${GROXPI_PORT}"
 TEST_DIR="${TEST_DIR:-/tmp/uv-test-$$}"
 GROXPI_BINARY="${GROXPI_BINARY:-./groxpi}"
+UV_IMAGE="${UV_IMAGE:-groxpi-uv:local}"
 
 # Function to check if groxpi server is running
 check_groxpi_server() {
@@ -128,16 +131,17 @@ test_uv_install() {
     # Set proper permissions for the directories
     chmod 755 "$project_dir"
 
-    # Initialize uv project first, then add package
+    # Initialize uv project with explicit Python version
     log_info "Initializing uv project..."
 
     if ! docker run --rm \
-        --platform linux/amd64 \
+        --pull never \
+        $DOCKER_PLATFORM \
         --network host \
         -v "${project_dir}:/workspace" \
         -w /workspace \
-        ghcr.io/astral-sh/uv:latest \
-        init --no-readme --name "test-${test_name}"; then
+        "$UV_IMAGE" \
+        uv init --no-readme --name "test-${test_name}" --python 3.12; then
         log_error "Failed to initialize uv project"
         return 1
     fi
@@ -146,12 +150,13 @@ test_uv_install() {
     log_info "Running uv add ${package_name} in Docker..."
 
     if docker run --rm \
-        --platform linux/amd64 \
+        --pull never \
+        $DOCKER_PLATFORM \
         --network host \
         -v "${project_dir}:/workspace" \
         -w /workspace \
-        ghcr.io/astral-sh/uv:latest \
-        add "$package_name" --no-cache --default-index "${GROXPI_URL}/simple/"; then
+        "$UV_IMAGE" \
+        uv add "$package_name" --no-cache --default-index "${GROXPI_URL}/simple/" --python 3.12; then
 
         log_success "Successfully installed $package_name"
 
@@ -271,10 +276,49 @@ main() {
 
     # Pull UV Docker image
     log_info "Pulling UV Docker image..."
-    docker pull ghcr.io/astral-sh/uv:latest || {
-        log_error "Failed to pull UV Docker image"
-        exit 1
-    }
+    if [ -n "$DOCKER_PLATFORM" ]; then
+        docker pull $DOCKER_PLATFORM ghcr.io/astral-sh/uv:latest || {
+            log_error "Failed to pull UV Docker image"
+            exit 1
+        }
+    else
+        docker pull ghcr.io/astral-sh/uv:latest || {
+            log_error "Failed to pull UV Docker image"
+            exit 1
+        }
+    fi
+
+    # Note: UV Docker image is distroless and doesn't include Python
+    # We'll use a Python base image with UV installed instead
+    log_info "Building custom UV image with Python..."
+
+    # Create a temporary build directory
+    local build_dir="/tmp/groxpi-uv-build"
+    mkdir -p "$build_dir"
+
+    # Create a Dockerfile for UV with Python
+    cat > "$build_dir/Dockerfile" << 'EOF'
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_PYTHON_DOWNLOADS=never
+WORKDIR /workspace
+EOF
+
+    # Build the custom image with appropriate platform
+    if [ -n "$DOCKER_PLATFORM" ]; then
+        docker build $DOCKER_PLATFORM -t groxpi-uv:local "$build_dir" || {
+            log_error "Failed to build custom UV image"
+            exit 1
+        }
+    else
+        docker build -t groxpi-uv:local "$build_dir" || {
+            log_error "Failed to build custom UV image"
+            exit 1
+        }
+    fi
+
+    # Clean up the temporary build directory
+    rm -rf "$build_dir"
 
     # Run tests
     local test_failed=0
