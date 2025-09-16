@@ -52,10 +52,7 @@ groxpi/
 │   │   ├── local.go             # Local storage implementation
 │   │   ├── local_test.go        # Local storage tests
 │   │   ├── s3.go                # S3 storage implementation
-│   │   ├── s3_unit_test.go      # S3 unit tests
 │   │   ├── s3_integration_test.go      # S3 integration tests
-│   │   ├── s3_full_integration_test.go # S3 comprehensive tests
-│   │   ├── s3_mock_integration_test.go # S3 mock tests
 │   │   └── storage_bench_test.go       # Storage benchmarks
 │   └── streaming/               # Zero-copy streaming
 │       ├── broadcast.go         # Broadcast implementation
@@ -112,12 +109,12 @@ func TestServer_Integration(t *testing.T) {
     // Setup test server with real dependencies
     server := setupTestServer(t)
     defer server.app.Shutdown()
-    
+
     // Test package index endpoint
     resp, err := http.Get("http://localhost:5000/simple/")
     require.NoError(t, err)
     assert.Equal(t, http.StatusOK, resp.StatusCode)
-    
+
     // Test JSON content negotiation
     req, _ := http.NewRequest("GET", "http://localhost:5000/simple/", nil)
     req.Header.Set("Accept", "application/json")
@@ -127,27 +124,42 @@ func TestServer_Integration(t *testing.T) {
 }
 ```
 
-#### Storage Integration Tests
+#### S3 Integration Tests
 ```go
-func TestS3Storage_Integration(t *testing.T) {
+func TestS3WithMinIO(t *testing.T) {
     if testing.Short() {
         t.Skip("Skipping S3 integration test in short mode")
     }
-    
-    storage := setupS3Storage(t)
-    
-    // Test file upload and download
+
+    storage := createTestS3Storage(t)
+    defer storage.Close()
+
+    // Test basic S3 operations
+    key := "test/file.txt"
     content := []byte("test file content")
-    err := storage.Put("test/file.txt", content)
+
+    // Test Put, Get, Delete cycle
+    _, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
     require.NoError(t, err)
-    
-    reader, size, err := storage.Get("test/file.txt")
+
+    reader, info, err := storage.Get(ctx, key)
     require.NoError(t, err)
-    assert.Equal(t, int64(len(content)), size)
-    
-    retrieved, err := io.ReadAll(reader)
+    defer reader.Close()
+
+    data, err := io.ReadAll(reader)
     require.NoError(t, err)
-    assert.Equal(t, content, retrieved)
+    assert.Equal(t, content, data)
+}
+
+func TestS3WithRealClients(t *testing.T) {
+    // Start groxpi with S3 backend
+    server := startGroxpiServer(t, groxpiBinary)
+    defer server.Stop()
+
+    // Test pip and uv work with S3 backend
+    testPipInstall(t, testDir)
+    testUVAdd(t, testDir)
+    verifyS3Storage(t)
 }
 ```
 
@@ -323,8 +335,8 @@ timeout 60s bash -c 'until curl -f http://localhost:9000/minio/health/live; do s
 docker exec groxpi-minio-test mc alias set local http://localhost:9000 minioadmin minioadmin
 docker exec groxpi-minio-test mc mb local/groxpi-test
 
-# Run S3 integration tests
-go test ./internal/storage -run S3
+# Run simplified S3 integration tests
+go test ./internal/storage -run TestS3
 
 # Clean up
 docker-compose -f docker-compose.test.yml down
