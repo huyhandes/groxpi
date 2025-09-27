@@ -14,6 +14,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/phuslu/log"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -30,26 +31,340 @@ type S3Config struct {
 
 	// Performance tuning
 	PartSize       int64 // Multipart upload part size (default: 10MB)
-	MaxConnections int   // Max concurrent connections
+	MaxConnections int   // Max concurrent connections (legacy - use specific pools below)
 	ConnectTimeout time.Duration
 	RequestTimeout time.Duration
+
+	// Connection pool configuration
+	ReadPoolSize  int  // Max connections for GET operations (default: 50)
+	WritePoolSize int  // Max connections for PUT operations (default: 30)
+	MetaPoolSize  int  // Max connections for HEAD/STAT operations (default: 20)
+	EnableHTTP2   bool // Enable HTTP/2 for better multiplexing (default: true)
+	TransferAccel bool // Enable S3 Transfer Acceleration (default: false)
+
+	// Async write configuration
+	AsyncWrites    bool // Enable async writes for non-blocking operations (default: true)
+	AsyncWorkers   int  // Number of async write workers (default: 10)
+	AsyncQueueSize int  // Size of async write queue (default: 1000)
 }
 
-// Buffer pools for zero-copy optimizations
-var s3BufferPool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 64*1024) // 64KB buffers for S3 streaming
-		return &buf
-	},
+// Adaptive buffer pools for different file sizes to optimize memory usage
+var (
+	// Small files (< 16KB) - 4KB buffers
+	s3SmallBufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 4*1024) // 4KB buffers
+			return &buf
+		},
+	}
+
+	// Medium files (16KB - 256KB) - 16KB buffers
+	s3MediumBufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 16*1024) // 16KB buffers
+			return &buf
+		},
+	}
+
+	// Large files (256KB - 4MB) - 64KB buffers
+	s3LargeBufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 64*1024) // 64KB buffers
+			return &buf
+		},
+	}
+
+	// Huge files (> 4MB) - 256KB buffers
+	s3HugeBufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 256*1024) // 256KB buffers
+			return &buf
+		},
+	}
+)
+
+// getOptimalBufferPool returns the appropriate buffer pool based on file size
+func getOptimalBufferPool(size int64) *sync.Pool {
+	switch {
+	case size < 16*1024: // < 16KB
+		return &s3SmallBufferPool
+	case size < 256*1024: // < 256KB
+		return &s3MediumBufferPool
+	case size < 4*1024*1024: // < 4MB
+		return &s3LargeBufferPool
+	default: // >= 4MB
+		return &s3HugeBufferPool
+	}
+}
+
+// getBufferSizeForPool returns the buffer size for a given pool
+func getBufferSizeForPool(pool *sync.Pool) int {
+	switch pool {
+	case &s3SmallBufferPool:
+		return 4 * 1024
+	case &s3MediumBufferPool:
+		return 16 * 1024
+	case &s3LargeBufferPool:
+		return 64 * 1024
+	case &s3HugeBufferPool:
+		return 256 * 1024
+	default:
+		return 64 * 1024 // fallback
+	}
+}
+
+// S3ConnectionPool manages HTTP connections for different types of S3 operations
+type S3ConnectionPool struct {
+	readTransport  *http.Transport // For GET operations
+	writeTransport *http.Transport // For PUT operations
+	metaTransport  *http.Transport // For HEAD/STAT operations
+}
+
+// NewS3ConnectionPool creates optimized HTTP transports for different operation types
+func NewS3ConnectionPool(cfg *S3Config) *S3ConnectionPool {
+	// Set defaults
+	if cfg.ReadPoolSize == 0 {
+		cfg.ReadPoolSize = 50
+	}
+	if cfg.WritePoolSize == 0 {
+		cfg.WritePoolSize = 30
+	}
+	if cfg.MetaPoolSize == 0 {
+		cfg.MetaPoolSize = 20
+	}
+
+	baseTransport := func(maxConns int) *http.Transport {
+		transport := &http.Transport{
+			MaxIdleConns:          maxConns,
+			MaxIdleConnsPerHost:   maxConns,
+			MaxConnsPerHost:       maxConns,
+			IdleConnTimeout:       90 * time.Second,
+			DisableCompression:    true, // S3 handles compression
+			ResponseHeaderTimeout: cfg.RequestTimeout,
+			TLSHandshakeTimeout:   cfg.ConnectTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   cfg.ConnectTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		}
+
+		// Enable HTTP/2 if configured
+		if cfg.EnableHTTP2 {
+			// Enable HTTP/2 support
+			http2Transport := &http.Transport{
+				MaxIdleConns:          maxConns,
+				MaxIdleConnsPerHost:   maxConns,
+				MaxConnsPerHost:       maxConns,
+				IdleConnTimeout:       90 * time.Second,
+				DisableCompression:    true,
+				ResponseHeaderTimeout: cfg.RequestTimeout,
+				TLSHandshakeTimeout:   cfg.ConnectTimeout,
+				ExpectContinueTimeout: 1 * time.Second,
+				ForceAttemptHTTP2:     true, // Force HTTP/2
+				DialContext: (&net.Dialer{
+					Timeout:   cfg.ConnectTimeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+			}
+			return http2Transport
+		}
+
+		return transport
+	}
+
+	return &S3ConnectionPool{
+		readTransport:  baseTransport(cfg.ReadPoolSize),
+		writeTransport: baseTransport(cfg.WritePoolSize),
+		metaTransport:  baseTransport(cfg.MetaPoolSize),
+	}
+}
+
+// GetReadTransport returns the transport optimized for GET operations
+func (pool *S3ConnectionPool) GetReadTransport() *http.Transport {
+	return pool.readTransport
+}
+
+// GetWriteTransport returns the transport optimized for PUT operations
+func (pool *S3ConnectionPool) GetWriteTransport() *http.Transport {
+	return pool.writeTransport
+}
+
+// GetMetaTransport returns the transport optimized for metadata operations
+func (pool *S3ConnectionPool) GetMetaTransport() *http.Transport {
+	return pool.metaTransport
+}
+
+// Close closes all idle connections in the pools
+func (pool *S3ConnectionPool) Close() {
+	pool.readTransport.CloseIdleConnections()
+	pool.writeTransport.CloseIdleConnections()
+	pool.metaTransport.CloseIdleConnections()
+}
+
+// AsyncWriteRequest represents a pending write operation
+type AsyncWriteRequest struct {
+	Key         string
+	Reader      io.Reader
+	Size        int64
+	ContentType string
+	ResultCh    chan AsyncWriteResult
+	Context     context.Context
+}
+
+// AsyncWriteResult contains the result of an async write operation
+type AsyncWriteResult struct {
+	Info  *ObjectInfo
+	Error error
+}
+
+// AsyncWriteQueue manages non-blocking S3 write operations
+type AsyncWriteQueue struct {
+	storage     *S3Storage
+	queue       chan *AsyncWriteRequest
+	semaphore   *semaphore.Weighted
+	workerCount int
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+}
+
+// NewAsyncWriteQueue creates a new async write queue
+func NewAsyncWriteQueue(storage *S3Storage, queueSize, workerCount int) *AsyncWriteQueue {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	awq := &AsyncWriteQueue{
+		storage:     storage,
+		queue:       make(chan *AsyncWriteRequest, queueSize),
+		semaphore:   semaphore.NewWeighted(int64(workerCount)),
+		workerCount: workerCount,
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+
+	// Start worker goroutines
+	for i := 0; i < workerCount; i++ {
+		awq.wg.Add(1)
+		go awq.worker(i)
+	}
+
+	log.Info().
+		Int("workers", workerCount).
+		Int("queue_size", queueSize).
+		Msg("S3 async write queue initialized")
+
+	return awq
+}
+
+// worker processes async write requests
+func (awq *AsyncWriteQueue) worker(id int) {
+	defer awq.wg.Done()
+
+	log.Debug().Int("worker_id", id).Msg("S3 async write worker started")
+
+	for {
+		select {
+		case <-awq.ctx.Done():
+			log.Debug().Int("worker_id", id).Msg("S3 async write worker shutting down")
+			return
+		case req := <-awq.queue:
+			// Acquire semaphore to limit concurrent operations
+			if err := awq.semaphore.Acquire(req.Context, 1); err != nil {
+				req.ResultCh <- AsyncWriteResult{Error: fmt.Errorf("failed to acquire semaphore: %w", err)}
+				continue
+			}
+
+			// Perform the write operation
+			start := time.Now()
+			info, err := awq.storage.putInternal(req.Context, req.Key, req.Reader, req.Size, req.ContentType)
+			duration := time.Since(start)
+
+			// Release semaphore
+			awq.semaphore.Release(1)
+
+			// Send result
+			result := AsyncWriteResult{Info: info, Error: err}
+			select {
+			case req.ResultCh <- result:
+			case <-req.Context.Done():
+				// Context cancelled, don't block
+			}
+
+			// Log async write completion
+			if err != nil {
+				log.Error().
+					Err(err).
+					Str("key", req.Key).
+					Int64("size", req.Size).
+					Dur("duration", duration).
+					Int("worker_id", id).
+					Msg("Async S3 write failed")
+			} else {
+				log.Debug().
+					Str("key", req.Key).
+					Int64("size", req.Size).
+					Dur("duration", duration).
+					Int("worker_id", id).
+					Msg("Async S3 write completed")
+			}
+		}
+	}
+}
+
+// SubmitWrite submits an async write request
+func (awq *AsyncWriteQueue) SubmitWrite(ctx context.Context, key string, reader io.Reader, size int64, contentType string) <-chan AsyncWriteResult {
+	resultCh := make(chan AsyncWriteResult, 1)
+
+	req := &AsyncWriteRequest{
+		Key:         key,
+		Reader:      reader,
+		Size:        size,
+		ContentType: contentType,
+		ResultCh:    resultCh,
+		Context:     ctx,
+	}
+
+	select {
+	case awq.queue <- req:
+		// Successfully queued
+	case <-ctx.Done():
+		// Context cancelled
+		resultCh <- AsyncWriteResult{Error: ctx.Err()}
+	default:
+		// Queue full, return error
+		resultCh <- AsyncWriteResult{Error: fmt.Errorf("async write queue is full")}
+	}
+
+	return resultCh
+}
+
+// Close shuts down the async write queue
+func (awq *AsyncWriteQueue) Close() error {
+	awq.cancel()
+
+	// Close the queue channel to signal workers to finish current work
+	close(awq.queue)
+
+	// Wait for all workers to finish
+	awq.wg.Wait()
+
+	log.Info().Msg("S3 async write queue shut down")
+	return nil
 }
 
 // S3Storage implements Storage interface for S3-compatible backends
 type S3Storage struct {
-	client    *minio.Client
-	bucket    string
-	prefix    string
-	partSize  int64
-	transport *http.Transport
+	readClient  *minio.Client // Client optimized for GET operations
+	writeClient *minio.Client // Client optimized for PUT operations
+	metaClient  *minio.Client // Client optimized for metadata operations
+	bucket      string
+	prefix      string
+	partSize    int64
+	connPool    *S3ConnectionPool
+
+	// Async write queue for non-blocking operations
+	asyncQueue  *AsyncWriteQueue
+	asyncWrites bool
 
 	// Singleflight groups for deduplicating concurrent operations
 	statSF singleflight.Group // For Stat/Exists operations
@@ -75,6 +390,14 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		cfg.Region = "us-east-1"
 	}
 
+	// Set async write defaults
+	if cfg.AsyncWorkers == 0 {
+		cfg.AsyncWorkers = 10
+	}
+	if cfg.AsyncQueueSize == 0 {
+		cfg.AsyncQueueSize = 1000
+	}
+
 	// Normalize endpoint URL - remove protocol if present
 	endpoint := cfg.Endpoint
 	if strings.HasPrefix(endpoint, "https://") {
@@ -93,46 +416,69 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		Bool("ssl", cfg.UseSSL).
 		Msg("Creating S3 storage backend")
 
-	// Configure HTTP transport for performance with extended timeouts
-	transport := &http.Transport{
-		MaxIdleConns:          cfg.MaxConnections,
-		MaxIdleConnsPerHost:   cfg.MaxConnections,
-		MaxConnsPerHost:       cfg.MaxConnections,
-		IdleConnTimeout:       90 * time.Second,
-		DisableCompression:    true,               // S3 already handles compression
-		ResponseHeaderTimeout: cfg.RequestTimeout, // 5 minutes for response headers
-		TLSHandshakeTimeout:   cfg.ConnectTimeout, // TLS handshake timeout
-		ExpectContinueTimeout: 1 * time.Second,    // 100-continue timeout
-		DialContext: (&net.Dialer{
-			Timeout:   cfg.ConnectTimeout, // Connection establishment timeout
-			KeepAlive: 30 * time.Second,   // Keep-alive timeout
-		}).DialContext,
+	// Create connection pool for different operation types
+	connPool := NewS3ConnectionPool(cfg)
+
+	// Handle S3 Transfer Acceleration
+	s3Endpoint := endpoint
+	if cfg.TransferAccel {
+		// Use transfer acceleration endpoint if enabled
+		if !strings.Contains(endpoint, "amazonaws.com") {
+			log.Warn().Msg("Transfer acceleration only works with AWS S3, ignoring setting")
+		} else {
+			// Replace s3.region.amazonaws.com with s3-accelerate.amazonaws.com
+			parts := strings.Split(endpoint, ".")
+			if len(parts) >= 3 && parts[0] == "s3" {
+				s3Endpoint = "s3-accelerate.amazonaws.com"
+				log.Info().Str("endpoint", s3Endpoint).Msg("Using S3 Transfer Acceleration")
+			}
+		}
 	}
 
-	// Initialize MinIO client
-	opts := &minio.Options{
-		Creds:     credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
-		Secure:    cfg.UseSSL,
-		Region:    cfg.Region,
-		Transport: transport,
+	// Helper function to create MinIO client with specific transport
+	createClient := func(transport *http.Transport, clientType string) (*minio.Client, error) {
+		opts := &minio.Options{
+			Creds:     credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
+			Secure:    cfg.UseSSL,
+			Region:    cfg.Region,
+			Transport: transport,
+		}
+
+		// Enable path-style addressing for MinIO
+		if cfg.ForcePathStyle {
+			opts.BucketLookup = minio.BucketLookupPath
+		}
+
+		client, err := minio.New(s3Endpoint, opts)
+		if err != nil {
+			log.Error().Err(err).Str("client_type", clientType).Msg("Failed to create S3 client")
+			return nil, fmt.Errorf("failed to create S3 %s client: %w", clientType, err)
+		}
+
+		return client, nil
 	}
 
-	// Enable path-style addressing for MinIO
-	if cfg.ForcePathStyle {
-		opts.BucketLookup = minio.BucketLookupPath
-	}
-
-	client, err := minio.New(endpoint, opts)
+	// Create specialized clients for different operations
+	readClient, err := createClient(connPool.GetReadTransport(), "read")
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to create S3 client")
-		return nil, fmt.Errorf("failed to create S3 client: %w", err)
+		return nil, err
 	}
 
-	// Ensure bucket exists
+	writeClient, err := createClient(connPool.GetWriteTransport(), "write")
+	if err != nil {
+		return nil, err
+	}
+
+	metaClient, err := createClient(connPool.GetMetaTransport(), "metadata")
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure bucket exists using metadata client
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
 	defer cancel()
 
-	exists, err := client.BucketExists(ctx, cfg.Bucket)
+	exists, err := metaClient.BucketExists(ctx, cfg.Bucket)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", cfg.Bucket).Msg("Failed to check bucket existence")
 		return nil, fmt.Errorf("failed to check bucket existence: %w", err)
@@ -142,19 +488,38 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		return nil, fmt.Errorf("bucket %s does not exist", cfg.Bucket)
 	}
 
+	// Create S3 storage instance
+	storage := &S3Storage{
+		readClient:  readClient,
+		writeClient: writeClient,
+		metaClient:  metaClient,
+		bucket:      cfg.Bucket,
+		prefix:      strings.TrimSuffix(cfg.Prefix, "/"),
+		partSize:    cfg.PartSize,
+		connPool:    connPool,
+		asyncWrites: cfg.AsyncWrites,
+	}
+
+	// Initialize async write queue if enabled
+	if cfg.AsyncWrites {
+		storage.asyncQueue = NewAsyncWriteQueue(storage, cfg.AsyncQueueSize, cfg.AsyncWorkers)
+	}
+
 	log.Info().
 		Str("endpoint", cfg.Endpoint).
 		Str("bucket", cfg.Bucket).
 		Str("prefix", cfg.Prefix).
-		Msg("S3 storage backend initialized successfully")
+		Int("read_pool_size", cfg.ReadPoolSize).
+		Int("write_pool_size", cfg.WritePoolSize).
+		Int("meta_pool_size", cfg.MetaPoolSize).
+		Bool("http2_enabled", cfg.EnableHTTP2).
+		Bool("transfer_accel", cfg.TransferAccel).
+		Bool("async_writes", cfg.AsyncWrites).
+		Int("async_workers", cfg.AsyncWorkers).
+		Int("async_queue_size", cfg.AsyncQueueSize).
+		Msg("S3 storage backend initialized successfully with performance optimizations")
 
-	return &S3Storage{
-		client:    client,
-		bucket:    cfg.Bucket,
-		prefix:    strings.TrimSuffix(cfg.Prefix, "/"),
-		partSize:  cfg.PartSize,
-		transport: transport,
-	}, nil
+	return storage, nil
 }
 
 // buildKey constructs the full S3 key with prefix
@@ -234,8 +599,8 @@ func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser,
 
 	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Getting object from S3")
 
-	// Get object
-	object, err := s.client.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
+	// Get object using read-optimized client
+	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object")
 		return nil, nil, fmt.Errorf("failed to get object %s: %w", key, err)
@@ -281,7 +646,7 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 			Msg("Setting range header for S3 request")
 	}
 
-	object, err := s.client.GetObject(ctx, s.bucket, fullKey, opts)
+	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, opts)
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object range from S3")
 		return nil, nil, fmt.Errorf("failed to get object range %s: %w", key, err)
@@ -312,9 +677,10 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 		Int64("object_size", fullObjectInfo.Size).
 		Msg("S3 range request prepared")
 
-	// For small ranges, use buffer pool to potentially reduce allocations
-	if length > 0 && length <= 64*1024 {
-		bufPtr := s3BufferPool.Get().(*[]byte)
+	// For small ranges, use appropriate buffer pool to reduce allocations
+	if length > 0 && length <= 256*1024 {
+		pool := getOptimalBufferPool(length)
+		bufPtr := pool.Get().(*[]byte)
 		buf := *bufPtr
 
 		// Create a buffered reader that returns buffer to pool when closed
@@ -322,7 +688,7 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 			Reader: object,
 			buffer: buf,
 			bufPtr: bufPtr,
-			pool:   &s3BufferPool,
+			pool:   pool,
 		}
 
 		return bufferedReader, info, nil
@@ -354,8 +720,8 @@ func (r *s3BufferedReader) Close() error {
 	return nil
 }
 
-// Put stores an object in S3 with zero-copy optimization
-func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+// putInternal performs the actual S3 Put operation (used by both sync and async paths)
+func (s *S3Storage) putInternal(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
 
 	log.Debug().
@@ -378,11 +744,12 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 			Msg("Using optimized multipart upload")
 	}
 
-	// For small files, use buffer pool for potential zero-copy optimization
+	// For small files, use appropriate buffer pool for zero-copy optimization
 	actualReader := reader
-	if size > 0 && size <= 64*1024 {
-		bufPtr := s3BufferPool.Get().(*[]byte)
-		defer s3BufferPool.Put(bufPtr)
+	if size > 0 && size <= 256*1024 {
+		pool := getOptimalBufferPool(size)
+		bufPtr := pool.Get().(*[]byte)
+		defer pool.Put(bufPtr)
 		buf := *bufPtr
 
 		if size <= int64(len(buf)) {
@@ -396,7 +763,7 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 	}
 
 	start := time.Now()
-	uploadInfo, err := s.client.PutObject(ctx, s.bucket, fullKey, actualReader, size, opts)
+	uploadInfo, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, actualReader, size, opts)
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to put object")
 		return nil, fmt.Errorf("failed to put object %s: %w", key, err)
@@ -419,6 +786,46 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 	}, nil
 }
 
+// Put stores an object in S3 with automatic sync/async selection based on configuration
+func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
+	// For small files and async writes enabled, use async queue
+	if s.asyncWrites && s.asyncQueue != nil && size <= 256*1024 { // <= 256KB
+		// Read all data into memory for async processing
+		pool := getOptimalBufferPool(size)
+		bufPtr := pool.Get().(*[]byte)
+		defer pool.Put(bufPtr)
+		buf := *bufPtr
+
+		// Ensure buffer is large enough
+		if size > int64(len(buf)) {
+			// Fall back to sync operation for oversized files
+			return s.putInternal(ctx, key, reader, size, contentType)
+		}
+
+		// Read data into buffer
+		data := buf[:size]
+		n, err := io.ReadFull(reader, data)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("failed to read data for async upload: %w", err)
+		}
+		data = data[:n]
+
+		// Submit async write
+		resultCh := s.asyncQueue.SubmitWrite(ctx, key, bytes.NewReader(data), int64(n), contentType)
+
+		// Wait for result
+		select {
+		case result := <-resultCh:
+			return result.Info, result.Error
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// Use synchronous operation for large files or when async is disabled
+	return s.putInternal(ctx, key, reader, size, contentType)
+}
+
 // PutMultipart uploads a large object using multipart upload with custom part size
 func (s *S3Storage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
@@ -432,7 +839,7 @@ func (s *S3Storage) PutMultipart(ctx context.Context, key string, reader io.Read
 		PartSize:    uint64(partSize),
 	}
 
-	uploadInfo, err := s.client.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
+	uploadInfo, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to put multipart object %s: %w", key, err)
 	}
@@ -451,7 +858,7 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 
 	log.Debug().Str("key", key).Msg("Deleting object from S3")
 
-	err := s.client.RemoveObject(ctx, s.bucket, fullKey, minio.RemoveObjectOptions{})
+	err := s.writeClient.RemoveObject(ctx, s.bucket, fullKey, minio.RemoveObjectOptions{})
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to delete object")
 		return fmt.Errorf("failed to delete object %s: %w", key, err)
@@ -479,7 +886,7 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 func (s *S3Storage) existsInternal(ctx context.Context, key string) (bool, error) {
 	fullKey := s.buildKey(key)
 
-	_, err := s.client.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
+	_, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
 	if err != nil {
 		errResponse := minio.ToErrorResponse(err)
 		if errResponse.Code == "NoSuchKey" {
@@ -509,7 +916,7 @@ func (s *S3Storage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
 func (s *S3Storage) statInternal(ctx context.Context, key string) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
 
-	stat, err := s.client.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
+	stat, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat object %s: %w", key, err)
 	}
@@ -553,7 +960,7 @@ func (s *S3Storage) listInternal(ctx context.Context, opts ListOptions) ([]*Obje
 	}
 
 	var objects []*ObjectInfo
-	for object := range s.client.ListObjects(ctx, s.bucket, listOpts) {
+	for object := range s.metaClient.ListObjects(ctx, s.bucket, listOpts) {
 		if object.Err != nil {
 			return nil, fmt.Errorf("failed to list objects: %w", object.Err)
 		}
@@ -577,8 +984,8 @@ func (s *S3Storage) listInternal(ctx context.Context, opts ListOptions) ([]*Obje
 func (s *S3Storage) GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
 	fullKey := s.buildKey(key)
 
-	// Generate presigned URL
-	url, err := s.client.PresignedGetObject(ctx, s.bucket, fullKey, expiry, nil)
+	// Generate presigned URL using read client
+	url, err := s.readClient.PresignedGetObject(ctx, s.bucket, fullKey, expiry, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate presigned URL for %s: %w", key, err)
 	}
@@ -608,13 +1015,14 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 		ContentType: contentType,
 	}
 
-	// Use pooled buffer for streaming
-	bufPtr := s3BufferPool.Get().(*[]byte)
+	// Use appropriately sized pooled buffer for streaming
+	pool := getOptimalBufferPool(size)
+	bufPtr := pool.Get().(*[]byte)
 	bufReader := &bufferedReader{
 		reader: reader,
 		buffer: *bufPtr,
 		bufPtr: bufPtr,
-		pool:   &s3BufferPool,
+		pool:   pool,
 	}
 	defer func() {
 		if err := bufReader.Close(); err != nil {
@@ -624,7 +1032,7 @@ func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Read
 	}()
 
 	start := time.Now()
-	info, err := s.client.PutObject(ctx, s.bucket, fullKey, bufReader, size, opts)
+	info, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, bufReader, size, opts)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -667,7 +1075,7 @@ func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, r
 		Msg("Starting multipart upload with optimal part size")
 
 	start := time.Now()
-	info, err := s.client.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
+	info, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -701,14 +1109,14 @@ func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writ
 
 	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Streaming get from S3")
 
-	// Get object info first for metadata
-	objInfo, err := s.client.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
+	// Get object info first for metadata using metadata client
+	objInfo, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat object %s: %w", key, err)
 	}
 
-	// Get object stream
-	object, err := s.client.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
+	// Get object stream using read client
+	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
 	}
@@ -719,9 +1127,10 @@ func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writ
 		}
 	}()
 
-	// Use pooled buffer for optimized streaming
-	copyBufPtr := s3BufferPool.Get().(*[]byte)
-	defer s3BufferPool.Put(copyBufPtr)
+	// Use appropriately sized pooled buffer for optimized streaming
+	pool := getOptimalBufferPool(objInfo.Size)
+	copyBufPtr := pool.Get().(*[]byte)
+	defer pool.Put(copyBufPtr)
 	copyBuf := *copyBufPtr
 
 	start := time.Now()
@@ -793,9 +1202,16 @@ func (br *bufferedReader) Close() error {
 
 // Close releases any resources held by the storage backend
 func (s *S3Storage) Close() error {
-	// Close idle connections
-	if s.transport != nil {
-		s.transport.CloseIdleConnections()
+	// Close async write queue first to ensure all pending writes complete
+	if s.asyncQueue != nil {
+		if err := s.asyncQueue.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close async write queue")
+		}
+	}
+
+	// Close all connection pools
+	if s.connPool != nil {
+		s.connPool.Close()
 	}
 	return nil
 }

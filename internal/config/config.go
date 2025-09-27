@@ -29,7 +29,17 @@ type Config struct {
 	S3ForcePathStyle  bool
 	S3UseSSL          bool
 	S3PartSize        int64 // Multipart upload part size
-	S3MaxConnections  int   // Max concurrent S3 connections
+	S3MaxConnections  int   // Max concurrent S3 connections (legacy)
+
+	// S3 Performance Configuration
+	S3ReadPoolSize   int  // Max connections for GET operations
+	S3WritePoolSize  int  // Max connections for PUT operations
+	S3MetaPoolSize   int  // Max connections for HEAD/STAT operations
+	S3EnableHTTP2    bool // Enable HTTP/2 for better multiplexing
+	S3TransferAccel  bool // Enable S3 Transfer Acceleration
+	S3AsyncWrites    bool // Enable async writes for non-blocking operations
+	S3AsyncWorkers   int  // Number of async write workers
+	S3AsyncQueueSize int  // Size of async write queue
 
 	// Timeout configuration
 	DownloadTimeout time.Duration
@@ -75,6 +85,16 @@ func Load() *Config {
 		S3UseSSL:          getBoolEnv("GROXPI_S3_USE_SSL", true),
 		S3PartSize:        getIntEnv("GROXPI_S3_PART_SIZE", 10*1024*1024), // 10MB
 		S3MaxConnections:  int(getIntEnv("GROXPI_S3_MAX_CONNECTIONS", 100)),
+
+		// S3 Performance Configuration
+		S3ReadPoolSize:   int(getIntEnv("GROXPI_S3_READ_POOL_SIZE", 50)),
+		S3WritePoolSize:  int(getIntEnv("GROXPI_S3_WRITE_POOL_SIZE", 30)),
+		S3MetaPoolSize:   int(getIntEnv("GROXPI_S3_META_POOL_SIZE", 20)),
+		S3EnableHTTP2:    getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
+		S3TransferAccel:  getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
+		S3AsyncWrites:    getBoolEnv("GROXPI_S3_ASYNC_WRITES", true),
+		S3AsyncWorkers:   int(getIntEnv("GROXPI_S3_ASYNC_WORKERS", 10)),
+		S3AsyncQueueSize: int(getIntEnv("GROXPI_S3_ASYNC_QUEUE_SIZE", 1000)),
 	}
 
 	// Parse extra index URLs

@@ -782,6 +782,18 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 			ForcePathStyle:  cfg.S3ForcePathStyle,
 			PartSize:        cfg.S3PartSize,
 			MaxConnections:  cfg.S3MaxConnections,
+
+			// Performance configuration
+			ReadPoolSize:   cfg.S3ReadPoolSize,
+			WritePoolSize:  cfg.S3WritePoolSize,
+			MetaPoolSize:   cfg.S3MetaPoolSize,
+			EnableHTTP2:    cfg.S3EnableHTTP2,
+			TransferAccel:  cfg.S3TransferAccel,
+			AsyncWrites:    cfg.S3AsyncWrites,
+			AsyncWorkers:   cfg.S3AsyncWorkers,
+			AsyncQueueSize: cfg.S3AsyncQueueSize,
+			ConnectTimeout: cfg.ConnectTimeout,
+			RequestTimeout: cfg.DownloadTimeout,
 		})
 	}
 
