@@ -97,22 +97,6 @@ func getOptimalBufferPool(size int64) *sync.Pool {
 	}
 }
 
-// getBufferSizeForPool returns the buffer size for a given pool
-func getBufferSizeForPool(pool *sync.Pool) int {
-	switch pool {
-	case &s3SmallBufferPool:
-		return 4 * 1024
-	case &s3MediumBufferPool:
-		return 16 * 1024
-	case &s3LargeBufferPool:
-		return 64 * 1024
-	case &s3HugeBufferPool:
-		return 256 * 1024
-	default:
-		return 64 * 1024 // fallback
-	}
-}
-
 // S3ConnectionPool manages HTTP connections for different types of S3 operations
 type S3ConnectionPool struct {
 	readTransport  *http.Transport // For GET operations
