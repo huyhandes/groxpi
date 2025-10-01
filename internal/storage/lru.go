@@ -85,7 +85,8 @@ func (lru *LRUCache) performEviction() {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
-	if lru.currentSize <= lru.maxSize {
+	// If maxSize is 0, treat as unlimited (no eviction)
+	if lru.maxSize == 0 || lru.currentSize <= lru.maxSize {
 		return
 	}
 
@@ -210,8 +211,8 @@ func (lru *LRUCache) RecordAccess(key string, size int64) error {
 		Int64("current_size_mb", lru.currentSize/(1024*1024)).
 		Msg("Added new entry to L1 cache")
 
-	// Trigger eviction if over size limit
-	if lru.currentSize > lru.maxSize {
+	// Trigger eviction if over size limit (skip if maxSize is 0 - unlimited)
+	if lru.maxSize > 0 && lru.currentSize > lru.maxSize {
 		select {
 		case lru.evictionChan <- struct{}{}:
 		default:
@@ -330,8 +331,8 @@ func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
 		Int64("max_size_mb", lru.maxSize/(1024*1024)).
 		Msg("L1 cache rebuild completed")
 
-	// Trigger eviction if needed
-	if lru.currentSize > lru.maxSize {
+	// Trigger eviction if needed (skip if maxSize is 0 - unlimited)
+	if lru.maxSize > 0 && lru.currentSize > lru.maxSize {
 		select {
 		case lru.evictionChan <- struct{}{}:
 		default:
