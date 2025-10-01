@@ -101,7 +101,13 @@ jobs:
     - name: Run Gosec Security Scanner
       run: |
         go install github.com/securego/gosec/v2/cmd/gosec@latest
-        gosec -no-fail -fmt sarif -out gosec-report.sarif ./...
+        gosec -no-fail -fmt sarif -out gosec-report.sarif -exclude-generated ./...
+        # Remove fixes array from SARIF to avoid GitHub validation errors
+        if [ -f gosec-report.sarif ]; then
+          # Use jq to remove the fixes field from all results
+          jq 'del(.runs[].results[].fixes)' gosec-report.sarif > gosec-report-clean.sarif
+          mv gosec-report-clean.sarif gosec-report.sarif
+        fi
 
     - name: Upload SARIF file
       uses: github/codeql-action/upload-sarif@v3
@@ -133,14 +139,18 @@ jobs:
     runs-on: ubuntu-latest
     services:
       minio:
-        image: bitnami/minio:latest
+        image: quay.io/minio/minio:latest
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: groxpi-test
         ports:
           - 9000:9000
-        options: --health-cmd "curl -f http://127.0.0.1:9000/minio/health/ready || exit 1" --health-interval 10s --health-timeout 5s --health-retries 5
+          - 9001:9001
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       TEST_S3_ENDPOINT: 127.0.0.1:9000

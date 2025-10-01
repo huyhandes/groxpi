@@ -121,7 +121,7 @@ func TestLRULocalStorage(t *testing.T) {
 		}
 
 		// Get file (should update LRU)
-		readCloser, info, err := storage.Get(ctx, "test/file.txt")
+		readCloser, _, err := storage.Get(ctx, "test/file.txt")
 		if err != nil {
 			t.Fatalf("Failed to get file: %v", err)
 		}
