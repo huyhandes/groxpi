@@ -770,6 +770,40 @@ func normalizePackageName(name string) string {
 
 // initStorage creates the appropriate storage backend based on configuration
 func initStorage(cfg *config.Config) (storage.Storage, error) {
+	if cfg.StorageType == "hybrid" {
+		// Create hybrid/tiered storage with local L1 cache and S3 L2 cache
+		return storage.NewTieredStorage(&storage.TieredConfig{
+			LocalCacheDir:  cfg.LocalCacheDir,
+			LocalCacheSize: cfg.LocalCacheSize,
+			S3Config: &storage.S3Config{
+				Endpoint:        cfg.S3Endpoint,
+				AccessKeyID:     cfg.S3AccessKeyID,
+				SecretAccessKey: cfg.S3SecretAccessKey,
+				Region:          cfg.S3Region,
+				Bucket:          cfg.S3Bucket,
+				Prefix:          cfg.S3Prefix,
+				UseSSL:          cfg.S3UseSSL,
+				ForcePathStyle:  cfg.S3ForcePathStyle,
+				PartSize:        cfg.S3PartSize,
+				MaxConnections:  cfg.S3MaxConnections,
+
+				// Performance configuration
+				ReadPoolSize:   cfg.S3ReadPoolSize,
+				WritePoolSize:  cfg.S3WritePoolSize,
+				MetaPoolSize:   cfg.S3MetaPoolSize,
+				EnableHTTP2:    cfg.S3EnableHTTP2,
+				TransferAccel:  cfg.S3TransferAccel,
+				AsyncWrites:    cfg.S3AsyncWrites,
+				AsyncWorkers:   cfg.S3AsyncWorkers,
+				AsyncQueueSize: cfg.S3AsyncQueueSize,
+				ConnectTimeout: cfg.ConnectTimeout,
+				RequestTimeout: cfg.DownloadTimeout,
+			},
+			SyncWorkers:   cfg.TieredSyncWorkers,
+			SyncQueueSize: cfg.TieredSyncQueueSize,
+		})
+	}
+
 	if cfg.StorageType == "s3" {
 		return storage.NewS3Storage(&storage.S3Config{
 			Endpoint:        cfg.S3Endpoint,
@@ -797,8 +831,8 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		})
 	}
 
-	// Default to local storage
-	return storage.NewLocalStorage(cfg.CacheDir)
+	// Default to local storage with LRU eviction
+	return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize)
 }
 
 // serveFromStorage serves a file from the storage backend

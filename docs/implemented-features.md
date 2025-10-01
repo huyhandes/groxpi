@@ -41,9 +41,11 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 
 ### Local Filesystem Storage
 - **File-Based Caching**: Local directory-based package storage
+- **LRU Eviction**: Automatic eviction of least recently used files when cache is full
 - **Configurable Paths**: Customizable cache directory locations
 - **Atomic Operations**: Safe file write operations with temporary files
 - **Directory Management**: Automatic directory creation and cleanup
+- **Cache Rebuild**: Automatic rebuild of LRU cache from existing files on startup
 
 ### S3-Compatible Storage
 - **AWS S3 Support**: Native AWS S3 integration
@@ -52,6 +54,16 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Path-Style URLs**: Configurable URL styles for different S3 implementations
 - **SSL/TLS Support**: Secure connections with configurable SSL settings
 - **Prefix Support**: Bucket prefixes for organized storage
+
+### Hybrid/Tiered Storage (NEW)
+- **Multi-Tier Caching**: Local L1 cache + S3 L2 storage
+- **Automatic L1 Population**: L2 hits asynchronously populate L1 for future requests
+- **Concurrent Writes**: New files written to both L1 and L2 simultaneously
+- **Zero-Copy L1 Serving**: Fast local file serving with sendfile optimization
+- **LRU L1 Eviction**: Intelligent local cache management with size-based LRU
+- **Background Sync Workers**: Configurable worker pool for L1 cache population
+- **Non-Blocking L1 Sync**: L1 population doesn't block user requests
+- **S3 as Primary**: L2 (S3) is authoritative source, L1 is performance layer
 
 ## High-Performance Streaming ✅
 

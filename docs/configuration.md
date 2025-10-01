@@ -28,6 +28,7 @@ Groxpi supports multiple storage backends for file caching.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GROXPI_STORAGE_TYPE` | `local` | Storage backend type |
+| `GROXPI_CACHE_SIZE` | `5368709120` | Local cache size limit with LRU eviction (5GB) |
 
 ### S3-Compatible Storage
 
@@ -42,6 +43,35 @@ Groxpi supports multiple storage backends for file caching.
 | `GROXPI_S3_PREFIX` | - | S3 key prefix |
 | `GROXPI_S3_USE_SSL` | `true` | Enable SSL for S3 connections |
 | `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Force path-style URLs |
+
+### Hybrid/Tiered Storage (Local L1 + S3 L2)
+
+Hybrid storage provides a multi-tier caching system with fast local cache (L1) backed by persistent S3 storage (L2).
+
+**Request Flow**: `User → Local Cache → S3 Cache → PyPI → Save to both S3 & Local`
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GROXPI_STORAGE_TYPE` | `local` | Set to `hybrid` for tiered caching |
+| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` | L1 local cache size limit (10GB) |
+| `GROXPI_LOCAL_CACHE_DIR` | Same as `GROXPI_CACHE_DIR` | L1 local cache directory |
+| `GROXPI_TIERED_SYNC_WORKERS` | `5` | Workers for async L1 population from L2 |
+| `GROXPI_TIERED_SYNC_QUEUE_SIZE` | `100` | Queue size for L1 sync operations |
+| `AWS_ENDPOINT_URL` | - | S3 endpoint URL (required for hybrid) |
+| `AWS_ACCESS_KEY_ID` | - | S3 access key (required for hybrid) |
+| `AWS_SECRET_ACCESS_KEY` | - | S3 secret key (required for hybrid) |
+| `AWS_REGION` | `us-east-1` | AWS region |
+| `GROXPI_S3_BUCKET` | - | S3 bucket name (required for hybrid) |
+| `GROXPI_S3_PREFIX` | `groxpi` | S3 key prefix |
+| `GROXPI_S3_USE_SSL` | `true` | Enable SSL for S3 connections |
+| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Force path-style URLs |
+
+**Benefits of Hybrid Storage:**
+- ⚡ **Fast Local Access**: Zero-copy serving from L1 for frequently-used packages
+- 💾 **S3 Persistence**: All packages stored durably in S3 (L2)
+- 🔄 **Auto L1 Population**: L2 hits automatically populate L1 for future requests
+- 📊 **LRU Eviction**: Intelligent L1 cache management based on access patterns
+- 💰 **Cost Efficient**: Only cache hot packages locally, everything else in S3
 
 ## Server Configuration
 
@@ -91,6 +121,32 @@ export AWS_REGION=us-east-1
 export GROXPI_S3_BUCKET=groxpi
 export GROXPI_S3_USE_SSL=false
 export GROXPI_S3_FORCE_PATH_STYLE=true
+```
+
+### Hybrid Storage Setup (Local L1 + S3 L2)
+```bash
+# Tiered caching: Fast local L1 + persistent S3 L2
+export GROXPI_STORAGE_TYPE=hybrid
+
+# Local L1 cache configuration
+export GROXPI_LOCAL_CACHE_SIZE=10737418240  # 10GB local cache
+export GROXPI_LOCAL_CACHE_DIR=/var/cache/groxpi
+export GROXPI_TIERED_SYNC_WORKERS=5
+export GROXPI_TIERED_SYNC_QUEUE_SIZE=100
+
+# S3 L2 storage configuration
+export AWS_ENDPOINT_URL=http://localhost:9000
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+export AWS_REGION=us-east-1
+export GROXPI_S3_BUCKET=groxpi
+export GROXPI_S3_PREFIX=packages/
+export GROXPI_S3_USE_SSL=false
+export GROXPI_S3_FORCE_PATH_STYLE=true
+
+# Server configuration
+export PORT=5000
+export GROXPI_LOGGING_LEVEL=INFO
 ```
 
 ### Multiple Indices

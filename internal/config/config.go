@@ -19,7 +19,7 @@ type Config struct {
 	CacheDir  string
 
 	// Storage configuration
-	StorageType       string // "local" or "s3"
+	StorageType       string // "local", "s3", or "hybrid"
 	S3Endpoint        string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
@@ -30,6 +30,12 @@ type Config struct {
 	S3UseSSL          bool
 	S3PartSize        int64 // Multipart upload part size
 	S3MaxConnections  int   // Max concurrent S3 connections (legacy)
+
+	// Hybrid/Tiered storage configuration
+	LocalCacheSize      int64  // Size limit for local L1 cache (hybrid mode only)
+	LocalCacheDir       string // Directory for local L1 cache (hybrid mode only)
+	TieredSyncWorkers   int    // Number of workers for L1 population (default: 5)
+	TieredSyncQueueSize int    // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
 	S3ReadPoolSize   int  // Max connections for GET operations
@@ -95,6 +101,12 @@ func Load() *Config {
 		S3AsyncWrites:    getBoolEnv("GROXPI_S3_ASYNC_WRITES", true),
 		S3AsyncWorkers:   int(getIntEnv("GROXPI_S3_ASYNC_WORKERS", 10)),
 		S3AsyncQueueSize: int(getIntEnv("GROXPI_S3_ASYNC_QUEUE_SIZE", 1000)),
+
+		// Hybrid/Tiered storage configuration
+		LocalCacheSize:      getIntEnv("GROXPI_LOCAL_CACHE_SIZE", 10*1024*1024*1024), // 10GB default
+		LocalCacheDir:       getEnv("GROXPI_LOCAL_CACHE_DIR", ""),
+		TieredSyncWorkers:   int(getIntEnv("GROXPI_TIERED_SYNC_WORKERS", 5)),
+		TieredSyncQueueSize: int(getIntEnv("GROXPI_TIERED_SYNC_QUEUE_SIZE", 100)),
 	}
 
 	// Parse extra index URLs
@@ -139,8 +151,13 @@ func Load() *Config {
 		cfg.CacheDir = os.TempDir()
 	}
 
-	// Validate S3 configuration if S3 storage is selected
-	if cfg.StorageType == "s3" {
+	// Set default local cache dir for hybrid mode
+	if cfg.LocalCacheDir == "" {
+		cfg.LocalCacheDir = cfg.CacheDir
+	}
+
+	// Validate S3 configuration if S3 or hybrid storage is selected
+	if cfg.StorageType == "s3" || cfg.StorageType == "hybrid" {
 		// Set S3 endpoint to AWS default if not specified
 		if cfg.S3Endpoint == "" {
 			cfg.S3Endpoint = "s3.amazonaws.com"
@@ -148,10 +165,10 @@ func Load() *Config {
 
 		// Validate required S3 settings
 		if cfg.S3Bucket == "" {
-			panic("GROXPI_S3_BUCKET must be set when using S3 storage")
+			panic("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
 		}
 		if cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
-			panic("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set when using S3 storage")
+			panic("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set when using S3 or hybrid storage")
 		}
 	}
 
