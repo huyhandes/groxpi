@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path"
 	"strings"
 	"sync"
@@ -129,10 +128,8 @@ func New(cfg *config.Config) *Server {
 	// Add compression middleware
 	router.Use(gzip.Gzip(gzip.BestSpeed))
 
-	// Load HTML templates (skip if templates directory doesn't exist - for tests)
-	if _, err := os.Stat("templates"); err == nil {
-		router.LoadHTMLGlob("templates/**/*.html")
-	}
+	// Note: Templates are not currently used - handlers generate HTML inline
+	// This avoids issues with template syntax differences between frameworks
 
 	// Initialize storage backend
 	storageBackend, err := initStorage(cfg)

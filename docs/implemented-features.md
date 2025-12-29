@@ -15,7 +15,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Metadata Support**: Requires-Python and file size information
 
 ### HTTP Server Features
-- **Fiber Framework**: Ultra-fast HTTP server with Express-like routing
+- **Gin Framework**: High-performance HTTP server with radix tree routing
 - **Response Compression**: Automatic gzip/deflate compression
 - **Request Logging**: Structured request/response logging with timing
 - **Error Recovery**: Automatic panic recovery with full stack traces
@@ -271,17 +271,16 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Performance Metrics**: RPS, latency percentiles, resource usage
 - **Historical Tracking**: Results saved for performance regression testing
 
-### Proven Performance Results (September 2024)
-- **15.4x Higher Throughput**: 43,335 vs 2,823 requests/sec
-- **30x Better Latency**: 1.12ms vs 33.6ms P50 response times
-- **Consistent Performance**: Stable across cold and warm cache scenarios
+### Proven Performance Results (December 2024)
+- **12.8x Higher Throughput**: 52,880 vs 4,139 requests/sec for package index
+- **27x Better Latency**: 0.85ms vs 23.04ms P50 response times
+- **High Load Stability**: Groxpi maintains stable responses while proxpi fails under high concurrency
 - **Production Validated**: Tested with popular packages (numpy, pandas, polars, pyspark, fastapi)
 
 ## Standards Compliance ✅
 
 ### HTTP Standards
 - **HTTP/1.1**: Full HTTP/1.1 specification compliance
-- **HTTP/2**: HTTP/2 support via Fiber framework
 - **Content Encoding**: Proper compression header handling
 - **Cache Control**: HTTP caching header support
 

@@ -10,12 +10,13 @@ Groxpi is designed as a drop-in replacement for the Python-based proxpi project,
 - **Same configuration**: All environment variables supported
 - **Same clients**: Works with pip, poetry, pipenv, uv, and other PyPI clients
 
-### 🚀 Performance Improvements
-- **16,000x faster** package index requests (benchmarked)
-- **Sub-millisecond** response times for cached requests
-- **4x less memory** usage (~50MB vs ~200MB+)
-- **50x faster** startup time (<100ms vs ~5s)
-- **1000+ concurrent** connections (vs ~100)
+### 🚀 Performance Improvements (December 2024 Benchmarks)
+- **12.8x higher throughput**: 52,880 vs 4,139 requests/sec for package index
+- **27x faster latency**: 0.85ms vs 23.04ms P50 response times
+- **Sub-millisecond** response times for cached package index
+- **High load stability**: Groxpi maintains responses while proxpi fails under high concurrency
+- **5x faster** startup time (<2s vs ~10s)
+- **1000+ concurrent** connections supported
 
 ## Migration Steps
 

@@ -120,15 +120,15 @@ results/
 └── benchmark-report-20240101_120000.md  # Consolidated report
 ```
 
-## Performance Results (September 2024)
+## Performance Results (December 2024)
 
 Latest benchmark results demonstrate groxpi's exceptional performance:
 
-**API Performance (WRK Load Testing):**
-- **15.4x faster** API throughput (43,335 vs 2,823 requests/sec)
-- **30x faster** response times (1.12ms vs 33.6ms P50 latency)
-- **Consistent performance** across cold and warm cache scenarios
-- **Sub-millisecond P50 latency** under high load (100 connections, 8 threads)
+**API Performance (WRK Load Testing - 60s, 8 threads, 100 connections):**
+- **12.8x higher throughput**: 52,880 vs 4,139 requests/sec for package index
+- **27x faster latency**: 0.85ms vs 23.04ms P50 response times
+- **High load stability**: Groxpi maintains stable responses while proxpi fails (returns non-2xx)
+- **Sub-millisecond P50 latency** for cached package index requests
 
 **Resource Efficiency:**
 - **Production validated** with popular packages (numpy, pandas, polars, pyspark, fastapi)

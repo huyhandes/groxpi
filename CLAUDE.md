@@ -1,10 +1,10 @@
 # groxpi - Go PyPI Proxy
 
-A high-performance PyPI caching proxy server written in Go, reimplemented from the Python-based proxpi project using Fiber framework and Sonic JSON.
+A high-performance PyPI caching proxy server written in Go, reimplemented from the Python-based proxpi project using Gin framework and Sonic JSON.
 
 ## Project Goals
 
-1. **Maximum Performance**: Leverage Go's concurrency, Fiber framework (2x faster), and Sonic JSON (3x faster) for minimal CPU/memory usage
+1. **Maximum Performance**: Leverage Go's concurrency, Gin framework, and Sonic JSON (3x faster) for minimal CPU/memory usage
 2. **Feature Parity**: Maintain all features from the original proxpi implementation, extend the power to use S3 as cache backend
 3. **Production Ready**: Built for reliability, observability, and ease of deployment
 
@@ -12,9 +12,9 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 
 ### Technology Stack
 - **Language**: Go 1.24+
-- **Web Framework**: [Fiber v2](https://gofiber.io/) - Express-inspired, ultra-fast HTTP framework
+- **Web Framework**: [Gin v1.11](https://gin-gonic.com/) - High-performance HTTP web framework
 - **JSON Processing**: [ByteDance Sonic](https://github.com/bytedance/sonic) - Blazingly fast JSON serialization
-- **Templates**: Go HTML templates with Fiber integration
+- **Templates**: Go HTML templates with Gin integration
 - **Cache**: In-memory TTL cache + LRU file cache
 - **Storage**: Local filesystem + S3-compatible storage (MinIO/AWS S3)
 - **Logging**: [phuslu/log](https://github.com/phuslu/log) - High-performance structured logging
@@ -34,7 +34,7 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 - Follow SingleFlight pattern to reduce IO overhead
 - Apply Zero-copy optimization to remove Memory overhead and avoid GC
 - Use byte pools for frequent allocations
-- Leverage Fiber's built-in optimizations
+- Leverage Gin's built-in optimizations
 
 ### Code Organization
 ```
@@ -45,7 +45,7 @@ groxpi/
 │   ├── config/         # Configuration management
 │   ├── logger/         # Structured logging with phuslu/log
 │   ├── pypi/           # PyPI client with Sonic JSON
-│   ├── server/         # Fiber HTTP server and handlers
+│   ├── server/         # Gin HTTP server and handlers
 │   ├── storage/        # Storage backend abstraction (local/S3)
 │   └── streaming/      # Zero-copy streaming (broadcast, downloader, zerocopy)
 ├── docs/               # Detailed documentation
@@ -157,7 +157,7 @@ docker-compose up -d
 - Document exported functions
 - Handle errors explicitly
 - No panics in production code
-- Follow Fiber and Sonic best practices
+- Follow Gin and Sonic best practices
 
 ## License
 
