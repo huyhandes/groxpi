@@ -495,7 +495,10 @@ func (s *Server) handleDownloadWithCoordination(c *gin.Context, packageName, fil
 	ctx := context.Background()
 	if exists, _ := s.storage.Exists(ctx, storageKey); exists {
 		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
-		s.serveFromStorageOptimized(c, storageKey)
+		if err := s.serveFromStorageOptimized(c, storageKey); err != nil {
+			log.Error().Err(err).Str("storage_key", storageKey).Msg("Failed to serve from storage")
+			c.String(http.StatusInternalServerError, "Failed to serve file")
+		}
 		return
 	}
 
@@ -552,7 +555,10 @@ func (s *Server) handleDownloadWithCoordination(c *gin.Context, packageName, fil
 		if downloadErr == nil {
 			if exists, _ := s.storage.Exists(ctx, storageKey); exists {
 				log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage after coordinated download")
-				s.serveFromStorageOptimized(c, storageKey)
+				if err := s.serveFromStorageOptimized(c, storageKey); err != nil {
+					log.Error().Err(err).Str("storage_key", storageKey).Msg("Failed to serve from storage after coordinated download")
+					c.String(http.StatusInternalServerError, "Failed to serve file")
+				}
 				return
 			}
 		}
@@ -647,8 +653,7 @@ func (s *Server) handleDownloadInternal(c *gin.Context, packageName, fileName st
 	if exists {
 		// Serve from storage using zero-copy when possible
 		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
-		s.serveFromStorageOptimized(c, storageKey)
-		return nil
+		return s.serveFromStorageOptimized(c, storageKey)
 	}
 
 	// Check download timeout to decide whether to stream or redirect
