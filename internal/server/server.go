@@ -807,6 +807,7 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		return storage.NewTieredStorage(&storage.TieredConfig{
 			LocalCacheDir:  cfg.LocalCacheDir,
 			LocalCacheSize: cfg.LocalCacheSize,
+			LocalCacheTTL:  cfg.LocalCacheTTL,
 			S3Config: &storage.S3Config{
 				Endpoint:        cfg.S3Endpoint,
 				AccessKeyID:     cfg.S3AccessKeyID,
@@ -863,8 +864,8 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		})
 	}
 
-	// Default to local storage with LRU eviction
-	return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize)
+	// Default to local storage with LRU eviction (no TTL for non-hybrid mode)
+	return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
 }
 
 // serveFromStorage serves a file from the storage backend

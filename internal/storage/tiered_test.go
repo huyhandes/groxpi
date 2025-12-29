@@ -19,7 +19,7 @@ func TestTieredStorage_BasicOperations(t *testing.T) {
 	// Note: This is a basic structure test. Full integration tests would use MinIO
 	t.Run("creation", func(t *testing.T) {
 		// Just verify local cache creation works
-		lruCache, err := NewLRULocalStorage(localDir, 1024*1024*10)
+		lruCache, err := NewLRULocalStorage(localDir, 1024*1024*10, 0)
 		if err != nil {
 			t.Fatalf("Failed to create LRU local storage: %v", err)
 		}
@@ -36,7 +36,7 @@ func TestLRUCache(t *testing.T) {
 	baseDir := t.TempDir()
 	maxSize := int64(1024) // 1KB max
 
-	lru := NewLRUCache(baseDir, maxSize)
+	lru := NewLRUCache(baseDir, maxSize, 0)
 	defer func() { _ = lru.Close() }()
 
 	t.Run("records access", func(t *testing.T) {
@@ -98,7 +98,7 @@ func TestLRULocalStorage(t *testing.T) {
 	baseDir := t.TempDir()
 	maxSize := int64(1024 * 1024) // 1MB
 
-	storage, err := NewLRULocalStorage(baseDir, maxSize)
+	storage, err := NewLRULocalStorage(baseDir, maxSize, 0)
 	if err != nil {
 		t.Fatalf("Failed to create LRU local storage: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestLRULocalStorage(t *testing.T) {
 		}
 
 		// Create new storage that should rebuild cache
-		newStorage, err := NewLRULocalStorage(baseDir, maxSize)
+		newStorage, err := NewLRULocalStorage(baseDir, maxSize, 0)
 		if err != nil {
 			t.Fatalf("Failed to create new LRU storage: %v", err)
 		}
@@ -198,7 +198,7 @@ func TestTieredStorage_ConcurrentAccess(t *testing.T) {
 	baseDir := t.TempDir()
 	maxSize := int64(10 * 1024 * 1024) // 10MB
 
-	storage, err := NewLRULocalStorage(baseDir, maxSize)
+	storage, err := NewLRULocalStorage(baseDir, maxSize, 0)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}

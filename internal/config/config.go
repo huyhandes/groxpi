@@ -32,10 +32,11 @@ type Config struct {
 	S3MaxConnections  int   // Max concurrent S3 connections (legacy)
 
 	// Hybrid/Tiered storage configuration
-	LocalCacheSize      int64  // Size limit for local L1 cache (hybrid mode only)
-	LocalCacheDir       string // Directory for local L1 cache (hybrid mode only)
-	TieredSyncWorkers   int    // Number of workers for L1 population (default: 5)
-	TieredSyncQueueSize int    // Size of tiered sync queue (default: 100)
+	LocalCacheSize      int64         // Size limit for local L1 cache (hybrid mode only)
+	LocalCacheDir       string        // Directory for local L1 cache (hybrid mode only)
+	LocalCacheTTL       time.Duration // TTL for local L1 cache entries (0 = disabled)
+	TieredSyncWorkers   int           // Number of workers for L1 population (default: 5)
+	TieredSyncQueueSize int           // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
 	S3ReadPoolSize   int  // Max connections for GET operations
@@ -105,6 +106,7 @@ func Load() *Config {
 		// Hybrid/Tiered storage configuration
 		LocalCacheSize:      getIntEnv("GROXPI_LOCAL_CACHE_SIZE", 10*1024*1024*1024), // 10GB default
 		LocalCacheDir:       getEnv("GROXPI_LOCAL_CACHE_DIR", ""),
+		LocalCacheTTL:       getDurationEnv("GROXPI_LOCAL_CACHE_TTL", 0), // 0 = disabled
 		TieredSyncWorkers:   int(getIntEnv("GROXPI_TIERED_SYNC_WORKERS", 5)),
 		TieredSyncQueueSize: int(getIntEnv("GROXPI_TIERED_SYNC_QUEUE_SIZE", 100)),
 	}

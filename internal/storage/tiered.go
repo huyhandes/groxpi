@@ -161,6 +161,7 @@ type TieredConfig struct {
 	// Local cache (L1) configuration
 	LocalCacheDir  string
 	LocalCacheSize int64
+	LocalCacheTTL  time.Duration // TTL for local cache entries (0 = disabled)
 
 	// S3 (L2) configuration
 	S3Config *S3Config
@@ -184,7 +185,7 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 	}
 
 	// Create local storage with LRU eviction (L1 cache)
-	localStorage, err := NewLRULocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize)
+	localStorage, err := NewLRULocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local storage: %w", err)
 	}
@@ -208,6 +209,7 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 		Str("local_cache_dir", cfg.LocalCacheDir).
 		Int64("local_cache_size_bytes", cfg.LocalCacheSize).
 		Int64("local_cache_size_mb", cfg.LocalCacheSize/(1024*1024)).
+		Dur("local_cache_ttl", cfg.LocalCacheTTL).
 		Str("s3_endpoint", cfg.S3Config.Endpoint).
 		Str("s3_bucket", cfg.S3Config.Bucket).
 		Int("sync_workers", cfg.SyncWorkers).
