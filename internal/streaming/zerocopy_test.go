@@ -47,31 +47,6 @@ func (m *mockZeroCopyWriter) String() string {
 	return m.buffer.String()
 }
 
-// Mock Fiber context for testing
-type mockFiberContext struct {
-	buffer      bytes.Buffer
-	sendFileErr error
-	sentFile    string
-}
-
-func (m *mockFiberContext) Write(p []byte) (n int, err error) {
-	return m.buffer.Write(p)
-}
-
-func (m *mockFiberContext) SendFile(filename string, compress ...bool) error {
-	if m.sendFileErr != nil {
-		return m.sendFileErr
-	}
-	m.sentFile = filename
-	return nil
-}
-
-func (m *mockFiberContext) Stream(fn func(w *io.Writer) error) error {
-	var buf bytes.Buffer
-	writer := io.Writer(&buf)
-	return fn(&writer)
-}
-
 // Test helper functions
 func createTempFile(t *testing.T, content string) string {
 	t.Helper()
@@ -232,87 +207,6 @@ func TestZeroCopyServer_ServeReader(t *testing.T) {
 	})
 }
 
-func TestNewFiberZeroCopyServer(t *testing.T) {
-	t.Run("creates fiber zero-copy server", func(t *testing.T) {
-		server := NewFiberZeroCopyServer()
-		if server == nil {
-			t.Fatal("NewFiberZeroCopyServer returned nil")
-		}
-	})
-}
-
-func TestFiberZeroCopyServer_ServeFile(t *testing.T) {
-	t.Run("serve file with fiber context", func(t *testing.T) {
-		content := "fiber test content"
-		filename := createTempFile(t, content)
-		defer func() { _ = os.Remove(filename) }()
-
-		server := NewFiberZeroCopyServer()
-		fiberCtx := &mockFiberContext{}
-		ctx := context.Background()
-
-		err := server.ServeFile(ctx, fiberCtx, filename)
-		if err != nil {
-			t.Fatalf("Fiber ServeFile failed: %v", err)
-		}
-
-		if fiberCtx.sentFile != filename {
-			t.Errorf("Expected sent file %q, got %q", filename, fiberCtx.sentFile)
-		}
-	})
-
-	t.Run("fiber sendfile error falls back to regular", func(t *testing.T) {
-		content := "fallback test content"
-		filename := createTempFile(t, content)
-		defer func() { _ = os.Remove(filename) }()
-
-		server := NewFiberZeroCopyServer()
-		fiberCtx := &mockFiberContext{sendFileErr: errors.New("sendfile failed")}
-		ctx := context.Background()
-
-		// Should fall back to regular zero-copy server, but may still fail due to mock limitations
-		err := server.ServeFile(ctx, fiberCtx, filename)
-		if err != nil && !strings.Contains(err.Error(), "sendfile failed") {
-			t.Fatalf("Fallback ServeFile failed with unexpected error: %v", err)
-		}
-	})
-
-	t.Run("non-fiber writer uses regular server", func(t *testing.T) {
-		content := "regular writer test"
-		filename := createTempFile(t, content)
-		defer func() { _ = os.Remove(filename) }()
-
-		server := NewFiberZeroCopyServer()
-		writer := &mockZeroCopyWriter{}
-		ctx := context.Background()
-
-		err := server.ServeFile(ctx, writer, filename)
-		if err != nil {
-			t.Fatalf("Regular writer ServeFile failed: %v", err)
-		}
-
-		if writer.String() != content {
-			t.Errorf("Content mismatch: expected %q, got %q", content, writer.String())
-		}
-	})
-}
-
-func TestFiberZeroCopyServer_ServeReader(t *testing.T) {
-	t.Run("serve reader with fiber streaming", func(t *testing.T) {
-		content := "fiber reader test"
-		reader := strings.NewReader(content)
-
-		server := NewFiberZeroCopyServer()
-		fiberCtx := &mockFiberContext{}
-		ctx := context.Background()
-
-		err := server.ServeReader(ctx, fiberCtx, reader, int64(len(content)))
-		if err != nil {
-			t.Fatalf("Fiber ServeReader failed: %v", err)
-		}
-	})
-}
-
 func TestNewMemoryMappedServer(t *testing.T) {
 	t.Run("creates memory-mapped server", func(t *testing.T) {
 		server := NewMemoryMappedServer()
@@ -410,25 +304,6 @@ func TestOptimalServer_ServeFile(t *testing.T) {
 		}
 	})
 
-	t.Run("fiber writer uses fiber optimization", func(t *testing.T) {
-		content := "fiber optimization test"
-		filename := createTempFile(t, content)
-		defer func() { _ = os.Remove(filename) }()
-
-		server := NewOptimalServer()
-		fiberCtx := &mockFiberContext{}
-		ctx := context.Background()
-
-		err := server.ServeFile(ctx, fiberCtx, filename)
-		if err != nil {
-			t.Fatalf("Fiber optimization failed: %v", err)
-		}
-
-		if fiberCtx.sentFile != filename {
-			t.Errorf("Fiber should have sent file %q, got %q", filename, fiberCtx.sentFile)
-		}
-	})
-
 	t.Run("sendfile compatible writer", func(t *testing.T) {
 		content := "sendfile compatible test"
 		filename := createTempFile(t, content)
@@ -494,26 +369,6 @@ func BenchmarkZeroCopyServer_LargeFile(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		writer := &mockZeroCopyWriter{}
 		_ = server.ServeFile(ctx, writer, filename)
-	}
-}
-
-func BenchmarkFiberZeroCopyServer_Comparison(b *testing.B) {
-	// Set log level to ERROR to suppress debug output during benchmarks
-	originalLogger := log.DefaultLogger
-	log.DefaultLogger.SetLevel(log.ErrorLevel)
-	defer func() { log.DefaultLogger = originalLogger }()
-
-	content := "fiber benchmark content"
-	filename := createTempFileForBench(content)
-	defer func() { _ = os.Remove(filename) }()
-
-	server := NewFiberZeroCopyServer()
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		fiberCtx := &mockFiberContext{}
-		_ = server.ServeFile(ctx, fiberCtx, filename)
 	}
 }
 

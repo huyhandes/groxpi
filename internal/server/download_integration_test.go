@@ -12,9 +12,17 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/stretchr/testify/assert"
 )
+
+// testRequestIntegration performs an HTTP request against the router
+func testRequestIntegration(router *gin.Engine, req *http.Request) *http.Response {
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Result()
+}
 
 type integrationTestResult struct {
 	StatusCode int
@@ -85,7 +93,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Test concurrent downloads are deduplicated
 	t.Run("concurrent_deduplication", func(t *testing.T) {
@@ -104,22 +112,19 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 				defer wg.Done()
 
 				req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-				resp, err := app.Test(req, 15000) // 15 second timeout
+				resp := testRequestIntegration(router, req)
 
 				results[index] = integrationTestResult{
-					StatusCode: -1,
-					Error:      err,
+					StatusCode: resp.StatusCode,
+					Error:      nil,
 				}
 
-				if err == nil {
-					results[index].StatusCode = resp.StatusCode
-					if resp.Body != nil {
-						body, readErr := io.ReadAll(resp.Body)
-						if readErr == nil {
-							results[index].BodySize = len(body)
-						}
-						_ = resp.Body.Close()
+				if resp.Body != nil {
+					body, readErr := io.ReadAll(resp.Body)
+					if readErr == nil {
+						results[index].BodySize = len(body)
 					}
+					_ = resp.Body.Close()
 				}
 			}(i)
 		}
@@ -226,7 +231,7 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Simulate multiple pip clients trying to download the same large package
 	t.Run("multiple_pip_clients", func(t *testing.T) {
@@ -242,12 +247,7 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 				defer wg.Done()
 
 				req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-				resp, err := app.Test(req, 45000) // 45 second timeout for real-world scenario
-
-				if err != nil {
-					t.Errorf("Client %d failed: %v", clientIndex, err)
-					return
-				}
+				resp := testRequestIntegration(router, req)
 
 				if resp.StatusCode != http.StatusOK {
 					t.Errorf("Client %d: expected status 200, got %d", clientIndex, resp.StatusCode)

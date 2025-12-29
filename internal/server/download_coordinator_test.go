@@ -11,8 +11,16 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
+
+// testRequestCoord performs an HTTP request against the router
+func testRequestCoord(router *gin.Engine, req *http.Request) *http.Response {
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Result()
+}
 
 // TestServer_DownloadCoordinator_ConcurrentRequests tests that concurrent requests for the same file are properly coordinated
 func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
@@ -71,7 +79,7 @@ func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	numConcurrentRequests := 10
 	var wg sync.WaitGroup
@@ -87,12 +95,7 @@ func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
 			defer wg.Done()
 
 			req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-			resp, err := app.Test(req, 10000) // 10 second timeout
-
-			if err != nil {
-				results[index] = -1 // Mark as error
-				return
-			}
+			resp := testRequestCoord(router, req)
 
 			results[index] = resp.StatusCode
 			_ = resp.Body.Close()
@@ -147,7 +150,7 @@ func TestServer_DownloadCoordinator_ErrorHandling(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Launch concurrent requests to a failing package
 	numRequests := 5
@@ -160,12 +163,7 @@ func TestServer_DownloadCoordinator_ErrorHandling(t *testing.T) {
 			defer wg.Done()
 
 			req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-			resp, err := app.Test(req, 5000)
-
-			if err != nil {
-				responses[index] = -1 // Mark as error
-				return
-			}
+			resp := testRequestCoord(router, req)
 
 			responses[index] = resp.StatusCode
 			_ = resp.Body.Close()
@@ -211,14 +209,11 @@ func TestServer_DownloadCoordinator_Cleanup(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Make a download request
 	req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-	resp, err := app.Test(req, 5000)
-	if err != nil {
-		t.Fatalf("Initial request failed: %v", err)
-	}
+	resp := testRequestCoord(router, req)
 	_ = resp.Body.Close()
 
 	// Verify download entry exists in coordinator

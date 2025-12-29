@@ -11,8 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
+
+// testRequestBench performs an HTTP request against the router
+func testRequestBench(router *gin.Engine, req *http.Request) *http.Response {
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Result()
+}
 
 // BenchmarkDownloadCoordination_SingleFile tests download coordination performance
 func BenchmarkDownloadCoordination_SingleFile(b *testing.B) {
@@ -59,7 +67,7 @@ func BenchmarkDownloadCoordination_SingleFile(b *testing.B) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	b.ResetTimer()
 
@@ -67,11 +75,7 @@ func BenchmarkDownloadCoordination_SingleFile(b *testing.B) {
 		atomic.StoreInt64(&downloadAttempts, 0)
 
 		req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-		resp, err := app.Test(req, 30000)
-
-		if err != nil {
-			b.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequestBench(router, req)
 
 		if resp.StatusCode != http.StatusOK {
 			b.Fatalf("Expected status 200, got %d", resp.StatusCode)
@@ -138,7 +142,7 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	concurrencyLevels := []int{1, 2, 5, 10, 20}
 
@@ -160,12 +164,7 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 						defer wg.Done()
 
 						req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-						resp, err := app.Test(req, 60000) // Longer timeout for concurrent tests
-
-						if err != nil {
-							errors <- err
-							return
-						}
+						resp := testRequestBench(router, req)
 
 						if resp.StatusCode != http.StatusOK {
 							errors <- fmt.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -291,18 +290,14 @@ func BenchmarkDownloadCoordination_LargeFile(b *testing.B) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	b.ResetTimer()
 	b.SetBytes(int64(fileSize)) // Report throughput
 
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-		resp, err := app.Test(req, 120000) // 2 minute timeout
-
-		if err != nil {
-			b.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequestBench(router, req)
 
 		if resp.StatusCode != http.StatusOK {
 			b.Fatalf("Expected status 200, got %d", resp.StatusCode)

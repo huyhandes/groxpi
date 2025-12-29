@@ -12,8 +12,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
+
+// testRequest performs an HTTP request against the router and returns the response
+func testRequest(router *gin.Engine, req *http.Request) *http.Response {
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Result()
+}
 
 func TestNew(t *testing.T) {
 	cfg := &config.Config{
@@ -31,8 +39,8 @@ func TestNew(t *testing.T) {
 	}
 
 	// Test that server has required components initialized
-	if srv.App() == nil {
-		t.Error("Fiber app not initialized")
+	if srv.Router() == nil {
+		t.Error("Gin router not initialized")
 	}
 
 	// Test server interface - we can't access private fields
@@ -49,13 +57,10 @@ func TestServer_HandleHome(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -89,13 +94,10 @@ func TestServer_HandleHealth(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/health", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -138,15 +140,12 @@ func TestServer_HandleListPackages_HTML(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "text/html")
 
-	resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -177,15 +176,12 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-	resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -236,13 +232,10 @@ func TestServer_HandleListFiles(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/nonexistent-test-package-xyz", nil)
-	resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	// Should return 404 since package doesn't exist
@@ -259,13 +252,10 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/numpy/numpy-1.21.0-py3-none-any.whl", nil)
-	resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	// Should return 404 since file is not cached
@@ -281,14 +271,11 @@ func TestServer_HandleCacheList(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Test DELETE method
 	req := httptest.NewRequest("DELETE", "/cache/list", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -306,10 +293,7 @@ func TestServer_HandleCacheList(t *testing.T) {
 
 	// Test wrong method
 	req = httptest.NewRequest("GET", "/cache/list", nil)
-	resp, err = app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp = testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -324,14 +308,11 @@ func TestServer_HandleCachePackage(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	// Test DELETE method with package name
 	req := httptest.NewRequest("DELETE", "/cache/numpy", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
@@ -355,13 +336,10 @@ func TestServer_Handle404(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/non-existent-path", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNotFound {
@@ -378,16 +356,13 @@ func TestServer_ContentNegotiation(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("JSON request returns JSON", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		contentType := resp.Header.Get("Content-Type")
@@ -400,10 +375,7 @@ func TestServer_ContentNegotiation(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "text/html")
 
-		resp, err := app.Test(req, 15000) // 15 second timeout for macOS compatibility
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		contentType := resp.Header.Get("Content-Type")
@@ -464,14 +436,11 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("Missing file returns 404", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/nonexistent/nonexistent-1.0.0.tar.gz", nil)
-		resp, err := app.Test(req, 15000)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusNotFound {
@@ -481,10 +450,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 
 	t.Run("Invalid package name", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/../etc/passwd", nil)
-		resp, err := app.Test(req, 15000)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle path traversal safely
@@ -502,16 +468,13 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("Package with special characters", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/test-package_123", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 15000)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle special characters in package names
@@ -522,10 +485,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 
 	t.Run("Empty package name", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index//", nil)
-		resp, err := app.Test(req, 15000)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle empty package names gracefully
@@ -542,7 +502,7 @@ func TestServer_WantsJSON(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	tests := []struct {
 		name        string
@@ -564,10 +524,7 @@ func TestServer_WantsJSON(t *testing.T) {
 				req.Header.Set("Accept", tt.accept)
 			}
 
-			resp, err := app.Test(req, 15000)
-			if err != nil {
-				t.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			defer func() { _ = resp.Body.Close() }()
 
 			contentType := resp.Header.Get("Content-Type")
@@ -597,16 +554,13 @@ func TestServer_NormalizePackageName(t *testing.T) {
 
 	cfg := &config.Config{IndexURL: "https://pypi.org/simple/", CacheDir: "/tmp/test"}
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
 			// Test through HTTP request to cover the normalization
 			req := httptest.NewRequest("GET", "/index/"+tt.input, nil)
-			resp, err := app.Test(req, 15000)
-			if err != nil {
-				t.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
 			// Should handle normalization without errors
@@ -624,16 +578,13 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("Cache list with invalid method", func(t *testing.T) {
 		methods := []string{"POST", "PUT", "PATCH"}
 		for _, method := range methods {
 			req := httptest.NewRequest(method, "/cache/list", nil)
-			resp, err := app.Test(req)
-			if err != nil {
-				t.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -646,10 +597,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 		packages := []string{"test-package", "test_package", "Test.Package"}
 		for _, pkg := range packages {
 			req := httptest.NewRequest("DELETE", "/cache/"+pkg, nil)
-			resp, err := app.Test(req)
-			if err != nil {
-				t.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
@@ -669,13 +617,10 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/health", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
+	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
 	var response map[string]interface{}
@@ -708,16 +653,13 @@ func TestServer_ErrorHandling(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("Network error handling", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, 10000) // 10 seconds for DNS timeout
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		// Should handle network errors gracefully without crashing
@@ -764,12 +706,11 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	const numConcurrentRequests = 10
 	var wg sync.WaitGroup
 	responses := make([]*http.Response, numConcurrentRequests)
-	errors := make([]error, numConcurrentRequests)
 
 	// Launch concurrent requests to the same endpoint
 	for i := 0; i < numConcurrentRequests; i++ {
@@ -779,9 +720,8 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 			req := httptest.NewRequest("GET", "/index/", nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req, -1) // No timeout
+			resp := testRequest(router, req)
 			responses[idx] = resp
-			errors[idx] = err
 		}(i)
 	}
 
@@ -795,10 +735,6 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 
 	// Verify all server responses are successful
 	for i := 0; i < numConcurrentRequests; i++ {
-		if errors[i] != nil {
-			t.Errorf("Request %d failed: %v", i, errors[i])
-			continue
-		}
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -882,12 +818,11 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	const numConcurrentRequests = 8
 	var wg sync.WaitGroup
 	responses := make([]*http.Response, numConcurrentRequests)
-	errors := make([]error, numConcurrentRequests)
 
 	// Launch concurrent requests for the same package
 	for i := 0; i < numConcurrentRequests; i++ {
@@ -897,9 +832,8 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 			req := httptest.NewRequest("GET", "/index/"+packageName, nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req, -1) // No timeout
+			resp := testRequest(router, req)
 			responses[idx] = resp
-			errors[idx] = err
 		}(i)
 	}
 
@@ -913,10 +847,6 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 
 	// Verify all server responses are successful
 	for i := 0; i < numConcurrentRequests; i++ {
-		if errors[i] != nil {
-			t.Errorf("Request %d failed: %v", i, errors[i])
-			continue
-		}
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -991,12 +921,11 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	const numConcurrentRequests = 6
 	var wg sync.WaitGroup
 	responses := make([]*http.Response, numConcurrentRequests)
-	errors := make([]error, numConcurrentRequests)
 
 	// Launch concurrent requests that should all fail
 	for i := 0; i < numConcurrentRequests; i++ {
@@ -1006,9 +935,8 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 			req := httptest.NewRequest("GET", "/index/", nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req, -1) // No timeout
+			resp := testRequest(router, req)
 			responses[idx] = resp
-			errors[idx] = err
 		}(i)
 	}
 
@@ -1022,10 +950,6 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 
 	// Verify all server responses indicate the error was handled consistently
 	for i := 0; i < numConcurrentRequests; i++ {
-		if errors[i] != nil {
-			t.Errorf("Request %d failed at app level: %v", i, errors[i])
-			continue
-		}
 
 		// The server may return 200 with empty list on PyPI error, which is valid behavior
 		// What matters is that singleflight prevented duplicate requests to PyPI
@@ -1094,12 +1018,11 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	packages := []string{"package-a", "package-b", "package-c"}
 	var wg sync.WaitGroup
 	responses := make([]*http.Response, len(packages))
-	errors := make([]error, len(packages))
 
 	// Launch concurrent requests for different packages
 	for i, pkg := range packages {
@@ -1109,9 +1032,8 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 			req := httptest.NewRequest("GET", "/index/"+packageName, nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req, -1) // No timeout
+			resp := testRequest(router, req)
 			responses[idx] = resp
-			errors[idx] = err
 		}(i, pkg)
 	}
 
@@ -1127,10 +1049,6 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 	responseData := make(map[string]map[string]interface{})
 
 	for i := 0; i < len(packages); i++ {
-		if errors[i] != nil {
-			t.Errorf("Request %d failed: %v", i, errors[i])
-			continue
-		}
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -1198,7 +1116,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -1206,10 +1124,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 			req := httptest.NewRequest("GET", "/index/", nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req)
-			if err != nil {
-				b.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
@@ -1244,7 +1159,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -1252,10 +1167,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 			req := httptest.NewRequest("GET", "/index/benchmark-package", nil)
 			req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-			resp, err := app.Test(req)
-			if err != nil {
-				b.Fatalf("Request failed: %v", err)
-			}
+			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
@@ -1298,16 +1210,13 @@ func TestServer_URLRewriting(t *testing.T) {
 	}
 
 	srv := New(cfg)
-	app := srv.App()
+	router := srv.Router()
 
 	t.Run("JSON response URLs rewritten to proxy", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/"+packageName, nil)
 		req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
 
-		resp, err := app.Test(req, -1)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
@@ -1355,10 +1264,7 @@ func TestServer_URLRewriting(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/"+packageName, nil)
 		req.Header.Set("Accept", "text/html")
 
-		resp, err := app.Test(req, -1)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
+		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {

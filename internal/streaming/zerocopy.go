@@ -155,60 +155,6 @@ func (zcs *zeroCopyServer) sendfile(dst, src int, size int64) error {
 	return nil
 }
 
-// FiberZeroCopyServer provides Fiber-specific zero-copy optimizations
-type fiberZeroCopyServer struct {
-	copyBufPool *sync.Pool
-}
-
-// NewFiberZeroCopyServer creates a ZeroCopyServer optimized for Fiber
-func NewFiberZeroCopyServer() ZeroCopyServer {
-	return &fiberZeroCopyServer{
-		copyBufPool: &sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, 64*1024)
-				return &buf
-			},
-		},
-	}
-}
-
-// ServeFile serves a file using Fiber-specific optimizations
-func (fzcs *fiberZeroCopyServer) ServeFile(ctx context.Context, writer io.Writer, filepath string) error {
-	// Check if writer is Fiber's fasthttp context
-	if fiberCtx, ok := writer.(interface {
-		SendFile(filename string, compress ...bool) error
-	}); ok {
-		// Use Fiber's SendFile which leverages fasthttp's zero-copy
-		return fiberCtx.SendFile(filepath)
-	}
-
-	// Fall back to regular zero-copy server
-	zcs := NewZeroCopyServer()
-	return zcs.ServeFile(ctx, writer, filepath)
-}
-
-// ServeReader serves from reader with Fiber optimizations
-func (fzcs *fiberZeroCopyServer) ServeReader(ctx context.Context, writer io.Writer, reader io.Reader, size int64) error {
-	// Check if we can use Fiber's streaming capabilities
-	if fiberCtx, ok := writer.(interface {
-		Stream(fn func(w *io.Writer) error) error
-	}); ok {
-		// Use Fiber's streaming for better performance
-		return fiberCtx.Stream(func(w *io.Writer) error {
-			copyBufPtr := fzcs.copyBufPool.Get().(*[]byte)
-			defer fzcs.copyBufPool.Put(copyBufPtr)
-			copyBuf := *copyBufPtr
-
-			_, err := io.CopyBuffer(*w, reader, copyBuf)
-			return err
-		})
-	}
-
-	// Fall back to regular serving
-	zcs := NewZeroCopyServer()
-	return zcs.ServeReader(ctx, writer, reader, size)
-}
-
 // MemoryMappedServer provides memory-mapped file serving for very large files
 type memoryMappedServer struct{}
 
@@ -268,7 +214,6 @@ func (mms *memoryMappedServer) ServeReader(ctx context.Context, writer io.Writer
 // OptimalServer chooses the best serving strategy based on context
 type optimalServer struct {
 	sendfileServer ZeroCopyServer
-	fiberServer    ZeroCopyServer
 	mmapServer     ZeroCopyServer
 	regularServer  ZeroCopyServer
 }
@@ -277,7 +222,6 @@ type optimalServer struct {
 func NewOptimalServer() ZeroCopyServer {
 	return &optimalServer{
 		sendfileServer: NewZeroCopyServer(),
-		fiberServer:    NewFiberZeroCopyServer(),
 		mmapServer:     NewMemoryMappedServer(),
 		regularServer:  NewZeroCopyServer(),
 	}
@@ -299,10 +243,6 @@ func (os *optimalServer) ServeFile(ctx context.Context, writer io.Writer, filepa
 		log.Debug().Str("file", filepath).Int64("size", size).Msg("Using memory-mapped serving")
 		return os.mmapServer.ServeFile(ctx, writer, filepath)
 
-	case isFiberWriter(writer): // Fiber context - use Fiber optimizations
-		log.Debug().Str("file", filepath).Msg("Using Fiber optimized serving")
-		return os.fiberServer.ServeFile(ctx, writer, filepath)
-
 	case supportsSendfile(writer): // TCP connection - use sendfile
 		log.Debug().Str("file", filepath).Msg("Using sendfile serving")
 		return os.sendfileServer.ServeFile(ctx, writer, filepath)
@@ -315,9 +255,6 @@ func (os *optimalServer) ServeFile(ctx context.Context, writer io.Writer, filepa
 
 // ServeReader chooses optimal reader serving strategy
 func (os *optimalServer) ServeReader(ctx context.Context, writer io.Writer, reader io.Reader, size int64) error {
-	if isFiberWriter(writer) {
-		return os.fiberServer.ServeReader(ctx, writer, reader, size)
-	}
 	return os.regularServer.ServeReader(ctx, writer, reader, size)
 }
 
@@ -326,14 +263,7 @@ func (o *optimalServer) Stat(filepath string) (os.FileInfo, error) {
 	return os.Stat(filepath)
 }
 
-// Helper functions
-func isFiberWriter(writer io.Writer) bool {
-	_, ok := writer.(interface {
-		SendFile(filename string, compress ...bool) error
-	})
-	return ok
-}
-
+// supportsSendfile checks if writer supports sendfile syscall
 func supportsSendfile(writer io.Writer) bool {
 	_, ok := writer.(interface{ File() (*os.File, error) })
 	return ok

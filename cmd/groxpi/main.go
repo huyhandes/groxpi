@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -66,7 +67,13 @@ func main() {
 
 	// Create server
 	srv := server.New(cfg)
-	app := srv.App()
+	router := srv.Router()
+
+	// Create HTTP server
+	httpServer := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: router,
+	}
 
 	// Start server in goroutine
 	go func() {
@@ -74,7 +81,7 @@ func main() {
 			Str("address", ":"+cfg.Port).
 			Msg("🌐 HTTP server starting")
 
-		if err := app.Listen(":" + cfg.Port); err != nil {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("Failed to start server")
 		}
 	}()
@@ -89,7 +96,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := app.ShutdownWithContext(ctx); err != nil {
+	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("Server forced to shutdown")
 	}
 
