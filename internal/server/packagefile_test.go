@@ -30,6 +30,9 @@ import (
 // --- test doubles -----------------------------------------------------------
 
 // fakeStorage is a minimal in-memory storage.Storage for decision-tree tests.
+// It implements the core interface and nothing else: no GetFilePath, no
+// GetPresignedURL, so it must not be picked up as ZeroCopyCapable or
+// Presignable and the server has to take the plain open-then-stream path.
 type fakeStorage struct {
 	mu        sync.Mutex
 	objects   map[string][]byte
@@ -70,7 +73,7 @@ func (f *fakeStorage) Get(_ context.Context, key string) (io.ReadCloser, *storag
 	defer f.mu.Unlock()
 	data, ok := f.objects[key]
 	if !ok {
-		return nil, nil, fmt.Errorf("object not found: %s", key)
+		return nil, nil, fmt.Errorf("%w: %s", storage.ErrNotFound, key)
 	}
 	return io.NopCloser(bytes.NewReader(data)), &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
@@ -95,7 +98,7 @@ func (f *fakeStorage) Stat(_ context.Context, key string) (*storage.ObjectInfo, 
 	defer f.mu.Unlock()
 	data, ok := f.objects[key]
 	if !ok {
-		return nil, fmt.Errorf("object not found: %s", key)
+		return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, key)
 	}
 	return &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
@@ -104,11 +107,9 @@ func (f *fakeStorage) List(_ context.Context, _ storage.ListOptions) ([]*storage
 	return nil, nil
 }
 
-func (f *fakeStorage) GetPresignedURL(_ context.Context, _ string, _ time.Duration) (string, error) {
-	return "", errors.New("not supported")
-}
-
 func (f *fakeStorage) Close() error { return nil }
+
+var _ storage.Storage = (*fakeStorage)(nil)
 
 // fakeIndex is a packageIndex double recording how often upstream was consulted.
 type fakeIndex struct {

@@ -453,18 +453,27 @@ func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
 // The inner storage is held in an explicit field rather than embedded: every
 // method is written out, so a read path that forgets to record an access is a
 // compile error instead of a silent fall-through. That fall-through was a real
-// bug - a hot file read only through GetFilePath/Stat/GetRange/StreamingGet
+// bug - a hot file read only through GetFilePath/Stat/GetRange
 // looked cold to the LRU and could be evicted while it was being served.
 //
 // Read paths that return the object's size record an access; metadata-only or
 // bulk-listing calls forward without touching recency (see each method).
+//
+// Capabilities are forwarded explicitly, never inherited: the wrapper exposes
+// exactly the capability set of its inner *LocalStorage — zero-copy yes,
+// presigning no — and the assertions below fail the build if that drifts.
 type LRULocalStorage struct {
 	inner    *LocalStorage
 	lruCache *LRUCache
 }
 
-// LRULocalStorage must remain usable as the L1 tier of TieredStorage.
-var _ StreamingStorage = (*LRULocalStorage)(nil)
+var (
+	// LRULocalStorage must remain usable as the L1 tier of TieredStorage, which
+	// requires core storage plus the zero-copy capability.
+	_ l1Storage       = (*LRULocalStorage)(nil)
+	_ Storage         = (*LRULocalStorage)(nil)
+	_ ZeroCopyCapable = (*LRULocalStorage)(nil)
+)
 
 // NewLRULocalStorage creates a LocalStorage with LRU eviction
 func NewLRULocalStorage(baseDir string, maxSize int64, ttl time.Duration) (*LRULocalStorage, error) {
@@ -574,18 +583,6 @@ func (lru *LRULocalStorage) StreamingPut(ctx context.Context, key string, reader
 	return info, nil
 }
 
-// StreamingGet streams an object to writer and records the access.
-func (lru *LRULocalStorage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
-	info, err := lru.inner.StreamingGet(ctx, key, writer)
-	if err != nil {
-		return nil, err
-	}
-
-	_ = lru.lruCache.RecordAccess(key, info.Size)
-
-	return info, nil
-}
-
 // GetFilePath returns the path used for zero-copy serving and records the
 // access. This is the hottest read path in the server: the file is about to be
 // sent, so it must not look cold to the evictor.
@@ -634,17 +631,6 @@ func (lru *LRULocalStorage) Exists(ctx context.Context, key string) (bool, error
 // cache and make recency meaningless.
 func (lru *LRULocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
 	return lru.inner.List(ctx, opts)
-}
-
-// GetPresignedURL forwards without recording: for local storage it only formats
-// a file:// URL and never touches the file.
-func (lru *LRULocalStorage) GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
-	return lru.inner.GetPresignedURL(ctx, key, expiry)
-}
-
-// SupportsZeroCopy forwards the backend capability; it touches no object.
-func (lru *LRULocalStorage) SupportsZeroCopy() bool {
-	return lru.inner.SupportsZeroCopy()
 }
 
 // GetStats returns LRU cache statistics

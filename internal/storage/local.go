@@ -7,14 +7,30 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
-	"time"
 )
 
-// LocalStorage implements StreamingStorage interface for local filesystem
+// LocalStorage stores objects as plain files under a base directory.
+//
+// Because its objects are real files it can hand out a path for the transport
+// to sendfile, so it implements ZeroCopyCapable. It has nothing to presign and
+// deliberately does not implement Presignable.
 type LocalStorage struct {
 	baseDir     string
 	copyBufPool *sync.Pool
+}
+
+var (
+	_ Storage         = (*LocalStorage)(nil)
+	_ ZeroCopyCapable = (*LocalStorage)(nil)
+)
+
+// localNotFound maps a filesystem error to the shared sentinel when it means
+// "no such object", and wraps it as an ordinary failure otherwise.
+func localNotFound(err error, key, op string) error {
+	if os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s", ErrNotFound, key)
+	}
+	return fmt.Errorf("failed to %s %s: %w", op, key, err)
 }
 
 // NewLocalStorage creates a new local filesystem storage backend
@@ -46,10 +62,7 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 
 	file, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil, fmt.Errorf("object not found: %s", key)
-		}
-		return nil, nil, fmt.Errorf("failed to open file: %w", err)
+		return nil, nil, localNotFound(err, key, "open")
 	}
 
 	stat, err := file.Stat()
@@ -73,10 +86,7 @@ func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length 
 
 	file, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil, fmt.Errorf("object not found: %s", key)
-		}
-		return nil, nil, fmt.Errorf("failed to open file: %w", err)
+		return nil, nil, localNotFound(err, key, "open")
 	}
 
 	stat, err := file.Stat()
@@ -200,10 +210,7 @@ func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error
 
 	stat, err := os.Stat(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("object not found: %s", key)
-		}
-		return nil, fmt.Errorf("failed to stat file: %w", err)
+		return nil, localNotFound(err, key, "stat")
 	}
 
 	return &ObjectInfo{
@@ -258,17 +265,6 @@ func (l *LocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInf
 	}
 
 	return objects, nil
-}
-
-// GetPresignedURL is not supported for local storage
-func (l *LocalStorage) GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
-	// For local storage, return a file:// URL
-	path := l.buildPath(key)
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to get absolute path: %w", err)
-	}
-	return "file://" + absPath, nil
 }
 
 // Close releases any resources (no-op for local storage)
@@ -332,130 +328,18 @@ func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.R
 	}, nil
 }
 
-// StreamingGet retrieves an object with zero-copy optimizations
-func (l *LocalStorage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
-	path := l.buildPath(key)
-
-	// Get file info first
-	stat, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("object not found: %s", key)
-		}
-		return nil, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	info := &ObjectInfo{
-		Key:          key,
-		Size:         stat.Size(),
-		LastModified: stat.ModTime(),
-	}
-
-	// Try sendfile optimization if writer supports it
-	if l.trySendfile(writer, path, stat.Size()) == nil {
-		return info, nil
-	}
-
-	// Fall back to optimized copy
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	// Use pooled buffer for optimized copy
-	copyBufPtr := l.copyBufPool.Get().(*[]byte)
-	defer l.copyBufPool.Put(copyBufPtr)
-	copyBuf := *copyBufPtr
-
-	_, err = io.CopyBuffer(writer, file, copyBuf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to copy file: %w", err)
-	}
-
-	return info, nil
-}
-
-// GetFilePath returns the local file path for zero-copy operations
+// GetFilePath returns the local file path for zero-copy serving. The transport
+// hands this path to the kernel (sendfile) instead of copying the bytes through
+// user space, so this is the hot read path.
 func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, error) {
 	path := l.buildPath(key)
 
 	// Check if file exists
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("object not found: %s", key)
-		}
-		return "", fmt.Errorf("failed to stat file: %w", err)
+		return "", localNotFound(err, key, "stat")
 	}
 
 	return path, nil
-}
-
-// SupportsZeroCopy indicates if the backend supports zero-copy operations
-func (l *LocalStorage) SupportsZeroCopy() bool {
-	return true // Local storage supports sendfile and direct file serving
-}
-
-// trySendfile attempts to use sendfile for zero-copy transfer
-func (l *LocalStorage) trySendfile(writer io.Writer, filepath string, size int64) error {
-	// Try to get file descriptor from writer (e.g., net.Conn)
-	type fdWriter interface {
-		File() (*os.File, error)
-	}
-
-	if fdWriter, ok := writer.(fdWriter); ok {
-		connFile, err := fdWriter.File()
-		if err != nil {
-			return err // Fall back to regular copy
-		}
-		defer func() {
-			if err := connFile.Close(); err != nil {
-				// Log error but continue
-				_ = err
-			}
-		}()
-
-		srcFile, err := os.Open(filepath)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := srcFile.Close(); err != nil {
-				// Log error but continue
-				_ = err
-			}
-		}()
-
-		// Use sendfile syscall
-		return l.sendfile(int(connFile.Fd()), int(srcFile.Fd()), size)
-	}
-
-	return fmt.Errorf("writer doesn't support sendfile")
-}
-
-// sendfile performs the actual sendfile syscall
-func (l *LocalStorage) sendfile(dst, src int, size int64) error {
-	var offset int64 = 0
-	remaining := size
-
-	for remaining > 0 {
-		n, err := syscall.Sendfile(dst, src, &offset, int(remaining))
-		if err != nil {
-			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				continue // Retry on would-block
-			}
-			return fmt.Errorf("sendfile failed: %w", err)
-		}
-
-		if n == 0 {
-			break // EOF
-		}
-
-		remaining -= int64(n)
-		offset += int64(n)
-	}
-
-	return nil
 }
 
 // limitedReadCloser wraps a limited reader with a closer

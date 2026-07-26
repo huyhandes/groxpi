@@ -10,6 +10,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewLocalStorage(t *testing.T) {
@@ -404,26 +407,57 @@ func TestLocalStorage_List(t *testing.T) {
 	})
 }
 
-func TestLocalStorage_GetPresignedURL(t *testing.T) {
-	storage, _ := NewLocalStorage(t.TempDir())
+// TestLocalStorage_NotFoundIsSentinel pins that every read path reports a
+// missing key with the shared sentinel, so callers can branch on errors.Is
+// instead of matching error strings.
+func TestLocalStorage_NotFoundIsSentinel(t *testing.T) {
+	s, err := NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
 	ctx := context.Background()
 
-	key := "presigned-test.txt"
-	content := "presigned content"
-	_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
+	const missing = "no/such/object.txt"
 
-	url, err := storage.GetPresignedURL(ctx, key, time.Hour)
-	if err != nil {
-		t.Fatalf("GetPresignedURL failed: %v", err)
-	}
+	t.Run("Get", func(t *testing.T) {
+		_, _, err := s.Get(ctx, missing)
+		require.ErrorIs(t, err, ErrNotFound)
+	})
 
-	if !strings.HasPrefix(url, "file://") {
-		t.Errorf("Expected file:// URL, got %s", url)
-	}
+	t.Run("GetRange", func(t *testing.T) {
+		_, _, err := s.GetRange(ctx, missing, 0, 10)
+		require.ErrorIs(t, err, ErrNotFound)
+	})
 
-	if !strings.Contains(url, key) {
-		t.Errorf("Expected URL to contain key %s, got %s", key, url)
-	}
+	t.Run("Stat", func(t *testing.T) {
+		_, err := s.Stat(ctx, missing)
+		require.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("GetFilePath", func(t *testing.T) {
+		_, err := s.GetFilePath(ctx, missing)
+		require.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("Exists is not an error", func(t *testing.T) {
+		exists, err := s.Exists(ctx, missing)
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+}
+
+// TestLocalStorage_Capabilities pins which capabilities local storage claims.
+// Local objects are real files, so zero-copy is real; there is nothing to
+// presign, so it must not advertise Presignable.
+func TestLocalStorage_Capabilities(t *testing.T) {
+	s, err := NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+
+	var backend Storage = s
+
+	_, isZeroCopy := backend.(ZeroCopyCapable)
+	assert.True(t, isZeroCopy, "LocalStorage must be ZeroCopyCapable")
+
+	_, isPresignable := backend.(Presignable)
+	assert.False(t, isPresignable, "LocalStorage must not advertise Presignable")
 }
 
 func TestLocalStorage_PutMultipart(t *testing.T) {

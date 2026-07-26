@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -11,33 +12,60 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// TieredStorage implements a multi-tier caching system with local (L1) and S3 (L2) storage
+// syncJobTimeout bounds a single L1 back-fill. A back-fill that has not
+// finished by then is abandoned; the next read will queue a fresh one.
+const syncJobTimeout = 5 * time.Minute
+
+// l1Storage is the L1 tier contract: core storage plus the local-path
+// capability that is the whole point of having an L1.
+type l1Storage interface {
+	Storage
+	ZeroCopyCapable
+}
+
+// l2Storage is the L2 tier contract: core storage plus presigning, which only
+// the remote tier can offer.
+type l2Storage interface {
+	Storage
+	Presignable
+}
+
+// TieredStorage implements a multi-tier caching system with local (L1) and S3 (L2) storage.
+//
+// It re-exposes each capability from the tier that genuinely has it: zero-copy
+// from L1 (real files on disk) and presigning from L2.
 type TieredStorage struct {
-	localCache    StreamingStorage               // L1 cache - fast local storage
-	remoteStorage StreamingStorage               // L2 cache - persistent S3 storage
+	localCache    l1Storage                      // L1 cache - fast local storage
+	remoteStorage l2Storage                      // L2 cache - persistent S3 storage
 	syncQueue     *WorkerPool[tieredSyncRequest] // Async queue for L1 cache population
 	sf            singleflight.Group
 }
 
-// tieredSyncRequest represents a pending L1 cache population request
+var (
+	_ Storage         = (*TieredStorage)(nil)
+	_ ZeroCopyCapable = (*TieredStorage)(nil)
+	_ Presignable     = (*TieredStorage)(nil)
+)
+
+// tieredSyncRequest represents a pending L1 cache population request.
 type tieredSyncRequest struct {
-	Key     string
-	Context context.Context
+	Key string
 }
 
 // newTieredSyncQueue builds the bounded worker pool that back-fills L1 from L2.
-// Each job carries the context of the request that triggered it, so pool
-// shutdown does not abort a population already under way.
+//
+// The job's context is derived from the pool's own lifetime context, never from
+// the request that queued it. Submitting used to hand over a context the
+// submitting goroutine cancelled on its way out, so every worker found a dead
+// context and the back-fill silently never happened.
 func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *WorkerPool[tieredSyncRequest] {
 	return NewWorkerPool("tiered-sync", queueSize, workerCount,
-		func(_ context.Context, req tieredSyncRequest) {
-			if err := req.Context.Err(); err != nil {
-				log.Debug().Err(err).Str("key", req.Key).Msg("Skipping L1 population, request context done")
-				return
-			}
+		func(poolCtx context.Context, req tieredSyncRequest) {
+			jobCtx, cancel := context.WithTimeout(poolCtx, syncJobTimeout)
+			defer cancel()
 
 			start := time.Now()
-			err := storage.populateLocalCache(req.Context, req.Key)
+			err := storage.populateLocalCache(jobCtx, req.Key)
 			duration := time.Since(start)
 
 			if err != nil {
@@ -56,9 +84,10 @@ func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *Wor
 }
 
 // submitSync queues an L1 population request. L1 back-fill is best-effort, so a
-// full queue drops the request instead of blocking the caller.
-func (ts *TieredStorage) submitSync(ctx context.Context, key string) {
-	if !ts.syncQueue.Submit(tieredSyncRequest{Key: key, Context: ctx}) {
+// full queue drops the request instead of blocking the caller. The job owns no
+// part of the caller's context: it must outlive the request that triggered it.
+func (ts *TieredStorage) submitSync(key string) {
+	if !ts.syncQueue.Submit(tieredSyncRequest{Key: key}) {
 		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
 	}
 }
@@ -103,14 +132,7 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 		return nil, fmt.Errorf("failed to create S3 storage: %w", err)
 	}
 
-	// Create tiered storage
-	ts := &TieredStorage{
-		localCache:    localStorage,
-		remoteStorage: s3Storage,
-	}
-
-	// Initialize sync queue
-	ts.syncQueue = newTieredSyncQueue(ts, cfg.SyncQueueSize, cfg.SyncWorkers)
+	ts := newTieredStorage(localStorage, s3Storage, cfg.SyncQueueSize, cfg.SyncWorkers)
 
 	log.Info().
 		Str("local_cache_dir", cfg.LocalCacheDir).
@@ -126,64 +148,53 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 	return ts, nil
 }
 
-// Get retrieves an object from tiered storage (L1 → L2 → error)
+// newTieredStorage wires the two tiers and starts the back-fill pool. It exists
+// so tests can supply tier doubles without a live S3.
+func newTieredStorage(l1 l1Storage, l2 l2Storage, queueSize, workers int) *TieredStorage {
+	ts := &TieredStorage{
+		localCache:    l1,
+		remoteStorage: l2,
+	}
+	ts.syncQueue = newTieredSyncQueue(ts, queueSize, workers)
+
+	return ts
+}
+
+// Get retrieves an object from tiered storage (L1 → L2 → ErrNotFound).
+//
+// Only a genuine L1 miss falls through to L2. Any other L1 failure is returned
+// as-is: treating a broken local disk as a cache miss hid real errors and
+// quietly turned every read into an L2 round trip.
 func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
-	// Try L1 (local) cache first
 	reader, info, err := ts.localCache.Get(ctx, key)
-	if err == nil {
+	switch {
+	case err == nil:
 		log.Debug().Str("key", key).Msg("✅ Tiered storage: L1 hit (local)")
 		return reader, info, nil
+	case !errors.Is(err, ErrNotFound):
+		log.Error().Err(err).Str("key", key).Msg("L1 read failed for a reason other than a miss")
+		return nil, nil, fmt.Errorf("L1 read of %q failed: %w", key, err)
 	}
 
 	// L1 miss, try L2 (S3) cache
 	log.Debug().Str("key", key).Msg("🔍 Tiered storage: L1 miss, checking L2 (S3)")
 
 	reader, info, err = ts.remoteStorage.Get(ctx, key)
-	if err == nil {
-		log.Info().Str("key", key).Msg("✅ Tiered storage: L2 hit (S3), populating L1 async")
-
-		// Asynchronously populate L1 cache for future requests
-		// Don't block current request on L1 population
-		go func() {
-			// Use background context with timeout
-			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-
-			// Submit async sync request (non-blocking)
-			ts.submitSync(syncCtx, key)
-		}()
-
-		return reader, info, nil
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			log.Debug().Str("key", key).Msg("❌ Tiered storage: L1 and L2 miss")
+			return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, key)
+		}
+		return nil, nil, fmt.Errorf("L2 read of %q failed: %w", key, err)
 	}
 
-	// Both L1 and L2 miss
-	log.Debug().Str("key", key).Msg("❌ Tiered storage: L1 and L2 miss")
-	return nil, nil, fmt.Errorf("object not found in tiered storage: %s", key)
-}
+	log.Info().Str("key", key).Msg("✅ Tiered storage: L2 hit (S3), populating L1 async")
 
-// GetRange retrieves a byte range from tiered storage
-func (ts *TieredStorage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
-	// Try L1 (local) cache first
-	reader, info, err := ts.localCache.GetRange(ctx, key, offset, length)
-	if err == nil {
-		log.Debug().Str("key", key).Msg("✅ Tiered storage range: L1 hit (local)")
-		return reader, info, nil
-	}
+	// Back-fill L1 for future requests without blocking this one. The job owns
+	// its own lifetime, so it survives this request finishing.
+	ts.submitSync(key)
 
-	// L1 miss, try L2 (S3) cache
-	log.Debug().Str("key", key).Msg("🔍 Tiered storage range: L1 miss, checking L2 (S3)")
-
-	reader, info, err = ts.remoteStorage.GetRange(ctx, key, offset, length)
-	if err == nil {
-		log.Debug().Str("key", key).Msg("✅ Tiered storage range: L2 hit (S3)")
-
-		// For range requests, we don't populate L1 cache
-		// Only full file downloads populate L1 cache
-		return reader, info, nil
-	}
-
-	// Both L1 and L2 miss
-	return nil, nil, fmt.Errorf("object not found in tiered storage: %s", key)
+	return reader, info, nil
 }
 
 // Put stores an object in both L1 and L2 concurrently
@@ -260,29 +271,6 @@ func (ts *TieredStorage) putInternal(ctx context.Context, key string, reader io.
 	return l2Info, nil
 }
 
-// PutMultipart uploads a large object using multipart upload
-func (ts *TieredStorage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
-	// For multipart uploads, only write to L2 (S3) initially
-	// L1 cache will be populated on first read
-	log.Debug().
-		Str("key", key).
-		Int64("size", size).
-		Int64("part_size", partSize).
-		Msg("Tiered storage: Multipart upload to L2 only")
-
-	info, err := ts.remoteStorage.PutMultipart(ctx, key, reader, size, contentType, partSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed multipart upload to L2: %w", err)
-	}
-
-	log.Info().
-		Str("key", key).
-		Int64("size", size).
-		Msg("✅ Multipart upload to L2 succeeded, L1 will be populated on first read")
-
-	return info, nil
-}
-
 // Delete removes an object from both L1 and L2
 func (ts *TieredStorage) Delete(ctx context.Context, key string) error {
 	var l1Err, l2Err error
@@ -317,27 +305,32 @@ func (ts *TieredStorage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Exists checks if an object exists in L1 or L2
+// Exists checks if an object exists in L1 or L2. Absence in L1 is (false, nil),
+// so any error here is a real failure and is propagated rather than being
+// papered over with an L2 lookup.
 func (ts *TieredStorage) Exists(ctx context.Context, key string) (bool, error) {
-	// Check L1 first (fast)
 	exists, err := ts.localCache.Exists(ctx, key)
-	if err == nil && exists {
+	if err != nil {
+		return false, fmt.Errorf("L1 existence check of %q failed: %w", key, err)
+	}
+	if exists {
 		return true, nil
 	}
 
-	// Check L2
 	return ts.remoteStorage.Exists(ctx, key)
 }
 
-// Stat retrieves object metadata from L1 or L2
+// Stat retrieves object metadata from L1, falling through to L2 only on a
+// genuine miss.
 func (ts *TieredStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
-	// Try L1 first
 	info, err := ts.localCache.Stat(ctx, key)
-	if err == nil {
+	switch {
+	case err == nil:
 		return info, nil
+	case !errors.Is(err, ErrNotFound):
+		return nil, fmt.Errorf("L1 stat of %q failed: %w", key, err)
 	}
 
-	// Try L2
 	return ts.remoteStorage.Stat(ctx, key)
 }
 
@@ -353,51 +346,11 @@ func (ts *TieredStorage) GetPresignedURL(ctx context.Context, key string, expiry
 	return ts.remoteStorage.GetPresignedURL(ctx, key, expiry)
 }
 
-// StreamingPut stores an object with streaming support
-func (ts *TieredStorage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	// For streaming puts, use the same logic as regular Put
-	return ts.Put(ctx, key, reader, size, contentType)
-}
-
-// StreamingGet retrieves an object with zero-copy optimizations
-func (ts *TieredStorage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
-	// Try L1 first (supports zero-copy)
-	info, err := ts.localCache.StreamingGet(ctx, key, writer)
-	if err == nil {
-		log.Debug().Str("key", key).Msg("✅ Tiered streaming get: L1 hit (local, zero-copy)")
-		return info, nil
-	}
-
-	// L1 miss, try L2
-	log.Debug().Str("key", key).Msg("🔍 Tiered streaming get: L1 miss, streaming from L2 (S3)")
-
-	info, err = ts.remoteStorage.StreamingGet(ctx, key, writer)
-	if err == nil {
-		log.Info().Str("key", key).Msg("✅ Tiered streaming get: L2 hit (S3), populating L1 async")
-
-		// Asynchronously populate L1 cache for future requests
-		go func() {
-			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			ts.submitSync(syncCtx, key)
-		}()
-
-		return info, nil
-	}
-
-	// Both L1 and L2 miss
-	return nil, fmt.Errorf("object not found in tiered storage: %s", key)
-}
-
-// GetFilePath returns the local file path for zero-copy operations (L1 only)
+// GetFilePath returns the local file path for zero-copy serving. Only L1 holds
+// real files, so an object that is only in L2 reports a miss here and the
+// caller falls back to streaming it.
 func (ts *TieredStorage) GetFilePath(ctx context.Context, key string) (string, error) {
-	// Only L1 supports local file paths
 	return ts.localCache.GetFilePath(ctx, key)
-}
-
-// SupportsZeroCopy indicates if L1 supports zero-copy operations
-func (ts *TieredStorage) SupportsZeroCopy() bool {
-	return ts.localCache.SupportsZeroCopy()
 }
 
 // Close releases resources from both storage backends

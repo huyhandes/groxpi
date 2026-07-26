@@ -265,7 +265,11 @@ func (s *S3Storage) submitAsyncWrite(ctx context.Context, key string, reader io.
 	return resultCh
 }
 
-// S3Storage implements Storage interface for S3-compatible backends
+// S3Storage implements Storage for S3-compatible backends.
+//
+// It can mint presigned URLs, so it implements Presignable. Its objects live
+// across the network rather than on the local filesystem, so it deliberately
+// does not implement ZeroCopyCapable: there is no path to hand the kernel.
 type S3Storage struct {
 	readClient  *minio.Client // Client optimized for GET operations
 	writeClient *minio.Client // Client optimized for PUT operations
@@ -283,6 +287,11 @@ type S3Storage struct {
 	statSF singleflight.Group // For Stat/Exists operations
 	listSF singleflight.Group // For List operations
 }
+
+var (
+	_ Storage     = (*S3Storage)(nil)
+	_ Presignable = (*S3Storage)(nil)
+)
 
 // NewS3Storage creates a new S3 storage backend
 func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
@@ -494,6 +503,23 @@ func (s *S3Storage) calculateOptimalPartSize(fileSize int64) int64 {
 	return optimalPartSize
 }
 
+// isNotFoundResponse reports whether err is MinIO's way of saying the object is
+// simply absent, as opposed to any other failure (denied, throttled, network).
+// Only this case may be reported as a miss.
+func isNotFoundResponse(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
+}
+
+// s3Error wraps a MinIO failure for key, folding a genuine absence into the
+// shared ErrNotFound sentinel so callers can branch with errors.Is.
+func s3Error(err error, key string) error {
+	if isNotFoundResponse(err) {
+		return fmt.Errorf("%w: %s", ErrNotFound, key)
+	}
+	return fmt.Errorf("s3 operation on %s failed: %w", key, err)
+}
+
 // Get retrieves an object from S3 with singleflight deduplication
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
 	// For S3, we cannot safely share readers between goroutines since each reader
@@ -513,14 +539,15 @@ func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser,
 	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object")
-		return nil, nil, fmt.Errorf("failed to get object %s: %w", key, err)
+		return nil, nil, s3Error(err, key)
 	}
 
-	// Get object info
+	// Stat resolves the response headers without consuming the body, so the
+	// metadata below is complete before the caller reads a single byte.
 	stat, err := object.Stat()
 	if err != nil {
 		_ = object.Close()
-		return nil, nil, fmt.Errorf("failed to stat object %s: %w", key, err)
+		return nil, nil, s3Error(err, key)
 	}
 
 	info := &ObjectInfo{
@@ -559,7 +586,7 @@ func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int
 	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, opts)
 	if err != nil {
 		log.Error().Err(err).Str("key", key).Msg("Failed to get object range from S3")
-		return nil, nil, fmt.Errorf("failed to get object range %s: %w", key, err)
+		return nil, nil, s3Error(err, key)
 	}
 
 	// For range requests, we need to get object info without consuming the reader
@@ -798,8 +825,9 @@ func (s *S3Storage) existsInternal(ctx context.Context, key string) (bool, error
 
 	_, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
 	if err != nil {
-		errResponse := minio.ToErrorResponse(err)
-		if errResponse.Code == "NoSuchKey" {
+		// Absence is the answer, not a failure. Anything else is a failure and
+		// must not be reported as "does not exist".
+		if isNotFoundResponse(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
@@ -828,7 +856,7 @@ func (s *S3Storage) statInternal(ctx context.Context, key string) (*ObjectInfo, 
 
 	stat, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to stat object %s: %w", key, err)
+		return nil, s3Error(err, key)
 	}
 
 	return &ObjectInfo{
@@ -1011,76 +1039,6 @@ func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, r
 		ETag:        info.ETag,
 		ContentType: contentType,
 	}, nil
-}
-
-// StreamingGet retrieves an object with streaming optimizations
-func (s *S3Storage) StreamingGet(ctx context.Context, key string, writer io.Writer) (*ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Streaming get from S3")
-
-	// Get object info first for metadata using metadata client
-	objInfo, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat object %s: %w", key, err)
-	}
-
-	// Get object stream using read client
-	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
-	}
-	defer func() {
-		if err := object.Close(); err != nil {
-			// Log error but continue
-			_ = err
-		}
-	}()
-
-	// Use appropriately sized pooled buffer for optimized streaming
-	pool := getOptimalBufferPool(objInfo.Size)
-	copyBufPtr := pool.Get().(*[]byte)
-	defer pool.Put(copyBufPtr)
-	copyBuf := *copyBufPtr
-
-	start := time.Now()
-	written, err := io.CopyBuffer(writer, object, copyBuf)
-	duration := time.Since(start)
-
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("key", key).
-			Int64("bytes_written", written).
-			Dur("duration", duration).
-			Msg("Failed to stream from S3")
-		return nil, fmt.Errorf("failed to stream object %s: %w", key, err)
-	}
-
-	log.Debug().
-		Str("key", key).
-		Int64("bytes_streamed", written).
-		Dur("duration", duration).
-		Float64("speed_mbps", float64(written)/duration.Seconds()/(1024*1024)).
-		Msg("Successfully streamed from S3")
-
-	return &ObjectInfo{
-		Key:          key,
-		Size:         objInfo.Size,
-		LastModified: objInfo.LastModified,
-		ETag:         objInfo.ETag,
-		ContentType:  objInfo.ContentType,
-	}, nil
-}
-
-// GetFilePath returns empty path as S3 doesn't support local file paths
-func (s *S3Storage) GetFilePath(ctx context.Context, key string) (string, error) {
-	return "", fmt.Errorf("S3 storage doesn't support local file paths")
-}
-
-// SupportsZeroCopy indicates if the backend supports zero-copy operations
-func (s *S3Storage) SupportsZeroCopy() bool {
-	return false // S3 requires network transfer, no zero-copy possible
 }
 
 // bufferedReader wraps a reader with pooled buffer for streaming optimization

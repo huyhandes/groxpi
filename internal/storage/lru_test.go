@@ -82,7 +82,7 @@ func waitForSize(t *testing.T, s *LRULocalStorage, maxSize int64) {
 // not be evicted while a colder file is still resident.
 //
 // It fails against an embedded LocalStorage, because GetFilePath / Stat /
-// GetRange / StreamingGet fall through to the embedded type and never reach
+// GetRange fall through to the embedded type and never reach
 // RecordAccess.
 func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 	ctx := context.Background()
@@ -109,10 +109,6 @@ func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 			_, err = io.Copy(io.Discard, rc)
 			require.NoError(t, err)
 			require.NoError(t, rc.Close())
-		},
-		"StreamingGet": func(t *testing.T, s *LRULocalStorage, key string) {
-			_, err := s.StreamingGet(ctx, key, io.Discard)
-			require.NoError(t, err)
 		},
 		"Get": func(t *testing.T, s *LRULocalStorage, key string) {
 			rc, _, err := s.Get(ctx, key)
@@ -156,6 +152,55 @@ func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 			assert.False(t, coldExists, "expected the cold file to be the eviction victim")
 		})
 	}
+}
+
+// TestLRULocalStorage_ForwardsCapabilities pins the wrapper's capability
+// contract: it must expose every capability its inner storage genuinely has and
+// none that it does not. A wrapper that silently drops zero-copy would push the
+// hottest read path onto a byte-by-byte copy; one that advertised presigning
+// would hand callers a URL nothing can serve.
+func TestLRULocalStorage_ForwardsCapabilities(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := NewLRULocalStorage(dir, 0, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	var backend Storage = s
+
+	zc, ok := backend.(ZeroCopyCapable)
+	require.True(t, ok, "wrapper dropped the inner storage's zero-copy capability")
+
+	_, isPresignable := backend.(Presignable)
+	assert.False(t, isPresignable, "wrapper advertised a capability local storage does not have")
+
+	putBlob(t, s, "served.bin", 64)
+
+	path, err := zc.GetFilePath(context.Background(), "served.bin")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, "served.bin"), path)
+
+	// Forwarding must not bypass the wrapper's bookkeeping.
+	assert.Equal(t, int64(64), trackedSize(s))
+}
+
+// TestLRULocalStorage_NotFoundIsSentinel pins that the wrapper forwards the
+// sentinel rather than rewriting it into some wrapper-specific error.
+func TestLRULocalStorage_NotFoundIsSentinel(t *testing.T) {
+	s, err := NewLRULocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	ctx := context.Background()
+
+	_, _, err = s.Get(ctx, "absent.bin")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = s.Stat(ctx, "absent.bin")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = s.GetFilePath(ctx, "absent.bin")
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 // TestLRULocalStorage_SizeAccountingMatchesDisk verifies the tracked size never
@@ -294,7 +339,10 @@ func TestLRULocalStorage_ConcurrentReadsUnderEvictionPressure(t *testing.T) {
 			for range 20 {
 				_, _ = s.GetFilePath(ctx, "shared.bin")
 				_, _ = s.Stat(ctx, "shared.bin")
-				_, _ = s.StreamingGet(ctx, "shared.bin", io.Discard)
+				if rc, _, err := s.Get(ctx, "shared.bin"); err == nil {
+					_, _ = io.Copy(io.Discard, rc)
+					_ = rc.Close()
+				}
 				if rc, _, err := s.GetRange(ctx, "shared.bin", 0, 10); err == nil {
 					_, _ = io.Copy(io.Discard, rc)
 					_ = rc.Close()

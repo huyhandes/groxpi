@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -446,7 +447,11 @@ func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 	case ActionFromStorage:
 		if err := s.serveFromStorageOptimized(c, plan.StorageKey); err != nil {
 			log.Error().Err(err).Str("storage_key", plan.StorageKey).Msg("Failed to serve from storage")
-			c.String(http.StatusInternalServerError, "Failed to serve file")
+			// Only a failure that happened before the first body byte can still
+			// be reported; anything later would append garbage to the payload.
+			if !c.Writer.Written() {
+				c.String(http.StatusInternalServerError, "Failed to serve file")
+			}
 		}
 	case ActionFromFileCache:
 		c.File(plan.FilePath)
@@ -706,12 +711,18 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		Str("method", c.Request.Method).
 		Msg("Starting file serve from storage")
 
-	// Get file from storage
+	// Open first: the reader and the metadata both arrive before a single body
+	// byte is written, so every header below is still settable.
 	reader, info, err := s.storage.Get(ctx, storageKey)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			log.Debug().Str("key", storageKey).Msg("Object missing from storage")
+			c.String(http.StatusNotFound, "File not found")
+			return nil
+		}
 		log.Error().Err(err).Str("key", storageKey).Msg("Failed to get from storage")
 		c.String(http.StatusInternalServerError, "Storage error")
-		return err
+		return nil
 	}
 	defer func() { _ = reader.Close() }()
 
@@ -732,7 +743,9 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 
 	// Set cache headers for better performance
 	c.Header("Cache-Control", "public, max-age=3600")
-	c.Header("ETag", fmt.Sprintf(`"%s"`, info.ETag))
+	if info.ETag != "" {
+		c.Header("ETag", fmt.Sprintf(`"%s"`, info.ETag))
+	}
 
 	// Handle HEAD requests without reading body
 	if c.Request.Method == "HEAD" {
@@ -768,19 +781,21 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	return nil
 }
 
-// serveFromStorageOptimized serves a file from storage with zero-copy optimizations when possible
+// serveFromStorageOptimized serves a file from storage, preferring the
+// zero-copy path when the backend can name a real file for the kernel to
+// sendfile. Backends that cannot fall back to open-then-stream.
 func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := c.Request.Context()
 
-	// Try to get local file path for zero-copy operations (local storage only)
-	if streamStorage, ok := s.storage.(storage.StreamingStorage); ok && streamStorage.SupportsZeroCopy() {
-		if filePath, err := streamStorage.GetFilePath(ctx, storageKey); err == nil {
-			// Use Gin's File for local file serving
+	// Zero-copy is a capability, not a property of every backend: ask, do not
+	// assume, and do not branch on a boolean the backend has to lie about.
+	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
+		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
 			log.Debug().
 				Str("storage_key", storageKey).
 				Str("file_path", filePath).
-				Msg("Using File serving")
+				Msg("Using zero-copy file serving")
 			c.File(filePath)
 			return nil
 		}
@@ -791,30 +806,6 @@ func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) er
 		Str("storage_key", storageKey).
 		Msg("Using streaming from storage backend")
 
-	if streamStorage, ok := s.storage.(storage.StreamingStorage); ok {
-		// Use optimized streaming - c.Writer is safe for concurrent use
-		info, err := streamStorage.StreamingGet(ctx, storageKey, c.Writer)
-		if err != nil {
-			log.Error().Err(err).Str("key", storageKey).Msg("Failed to stream from storage")
-			c.String(http.StatusInternalServerError, "Storage error")
-			return err
-		}
-
-		// Set headers
-		if info.ContentType != "" {
-			c.Header("Content-Type", info.ContentType)
-		}
-		if info.Size > 0 {
-			c.Header("Content-Length", fmt.Sprintf("%d", info.Size))
-		}
-		if info.ETag != "" {
-			c.Header("ETag", fmt.Sprintf("\"%s\"", info.ETag))
-		}
-
-		return nil
-	}
-
-	// Fall back to regular storage serving
 	return s.serveFromStorage(c, storageKey)
 }
 

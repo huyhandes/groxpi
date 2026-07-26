@@ -3,12 +3,276 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// fakeTier is an in-memory Storage double usable as either tier. It satisfies
+// both capability interfaces so it can be dropped into the L1 or the L2 slot,
+// and it can be told to fail so tests can tell a real backend error apart from
+// a miss.
+type fakeTier struct {
+	mu       sync.Mutex
+	objects  map[string][]byte
+	failWith error // returned by every read path instead of consulting objects
+
+	gets atomic.Int64
+	puts atomic.Int64
+}
+
+func newFakeTier(objects map[string][]byte) *fakeTier {
+	if objects == nil {
+		objects = map[string][]byte{}
+	}
+	return &fakeTier{objects: objects}
+}
+
+func (f *fakeTier) load(key string) ([]byte, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	data, ok := f.objects[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return data, nil
+}
+
+func (f *fakeTier) Get(_ context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
+	f.gets.Add(1)
+
+	data, err := f.load(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), &ObjectInfo{Key: key, Size: int64(len(data))}, nil
+}
+
+func (f *fakeTier) Put(_ context.Context, key string, reader io.Reader, _ int64, _ string) (*ObjectInfo, error) {
+	f.puts.Add(1)
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.objects[key] = data
+
+	return &ObjectInfo{Key: key, Size: int64(len(data))}, nil
+}
+
+func (f *fakeTier) Stat(_ context.Context, key string) (*ObjectInfo, error) {
+	data, err := f.load(key)
+	if err != nil {
+		return nil, err
+	}
+	return &ObjectInfo{Key: key, Size: int64(len(data))}, nil
+}
+
+func (f *fakeTier) Delete(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects, key)
+	return nil
+}
+
+func (f *fakeTier) Exists(_ context.Context, key string) (bool, error) {
+	if f.failWith != nil {
+		return false, f.failWith
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.objects[key]
+	return ok, nil
+}
+
+func (f *fakeTier) List(_ context.Context, _ ListOptions) ([]*ObjectInfo, error) { return nil, nil }
+
+func (f *fakeTier) Close() error { return nil }
+
+func (f *fakeTier) GetFilePath(_ context.Context, key string) (string, error) {
+	if _, err := f.load(key); err != nil {
+		return "", err
+	}
+	return "/fake/" + key, nil
+}
+
+func (f *fakeTier) GetPresignedURL(_ context.Context, key string, _ time.Duration) (string, error) {
+	return "https://fake.example/" + key, nil
+}
+
+var (
+	_ l1Storage = (*fakeTier)(nil)
+	_ l2Storage = (*fakeTier)(nil)
+)
+
+// TestTieredStorage_L1BackfillLands covers the bug where the back-fill job was
+// submitted with a context the submitting goroutine cancelled on its way out:
+// the worker then bailed and L1 was never populated from L2.
+func TestTieredStorage_L1BackfillLands(t *testing.T) {
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+	payload := []byte("wheel bytes")
+
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	l2 := newFakeTier(map[string][]byte{key: payload})
+
+	ts := newTieredStorage(l1, l2, 8, 2)
+	defer func() { _ = ts.Close() }()
+
+	ctx := context.Background()
+
+	reader, info, err := ts.Get(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(payload)), info.Size)
+
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, payload, body)
+
+	// The back-fill runs asynchronously, but it must actually run.
+	require.Eventually(t, func() bool {
+		exists, err := l1.Exists(ctx, key)
+		return err == nil && exists
+	}, 5*time.Second, 10*time.Millisecond, "L1 was never populated from L2")
+
+	// And the copy that landed must be the real payload.
+	cached, _, err := l1.Get(ctx, key)
+	require.NoError(t, err)
+	defer func() { _ = cached.Close() }()
+
+	cachedBody, err := io.ReadAll(cached)
+	require.NoError(t, err)
+	assert.Equal(t, payload, cachedBody)
+}
+
+// TestTieredStorage_L1BackfillSurvivesRequestCancellation pins that the job
+// outlives the request that triggered it: cancelling the caller's context must
+// not abort a population already queued.
+func TestTieredStorage_L1BackfillSurvivesRequestCancellation(t *testing.T) {
+	const key = "packages/flask/flask-3.0.0.tar.gz"
+	payload := []byte("more wheel bytes")
+
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	l2 := newFakeTier(map[string][]byte{key: payload})
+
+	ts := newTieredStorage(l1, l2, 8, 2)
+	defer func() { _ = ts.Close() }()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+
+	reader, _, err := ts.Get(reqCtx, key)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+
+	// Client goes away immediately after the body is handed over.
+	cancel()
+
+	require.Eventually(t, func() bool {
+		exists, err := l1.Exists(context.Background(), key)
+		return err == nil && exists
+	}, 5*time.Second, 10*time.Millisecond, "back-fill died with the request context")
+}
+
+// TestTieredStorage_PropagatesRealL1Error covers the bug where any L1 error was
+// treated as a cache miss, so a broken local disk silently became an L2 read
+// and the real failure was never surfaced.
+func TestTieredStorage_PropagatesRealL1Error(t *testing.T) {
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+
+	diskFailure := errors.New("input/output error")
+
+	l1 := newFakeTier(nil)
+	l1.failWith = diskFailure
+
+	l2 := newFakeTier(map[string][]byte{key: []byte("wheel bytes")})
+
+	ts := newTieredStorage(l1, l2, 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	ctx := context.Background()
+
+	t.Run("Get", func(t *testing.T) {
+		_, _, err := ts.Get(ctx, key)
+		require.ErrorIs(t, err, diskFailure)
+		assert.NotErrorIs(t, err, ErrNotFound)
+		assert.Zero(t, l2.gets.Load(), "L2 must not be consulted after a real L1 failure")
+	})
+
+	t.Run("Stat", func(t *testing.T) {
+		_, err := ts.Stat(ctx, key)
+		require.ErrorIs(t, err, diskFailure)
+	})
+
+	t.Run("Exists", func(t *testing.T) {
+		_, err := ts.Exists(ctx, key)
+		require.ErrorIs(t, err, diskFailure)
+	})
+}
+
+// TestTieredStorage_MissIsSentinel pins that a genuine miss in both tiers is
+// reported with the shared sentinel.
+func TestTieredStorage_MissIsSentinel(t *testing.T) {
+	ts := newTieredStorage(newFakeTier(nil), newFakeTier(nil), 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	ctx := context.Background()
+
+	_, _, err := ts.Get(ctx, "packages/absent/absent-1.0.0.tar.gz")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = ts.Stat(ctx, "packages/absent/absent-1.0.0.tar.gz")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestTieredStorage_Capabilities pins that the tiered backend exposes each
+// capability from the tier that genuinely has it: zero-copy from L1 (real local
+// files) and presigning from L2 (S3).
+func TestTieredStorage_Capabilities(t *testing.T) {
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+
+	l1 := newFakeTier(map[string][]byte{key: []byte("wheel bytes")})
+	l2 := newFakeTier(map[string][]byte{key: []byte("wheel bytes")})
+
+	ts := newTieredStorage(l1, l2, 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	var backend Storage = ts
+
+	zc, ok := backend.(ZeroCopyCapable)
+	require.True(t, ok, "TieredStorage must be ZeroCopyCapable via L1")
+
+	path, err := zc.GetFilePath(context.Background(), key)
+	require.NoError(t, err)
+	assert.Equal(t, "/fake/"+key, path, "zero-copy must resolve against L1")
+
+	presigner, ok := backend.(Presignable)
+	require.True(t, ok, "TieredStorage must be Presignable via L2")
+
+	url, err := presigner.GetPresignedURL(context.Background(), key, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, "https://fake.example/"+key, url)
+}
 
 // TestTieredStorage_BasicOperations tests basic tiered storage operations
 func TestTieredStorage_BasicOperations(t *testing.T) {
