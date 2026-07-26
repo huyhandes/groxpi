@@ -8,152 +8,59 @@ import (
 	"time"
 
 	"github.com/phuslu/log"
-	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
 // TieredStorage implements a multi-tier caching system with local (L1) and S3 (L2) storage
 type TieredStorage struct {
-	localCache    StreamingStorage // L1 cache - fast local storage
-	remoteStorage StreamingStorage // L2 cache - persistent S3 storage
-	syncQueue     *TieredSyncQueue // Async queue for L1 cache population
+	localCache    StreamingStorage               // L1 cache - fast local storage
+	remoteStorage StreamingStorage               // L2 cache - persistent S3 storage
+	syncQueue     *WorkerPool[tieredSyncRequest] // Async queue for L1 cache population
 	sf            singleflight.Group
 }
 
-// TieredSyncRequest represents a pending L1 cache population request
-type TieredSyncRequest struct {
-	Key      string
-	Context  context.Context
-	ResultCh chan error
+// tieredSyncRequest represents a pending L1 cache population request
+type tieredSyncRequest struct {
+	Key     string
+	Context context.Context
 }
 
-// TieredSyncQueue manages async L1 cache population from L2
-type TieredSyncQueue struct {
-	storage     *TieredStorage
-	queue       chan *TieredSyncRequest
-	semaphore   *semaphore.Weighted
-	workerCount int
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-}
-
-// NewTieredSyncQueue creates a new tiered sync queue
-func NewTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *TieredSyncQueue {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	tsq := &TieredSyncQueue{
-		storage:     storage,
-		queue:       make(chan *TieredSyncRequest, queueSize),
-		semaphore:   semaphore.NewWeighted(int64(workerCount)),
-		workerCount: workerCount,
-		ctx:         ctx,
-		cancel:      cancel,
-	}
-
-	// Start worker goroutines
-	for i := range workerCount {
-		tsq.wg.Add(1)
-		go tsq.worker(i)
-	}
-
-	log.Info().
-		Int("workers", workerCount).
-		Int("queue_size", queueSize).
-		Msg("Tiered storage sync queue initialized")
-
-	return tsq
-}
-
-// worker processes L1 cache population requests
-func (tsq *TieredSyncQueue) worker(id int) {
-	defer tsq.wg.Done()
-
-	log.Debug().Int("worker_id", id).Msg("Tiered sync worker started")
-
-	for {
-		select {
-		case <-tsq.ctx.Done():
-			log.Debug().Int("worker_id", id).Msg("Tiered sync worker shutting down")
-			return
-		case req := <-tsq.queue:
-			// Acquire semaphore to limit concurrent operations
-			if err := tsq.semaphore.Acquire(req.Context, 1); err != nil {
-				req.ResultCh <- fmt.Errorf("failed to acquire semaphore: %w", err)
-				continue
+// newTieredSyncQueue builds the bounded worker pool that back-fills L1 from L2.
+// Each job carries the context of the request that triggered it, so pool
+// shutdown does not abort a population already under way.
+func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *WorkerPool[tieredSyncRequest] {
+	return NewWorkerPool("tiered-sync", queueSize, workerCount,
+		func(_ context.Context, req tieredSyncRequest) {
+			if err := req.Context.Err(); err != nil {
+				log.Debug().Err(err).Str("key", req.Key).Msg("Skipping L1 population, request context done")
+				return
 			}
 
-			// Copy from L2 (S3) to L1 (local)
 			start := time.Now()
-			err := tsq.storage.populateLocalCache(req.Context, req.Key)
+			err := storage.populateLocalCache(req.Context, req.Key)
 			duration := time.Since(start)
 
-			// Release semaphore
-			tsq.semaphore.Release(1)
-
-			// Send result
-			select {
-			case req.ResultCh <- err:
-			case <-req.Context.Done():
-				// Context cancelled, don't block
-			}
-
-			// Log completion
 			if err != nil {
 				log.Error().
 					Err(err).
 					Str("key", req.Key).
 					Dur("duration", duration).
-					Int("worker_id", id).
 					Msg("Failed to populate L1 cache from L2")
 			} else {
 				log.Debug().
 					Str("key", req.Key).
 					Dur("duration", duration).
-					Int("worker_id", id).
 					Msg("Successfully populated L1 cache from L2")
 			}
-		}
-	}
+		})
 }
 
-// SubmitSync submits an async L1 cache population request
-func (tsq *TieredSyncQueue) SubmitSync(ctx context.Context, key string) <-chan error {
-	resultCh := make(chan error, 1)
-
-	req := &TieredSyncRequest{
-		Key:      key,
-		Context:  ctx,
-		ResultCh: resultCh,
-	}
-
-	select {
-	case tsq.queue <- req:
-		// Successfully queued
-	case <-ctx.Done():
-		// Context cancelled
-		resultCh <- ctx.Err()
-	default:
-		// Queue full, skip async sync (not critical)
+// submitSync queues an L1 population request. L1 back-fill is best-effort, so a
+// full queue drops the request instead of blocking the caller.
+func (ts *TieredStorage) submitSync(ctx context.Context, key string) {
+	if !ts.syncQueue.Submit(tieredSyncRequest{Key: key, Context: ctx}) {
 		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
-		resultCh <- fmt.Errorf("sync queue is full")
 	}
-
-	return resultCh
-}
-
-// Close shuts down the tiered sync queue
-func (tsq *TieredSyncQueue) Close() error {
-	tsq.cancel()
-
-	// Close the queue channel to signal workers to finish current work
-	close(tsq.queue)
-
-	// Wait for all workers to finish
-	tsq.wg.Wait()
-
-	log.Info().Msg("Tiered sync queue shut down")
-	return nil
 }
 
 // TieredConfig holds configuration for tiered storage
@@ -203,7 +110,7 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 	}
 
 	// Initialize sync queue
-	ts.syncQueue = NewTieredSyncQueue(ts, cfg.SyncQueueSize, cfg.SyncWorkers)
+	ts.syncQueue = newTieredSyncQueue(ts, cfg.SyncQueueSize, cfg.SyncWorkers)
 
 	log.Info().
 		Str("local_cache_dir", cfg.LocalCacheDir).
@@ -243,7 +150,7 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 			defer cancel()
 
 			// Submit async sync request (non-blocking)
-			_ = ts.syncQueue.SubmitSync(syncCtx, key)
+			ts.submitSync(syncCtx, key)
 		}()
 
 		return reader, info, nil
@@ -472,7 +379,7 @@ func (ts *TieredStorage) StreamingGet(ctx context.Context, key string, writer io
 		go func() {
 			syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			_ = ts.syncQueue.SubmitSync(syncCtx, key)
+			ts.submitSync(syncCtx, key)
 		}()
 
 		return info, nil
@@ -497,9 +404,7 @@ func (ts *TieredStorage) SupportsZeroCopy() bool {
 func (ts *TieredStorage) Close() error {
 	// Close sync queue first
 	if ts.syncQueue != nil {
-		if err := ts.syncQueue.Close(); err != nil {
-			log.Error().Err(err).Msg("Failed to close tiered sync queue")
-		}
+		ts.syncQueue.Close()
 	}
 
 	// Close both storage backends

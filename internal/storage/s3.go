@@ -14,7 +14,6 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/phuslu/log"
-	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -186,8 +185,8 @@ func (pool *S3ConnectionPool) Close() {
 	pool.metaTransport.CloseIdleConnections()
 }
 
-// AsyncWriteRequest represents a pending write operation
-type AsyncWriteRequest struct {
+// asyncWriteRequest represents a pending write operation
+type asyncWriteRequest struct {
 	Key         string
 	Reader      io.Reader
 	Size        int64
@@ -202,104 +201,55 @@ type AsyncWriteResult struct {
 	Error error
 }
 
-// AsyncWriteQueue manages non-blocking S3 write operations
-type AsyncWriteQueue struct {
-	storage     *S3Storage
-	queue       chan *AsyncWriteRequest
-	semaphore   *semaphore.Weighted
-	workerCount int
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-}
-
-// NewAsyncWriteQueue creates a new async write queue
-func NewAsyncWriteQueue(storage *S3Storage, queueSize, workerCount int) *AsyncWriteQueue {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	awq := &AsyncWriteQueue{
-		storage:     storage,
-		queue:       make(chan *AsyncWriteRequest, queueSize),
-		semaphore:   semaphore.NewWeighted(int64(workerCount)),
-		workerCount: workerCount,
-		ctx:         ctx,
-		cancel:      cancel,
-	}
-
-	// Start worker goroutines
-	for i := range workerCount {
-		awq.wg.Add(1)
-		go awq.worker(i)
-	}
-
-	log.Info().
-		Int("workers", workerCount).
-		Int("queue_size", queueSize).
-		Msg("S3 async write queue initialized")
-
-	return awq
-}
-
-// worker processes async write requests
-func (awq *AsyncWriteQueue) worker(id int) {
-	defer awq.wg.Done()
-
-	log.Debug().Int("worker_id", id).Msg("S3 async write worker started")
-
-	for {
-		select {
-		case <-awq.ctx.Done():
-			log.Debug().Int("worker_id", id).Msg("S3 async write worker shutting down")
-			return
-		case req := <-awq.queue:
-			// Acquire semaphore to limit concurrent operations
-			if err := awq.semaphore.Acquire(req.Context, 1); err != nil {
-				req.ResultCh <- AsyncWriteResult{Error: fmt.Errorf("failed to acquire semaphore: %w", err)}
-				continue
+// newAsyncWriteQueue builds the bounded worker pool that performs non-blocking
+// S3 writes. Each job carries its own request context, so an in-flight upload
+// is not aborted by pool shutdown.
+func newAsyncWriteQueue(storage *S3Storage, queueSize, workerCount int) *WorkerPool[*asyncWriteRequest] {
+	return NewWorkerPool("s3-async-write", queueSize, workerCount,
+		func(_ context.Context, req *asyncWriteRequest) {
+			if err := req.Context.Err(); err != nil {
+				req.ResultCh <- AsyncWriteResult{Error: fmt.Errorf("async S3 write cancelled: %w", err)}
+				return
 			}
 
-			// Perform the write operation
 			start := time.Now()
-			info, err := awq.storage.putInternal(req.Context, req.Key, req.Reader, req.Size, req.ContentType)
+			info, err := storage.putInternal(req.Context, req.Key, req.Reader, req.Size, req.ContentType)
 			duration := time.Since(start)
 
-			// Release semaphore
-			awq.semaphore.Release(1)
-
-			// Send result
-			result := AsyncWriteResult{Info: info, Error: err}
 			select {
-			case req.ResultCh <- result:
+			case req.ResultCh <- AsyncWriteResult{Info: info, Error: err}:
 			case <-req.Context.Done():
 				// Context cancelled, don't block
 			}
 
-			// Log async write completion
 			if err != nil {
 				log.Error().
 					Err(err).
 					Str("key", req.Key).
 					Int64("size", req.Size).
 					Dur("duration", duration).
-					Int("worker_id", id).
 					Msg("Async S3 write failed")
 			} else {
 				log.Debug().
 					Str("key", req.Key).
 					Int64("size", req.Size).
 					Dur("duration", duration).
-					Int("worker_id", id).
 					Msg("Async S3 write completed")
 			}
-		}
-	}
+		})
 }
 
-// SubmitWrite submits an async write request
-func (awq *AsyncWriteQueue) SubmitWrite(ctx context.Context, key string, reader io.Reader, size int64, contentType string) <-chan AsyncWriteResult {
+// submitAsyncWrite queues an async write and returns the channel its result
+// will arrive on. A full queue fails the write immediately rather than blocking.
+func (s *S3Storage) submitAsyncWrite(ctx context.Context, key string, reader io.Reader, size int64, contentType string) <-chan AsyncWriteResult {
 	resultCh := make(chan AsyncWriteResult, 1)
 
-	req := &AsyncWriteRequest{
+	if err := ctx.Err(); err != nil {
+		resultCh <- AsyncWriteResult{Error: err}
+		return resultCh
+	}
+
+	req := &asyncWriteRequest{
 		Key:         key,
 		Reader:      reader,
 		Size:        size,
@@ -308,32 +258,11 @@ func (awq *AsyncWriteQueue) SubmitWrite(ctx context.Context, key string, reader 
 		Context:     ctx,
 	}
 
-	select {
-	case awq.queue <- req:
-		// Successfully queued
-	case <-ctx.Done():
-		// Context cancelled
-		resultCh <- AsyncWriteResult{Error: ctx.Err()}
-	default:
-		// Queue full, return error
+	if !s.asyncQueue.Submit(req) {
 		resultCh <- AsyncWriteResult{Error: fmt.Errorf("async write queue is full")}
 	}
 
 	return resultCh
-}
-
-// Close shuts down the async write queue
-func (awq *AsyncWriteQueue) Close() error {
-	awq.cancel()
-
-	// Close the queue channel to signal workers to finish current work
-	close(awq.queue)
-
-	// Wait for all workers to finish
-	awq.wg.Wait()
-
-	log.Info().Msg("S3 async write queue shut down")
-	return nil
 }
 
 // S3Storage implements Storage interface for S3-compatible backends
@@ -347,7 +276,7 @@ type S3Storage struct {
 	connPool    *S3ConnectionPool
 
 	// Async write queue for non-blocking operations
-	asyncQueue  *AsyncWriteQueue
+	asyncQueue  *WorkerPool[*asyncWriteRequest]
 	asyncWrites bool
 
 	// Singleflight groups for deduplicating concurrent operations
@@ -486,7 +415,7 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 
 	// Initialize async write queue if enabled
 	if cfg.AsyncWrites {
-		storage.asyncQueue = NewAsyncWriteQueue(storage, cfg.AsyncQueueSize, cfg.AsyncWorkers)
+		storage.asyncQueue = newAsyncWriteQueue(storage, cfg.AsyncQueueSize, cfg.AsyncWorkers)
 	}
 
 	log.Info().
@@ -792,7 +721,7 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 		data = data[:n]
 
 		// Submit async write
-		resultCh := s.asyncQueue.SubmitWrite(ctx, key, bytes.NewReader(data), int64(n), contentType)
+		resultCh := s.submitAsyncWrite(ctx, key, bytes.NewReader(data), int64(n), contentType)
 
 		// Wait for result
 		select {
@@ -1183,11 +1112,9 @@ func (br *bufferedReader) Close() error {
 
 // Close releases any resources held by the storage backend
 func (s *S3Storage) Close() error {
-	// Close async write queue first to ensure all pending writes complete
+	// Close async write queue first to ensure in-flight writes complete
 	if s.asyncQueue != nil {
-		if err := s.asyncQueue.Close(); err != nil {
-			log.Error().Err(err).Msg("Failed to close async write queue")
-		}
+		s.asyncQueue.Close()
 	}
 
 	// Close all connection pools
