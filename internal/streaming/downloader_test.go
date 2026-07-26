@@ -269,7 +269,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		ctx := context.Background()
 		errors := make(chan error, concurrency)
 
-		for i := 0; i < concurrency; i++ {
+		for i := range concurrency {
 			go func(id int) {
 				defer wg.Done()
 				var buffer bytes.Buffer

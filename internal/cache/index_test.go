@@ -131,7 +131,7 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 	done := make(chan bool)
 
 	// Test concurrent reads and writes
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(id int) {
 			defer func() { done <- true }()
 
@@ -155,7 +155,7 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all goroutines to complete
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 }
@@ -166,7 +166,7 @@ func TestIndexCache_DifferentDataTypes(t *testing.T) {
 	testCases := []struct {
 		name string
 		key  string
-		data interface{}
+		data any
 	}{
 		{"string", "str-key", "string-value"},
 		{"int", "int-key", 42},

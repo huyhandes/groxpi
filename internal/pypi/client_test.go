@@ -386,7 +386,7 @@ func TestClient_SingleflightPackageList(t *testing.T) {
 	errors := make([]error, numGoroutines)
 
 	// Launch concurrent requests
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -405,7 +405,7 @@ func TestClient_SingleflightPackageList(t *testing.T) {
 	}
 
 	// Verify all results are identical and successful
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		if errors[i] != nil {
 			t.Errorf("Request %d failed: %v", i, errors[i])
 		}
@@ -450,7 +450,7 @@ func TestClient_SingleflightPackageFiles(t *testing.T) {
 	errors := make([]error, numGoroutines)
 
 	// Launch concurrent requests for same package
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -469,7 +469,7 @@ func TestClient_SingleflightPackageFiles(t *testing.T) {
 	}
 
 	// Verify all results are identical and successful
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		if errors[i] != nil {
 			t.Errorf("Request %d failed: %v", i, errors[i])
 		}
@@ -501,7 +501,7 @@ func TestClient_SingleflightErrorPropagation(t *testing.T) {
 	errors := make([]error, numGoroutines)
 
 	// Launch concurrent requests that should all fail
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -519,7 +519,7 @@ func TestClient_SingleflightErrorPropagation(t *testing.T) {
 	}
 
 	// Verify all requests got the same error
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		if errors[i] == nil {
 			t.Errorf("Request %d should have failed", i)
 			continue
@@ -659,7 +659,7 @@ func BenchmarkClient_GetPackageFiles_WithSingleflight(b *testing.B) {
 func TestFileInfo_IsYanked(t *testing.T) {
 	testCases := []struct {
 		name     string
-		yanked   interface{}
+		yanked   any
 		expected bool
 	}{
 		{"nil yanked", nil, false},
@@ -686,7 +686,7 @@ func TestFileInfo_IsYanked(t *testing.T) {
 func TestFileInfo_GetYankedReason(t *testing.T) {
 	testCases := []struct {
 		name         string
-		yanked       interface{}
+		yanked       any
 		yankedReason string
 		expected     string
 	}{

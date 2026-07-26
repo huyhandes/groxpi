@@ -52,7 +52,7 @@ func NewTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *Tie
 	}
 
 	// Start worker goroutines
-	for i := 0; i < workerCount; i++ {
+	for i := range workerCount {
 		tsq.wg.Add(1)
 		go tsq.worker(i)
 	}
@@ -282,7 +282,7 @@ func (ts *TieredStorage) GetRange(ctx context.Context, key string, offset, lengt
 // Put stores an object in both L1 and L2 concurrently
 func (ts *TieredStorage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	// Use singleflight to prevent duplicate concurrent puts
-	result, err, _ := ts.sf.Do("put:"+key, func() (interface{}, error) {
+	result, err, _ := ts.sf.Do("put:"+key, func() (any, error) {
 		return ts.putInternal(ctx, key, reader, size, contentType)
 	})
 

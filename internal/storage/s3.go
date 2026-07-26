@@ -52,7 +52,7 @@ type S3Config struct {
 var (
 	// Small files (< 16KB) - 4KB buffers
 	s3SmallBufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			buf := make([]byte, 4*1024) // 4KB buffers
 			return &buf
 		},
@@ -60,7 +60,7 @@ var (
 
 	// Medium files (16KB - 256KB) - 16KB buffers
 	s3MediumBufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			buf := make([]byte, 16*1024) // 16KB buffers
 			return &buf
 		},
@@ -68,7 +68,7 @@ var (
 
 	// Large files (256KB - 4MB) - 64KB buffers
 	s3LargeBufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			buf := make([]byte, 64*1024) // 64KB buffers
 			return &buf
 		},
@@ -76,7 +76,7 @@ var (
 
 	// Huge files (> 4MB) - 256KB buffers
 	s3HugeBufferPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			buf := make([]byte, 256*1024) // 256KB buffers
 			return &buf
 		},
@@ -227,7 +227,7 @@ func NewAsyncWriteQueue(storage *S3Storage, queueSize, workerCount int) *AsyncWr
 	}
 
 	// Start worker goroutines
-	for i := 0; i < workerCount; i++ {
+	for i := range workerCount {
 		awq.wg.Add(1)
 		go awq.worker(i)
 	}
@@ -384,11 +384,11 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 
 	// Normalize endpoint URL - remove protocol if present
 	endpoint := cfg.Endpoint
-	if strings.HasPrefix(endpoint, "https://") {
-		endpoint = strings.TrimPrefix(endpoint, "https://")
+	if after, ok := strings.CutPrefix(endpoint, "https://"); ok {
+		endpoint = after
 		cfg.UseSSL = true
-	} else if strings.HasPrefix(endpoint, "http://") {
-		endpoint = strings.TrimPrefix(endpoint, "http://")
+	} else if after, ok := strings.CutPrefix(endpoint, "http://"); ok {
+		endpoint = after
 		cfg.UseSSL = false
 	}
 
@@ -524,10 +524,7 @@ func (s *S3Storage) calculateOptimalPartSize(fileSize int64) int64 {
 	)
 
 	// For very large files, calculate part size to stay under 10,000 parts
-	calculatedPartSize := fileSize / maxParts
-	if calculatedPartSize < minPartSize {
-		calculatedPartSize = minPartSize
-	}
+	calculatedPartSize := max(fileSize/maxParts, minPartSize)
 
 	// Use larger parts for better throughput, but not too large
 	// Scale part size based on file size:
@@ -855,7 +852,7 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 // Exists checks if an object exists in S3 with singleflight deduplication
 func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 	// Use singleflight to deduplicate concurrent stat requests
-	result, err, _ := s.statSF.Do("exists:"+key, func() (interface{}, error) {
+	result, err, _ := s.statSF.Do("exists:"+key, func() (any, error) {
 		return s.existsInternal(ctx, key)
 	})
 
@@ -885,7 +882,7 @@ func (s *S3Storage) existsInternal(ctx context.Context, key string) (bool, error
 // Stat retrieves object metadata without downloading content with singleflight deduplication
 func (s *S3Storage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
 	// Use singleflight to deduplicate concurrent stat requests
-	result, err, _ := s.statSF.Do("stat:"+key, func() (interface{}, error) {
+	result, err, _ := s.statSF.Do("stat:"+key, func() (any, error) {
 		return s.statInternal(ctx, key)
 	})
 
@@ -921,7 +918,7 @@ func (s *S3Storage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, 
 	listKey := fmt.Sprintf("list:%s:%d:%s", opts.Prefix, opts.MaxKeys, opts.StartAfter)
 
 	// Use singleflight to deduplicate concurrent list requests
-	result, err, _ := s.listSF.Do(listKey, func() (interface{}, error) {
+	result, err, _ := s.listSF.Do(listKey, func() (any, error) {
 		return s.listInternal(ctx, opts)
 	})
 

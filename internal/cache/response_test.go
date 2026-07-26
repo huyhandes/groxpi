@@ -173,9 +173,9 @@ func TestResponseCache_LRUEviction(t *testing.T) {
 		key  string
 		data []byte
 	}{
-		{"key1", []byte(fmt.Sprintf("%0400s", "a"))}, // 400 bytes
-		{"key2", []byte(fmt.Sprintf("%0400s", "b"))}, // 400 bytes
-		{"key3", []byte(fmt.Sprintf("%0400s", "c"))}, // 400 bytes - should trigger eviction
+		{"key1", fmt.Appendf(nil, "%0400s", "a")}, // 400 bytes
+		{"key2", fmt.Appendf(nil, "%0400s", "b")}, // 400 bytes
+		{"key3", fmt.Appendf(nil, "%0400s", "c")}, // 400 bytes - should trigger eviction
 	}
 
 	ttl := 5 * time.Second
@@ -213,9 +213,9 @@ func TestResponseCache_AccessUpdatesLRU(t *testing.T) {
 	responseCache := NewResponseCache(maxSize)
 
 	// Add two entries
-	data1 := []byte(fmt.Sprintf("%0400s", "data1"))
-	data2 := []byte(fmt.Sprintf("%0400s", "data2"))
-	data3 := []byte(fmt.Sprintf("%0400s", "data3"))
+	data1 := fmt.Appendf(nil, "%0400s", "data1")
+	data2 := fmt.Appendf(nil, "%0400s", "data2")
+	data3 := fmt.Appendf(nil, "%0400s", "data3")
 	ttl := 5 * time.Second
 
 	responseCache.Set("key1", data1, ttl)
@@ -283,14 +283,14 @@ func TestResponseCache_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 
 	// Test concurrent reads and writes
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				key := fmt.Sprintf("concurrent-key-%d-%d", id, j)
-				data := []byte(fmt.Sprintf(`{"id": %d, "operation": %d}`, id, j))
+				data := fmt.Appendf(nil, `{"id": %d, "operation": %d}`, id, j)
 
 				// Write
 				responseCache.Set(key, data, 1*time.Second)
@@ -326,10 +326,8 @@ func TestResponseCache_ConcurrentZeroCopyAccess(t *testing.T) {
 	var successCount int64
 
 	// Test concurrent zero-copy access
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numGoroutines {
+		wg.Go(func() {
 
 			result, release, exists := responseCache.GetZeroCopy(key)
 			if !exists {
@@ -349,7 +347,7 @@ func TestResponseCache_ConcurrentZeroCopyAccess(t *testing.T) {
 			release()
 
 			atomic.AddInt64(&successCount, 1)
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -426,7 +424,7 @@ func TestResponseCache_EdgeCases(t *testing.T) {
 
 	t.Run("data larger than cache", func(t *testing.T) {
 		key := "too-large"
-		data := []byte(fmt.Sprintf("%0200s", "large"))
+		data := fmt.Appendf(nil, "%0200s", "large")
 		ttl := 5 * time.Second
 
 		responseCache.Set(key, data, ttl)
@@ -448,7 +446,7 @@ func TestResponseCache_LRUUpdateLogic(t *testing.T) {
 	// Add several entries
 	keys := []string{"key1", "key2", "key3", "key4"}
 	for i, key := range keys {
-		data := []byte(fmt.Sprintf(`{"index": %d}`, i))
+		data := fmt.Appendf(nil, `{"index": %d}`, i)
 		responseCache.Set(key, data, 5*time.Second)
 	}
 
@@ -479,7 +477,7 @@ func BenchmarkResponseCache_Get(b *testing.B) {
 	ttl := 1 * time.Hour
 
 	// Pre-populate cache
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		key := fmt.Sprintf("bench-get-%d", i)
 		responseCache.Set(key, data, ttl)
 	}
@@ -499,7 +497,7 @@ func BenchmarkResponseCache_GetZeroCopy(b *testing.B) {
 	ttl := 1 * time.Hour
 
 	// Pre-populate cache
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		key := fmt.Sprintf("bench-zero-copy-%d", i)
 		responseCache.Set(key, data, ttl)
 	}
@@ -522,7 +520,7 @@ func BenchmarkResponseCache_ConcurrentAccess(b *testing.B) {
 	ttl := 1 * time.Hour
 
 	// Pre-populate cache
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		key := fmt.Sprintf("bench-concurrent-%d", i)
 		responseCache.Set(key, data, ttl)
 	}

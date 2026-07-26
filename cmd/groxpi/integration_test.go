@@ -37,7 +37,7 @@ func TestMainIntegration(t *testing.T) {
 	defer cancel()
 
 	done := make(chan bool, 1)
-	var panicValue interface{}
+	var panicValue any
 
 	go func() {
 		defer func() {

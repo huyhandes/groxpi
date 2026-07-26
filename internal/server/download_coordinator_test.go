@@ -37,9 +37,9 @@ func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
 			if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
 				// Return JSON API response
 				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				response := map[string]interface{}{
+				response := map[string]any{
 					"name": packageName,
-					"files": []map[string]interface{}{
+					"files": []map[string]any{
 						{
 							"filename": fileName,
 							"url":      fmt.Sprintf("%s/files/%s", mockPyPI.URL, fileName),
@@ -89,7 +89,7 @@ func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
 	atomic.StoreInt64(&pypiRequestCount, 0)
 
 	// Launch concurrent requests
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
@@ -157,7 +157,7 @@ func TestServer_DownloadCoordinator_ErrorHandling(t *testing.T) {
 	var wg sync.WaitGroup
 	responses := make([]int, numRequests)
 
-	for i := 0; i < numRequests; i++ {
+	for i := range numRequests {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()

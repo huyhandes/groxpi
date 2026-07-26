@@ -27,7 +27,7 @@ func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 	return &LocalStorage{
 		baseDir: baseDir,
 		copyBufPool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 64*1024) // 64KB buffer
 				return &buf
 			},

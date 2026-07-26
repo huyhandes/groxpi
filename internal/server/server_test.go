@@ -109,7 +109,7 @@ func TestServer_HandleHealth(t *testing.T) {
 		t.Errorf("Expected JSON content type, got %s", contentType)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode JSON response: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestServer_HandleHealth(t *testing.T) {
 		t.Errorf("Expected status 'success', got %v", response["status"])
 	}
 
-	data, ok := response["data"].(map[string]interface{})
+	data, ok := response["data"].(map[string]any)
 	if !ok {
 		t.Error("Expected data to be an object")
 	}
@@ -193,12 +193,12 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 		t.Errorf("Expected PyPI JSON content type, got %s", contentType)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode JSON response: %v", err)
 	}
 
-	meta, ok := response["meta"].(map[string]interface{})
+	meta, ok := response["meta"].(map[string]any)
 	if !ok {
 		t.Error("Expected meta to be an object")
 	}
@@ -207,7 +207,7 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 		t.Errorf("Expected api-version '1.0', got %v", meta["api-version"])
 	}
 
-	projects, ok := response["projects"].([]interface{})
+	projects, ok := response["projects"].([]any)
 	if !ok {
 		t.Error("Expected projects to be an array")
 	}
@@ -282,7 +282,7 @@ func TestServer_HandleCacheList(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode JSON response: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestServer_HandleCachePackage(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode JSON response: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
-	var response map[string]interface{}
+	var response map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode JSON response: %v", err)
 	}
@@ -636,7 +636,7 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 		}
 	}
 
-	data := response["data"].(map[string]interface{})
+	data := response["data"].(map[string]any)
 	expectedDataFields := []string{"index_url", "cache_dir", "cache_size", "index_ttl_seconds", "storage_type"}
 	for _, field := range expectedDataFields {
 		if _, exists := data[field]; !exists {
@@ -713,7 +713,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 	responses := make([]*http.Response, numConcurrentRequests)
 
 	// Launch concurrent requests to the same endpoint
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -734,7 +734,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 	}
 
 	// Verify all server responses are successful
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -749,13 +749,13 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 		}
 
 		// Verify response contains expected content (all should have same data due to singleflight)
-		var response map[string]interface{}
+		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
 			t.Errorf("Failed to parse JSON response for request %d: %v", i, err)
 			continue
 		}
 
-		projects, ok := response["projects"].([]interface{})
+		projects, ok := response["projects"].([]any)
 		if !ok {
 			t.Errorf("Request %d: expected projects array", i)
 			continue
@@ -768,7 +768,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 		// Verify it contains the expected project names
 		projectNames := make(map[string]bool)
 		for _, proj := range projects {
-			if projMap, ok := proj.(map[string]interface{}); ok {
+			if projMap, ok := proj.(map[string]any); ok {
 				if name, ok := projMap["name"].(string); ok {
 					projectNames[name] = true
 				}
@@ -825,7 +825,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 	responses := make([]*http.Response, numConcurrentRequests)
 
 	// Launch concurrent requests for the same package
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -846,7 +846,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 	}
 
 	// Verify all server responses are successful
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -861,13 +861,13 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 		}
 
 		// Verify response contains expected content (all should have same data due to singleflight)
-		var response map[string]interface{}
+		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
 			t.Errorf("Failed to parse JSON response for request %d: %v", i, err)
 			continue
 		}
 
-		files, ok := response["files"].([]interface{})
+		files, ok := response["files"].([]any)
 		if !ok {
 			t.Errorf("Request %d: expected files array", i)
 			continue
@@ -884,7 +884,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 		// Verify it contains the expected file names
 		fileNames := make(map[string]bool)
 		for _, file := range files {
-			if fileMap, ok := file.(map[string]interface{}); ok {
+			if fileMap, ok := file.(map[string]any); ok {
 				if name, ok := fileMap["filename"].(string); ok {
 					fileNames[name] = true
 				}
@@ -928,7 +928,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 	responses := make([]*http.Response, numConcurrentRequests)
 
 	// Launch concurrent requests that should all fail
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -949,7 +949,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 	}
 
 	// Verify all server responses indicate the error was handled consistently
-	for i := 0; i < numConcurrentRequests; i++ {
+	for i := range numConcurrentRequests {
 
 		// The server may return 200 with empty list on PyPI error, which is valid behavior
 		// What matters is that singleflight prevented duplicate requests to PyPI
@@ -965,13 +965,13 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 		}
 
 		// Verify response is valid JSON with empty projects list (server handles PyPI errors)
-		var response map[string]interface{}
+		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
 			t.Errorf("Failed to parse JSON response for request %d: %v", i, err)
 			continue
 		}
 
-		projects, ok := response["projects"].([]interface{})
+		projects, ok := response["projects"].([]any)
 		if !ok {
 			t.Errorf("Request %d: expected projects array", i)
 			continue
@@ -1046,9 +1046,9 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 	}
 
 	// Verify all results are correct (collect results first to avoid race conditions)
-	responseData := make(map[string]map[string]interface{})
+	responseData := make(map[string]map[string]any)
 
-	for i := 0; i < len(packages); i++ {
+	for i := range packages {
 
 		if responses[i].StatusCode != http.StatusOK {
 			t.Errorf("Request %d got status %d, expected 200", i, responses[i].StatusCode)
@@ -1062,7 +1062,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 			continue
 		}
 
-		var response map[string]interface{}
+		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
 			t.Errorf("Failed to parse JSON response for request %d: %v", i, err)
 			continue
@@ -1082,13 +1082,13 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 			continue
 		}
 
-		files, ok := response["files"].([]interface{})
+		files, ok := response["files"].([]any)
 		if !ok || len(files) != 1 {
 			t.Errorf("Expected 1 file for %s, got %v", pkg, files)
 			continue
 		}
 
-		file := files[0].(map[string]interface{})
+		file := files[0].(map[string]any)
 		expectedFilename := pkg + "-1.0.0.tar.gz"
 		if file["filename"] != expectedFilename {
 			t.Errorf("Expected filename '%s', got %v", expectedFilename, file["filename"])
@@ -1228,12 +1228,12 @@ func TestServer_URLRewriting(t *testing.T) {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
 
-		var response map[string]interface{}
+		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
 			t.Fatalf("Failed to parse JSON response: %v", err)
 		}
 
-		files, ok := response["files"].([]interface{})
+		files, ok := response["files"].([]any)
 		if !ok {
 			t.Fatal("Expected files array")
 		}
@@ -1244,7 +1244,7 @@ func TestServer_URLRewriting(t *testing.T) {
 
 		// Verify URLs are rewritten to point to proxy
 		for _, file := range files {
-			fileMap := file.(map[string]interface{})
+			fileMap := file.(map[string]any)
 			filename := fileMap["filename"].(string)
 			url := fileMap["url"].(string)
 

@@ -306,11 +306,11 @@ func (lru *LRUCache) RecordDelete(key string) error {
 }
 
 // GetStats returns current cache statistics
-func (lru *LRUCache) GetStats() map[string]interface{} {
+func (lru *LRUCache) GetStats() map[string]any {
 	lru.mu.RLock()
 	defer lru.mu.RUnlock()
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"max_size_bytes":     lru.maxSize,
 		"max_size_mb":        lru.maxSize / (1024 * 1024),
 		"current_size_bytes": lru.currentSize,
@@ -485,7 +485,7 @@ func (lru *LRULocalStorage) Delete(ctx context.Context, key string) error {
 }
 
 // GetStats returns LRU cache statistics
-func (lru *LRULocalStorage) GetStats() map[string]interface{} {
+func (lru *LRULocalStorage) GetStats() map[string]any {
 	return lru.lruCache.GetStats()
 }
 

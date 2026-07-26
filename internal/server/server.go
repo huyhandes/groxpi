@@ -26,7 +26,7 @@ import (
 
 // Response buffer pool for reducing allocations
 var responseBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -241,7 +241,7 @@ func (s *Server) handleListPackages(c *gin.Context) {
 
 	if len(packages) == 0 {
 		// Use singleflight to deduplicate concurrent requests
-		result, err, _ := s.sf.Do("package-list", func() (interface{}, error) {
+		result, err, _ := s.sf.Do("package-list", func() (any, error) {
 			return s.pypiClient.GetPackageList()
 		})
 
@@ -262,8 +262,8 @@ func (s *Server) handleListPackages(c *gin.Context) {
 			projects = append(projects, map[string]string{"name": pkg})
 		}
 
-		response := map[string]interface{}{
-			"meta": map[string]interface{}{
+		response := map[string]any{
+			"meta": map[string]any{
 				"api-version": "1.0",
 			},
 			"projects": projects,
@@ -333,7 +333,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 
 	// Use singleflight to deduplicate concurrent requests for the same package
 	key := "package-files:" + packageName
-	result, err, _ := s.sf.Do(key, func() (interface{}, error) {
+	result, err, _ := s.sf.Do(key, func() (any, error) {
 		return s.pypiClient.GetPackageFiles(packageName)
 	})
 
@@ -367,11 +367,11 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 		}()
 
 		// Pre-allocate slice with exact capacity
-		fileList := make([]map[string]interface{}, 0, len(files))
+		fileList := make([]map[string]any, 0, len(files))
 
 		for _, file := range files {
 			// Use simple map
-			fileMap := make(map[string]interface{}, 6)
+			fileMap := make(map[string]any, 6)
 			fileMap["filename"] = file.Name
 			// Rewrite URL to point to proxy instead of direct PyPI
 			fileMap["url"] = fmt.Sprintf("/simple/%s/%s", packageName, file.Name)
@@ -393,8 +393,8 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 		}
 
 		// Build response structure
-		response := map[string]interface{}{
-			"meta": map[string]interface{}{
+		response := map[string]any{
+			"meta": map[string]any{
 				"api-version": "1.0",
 			},
 			"name":  packageName,

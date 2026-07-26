@@ -2,7 +2,7 @@
 
 A high-performance PyPI caching proxy server written in Go, reimplemented from the Python-based [proxpi](https://github.com/EpicWink/proxpi) project using Gin framework and Sonic JSON.
 
-[![Go Version](https://img.shields.io/badge/go-1.24+-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.26+-blue.svg)](https://golang.org)
 [![Gin](https://img.shields.io/badge/gin-v1.11+-green.svg)](https://gin-gonic.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

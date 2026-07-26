@@ -174,7 +174,7 @@ func TestS3Storage_CalculateOptimalPartSize_Performance(t *testing.T) {
 
 	// Run multiple times to ensure consistency
 	var results []int64
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		result := storage.calculateOptimalPartSize(fileSize)
 		results = append(results, result)
 	}

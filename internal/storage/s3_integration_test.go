@@ -191,7 +191,7 @@ func startGroxpiServer(t *testing.T, groxpiBinary string) *groxpiServer {
 func waitForServer(t *testing.T, url string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		if resp, err := client.Get(url + "/health"); err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {

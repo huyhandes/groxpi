@@ -473,7 +473,7 @@ func TestLocalStorage_ConcurrentAccess(t *testing.T) {
 	numGoroutines := 10
 
 	wg.Add(numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(id int) {
 			defer wg.Done()
 
@@ -489,7 +489,7 @@ func TestLocalStorage_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 
 	// Verify all files were created
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		key := fmt.Sprintf("concurrent-%d.txt", i)
 		exists, err := storage.Exists(ctx, key)
 		if err != nil {

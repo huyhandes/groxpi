@@ -21,7 +21,7 @@ type zeroCopyServer struct {
 func NewZeroCopyServer() ZeroCopyServer {
 	return &zeroCopyServer{
 		copyBufPool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 64*1024) // 64KB buffer
 				return &buf
 			},

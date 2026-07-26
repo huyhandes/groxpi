@@ -208,7 +208,7 @@ func TestTieredStorage_ConcurrentAccess(t *testing.T) {
 
 	// Perform concurrent puts and gets
 	done := make(chan bool)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		go func(n int) {
 			key := filepath.Join("concurrent", "file", string(rune('a'+n))+".txt")
 			data := bytes.Repeat([]byte{byte(n)}, 100)
@@ -232,7 +232,7 @@ func TestTieredStorage_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all goroutines
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		<-done
 	}
 }

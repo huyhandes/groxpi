@@ -6,7 +6,7 @@ import (
 )
 
 type IndexEntry struct {
-	Data      interface{}
+	Data      any
 	ExpiresAt time.Time
 }
 
@@ -21,7 +21,7 @@ func NewIndexCache() *IndexCache {
 	}
 }
 
-func (c *IndexCache) Get(key string) (interface{}, bool) {
+func (c *IndexCache) Get(key string) (any, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -37,7 +37,7 @@ func (c *IndexCache) Get(key string) (interface{}, bool) {
 	return entry.Data, true
 }
 
-func (c *IndexCache) Set(key string, data interface{}, ttl time.Duration) {
+func (c *IndexCache) Set(key string, data any, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -61,10 +61,10 @@ func (c *IndexCache) InvalidatePackage(packageName string) {
 	delete(c.entries, "package:"+packageName)
 }
 
-func (c *IndexCache) GetPackage(packageName string) (interface{}, bool) {
+func (c *IndexCache) GetPackage(packageName string) (any, bool) {
 	return c.Get("package:" + packageName)
 }
 
-func (c *IndexCache) SetPackage(packageName string, data interface{}, ttl time.Duration) {
+func (c *IndexCache) SetPackage(packageName string, data any, ttl time.Duration) {
 	c.Set("package:"+packageName, data, ttl)
 }

@@ -167,7 +167,7 @@ func TestFileCache_MultipleEvictions(t *testing.T) {
 	fileCache := NewFileCache(cacheDir, maxSize)
 
 	// Add multiple small files
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		key := fmt.Sprintf("pkg%d/file%d.whl", i, i)
 		path := fmt.Sprintf("/path/to/file%d.whl", i)
 		size := int64(300) // Each file is 300 bytes
@@ -218,7 +218,7 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 	done := make(chan bool)
 
 	// Test concurrent reads and writes
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(id int) {
 			defer func() { done <- true }()
 
@@ -243,7 +243,7 @@ func TestFileCache_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Wait for all goroutines to complete
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 }

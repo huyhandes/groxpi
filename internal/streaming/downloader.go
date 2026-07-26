@@ -35,7 +35,7 @@ func NewStreamingDownloader(storage StorageWriter, client *http.Client) Streamin
 		storage:    storage,
 		httpClient: client,
 		copyBufPool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 64*1024) // 64KB buffer
 				return &buf
 			},
@@ -170,7 +170,7 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 		storage:    storage,
 		httpClient: client,
 		copyBufPool: &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 64*1024) // 64KB buffer
 				return &buf
 			},

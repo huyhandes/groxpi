@@ -195,16 +195,14 @@ func (abw *asyncBroadcastWriter) AddWriter(w io.Writer) error {
 	abw.writers = append(abw.writers, ch)
 
 	// Start goroutine to read from channel and write to writer
-	abw.wg.Add(1)
-	go func() {
-		defer abw.wg.Done()
+	abw.wg.Go(func() {
 		for data := range ch {
 			if _, err := w.Write(data); err != nil {
 				// Log error but continue with other writers
 				return
 			}
 		}
-	}()
+	})
 
 	return nil
 }

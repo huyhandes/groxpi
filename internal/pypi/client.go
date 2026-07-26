@@ -30,7 +30,7 @@ type FileInfo struct {
 	RequiresPython string            `json:"requires-python,omitempty"`
 	Size           int64             `json:"size,omitempty"`
 	UploadTime     string            `json:"upload-time,omitempty"`
-	Yanked         interface{}       `json:"yanked,omitempty"` // Can be bool or string
+	Yanked         any               `json:"yanked,omitempty"` // Can be bool or string
 	YankedReason   string            `json:"yanked-reason,omitempty"`
 }
 
@@ -73,14 +73,14 @@ type PyPISimpleResponse struct {
 
 // Buffer pool for reducing allocations
 var bufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
 
 // Copy buffer pool for zero-copy optimizations
 var copyBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 32*1024) // 32KB copy buffers
 		return &buf
 	},
@@ -150,7 +150,7 @@ func NewClient(cfg *config.Config) *Client {
 
 func (c *Client) GetPackageList() ([]string, error) {
 	// Use singleflight to deduplicate concurrent requests
-	result, err, _ := c.sf.Do("package-list", func() (interface{}, error) {
+	result, err, _ := c.sf.Do("package-list", func() (any, error) {
 		return c.getPackageListInternal()
 	})
 
@@ -193,7 +193,7 @@ func (c *Client) getPackageListInternal() ([]string, error) {
 func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
 	// Use singleflight to deduplicate concurrent requests for the same package
 	key := "package-files:" + packageName
-	result, err, _ := c.sf.Do(key, func() (interface{}, error) {
+	result, err, _ := c.sf.Do(key, func() (any, error) {
 		return c.getPackageFilesInternal(packageName)
 	})
 
@@ -330,8 +330,8 @@ func (c *Client) parseHTMLPackageList(body io.Reader) ([]string, error) {
 		packages = make([]string, 0, 1000)
 
 		// Simple HTML parsing for package list
-		lines := strings.Split(html, "\n")
-		for _, line := range lines {
+		lines := strings.SplitSeq(html, "\n")
+		for line := range lines {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "<a ") {
 				continue
@@ -365,8 +365,8 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader) ([]FileInfo, error) {
 		files = make([]FileInfo, 0, 50)
 
 		// Simple HTML parsing for package files
-		lines := strings.Split(html, "\n")
-		for _, line := range lines {
+		lines := strings.SplitSeq(html, "\n")
+		for line := range lines {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "<a ") {
 				continue
@@ -402,7 +402,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader) ([]FileInfo, error) {
 			}
 
 			// Extract data-yanked if present
-			var yanked interface{}
+			var yanked any
 			if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
 				yankStart += 13
 				if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {

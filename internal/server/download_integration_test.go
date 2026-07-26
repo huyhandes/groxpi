@@ -49,9 +49,9 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 			if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
 				// Return JSON API response
 				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				response := map[string]interface{}{
+				response := map[string]any{
 					"name": packageName,
-					"files": []map[string]interface{}{
+					"files": []map[string]any{
 						{
 							"filename": fileName,
 							"url":      fmt.Sprintf("%s/files/%s", mockPyPI.URL, fileName),
@@ -106,7 +106,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 		startTime := time.Now()
 
 		// Launch concurrent requests
-		for i := 0; i < numConcurrentRequests; i++ {
+		for i := range numConcurrentRequests {
 			wg.Add(1)
 			go func(index int) {
 				defer wg.Done()
@@ -188,9 +188,9 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 			if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
 				// Return JSON API response
 				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				response := map[string]interface{}{
+				response := map[string]any{
 					"name": packageName,
-					"files": []map[string]interface{}{
+					"files": []map[string]any{
 						{
 							"filename": fileName,
 							"url":      fmt.Sprintf("%s/files/%s", mockPyPI.URL, fileName),
@@ -241,7 +241,7 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 
 		startTime := time.Now()
 
-		for i := 0; i < numClients; i++ {
+		for i := range numClients {
 			wg.Add(1)
 			go func(clientIndex int) {
 				defer wg.Done()

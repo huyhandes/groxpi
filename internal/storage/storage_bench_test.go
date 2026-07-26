@@ -143,14 +143,14 @@ func BenchmarkS3Storage(b *testing.B) {
 
 	b.Run("List", func(b *testing.B) {
 		// Setup: upload 100 small files
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			key := fmt.Sprintf("bench/list/item_%03d", i)
 			data := []byte(key)
 			_, _ = storage.Put(ctx, key, bytes.NewReader(data), int64(len(data)), "text/plain")
 		}
 		defer func() {
 			// Cleanup
-			for i := 0; i < 100; i++ {
+			for i := range 100 {
 				key := fmt.Sprintf("bench/list/item_%03d", i)
 				_ = storage.Delete(ctx, key)
 			}

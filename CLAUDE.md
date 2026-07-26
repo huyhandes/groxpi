@@ -11,7 +11,7 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 ## Architecture Overview
 
 ### Technology Stack
-- **Language**: Go 1.24+
+- **Language**: Go 1.26+
 - **Web Framework**: [Gin v1.11](https://gin-gonic.com/) - High-performance HTTP web framework
 - **JSON Processing**: [ByteDance Sonic](https://github.com/bytedance/sonic) - Blazingly fast JSON serialization
 - **Templates**: Go HTML templates with Gin integration

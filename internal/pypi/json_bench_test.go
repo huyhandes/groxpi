@@ -14,7 +14,7 @@ import (
 
 // Buffer pool for testing zero-copy optimizations
 var testBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 64*1024) // 64KB buffers
 		return &buf
 	},
@@ -22,12 +22,12 @@ var testBufferPool = sync.Pool{
 
 // Baseline benchmarks using standard approaches (with copying)
 func BenchmarkJSONMarshal_StandardCopy(b *testing.B) {
-	data := map[string]interface{}{
-		"meta": map[string]interface{}{
+	data := map[string]any{
+		"meta": map[string]any{
 			"api-version": "1.0",
 		},
 		"name": "test-package",
-		"files": []map[string]interface{}{
+		"files": []map[string]any{
 			{
 				"filename": "test-package-1.0.0.tar.gz",
 				"url":      "https://files.pythonhosted.org/packages/.../test-package-1.0.0.tar.gz",
@@ -54,12 +54,12 @@ func BenchmarkJSONMarshal_StandardCopy(b *testing.B) {
 }
 
 func BenchmarkJSONMarshal_StreamingZeroCopy(b *testing.B) {
-	data := map[string]interface{}{
-		"meta": map[string]interface{}{
+	data := map[string]any{
+		"meta": map[string]any{
 			"api-version": "1.0",
 		},
 		"name": "test-package",
-		"files": []map[string]interface{}{
+		"files": []map[string]any{
 			{
 				"filename": "test-package-1.0.0.tar.gz",
 				"url":      "https://files.pythonhosted.org/packages/.../test-package-1.0.0.tar.gz",

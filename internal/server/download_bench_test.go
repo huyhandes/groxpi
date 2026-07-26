@@ -158,10 +158,8 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 
 				startTime := time.Now()
 
-				for j := 0; j < concurrency; j++ {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
+				for range concurrency {
+					wg.Go(func() {
 
 						req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
 						resp := testRequestBench(router, req)
@@ -184,7 +182,7 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 							errors <- fmt.Errorf("expected body size %d, got %d", len(fileContent), len(body))
 							return
 						}
-					}()
+					})
 				}
 
 				wg.Wait()
@@ -271,10 +269,7 @@ func BenchmarkDownloadCoordination_LargeFile(b *testing.B) {
 			// Stream the content in chunks to simulate real-world download
 			chunkSize := 64 * 1024 // 64KB chunks
 			for i := 0; i < len(fileContent); i += chunkSize {
-				end := i + chunkSize
-				if end > len(fileContent) {
-					end = len(fileContent)
-				}
+				end := min(i+chunkSize, len(fileContent))
 				_, _ = w.Write(fileContent[i:end])
 				time.Sleep(time.Millisecond) // Simulate network latency
 			}

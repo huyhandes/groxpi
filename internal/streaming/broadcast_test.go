@@ -386,10 +386,10 @@ func TestBroadcastWriter_ConcurrentOperations(t *testing.T) {
 		// Use channel to synchronize writes
 		writeDone := make(chan int, writes)
 
-		for i := 0; i < writes; i++ {
+		for i := range writes {
 			go func(i int) {
 				defer wg.Done()
-				data := []byte(fmt.Sprintf("write_%02d_", i)) // Zero-pad for consistent ordering
+				data := fmt.Appendf(nil, "write_%02d_", i) // Zero-pad for consistent ordering
 				_, _ = bw.Write(data)
 				writeDone <- i
 			}(i)
@@ -426,7 +426,7 @@ func TestBroadcastWriter_ConcurrentOperations(t *testing.T) {
 
 		// Add writers concurrently
 		wg.Add(operations)
-		for i := 0; i < operations; i++ {
+		for i := range operations {
 			go func(i int) {
 				defer wg.Done()
 				writer := &mockWriter{}
@@ -515,8 +515,8 @@ func TestAsyncBroadcastWriter_BasicOperations(t *testing.T) {
 		_ = bw.AddWriter(slowWriter)
 
 		// Write more data than buffer can hold
-		for i := 0; i < 10; i++ {
-			data := []byte(fmt.Sprintf("data_%d", i))
+		for i := range 10 {
+			data := fmt.Appendf(nil, "data_%d", i)
 			_, _ = bw.Write(data)
 		}
 
@@ -545,7 +545,7 @@ func BenchmarkBroadcastWriter_MultipleWriters(b *testing.B) {
 	bw := NewBroadcastWriter()
 
 	// Add multiple writers
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		writer := &bytes.Buffer{}
 		_ = bw.AddWriter(writer)
 	}
