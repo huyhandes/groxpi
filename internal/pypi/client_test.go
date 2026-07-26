@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewClient(t *testing.T) {
@@ -784,6 +786,126 @@ func TestClient_ParseHTMLPackageList(t *testing.T) {
 	}
 }
 
+// TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs verifies that hrefs on a
+// PEP 503 HTML index page are resolved against the URL of the index page they came
+// from (relative, same-directory, absolute and protocol-relative forms), and that
+// the #sha256=... fragment survives resolution.
+func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
+	client := &Client{}
+	const baseURL = "https://pypi.org/simple/foo/"
+
+	testCases := []struct {
+		name        string
+		html        string
+		expectedURL string
+	}{
+		{
+			name:        "parent-relative href",
+			html:        `<a href="../../packages/ab/cd/foo-1.0.tar.gz">foo-1.0.tar.gz</a>`,
+			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz",
+		},
+		{
+			name:        "same-directory relative href",
+			html:        `<a href="foo-1.0.whl">foo-1.0.whl</a>`,
+			expectedURL: "https://pypi.org/simple/foo/foo-1.0.whl",
+		},
+		{
+			name:        "absolute href passes through unchanged",
+			html:        `<a href="https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz">foo-1.0.tar.gz</a>`,
+			expectedURL: "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz",
+		},
+		{
+			name:        "protocol-relative href inherits base scheme",
+			html:        `<a href="//files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz">foo-1.0.tar.gz</a>`,
+			expectedURL: "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz",
+		},
+		{
+			name:        "relative href keeps sha256 fragment",
+			html:        `<a href="../../packages/ab/cd/foo-1.0.tar.gz#sha256=abc123">foo-1.0.tar.gz</a>`,
+			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
+		},
+		{
+			name:        "root-relative href",
+			html:        `<a href="/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123">foo-1.0.tar.gz</a>`,
+			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			files, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), baseURL)
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			assert.Equal(t, tc.expectedURL, files[0].URL)
+		})
+	}
+}
+
+// TestClient_ParseHTMLPackageFiles_PreservesAttributes ensures resolution did not
+// disturb the other data pulled off the anchor tag.
+func TestClient_ParseHTMLPackageFiles_PreservesAttributes(t *testing.T) {
+	client := &Client{}
+	html := `<a href="../../packages/ab/cd/foo-1.0.tar.gz#sha256=abc123" data-requires-python="&gt;=3.8" data-yanked="broken sdist">foo-1.0.tar.gz</a>`
+
+	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://pypi.org/simple/foo/")
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+
+	assert.Equal(t, "foo-1.0.tar.gz", files[0].Name)
+	assert.Equal(t, "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123", files[0].URL)
+	assert.Equal(t, "&gt;=3.8", files[0].RequiresPython)
+	assert.Equal(t, "broken sdist", files[0].Yanked)
+}
+
+// TestClient_ParseHTMLPackageFiles_MalformedHref verifies an unparseable href is
+// skipped rather than aborting the whole index.
+func TestClient_ParseHTMLPackageFiles_MalformedHref(t *testing.T) {
+	client := &Client{}
+	html := `<a href="http://[::1]bad">bad.tar.gz</a>
+<a href="foo-1.0.whl">foo-1.0.whl</a>`
+
+	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://pypi.org/simple/foo/")
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "https://pypi.org/simple/foo/foo-1.0.whl", files[0].URL)
+}
+
+// TestClient_ParseHTMLPackageFiles_UnparseableBase falls back to leaving hrefs as-is
+// rather than dropping every file.
+func TestClient_ParseHTMLPackageFiles_UnparseableBase(t *testing.T) {
+	client := &Client{}
+	html := `<a href="foo-1.0.whl">foo-1.0.whl</a>`
+
+	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "://not a url")
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "foo-1.0.whl", files[0].URL)
+}
+
+// TestClient_ParseJSONPackageFiles_AbsoluteURLsUnchanged documents that the PEP 691
+// JSON path is unaffected: PEP 691 requires absolute URLs, and the values are taken
+// verbatim from the payload.
+func TestClient_ParseJSONPackageFiles_AbsoluteURLsUnchanged(t *testing.T) {
+	client := &Client{}
+	jsonResponse := `{
+		"meta": {"api-version": "1.0"},
+		"name": "foo",
+		"files": [
+			{
+				"filename": "foo-1.0.tar.gz",
+				"url": "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz",
+				"hashes": {"sha256": "abc123"}
+			}
+		]
+	}`
+
+	files, err := client.parseJSONPackageFiles(strings.NewReader(jsonResponse))
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz", files[0].URL)
+	assert.Equal(t, map[string]string{"sha256": "abc123"}, files[0].Hashes)
+}
+
 // TestClient_ParseHTMLPackageFiles tests HTML parsing for package files
 func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 	client := &Client{}
@@ -803,8 +925,8 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 </body>
 </html>`,
 			expected: []FileInfo{
-				{Name: "numpy-1.21.0.tar.gz", URL: "numpy-1.21.0.tar.gz"},
-				{Name: "numpy-1.21.0-py3-none-any.whl", URL: "numpy-1.21.0-py3-none-any.whl"},
+				{Name: "numpy-1.21.0.tar.gz", URL: "https://pypi.org/simple/numpy/numpy-1.21.0.tar.gz"},
+				{Name: "numpy-1.21.0-py3-none-any.whl", URL: "https://pypi.org/simple/numpy/numpy-1.21.0-py3-none-any.whl"},
 			},
 		},
 		{
@@ -818,11 +940,11 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 			expected: []FileInfo{
 				{
 					Name: "package-1.0.tar.gz",
-					URL:  "package-1.0.tar.gz#sha256=abc123",
+					URL:  "https://pypi.org/simple/numpy/package-1.0.tar.gz#sha256=abc123",
 				},
 				{
 					Name: "package-1.0.whl",
-					URL:  "package-1.0.whl#md5=def456",
+					URL:  "https://pypi.org/simple/numpy/package-1.0.whl#md5=def456",
 				},
 			},
 		},
@@ -835,7 +957,7 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html))
+			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://pypi.org/simple/numpy/")
 			if err != nil {
 				t.Fatalf("parseHTMLPackageFiles failed: %v", err)
 			}

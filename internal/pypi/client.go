@@ -8,12 +8,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/phuslu/log"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -205,10 +207,10 @@ func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
 }
 
 func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error) {
-	url := strings.TrimSuffix(c.config.IndexURL, "/") + "/" + packageName + "/"
+	indexURL := strings.TrimSuffix(c.config.IndexURL, "/") + "/" + packageName + "/"
 
 	// Try JSON first
-	resp, err := c.makeRequest(url, "application/vnd.pypi.simple.v1+json")
+	resp, err := c.makeRequest(indexURL, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package files for %s: %w", packageName, err)
 	}
@@ -224,17 +226,23 @@ func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, indexURL)
 	}
 
 	// Check if response is JSON
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(contentType, "json") {
+		// PEP 691 requires absolute URLs in the JSON payload, so no resolution is needed.
 		return c.parseJSONPackageFiles(resp.Body)
 	}
 
-	// Fall back to HTML parsing
-	return c.parseHTMLPackageFiles(resp.Body)
+	// Fall back to HTML parsing. Resolve hrefs against the URL actually served
+	// (which may differ from indexURL after a redirect).
+	baseURL := indexURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		baseURL = resp.Request.URL.String()
+	}
+	return c.parseHTMLPackageFiles(resp.Body, baseURL)
 }
 
 func (c *Client) DownloadFile(url string, dest string) error {
@@ -353,8 +361,20 @@ func (c *Client) parseHTMLPackageList(body io.Reader) ([]string, error) {
 	return packages, err
 }
 
-func (c *Client) parseHTMLPackageFiles(body io.Reader) ([]FileInfo, error) {
+// parseHTMLPackageFiles parses a PEP 503 HTML index page. baseURL is the URL the
+// page was served from; relative and protocol-relative hrefs are resolved against
+// it so that FileInfo.URL is always usable on its own.
+func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileInfo, error) {
 	var files []FileInfo
+
+	// A base we cannot parse means we cannot resolve anything; fall back to
+	// emitting hrefs verbatim rather than dropping the whole index.
+	base, baseErr := url.Parse(baseURL)
+	if baseErr != nil {
+		log.Warn().Err(baseErr).Str("base_url", baseURL).
+			Msg("Cannot parse index URL, leaving package file hrefs unresolved")
+		base = nil
+	}
 
 	err := withBuffers(func(buf *bytes.Buffer) error {
 		if err := copyToBuffer(buf, body); err != nil {
@@ -382,7 +402,21 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader) ([]FileInfo, error) {
 			if hrefEnd == -1 {
 				continue
 			}
-			url := line[hrefStart : hrefStart+hrefEnd]
+			href := line[hrefStart : hrefStart+hrefEnd]
+
+			// Resolve the href against the index page URL. ResolveReference
+			// correctly handles absolute, protocol-relative, root-relative and
+			// path-relative hrefs, and carries the #sha256=... fragment through.
+			fileURL := href
+			if base != nil {
+				ref, err := url.Parse(href)
+				if err != nil {
+					log.Warn().Err(err).Str("href", href).Str("base_url", baseURL).
+						Msg("Skipping package file with unparseable href")
+					continue
+				}
+				fileURL = base.ResolveReference(ref).String()
+			}
 
 			// Extract filename from anchor text
 			textStart := strings.Index(line, ">")
@@ -417,7 +451,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader) ([]FileInfo, error) {
 
 			files = append(files, FileInfo{
 				Name:           filename,
-				URL:            url,
+				URL:            fileURL,
 				RequiresPython: requiresPython,
 				Yanked:         yanked,
 			})
