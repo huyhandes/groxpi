@@ -1,12 +1,14 @@
 # Performance
 
-Groxpi delivers exceptional performance through its Go-native architecture, zero-copy optimizations, and efficient caching strategies.
+Groxpi delivers strong performance through its Go-native architecture, buffer pooling, streaming file transfer and multi-level caching.
+
+> ⚠️ **All figures on this page are unverified against the current code.** They were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the architecture refactor landed in `d20f16c..6a11326` (2026-07-26), which reworked the download path, the storage interface and the L1 eviction logic. Re-run `./benchmarks/benchmark.sh` before quoting any number below.
 
 ## Benchmark Results
 
 ### API Performance (vs Python proxpi)
 
-**Real-world Benchmark Results (December 2024)**
+**Benchmark results as recorded December 2024 — not re-measured since; see the warning above**
 
 | Metric | Groxpi | Proxpi | Improvement |
 |--------|--------|---------|-------------|
@@ -24,12 +26,12 @@ Groxpi delivers exceptional performance through its Go-native architecture, zero
 #### Response Times (Cached Requests)
 - **Index endpoints**: 6-542μs (sub-millisecond)
 - **Package files**: 15-89μs for metadata
-- **File downloads**: Zero-copy streaming
+- **File downloads**: streamed, never buffered whole in memory
 - **Health checks**: <1ms
 
 #### Memory Efficiency
 - **Allocations**: 4 vs 789 (typical request)
-- **GC pressure**: Minimal due to zero-copy design
+- **GC pressure**: reduced by buffer pooling and streaming (no whole-file buffering)
 - **Buffer pools**: Reused for frequent operations
 - **Peak memory**: ~50MB under load
 
@@ -41,40 +43,49 @@ Groxpi delivers exceptional performance through its Go-native architecture, zero
 
 ## Performance Optimizations
 
-### Zero-Copy Architecture
-```go
-// Zero-copy file streaming
-func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
-    reader, size, err := s.storage.Get(storageKey)
-    if err != nil {
-        return err
-    }
-    defer reader.Close()
+### Serve-by-path for locally cached files
 
-    c.Header("Content-Length", fmt.Sprintf("%d", size))
-    c.DataFromReader(http.StatusOK, size, "application/octet-stream", reader, nil)
-    return nil  // Zero-copy streaming
+When the configured backend can name a real file on disk, the path is handed to `net/http` instead of being opened and copied by handler code:
+
+```go
+// internal/server/server.go
+func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
+    if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
+        if filePath, err := zeroCopy.GetFilePath(c.Request.Context(), storageKey); err == nil {
+            c.File(filePath) // net/http handles range + If-Modified-Since
+            return nil
+        }
+    }
+    return s.serveFromStorage(c, storageKey) // open-then-stream fallback
 }
 ```
+
+**This is not a kernel-level zero copy.** Gin's `responseWriter` implements neither `File()` nor `io.ReaderFrom`, so `net/http`'s sendfile fast path cannot engage, and the gzip middleware wraps the writer regardless — the bytes still travel through user space. The benefit is delegated correctness (range requests, conditional requests, content-type sniffing handled by the standard library), not a saved copy. Earlier revisions of this page and a `trySendfile` helper in `storage/local.go` claimed OS-level zero copy; both were wrong and have been removed.
+
+The fallback path is also cheap in the way that matters: `Storage.Get` returns `(io.ReadCloser, *ObjectInfo, error)` with metadata complete *before* the first body byte, so headers are emitted once and never re-derived mid-stream.
 
 ### Buffer Pool Management
 ```go
 var responseBufferPool = sync.Pool{
-    New: func() interface{} {
+    New: func() any {
         return new(bytes.Buffer)
     },
 }
 ```
 
 ### SingleFlight Pattern
-- Deduplicates concurrent requests to same resource
+- Deduplicates concurrent requests for the same index or package file
 - Prevents cache stampede scenarios
-- Reduces upstream load by 90%+
+- The sole dedup mechanism on the download path (the hand-rolled `downloadCoordinator` was removed in `5cb9f18`)
+- Upstream-load reduction is workload-dependent and has not been measured in this repo
 
 ### Streaming Pipeline
-- **Broadcast**: Simultaneous serving to multiple clients
-- **Downloader**: Parallel chunk downloading
-- **ZeroCopy**: Memory-efficient data transfer
+- **Tee download-and-cache**: `streaming.StreamingDownloader.DownloadAndStream` writes to the client and into storage from one upstream read, via `io.TeeReader` + `io.Pipe`
+- **Pooled copy buffers**: 64KB buffers reused across downloads
+- **Deduplicated**: concurrent requests for the same file wait on the leader, then serve from cache
+
+### Bounded worker pools
+`storage.WorkerPool[T]` backs both the S3 write queue and the tiered L1 back-fill. Worker count is the concurrency cap; `Submit` never blocks — a full queue drops the job. Note that `S3Storage.Put` still waits on its queued write's result, so the queue bounds concurrency rather than making writes non-blocking.
 
 ## Technology Stack Performance
 
@@ -106,11 +117,14 @@ var responseBufferPool = sync.Pool{
 - **Thread-safe**: Concurrent read operations
 - **Memory usage**: ~1-5MB for 50k packages
 
-### File Cache (LRU)
-- **Hit ratio**: >85% for repeated downloads
+### On-Disk Object Cache (LRU)
+- **Hit ratio**: >85% for repeated downloads *(unverified — no measurement in this repo)*
 - **Size-based**: Configurable limits (default: 5GB)
-- **Eviction**: Least Recently Used strategy
-- **Storage**: Local filesystem or S3
+- **Eviction**: Least Recently Used, with an optional TTL phase that evicts expired entries first
+- **Storage**: Local filesystem, S3, or hybrid (local L1 + S3 L2)
+- **Recency correctness**: `LRULocalStorage` wraps `LocalStorage` and records an access on every read path that yields a size, so a file being served cannot read as cold to the evictor
+
+There is no separate in-process file cache. `cache.FileCache` existed as a third tier with no production callers and was deleted in `6a11326`.
 
 ### Response Cache
 - **Duration**: Short-term caching (5min default)
@@ -130,7 +144,7 @@ var responseBufferPool = sync.Pool{
 
 ### Results Under Load
 
-**Latest Benchmark Results (December 2024 - 60s duration, 8 threads, 100 connections)**
+**Benchmark run of December 2024 — 60s duration, 8 threads, 100 connections. Not re-measured since the 2026-07 refactor.**
 
 ```bash
 # Groxpi - Package Index (/simple/) - Warm Cache
@@ -183,13 +197,13 @@ Requests/sec:   4139.27
 
 ### CPU Optimization
 - **GOMAXPROCS**: Automatic CPU detection
-- **Worker pools**: Bounded concurrency for downloads
-- **Lock-free reads**: Cache access optimization
-- **SIMD**: JSON processing acceleration
+- **Worker pools**: `WorkerPool[T]` bounds S3 writes and tiered L1 back-fill (not client downloads, which are bounded by singleflight dedup)
+- **Read-mostly locking**: `sync.RWMutex` on every cache; `ResponseCache.Get` upgrades to a write lock only to reorder LRU
+- **SIMD**: JSON processing acceleration via Sonic
 
 ### Memory Optimization
-- **Buffer reuse**: Sync.Pool for frequent allocations
-- **String interning**: Package name deduplication
+- **Buffer reuse**: `sync.Pool` for response buffers and 64KB copy buffers
+- **Package name normalization**: lowercase + `_`→`-`, so cache keys collapse equivalent spellings (this is key normalization, not string interning)
 - **Streaming**: No full-file memory loading
 - **GC tuning**: GOGC=100 for balanced performance
 
@@ -197,13 +211,13 @@ Requests/sec:   4139.27
 - **Connection pooling**: HTTP client reuse
 - **TCP keepalive**: Persistent connections
 - **Compression**: Automatic response compression
-- **Sendfile**: Zero-copy file serving (Linux)
+- **Serve-by-path**: locally cached files handed to `net/http` for range/conditional handling (see above — not a kernel zero copy)
 
 ### Storage Optimization
-- **S3 optimization**: Parallel chunk uploads
-- **Local caching**: SSD-optimized access patterns
-- **Prefetching**: Predictive cache warming
-- **Compression**: On-disk file compression
+- **S3 multipart**: automatic part sizing for large objects
+- **Local caching**: L1 on local disk in hybrid mode, back-filled asynchronously from S3 on an L2 hit
+- **Prefetching**: not implemented
+- **On-disk compression**: not implemented
 
 ## Monitoring Performance
 

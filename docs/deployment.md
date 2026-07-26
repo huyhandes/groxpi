@@ -8,7 +8,7 @@ Groxpi supports multiple deployment methods from local development to production
 Run groxpi directly on your development machine for testing and development.
 
 #### Prerequisites
-- Go 1.24+
+- Go 1.26+
 - Git
 
 #### Quick Start

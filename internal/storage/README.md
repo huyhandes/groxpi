@@ -41,13 +41,16 @@ go test -bench=. ./internal/storage/
 
 ### Unit Tests
 - **Local Storage**: Tests the filesystem-based storage implementation
-- **S3 Buffer Pools**: Tests zero-copy optimizations and buffer reuse
+- **LRU Eviction** (`lru_test.go`): a frequently-read file survives eviction pressure; eviction goes through the `objectDeleter` seam; size accounting matches disk after overwrites
+- **Tiering** (`tiered_test.go`): L1 back-fill lands and survives request cancellation; a real L1 error propagates instead of being masked as a miss; misses are the `ErrNotFound` sentinel
+- **Worker Pool** (`workerpool_test.go`): every submitted job runs, concurrency never exceeds the worker count, `Submit` drops when full, `Close` is idempotent and waits for in-flight jobs
+- **S3 Buffer Pools**: Tests buffer reuse for small-object writes
 - **Singleflight Patterns**: Tests request deduplication logic
 - **Configuration**: Tests various S3 configuration scenarios
 
 ### Integration Tests
 - **S3 Basic Operations**: Put, Get, Delete, Exists, Stat operations with real S3
-- **S3 Advanced Features**: Multipart uploads, presigned URLs, range requests
+- **S3 Advanced Features**: Multipart uploads (handled internally by the SDK via part sizing) and presigned URLs
 - **S3 Concurrency**: Concurrent operations and singleflight deduplication
 - **S3 Error Handling**: Network failures, timeouts, invalid requests
 - **S3 Edge Cases**: Empty files, large files, Unicode content, special characters
@@ -67,8 +70,8 @@ go test -bench=. ./internal/storage/
 
 ## Coverage Targets
 
-- **Overall Storage Package**: 81.6% achieved
-- **Local Storage**: 90%+ coverage
-- **S3 Implementation**: 80%+ coverage with real integration testing
+- **Overall Storage Package**: 81.6% — *this figure predates the 2026-07 architecture refactor and is unverified. Measured at `6a11326` with `go test -short -coverprofile`, the package is **53.1%**; the gap is the S3 network paths, which only the skipped integration tests reach.*
+- **Local Storage**: 90%+ coverage *(unverified since the refactor)*
+- **S3 Implementation**: 80%+ coverage with real integration testing *(requires the `TEST_S3_*` environment above; skipped by default)*
 - **Edge Cases**: Comprehensive boundary condition testing
-- **Error Scenarios**: Full error path validation
+- **Error Scenarios**: Full error path validation, including `errors.Is(err, ErrNotFound)` on every adapter

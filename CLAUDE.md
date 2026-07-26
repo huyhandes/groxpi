@@ -15,8 +15,8 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 - **Web Framework**: [Gin v1.11](https://gin-gonic.com/) - High-performance HTTP web framework
 - **JSON Processing**: [ByteDance Sonic](https://github.com/bytedance/sonic) - Blazingly fast JSON serialization
 - **Templates**: Go HTML templates with Gin integration
-- **Cache**: In-memory TTL cache + LRU file cache
-- **Storage**: Local filesystem + S3-compatible storage (MinIO/AWS S3)
+- **Cache**: In-memory TTL index cache + LRU response cache; LRU eviction over the on-disk object store
+- **Storage**: Local filesystem, S3-compatible (MinIO/AWS S3), or hybrid (local L1 + S3 L2)
 - **Logging**: [phuslu/log](https://github.com/phuslu/log) - High-performance structured logging
 - **Middleware**: Recovery, structured logging, compression
 
@@ -32,22 +32,24 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 - Implement efficient caching with minimal lock contention
 - Stream large files instead of loading into memory
 - Follow SingleFlight pattern to reduce IO overhead
-- Apply Zero-copy optimization to remove Memory overhead and avoid GC
+- Serve locally-cached files by path (`storage.ZeroCopyCapable` → `c.File`) so `net/http` handles range and conditional requests. Note this is **not** a kernel zero copy: gin's response writer implements neither `File()` nor `io.ReaderFrom`, and the gzip middleware wraps it anyway, so the bytes are still copied through user space. Do not add code or docs claiming otherwise
 - Use byte pools for frequent allocations
 - Leverage Gin's built-in optimizations
+- Do not add speculative machinery. A seam with one production caller is a liability; the A–E refactor deleted ~2,000 lines of it (see `tasks/architecture-improvement-plan.md`)
 
 ### Code Organization
 ```
 groxpi/
 ├── cmd/groxpi/          # Main application entry point
 ├── internal/            # Private application code
-│   ├── cache/          # Caching implementations (TTL + LRU + Response)
+│   ├── cache/          # index.go (TTL map) + response.go (LRU of marshaled JSON)
 │   ├── config/         # Configuration management
 │   ├── logger/         # Structured logging with phuslu/log
 │   ├── pypi/           # PyPI client with Sonic JSON
-│   ├── server/         # Gin HTTP server and handlers
-│   ├── storage/        # Storage backend abstraction (local/S3)
-│   └── streaming/      # Zero-copy streaming (broadcast, downloader, zerocopy)
+│   ├── server/         # server.go (Gin transport) + packagefile.go (PackageFileService)
+│   ├── storage/        # Storage seam: storage.go (Storage + capability interfaces),
+│   │                   #   local.go, lru.go, s3.go, tiered.go, workerpool.go
+│   └── streaming/      # interfaces.go + downloader.go (tee download-and-cache)
 ├── docs/               # Detailed documentation
 ├── benchmarks/         # Performance benchmarking suite
 ├── monitoring/         # Monitoring and observability
@@ -79,16 +81,18 @@ Production-ready PyPI caching proxy with enterprise-grade performance and reliab
 **📋 See [docs/implemented-features.md](docs/implemented-features.md)** for complete feature list including:
 - PyPI Simple API compliance (PEP 503/691)
 - Advanced multi-level caching system
-- Zero-copy streaming with broadcast capabilities
-- Multi-backend storage (local/S3)
+- Simultaneous stream-to-client and stream-to-cache downloads
+- Multi-backend storage (local/S3/hybrid)
 - High-performance optimizations
+
+**🏛️ See [docs/architecture.md](docs/architecture.md)** for the module map, seams, request flows and remaining friction.
 
 ### Configuration
 Full compatibility with original proxpi configuration through environment variables.
 
 **📖 See [docs/configuration.md](docs/configuration.md)** for complete configuration reference including:
 - Core configuration options
-- Storage backends (local/S3)
+- Storage backends (local/S3/hybrid)
 - Performance tuning
 - Example configurations
 
@@ -103,11 +107,13 @@ Fully compliant PyPI Simple API (PEP 503/691) with cache management endpoints.
 - Error responses and compatibility
 
 ## Performance
-16,000x performance improvement over original Python proxpi with sub-millisecond response times.
+Substantially faster than the original Python proxpi, with sub-millisecond P50 latency on cached index responses.
+
+> The "16,000x" figure previously quoted here is not supported by any benchmark in this repo — the measured index-throughput gain is 12.8x (`docs/performance.md`). All published figures were recorded in `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the 2026-07 architecture refactor. Treat them as unverified against current code.
 
 **📊 See [docs/performance.md](docs/performance.md)** for detailed benchmarks including:
 - API performance metrics
-- Zero-copy optimizations
+- Buffer-pool and streaming optimizations
 - Load testing results
 - Performance tuning guide
 

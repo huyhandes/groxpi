@@ -8,11 +8,13 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 
 ## ✨ Features
 
-### 🚀 **Proven Superior Performance** (Latest Benchmark Results - December 2024)
+### 🚀 **Performance** (benchmark run of December 2024 — see caveat)
 - **53,000+ requests/sec** package index throughput (vs proxpi which fails under load)
 - **Sub-millisecond** P50 latency for cached requests (0.86ms)
 - **21x faster** single request response times (18ms vs 397ms for package queries)
 - **Instant startup** with compiled Go binary (<2s vs ~10s)
+
+> ⚠️ These numbers were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the architecture refactor of 2026-07-26, which reworked the download path, the storage interface and L1 eviction. Re-run `./benchmarks/benchmark.sh` before relying on them. See [docs/performance.md](docs/performance.md).
 
 ### 🛠️ **Advanced Technology Stack**
 - **Go + Gin Framework**: Ultra-fast HTTP server with minimal overhead
@@ -141,7 +143,7 @@ All configuration is done through environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GROXPI_STORAGE_TYPE` | `local` | Storage backend (`local` or `s3`) |
+| `GROXPI_STORAGE_TYPE` | `local` | Storage backend (`local`, `s3`, or `hybrid` = local L1 + S3 L2) |
 | `AWS_ENDPOINT_URL` | - | S3-compatible endpoint URL |
 | `AWS_ACCESS_KEY_ID` | - | S3 access key ID |
 | `AWS_SECRET_ACCESS_KEY` | - | S3 secret access key |
@@ -285,7 +287,7 @@ With S3-compatible storage backends:
 - **Cached requests**: Serves directly from S3 (~10-20ms)  
 - **Cache hit improvement**: **5-10x faster** than repeated PyPI calls
 
-**Latest Benchmark Results (December 2024):**
+**Benchmark results as recorded December 2024 (commit `ca9c979`) — not re-measured since the 2026-07 refactor:**
 - **Test Method**: WRK load testing (30-60s duration, 8 threads, 100 connections)
 - **Package Index**: 53,095 RPS (groxpi) vs proxpi fails under high load
 - **Package Files (numpy)**: 4,145 RPS (groxpi) with P50 latency 14.45ms
@@ -368,7 +370,7 @@ default = true
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.26+
 - Docker & Docker Compose (optional)
 
 ### Building
@@ -393,8 +395,11 @@ go test ./...
 # Test with coverage
 go test -cover ./...
 
-# S3 performance test
-go run test_s3_performance.go
+# Unit tests only (skips tests needing a live S3)
+go test -short ./...
+
+# Storage and download benchmarks
+go test -bench=. -benchmem ./internal/storage/ ./internal/server/
 ```
 
 ## 🚚 Migration from proxpi
@@ -409,7 +414,7 @@ groxpi is designed as a drop-in replacement with zero client changes:
 - **Features**: All original proxpi functionality
 - **Configuration**: Same environment variables (just change prefix)
 
-### ⚡ **What Gets Better** (Verified Benchmarks)
+### ⚡ **What Gets Better** (figures from the December 2024 benchmark run; not re-measured since)
 - **53,000+ req/sec throughput** for package index (proxpi fails under high load)
 - **21x faster single request** response times (18ms vs 397ms)
 - **Sub-millisecond P50 latency** (0.86ms) for cached requests

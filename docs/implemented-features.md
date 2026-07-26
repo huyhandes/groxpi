@@ -25,17 +25,20 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 ## Advanced Caching System ✅
 
 ### Multi-Level Caching
-- **Index Cache**: In-memory TTL-based cache for package listings
-- **File Cache**: LRU file cache with configurable size limits
-- **Response Cache**: Short-term response caching for repeated requests
+- **Index Cache**: In-memory TTL-based cache for package listings and parsed file indexes
+- **Response Cache**: In-memory LRU cache of pre-marshaled JSON responses
+- **On-Disk Object Cache**: LRU-evicted package files on local disk, S3, or both (hybrid)
 - **Thread-Safe Operations**: Concurrent cache access with minimal locking
 - **Cache Invalidation**: Manual cache clearing via DELETE endpoints
 
+*A third in-process tier (`cache.FileCache`) existed with no production callers and was deleted in `6a11326`.*
+
 ### Cache Strategies
-- **TTL-Based Expiration**: Configurable time-to-live for different content types
-- **LRU Eviction**: Least Recently Used eviction for file cache
-- **Size-Based Limits**: Automatic eviction when cache size limits reached
-- **Hit/Miss Tracking**: Cache performance monitoring and metrics
+- **TTL-Based Expiration**: Configurable time-to-live for index and response caches
+- **LRU Eviction**: Least Recently Used eviction for the on-disk object cache, with an optional TTL phase that evicts expired entries before unexpired ones
+- **Size-Based Limits**: Automatic eviction when cache size limits reached (`0` means unlimited)
+- **Eviction Safety**: Every read path that yields a size records an access, so a file currently being served cannot look cold to the evictor
+- **Cache Stats**: `LRULocalStorage.GetStats()` reports size, entry count, usage percent and expired-entry count
 
 ## Storage Backend Support ✅
 
@@ -55,44 +58,53 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **SSL/TLS Support**: Secure connections with configurable SSL settings
 - **Prefix Support**: Bucket prefixes for organized storage
 
-### Hybrid/Tiered Storage (NEW)
-- **Multi-Tier Caching**: Local L1 cache + S3 L2 storage
-- **Automatic L1 Population**: L2 hits asynchronously populate L1 for future requests
-- **Concurrent Writes**: New files written to both L1 and L2 simultaneously
-- **Zero-Copy L1 Serving**: Fast local file serving with sendfile optimization
-- **LRU L1 Eviction**: Intelligent local cache management with size-based LRU
-- **Background Sync Workers**: Configurable worker pool for L1 cache population
-- **Non-Blocking L1 Sync**: L1 population doesn't block user requests
+### Hybrid/Tiered Storage
+- **Multi-Tier Caching**: Local L1 cache + S3 L2 storage (`GROXPI_STORAGE_TYPE=hybrid`)
+- **Automatic L1 Population**: L2 hits asynchronously populate L1 for future requests, on jobs that outlive the request that queued them
+- **Concurrent Writes**: New files written to both L1 and L2 simultaneously (`io.Pipe` tee under singleflight)
+- **Local-Path L1 Serving**: L1 objects are real files, so they are served by path and `net/http` handles range and conditional requests (see the note below — this is not a kernel zero copy)
+- **LRU L1 Eviction**: Size-based LRU with optional TTL, deleting through the storage backend so on-disk state and size accounting have one owner
+- **Background Sync Workers**: Configurable `WorkerPool[T]` for L1 cache population
+- **Non-Blocking L1 Sync**: L1 population doesn't block user requests; a full queue drops the back-fill rather than stalling the reader
+- **Typed Misses**: `storage.ErrNotFound` means L1 falls through to L2 only on a genuine miss — a real L1 failure is reported, not silently treated as a miss
 - **S3 as Primary**: L2 (S3) is authoritative source, L1 is performance layer
+- **Capability-Based Tiering**: the tier that genuinely has a capability provides it — `GetFilePath` from L1, `GetPresignedURL` from L2
 
-## High-Performance Streaming ✅
+## High-Performance File Transfer ✅
 
-### Zero-Copy Optimizations
-- **Memory Efficiency**: Minimal memory allocations during file serving
-- **Stream Processing**: Direct file streaming without full memory loading
-- **Buffer Pools**: Reused buffers for frequent operations
-- **GC Optimization**: Reduced garbage collection pressure
+### Memory Efficiency
+- **Streaming, Never Buffering**: files are piped through, never loaded whole into memory
+- **Metadata Before Body**: `Storage.Get` returns `*ObjectInfo` before the first body byte, so headers are emitted once and correctly
+- **Buffer Pools**: reused response buffers and 64KB copy buffers
+- **GC Optimization**: reduced allocation pressure from pooling and streaming
+
+### About "zero copy"
+
+groxpi does **not** have a kernel zero-copy path. `storage.ZeroCopyCapable` means "this backend can name a real file on the local filesystem", which lets the transport delegate range requests, `If-Modified-Since` and content-type sniffing to `net/http`. It does not avoid a copy: gin's `responseWriter` implements neither `File()` nor `io.ReaderFrom`, so `net/http`'s sendfile path cannot engage, and the gzip middleware wraps the writer regardless. Earlier versions of this document claimed OS-level sendfile; that was never true in this codebase, and the `trySendfile` helper that implied it was removed in `6243e0a`.
 
 ### Streaming Pipeline
-- **Broadcast System**: Simultaneous serving to multiple clients
-- **Parallel Downloads**: Concurrent chunk downloading for large files
-- **SingleFlight Pattern**: Request deduplication for popular packages
+- **Tee Download-and-Cache**: one upstream read feeds both the client and the storage backend (`io.TeeReader` + `io.Pipe`)
+- **SingleFlight Deduplication**: one request per file streams; concurrent requests wait and are then served from cache
+- **Download Outlives Its Trigger**: the fetch populates the cache for every waiter, so it is not cancelled when the triggering client disconnects
+- **Headers Before Body**: response headers are emitted lazily, immediately before the first body byte, so nothing is dropped
 - **Connection Pooling**: HTTP client connection reuse
 
-## Multi-Index Support ✅
+Speculative streaming machinery — `ZeroCopyServer`, `BroadcastWriter`, `HashingWriter` and a second non-tee downloader — had no production callers and was deleted in `6243e0a`.
+
+## Multi-Index Support 🔄 (configuration only)
+
+`GROXPI_EXTRA_INDEX_URLS` and `GROXPI_EXTRA_INDEX_TTLS` are parsed and validated into `config.ExtraIndexURLs` / `ExtraIndexTTLs`, but **no code reads them** — `pypi.Client` queries `IndexURL` only. Verified at `6a11326`: the only references to these fields outside `internal/config` are its own tests.
 
 ### Index Configuration
-- **Main Index**: Primary PyPI index configuration
-- **Extra Indices**: Multiple additional index support
-- **Individual TTLs**: Per-index cache TTL configuration
-- **Fallback Logic**: Automatic fallback between indices
-- **Health Monitoring**: Index availability tracking
+- **Main Index**: Primary PyPI index configuration ✅
+- **Extra Indices**: parsed from env, not yet queried 🔄
+- **Individual TTLs**: parsed from env, not yet applied 🔄
+- **Fallback Logic**: not implemented 🔄
+- **Health Monitoring**: not implemented 🔄
 
-### Search Strategy
-- **Sequential Search**: Search across all configured indices
-- **First-Match Strategy**: Return first successful package match
-- **Error Aggregation**: Collect and report errors from all indices
-- **Timeout Handling**: Per-index timeout configuration
+### Timeouts
+- **Connect / read / download timeouts**: configurable and applied to the single index ✅
+- **Dynamic download timeout**: scaled from the advertised file size (100 KB/s floor, 2min minimum, 60min cap) ✅
 
 ## JSON Processing ✅
 
@@ -165,10 +177,10 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Client Errors**: Proper HTTP error response codes
 
 ### Recovery Mechanisms
-- **Retry Logic**: Automatic retry with exponential backoff
-- **Circuit Breaker**: Fail-fast for repeatedly failing operations
-- **Graceful Degradation**: Partial functionality during failures
-- **Error Aggregation**: Comprehensive error reporting
+- **Redirect Fallback**: an upstream stream that fails before the first body byte falls back to a 302 to PyPI; once bytes are on the wire the request is aborted rather than corrupted ✅
+- **Typed Not-Found**: `storage.ErrNotFound` keeps a genuine miss distinguishable from a backend failure, so a broken disk is reported instead of silently degrading into an L2 round trip ✅
+- **Non-Fatal L1 Failures**: in hybrid mode an L1 write or delete failure is logged; L2 (authoritative) decides the outcome ✅
+- **Retry Logic / Circuit Breaker**: not implemented 🔄 — no retry, backoff or breaker code exists as of `6a11326`
 
 ## Client Compatibility ✅
 
@@ -183,22 +195,17 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 ### HTTP Client Features
 - **User Agent Detection**: Client identification and logging
 - **Accept Header Handling**: Proper content negotiation
-- **Range Requests**: Partial content support (planned)
+- **Range Requests**: supported for files served by path from a local backend (`c.File` → `net/http`); not supported on the S3 open-then-stream fallback
 - **Keep-Alive**: Connection reuse for performance
 
-## Template System ✅
+## HTML Interface ✅ (inline, not templated)
 
-### HTML Interface
-- **Package Browsing**: Web interface for package exploration
-- **Layout System**: Modular template architecture
-- **Responsive Design**: Mobile-friendly interface
-- **Performance Info**: Real-time system statistics display
+Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberately does not load templates. The `templates/` directory is retained but unused.
 
-### Template Features
-- **Go Templates**: Native Go template engine
-- **Partial Templates**: Reusable template components
-- **Layout Inheritance**: Template layout system
-- **Asset Management**: Static asset serving
+### What the HTML interface provides
+- **Home page**: index URL, cache size, index TTL, version
+- **Package file listings**: PEP 503-compatible anchor list with `data-requires-python` and `data-yanked`, URLs rewritten to point at the proxy
+- **Go Templates / layouts / partials**: not wired up 🔄
 
 ## Development Features ✅
 
@@ -232,7 +239,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 
 ### Memory Management
 - **Buffer Pools**: Reused buffers for frequent operations
-- **String Interning**: Package name deduplication
+- **Package Name Normalization**: lowercase + `_`→`-` so equivalent spellings collapse to one cache key (key normalization, not string interning)
 - **GC Tuning**: Optimized garbage collection settings
 - **Memory Profiling**: Built-in memory usage monitoring
 
@@ -243,10 +250,10 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **CPU Profiling**: Performance bottleneck identification
 
 ### I/O Optimizations
-- **Zero-Copy**: File serving without memory copies
+- **Serve-by-Path**: locally cached files handed to `net/http`, which brings range and conditional-request handling (not a kernel zero copy — see above)
 - **Connection Pooling**: HTTP client connection reuse
 - **Compression**: Response compression for bandwidth savings
-- **Sendfile**: OS-level zero-copy file transfers (Linux)
+- **Streaming**: no whole-file buffering on any path
 
 ## Comprehensive Benchmarking Suite ✅
 
@@ -271,7 +278,10 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Performance Metrics**: RPS, latency percentiles, resource usage
 - **Historical Tracking**: Results saved for performance regression testing
 
-### Proven Performance Results (December 2024)
+### Performance Results as of December 2024 — not re-measured since
+
+> ⚠️ These figures were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured after the architecture refactor in `d20f16c..6a11326` (2026-07-26). Treat them as unverified against current code; re-run `./benchmarks/benchmark.sh` before quoting them.
+
 - **12.8x Higher Throughput**: 52,880 vs 4,139 requests/sec for package index
 - **27x Better Latency**: 0.85ms vs 23.04ms P50 response times
 - **High Load Stability**: Groxpi maintains stable responses while proxpi fails under high concurrency
@@ -306,4 +316,4 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 
 ---
 
-**Status**: All core features are production-ready with comprehensive testing and proven performance benchmarks. The system provides complete API compatibility with the original proxpi while delivering significant performance improvements.
+**Status**: Core features are production-ready and covered by unit, integration and benchmark tests (`go test ./...` green at `6a11326`). The system provides API compatibility with the original proxpi. Performance figures quoted above predate the 2026-07 architecture refactor and have not been re-measured; items marked 🔄 are configured but not implemented.

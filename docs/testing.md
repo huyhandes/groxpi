@@ -29,8 +29,6 @@ groxpi/
 │   └── integration_test.go      # Full server integration tests
 ├── internal/                    # Private application code
 │   ├── cache/                   # Caching implementations
-│   │   ├── file.go              # File cache implementation
-│   │   ├── file_test.go         # File cache tests
 │   │   ├── index.go             # Index cache implementation
 │   │   ├── index_test.go        # Index cache tests
 │   │   ├── response.go          # Response cache implementation
@@ -45,25 +43,37 @@ groxpi/
 │   │   ├── client.go            # PyPI client implementation
 │   │   ├── client_test.go       # PyPI client tests
 │   │   └── json_bench_test.go   # JSON performance benchmarks
-│   ├── server/                  # HTTP server and handlers
-│   │   ├── server.go            # Server implementation
-│   │   └── server_test.go       # Server tests
+│   ├── server/                  # HTTP server, handlers, serving policy
+│   │   ├── server.go            # Gin transport + wiring
+│   │   ├── server_test.go       # Server tests
+│   │   ├── packagefile.go       # PackageFileService (Plan/Fetch, ServePlan)
+│   │   ├── packagefile_test.go  # Decision-tree + dedup tests (no Gin needed)
+│   │   ├── download_bench_test.go        # Download-path benchmarks
+│   │   ├── download_coordinator_test.go  # Concurrent-download behaviour
+│   │   └── download_integration_test.go  # End-to-end download tests
 │   ├── storage/                 # Storage backend abstraction
+│   │   ├── storage.go           # Storage interface + capability interfaces
 │   │   ├── local.go             # Local storage implementation
 │   │   ├── local_test.go        # Local storage tests
+│   │   ├── lru.go               # LRU eviction + LRULocalStorage wrapper
+│   │   ├── lru_test.go          # Eviction-safety and accounting tests
 │   │   ├── s3.go                # S3 storage implementation
+│   │   ├── s3_test.go           # S3 unit tests (sentinel errors, config)
 │   │   ├── s3_integration_test.go      # S3 integration tests
+│   │   ├── tiered.go            # L1/L2 tiering
+│   │   ├── tiered_test.go       # Tiering, back-fill, error-propagation tests
+│   │   ├── workerpool.go        # Generic bounded WorkerPool[T]
+│   │   ├── workerpool_test.go   # Pool lifecycle and concurrency-cap tests
 │   │   └── storage_bench_test.go       # Storage benchmarks
-│   └── streaming/               # Zero-copy streaming
-│       ├── broadcast.go         # Broadcast implementation
-│       ├── broadcast_test.go    # Broadcast tests
-│       ├── downloader.go        # Downloader implementation
-│       ├── downloader_test.go   # Downloader tests
-│       ├── zerocopy.go          # Zero-copy implementation
-│       └── zerocopy_test.go     # Zero-copy tests
-└── templates/                   # HTML templates
+│   └── streaming/               # Download-and-cache
+│       ├── interfaces.go        # StreamingDownloader seam, StreamResult
+│       ├── downloader.go        # Tee downloader implementation
+│       └── downloader_test.go   # Downloader tests
+└── templates/                   # HTML templates (present but not wired up)
     └── ...
 ```
+
+> `download_coordinator_test.go` keeps its historical name; the `downloadCoordinator` type it was written against was deleted in `5cb9f18`, and the file now exercises concurrent-download behaviour through `PackageFileService`. Renaming it is an open follow-up.
 
 ## Test Categories
 
@@ -195,22 +205,14 @@ func BenchmarkJSONMarshal_Stdlib(b *testing.B) {
 }
 ```
 
-#### Zero-Copy Benchmarks
-```go
-func BenchmarkZeroCopy_Stream(b *testing.B) {
-    testData := make([]byte, 1024*1024) // 1MB
-    b.ReportAllocs()
-    b.ResetTimer()
-    
-    for i := 0; i < b.N; i++ {
-        reader := bytes.NewReader(testData)
-        _, err := io.Copy(io.Discard, reader)
-        if err != nil {
-            b.Fatal(err)
-        }
-    }
-}
+#### Storage and Download Benchmarks
+Live in `internal/storage/storage_bench_test.go` and `internal/server/download_bench_test.go`. Run them with:
+
+```bash
+go test -bench=. -benchmem ./internal/storage/ ./internal/server/
 ```
+
+There is no zero-copy benchmark: groxpi has no kernel zero-copy path (see [performance.md](performance.md)), and the streaming abstractions that used to be benchmarked in isolation were deleted in `6243e0a` for having no production callers.
 
 ### Load Tests
 Test system behavior under concurrent load.
