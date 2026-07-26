@@ -229,7 +229,7 @@ func BenchmarkCalculateDynamicTimeout(b *testing.B) {
 		b.Run(fmt.Sprintf("size_%dMB", size/(1024*1024)), func(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_ = srv.calculateDynamicTimeout(size)
+				_ = srv.packageFiles.calculateDynamicTimeout(size)
 			}
 		})
 	}

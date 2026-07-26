@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -181,12 +182,23 @@ func TestServer_DownloadCoordinator_ErrorHandling(t *testing.T) {
 	}
 }
 
-// TestServer_DownloadCoordinator_Cleanup tests the cleanup mechanism
-func TestServer_DownloadCoordinator_Cleanup(t *testing.T) {
+// TestServer_DownloadDedup_ReleasesStateAfterDownload is the port of the old
+// hand-rolled download coordinator cleanup test. The coordinator kept a per-download entry in
+// a map and needed a 30s cleanup goroutine to drop it; singleflight releases the
+// key as soon as the leader returns. The observable claim is the same: the dedup
+// bookkeeping for a finished download must not linger and block or misdirect the
+// next request for that file.
+func TestServer_DownloadDedup_ReleasesStateAfterDownload(t *testing.T) {
 	packageName := "cleanup-test"
 	fileName := "cleanup-file-1.0.0.tar.gz"
+	fileContent := []byte("cleanup payload")
 
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstreamDownloads := int64(0)
+
+	// NOTE: the href is absolute on purpose - the HTML index parser does not
+	// resolve relative hrefs against the index URL (see report).
+	var mockPyPI *httptest.Server
+	mockPyPI = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/"+packageName+"/" {
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
@@ -194,9 +206,14 @@ func TestServer_DownloadCoordinator_Cleanup(t *testing.T) {
 <head><title>Links for %s</title></head>
 <body>
 <h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
+<a href="%s/files/%s">%s</a>
 </body>
-</html>`, packageName, packageName, fileName, fileName)
+</html>`, packageName, packageName, mockPyPI.URL, fileName, fileName)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/files/") {
+			atomic.AddInt64(&upstreamDownloads, 1)
+			_, _ = w.Write(fileContent)
 		}
 	}))
 	defer mockPyPI.Close()
@@ -204,31 +221,45 @@ func TestServer_DownloadCoordinator_Cleanup(t *testing.T) {
 	cfg := &config.Config{
 		IndexURL:        mockPyPI.URL,
 		CacheDir:        t.TempDir(),
-		DownloadTimeout: 1 * time.Second,
+		DownloadTimeout: 5 * time.Second,
 		LogLevel:        "ERROR",
 	}
 
 	srv := New(cfg)
 	router := srv.Router()
 
-	// Make a download request
+	// First request downloads and caches.
 	req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
 	resp := testRequestCoord(router, req)
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	// Verify download entry exists in coordinator
-	downloadKey := fmt.Sprintf("%s/%s", packageName, fileName)
-	srv.downloadCoord.mu.RLock()
-	_, exists := srv.downloadCoord.downloads[downloadKey]
-	srv.downloadCoord.mu.RUnlock()
-
-	if !exists {
-		t.Error("Download entry should exist in coordinator after request")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+	if len(body) != len(fileContent) {
+		t.Fatalf("Expected body size %d, got %d", len(fileContent), len(body))
+	}
+	if got := atomic.LoadInt64(&upstreamDownloads); got != 1 {
+		t.Fatalf("Expected 1 upstream download, got %d", got)
 	}
 
-	// Wait for cleanup (30 seconds is too long for tests, so we check the mechanism works)
-	// Note: In a real test environment, we might want to reduce the cleanup time or test the cleanup mechanism directly
-	t.Logf("Download coordinator cleanup test completed - entry exists: %v", exists)
+	// A later request for the same file must be served immediately from the cache
+	// populated by the first one - no stale dedup entry, no second upstream fetch.
+	req = httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
+	resp = testRequestCoord(router, req)
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200 on the cached request, got %d", resp.StatusCode)
+	}
+	if len(body) != len(fileContent) {
+		t.Errorf("Expected cached body size %d, got %d", len(fileContent), len(body))
+	}
+	if got := atomic.LoadInt64(&upstreamDownloads); got != 1 {
+		t.Errorf("Expected the cached request to skip upstream, got %d downloads", got)
+	}
 }
 
 // TestServer_CalculateDynamicTimeout tests timeout calculation for various file sizes
@@ -294,7 +325,7 @@ func TestServer_CalculateDynamicTimeout(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timeout := srv.calculateDynamicTimeout(tt.fileSize)
+			timeout := srv.packageFiles.calculateDynamicTimeout(tt.fileSize)
 
 			if timeout < tt.expectedMin {
 				t.Errorf("%s: timeout %v is less than expected minimum %v", tt.description, timeout, tt.expectedMin)
@@ -338,7 +369,7 @@ func TestServer_CalculateDynamicTimeout_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timeout := srv.calculateDynamicTimeout(tt.fileSize)
+			timeout := srv.packageFiles.calculateDynamicTimeout(tt.fileSize)
 
 			// Should not panic and should return reasonable timeout
 			if timeout < time.Minute || timeout > time.Hour {

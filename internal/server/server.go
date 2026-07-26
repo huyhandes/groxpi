@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,64 +32,6 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
-// downloadStatus represents the status of an ongoing download
-type downloadStatus struct {
-	mu         sync.RWMutex
-	inProgress bool
-	completed  bool
-	storageKey string
-	startTime  time.Time
-	waitGroup  sync.WaitGroup
-	error      error
-}
-
-// downloadCoordinator manages concurrent downloads of the same file
-type downloadCoordinator struct {
-	mu        sync.RWMutex
-	downloads map[string]*downloadStatus
-}
-
-// newDownloadCoordinator creates a new download coordinator
-func newDownloadCoordinator() *downloadCoordinator {
-	return &downloadCoordinator{
-		downloads: make(map[string]*downloadStatus),
-	}
-}
-
-// calculateDynamicTimeout calculates appropriate timeout based on file size
-func (s *Server) calculateDynamicTimeout(expectedSize int64) time.Duration {
-	if expectedSize <= 0 {
-		// Use default timeout for unknown sizes
-		return s.config.DownloadTimeout
-	}
-
-	// Calculate timeout based on minimum transfer speed
-	// Use 100 KB/s as minimum acceptable speed for S3 uploads
-	const minSpeedBytesPerSec = 100 * 1024
-
-	// Calculate base timeout: file_size / min_speed
-	baseTimeout := time.Duration(expectedSize/minSpeedBytesPerSec) * time.Second
-
-	// Add minimum timeout of 2 minutes for network overhead
-	minTimeout := 2 * time.Minute
-	if baseTimeout < minTimeout {
-		baseTimeout = minTimeout
-	}
-
-	// Cap maximum timeout at 1 hour to prevent indefinite waits
-	maxTimeout := 60 * time.Minute
-	if baseTimeout > maxTimeout {
-		baseTimeout = maxTimeout
-	}
-
-	log.Debug().
-		Int64("expected_size", expectedSize).
-		Dur("calculated_timeout", baseTimeout).
-		Msg("🕐 Calculated dynamic timeout for download")
-
-	return baseTimeout
-}
-
 type Server struct {
 	config           *config.Config
 	indexCache       *cache.IndexCache
@@ -99,7 +42,7 @@ type Server struct {
 	router           *gin.Engine
 	sf               singleflight.Group // For deduplicating concurrent requests
 	streamDownloader streaming.StreamingDownloader
-	downloadCoord    *downloadCoordinator // For coordinating concurrent downloads
+	packageFiles     *PackageFileService // Owns the package-file miss pipeline
 }
 
 func New(cfg *config.Config) *Server {
@@ -155,8 +98,17 @@ func New(cfg *config.Config) *Server {
 		storage:          storageBackend,
 		router:           router,
 		streamDownloader: streaming.NewTeeStreamingDownloader(&storageAdapter{storageBackend}, streamClient),
-		downloadCoord:    newDownloadCoordinator(),
 	}
+
+	s.packageFiles = newPackageFileService(
+		cfg,
+		storageBackend,
+		s.fileCache,
+		s.indexCache,
+		s.pypiClient,
+		s.streamDownloader,
+		&s.sf,
+	)
 
 	s.setupRoutes()
 	return s
@@ -438,7 +390,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
 		// Rewrite URL to point to proxy instead of direct PyPI
-		sb.WriteString(fmt.Sprintf("/simple/%s/%s", packageName, file.Name))
+		_, _ = fmt.Fprintf(&sb, "/simple/%s/%s", packageName, file.Name)
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {
@@ -467,7 +419,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 }
 
 func (s *Server) handleDownloadFile(c *gin.Context) {
-	packageName := c.Param("package")
+	packageName := normalizePackageName(c.Param("package"))
 	fileName := c.Param("file")
 
 	log.Debug().
@@ -477,245 +429,124 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 		Str("client_ip", c.ClientIP()).
 		Msg("📦 File download request received")
 
-	// Normalize package name
-	packageName = normalizePackageName(packageName)
+	plan, err := s.packageFiles.Plan(c.Request.Context(), packageName, fileName)
+	if err != nil {
+		log.Debug().Err(err).Str("package", packageName).Str("file", fileName).Msg("Package index unavailable")
+		c.String(http.StatusNotFound, "Package not found")
+		return
+	}
 
-	s.handleDownloadWithCoordination(c, packageName, fileName)
+	s.servePlan(c, plan)
 }
 
-// handleDownloadWithCoordination coordinates concurrent downloads of the same file
-func (s *Server) handleDownloadWithCoordination(c *gin.Context, packageName, fileName string) {
-	downloadKey := fmt.Sprintf("%s/%s", packageName, fileName)
-	storageKey := fmt.Sprintf("packages/%s/%s", packageName, fileName)
-
-	// Check if file already exists in storage - fast path
-	ctx := context.Background()
-	if exists, _ := s.storage.Exists(ctx, storageKey); exists {
-		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
-		if err := s.serveFromStorageOptimized(c, storageKey); err != nil {
-			log.Error().Err(err).Str("storage_key", storageKey).Msg("Failed to serve from storage")
+// servePlan translates a ServePlan into an HTTP response. It makes no policy
+// decisions of its own.
+func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
+	switch plan.Action {
+	case ActionFromStorage:
+		if err := s.serveFromStorageOptimized(c, plan.StorageKey); err != nil {
+			log.Error().Err(err).Str("storage_key", plan.StorageKey).Msg("Failed to serve from storage")
 			c.String(http.StatusInternalServerError, "Failed to serve file")
 		}
-		return
-	}
-
-	// Get or create download status
-	s.downloadCoord.mu.Lock()
-	status, exists := s.downloadCoord.downloads[downloadKey]
-	if !exists {
-		status = &downloadStatus{
-			storageKey: storageKey,
-			startTime:  time.Now(),
-		}
-		s.downloadCoord.downloads[downloadKey] = status
-		status.waitGroup.Add(1)
-		status.inProgress = true
-		s.downloadCoord.mu.Unlock()
-
-		// First request - handle the download
-		log.Info().Str("package", packageName).Str("file", fileName).Msg("🚀 Starting coordinated download")
-
-		// Perform the actual download
-		err := s.handleDownloadInternal(c, packageName, fileName)
-
-		// Update status and wake up waiting requests
-		status.mu.Lock()
-		status.inProgress = false
-		status.completed = true
-		status.error = err
-		status.mu.Unlock()
-		status.waitGroup.Done()
-
-		// Clean up after a delay
-		go func() {
-			time.Sleep(30 * time.Second)
-			s.downloadCoord.mu.Lock()
-			delete(s.downloadCoord.downloads, downloadKey)
-			s.downloadCoord.mu.Unlock()
-		}()
-
-		return
-	} else {
-		s.downloadCoord.mu.Unlock()
-
-		// Subsequent requests - wait for the download to complete
-		log.Debug().Str("package", packageName).Str("file", fileName).Msg("🔄 Waiting for ongoing download")
-
-		// Wait for the download to complete
-		status.waitGroup.Wait()
-
-		status.mu.RLock()
-		downloadErr := status.error
-		status.mu.RUnlock()
-
-		// If the original download succeeded, serve from storage
-		if downloadErr == nil {
-			if exists, _ := s.storage.Exists(ctx, storageKey); exists {
-				log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage after coordinated download")
-				if err := s.serveFromStorageOptimized(c, storageKey); err != nil {
-					log.Error().Err(err).Str("storage_key", storageKey).Msg("Failed to serve from storage after coordinated download")
-					c.String(http.StatusInternalServerError, "Failed to serve file")
-				}
-				return
-			}
-		}
-
-		// If download failed, try to get file URL and redirect
-		if files, err := s.pypiClient.GetPackageFiles(packageName); err == nil {
-			for _, file := range files {
-				if file.Name == fileName {
-					log.Debug().Str("package", packageName).Str("file", fileName).Msg("⏭️ Redirecting to PyPI after download coordination")
-					c.Redirect(http.StatusFound, file.URL)
-					return
-				}
-			}
-		}
-
+	case ActionFromFileCache:
+		c.File(plan.FilePath)
+	case ActionStreamAndCache:
+		s.streamAndCache(c, plan)
+	case ActionRedirect:
+		c.Redirect(http.StatusFound, plan.URL)
+	default:
 		c.String(http.StatusNotFound, "File not found")
 	}
 }
 
-// handleDownloadInternal performs the actual download logic with streaming and caching
-func (s *Server) handleDownloadInternal(c *gin.Context, packageName, fileName string) error {
-	// Try to get from file cache first
-	if filePath, exists := s.fileCache.Get(packageName + "/" + fileName); exists {
-		log.Debug().
-			Str("package", packageName).
-			Str("file", fileName).
-			Str("cache_path", filePath).
-			Msg("✅ Serving from file cache")
-		c.File(filePath)
-		return nil
-	}
+// streamAndCache streams the upstream file to the client while it is cached.
+// Concurrent requests for the same file are deduplicated inside the service:
+// only one of them streams, the rest are served the freshly cached object.
+func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
+	// Headers are emitted lazily, immediately before the first body byte, because
+	// gin flushes them on the first Write and silently drops anything set later.
+	body := &headerWriter{w: c.Writer, header: func() { applyDownloadHeaders(c, plan) }}
 
-	// Get package files to find the download URL
-	var files []pypi.FileInfo
-	if cachedData, found := s.indexCache.GetPackage(packageName); found {
-		if cachedFiles, ok := cachedData.([]pypi.FileInfo); ok {
-			files = cachedFiles
+	result, led, err := s.packageFiles.Fetch(c.Request.Context(), plan, body)
+
+	switch {
+	case err != nil:
+		log.Error().
+			Err(err).
+			Str("package", plan.PackageName).
+			Str("file", plan.FileName).
+			Str("file_url", plan.URL).
+			Int64("file_size", plan.Size).
+			Dur("timeout", plan.Timeout).
+			Msg("Failed to stream download, redirecting to PyPI")
+		if body.wrote {
+			// The body is already partly on the wire; a redirect would corrupt it.
+			c.Abort()
+			return
 		}
-	}
-
-	if len(files) == 0 {
-		// Fetch from PyPI
-		var err error
-		files, err = s.pypiClient.GetPackageFiles(packageName)
-		if err != nil {
-			c.String(http.StatusNotFound, "Package not found")
-			return err
-		}
-		// Cache the result
-		s.indexCache.SetPackage(packageName, files, s.config.IndexTTL)
-	}
-
-	// Find the file URL and size
-	var fileURL string
-	var fileSize int64
-	for _, file := range files {
-		if file.Name == fileName {
-			fileURL = file.URL
-			fileSize = file.Size
-			break
-		}
-	}
-
-	if fileURL == "" {
-		c.String(http.StatusNotFound, "File not found")
-		return fmt.Errorf("file not found: %s/%s", packageName, fileName)
-	}
-
-	// Build storage key for the file
-	storageKey := fmt.Sprintf("packages/%s/%s", packageName, fileName)
-
-	log.Debug().
-		Str("package", packageName).
-		Str("file", fileName).
-		Str("storage_key", storageKey).
-		Str("file_url", fileURL).
-		Str("storage_type", s.config.StorageType).
-		Msg("🔍 Checking if file exists in storage")
-
-	// Check if file exists in storage
-	ctx := context.Background()
-	exists, err := s.storage.Exists(ctx, storageKey)
-	if err != nil {
-		log.Error().Err(err).Str("key", storageKey).Msg("Failed to check storage")
-	}
-
-	log.Debug().
-		Str("storage_key", storageKey).
-		Bool("exists_in_storage", exists).
-		Msg("💾 Storage existence check result")
-
-	if exists {
-		// Serve from storage using zero-copy when possible
-		log.Debug().Str("package", packageName).Str("file", fileName).Msg("✅ Serving from storage cache")
-		return s.serveFromStorageOptimized(c, storageKey)
-	}
-
-	// Check download timeout to decide whether to stream or redirect
-	if s.config.DownloadTimeout > 0 {
-		// Calculate dynamic timeout based on file size
-		dynamicTimeout := s.calculateDynamicTimeout(fileSize)
-
-		// Use streaming downloader for simultaneous download and serve
-		downloadCtx, cancel := context.WithTimeout(ctx, dynamicTimeout)
-		defer cancel()
-
+		c.Redirect(http.StatusFound, plan.URL)
+	case !led:
+		s.serveDeduplicated(c, plan)
+	default:
 		log.Info().
-			Str("package", packageName).
-			Str("file", fileName).
-			Str("file_url", fileURL).
-			Int64("file_size", fileSize).
-			Dur("timeout", dynamicTimeout).
-			Msg("🚀 Starting streaming download with simultaneous cache")
-
-		// Stream to client while caching - c.Writer is safe for goroutines (unlike Fiber's context)
-		result, err := s.streamDownloader.DownloadAndStream(downloadCtx, fileURL, storageKey, c.Writer)
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("package", packageName).
-				Str("file", fileName).
-				Str("file_url", fileURL).
-				Int64("file_size", fileSize).
-				Dur("timeout", dynamicTimeout).
-				Msg("Failed to stream download, redirecting to PyPI")
-
-			// Fall back to redirect
-			c.Redirect(http.StatusFound, fileURL)
-			return err
-		}
-
-		// Set appropriate headers
-		if result.ContentType != "" {
-			c.Header("Content-Type", result.ContentType)
-		}
-		if result.Size > 0 {
-			c.Header("Content-Length", fmt.Sprintf("%d", result.Size))
-		}
-		if result.ETag != "" {
-			c.Header("ETag", result.ETag)
-		}
-
-		log.Info().
-			Str("package", packageName).
-			Str("file", fileName).
+			Str("package", plan.PackageName).
+			Str("file", plan.FileName).
 			Int64("size", result.Size).
 			Bool("cached", result.Error == nil).
 			Msg("✅ Successfully streamed file to client")
+	}
+}
 
-		return nil // Response already written
-	} else {
+// serveDeduplicated handles a request that waited on another request's download:
+// the object should now be cached, so re-plan and serve it from there. If it is
+// not (async or failed cache write), fall back to the upstream URL.
+func (s *Server) serveDeduplicated(c *gin.Context, plan ServePlan) {
+	next, err := s.packageFiles.Plan(c.Request.Context(), plan.PackageName, plan.FileName)
+	if err == nil && (next.Action == ActionFromStorage || next.Action == ActionFromFileCache) {
 		log.Debug().
-			Str("package", packageName).
-			Str("file", fileName).
-			Msg("Download timeout is 0, redirecting directly to PyPI")
+			Str("package", plan.PackageName).
+			Str("file", plan.FileName).
+			Msg("✅ Serving from storage after coordinated download")
+		s.servePlan(c, next)
+		return
 	}
 
-	// Redirect to upstream URL
-	c.Redirect(http.StatusFound, fileURL)
-	return nil
+	log.Debug().
+		Str("package", plan.PackageName).
+		Str("file", plan.FileName).
+		Msg("⏭️ Redirecting to PyPI after download coordination")
+	c.Redirect(http.StatusFound, plan.URL)
+}
+
+// applyDownloadHeaders sets everything knowable about the response before the
+// first byte of the body is written.
+func applyDownloadHeaders(c *gin.Context, plan ServePlan) {
+	if plan.ContentType != "" {
+		c.Header("Content-Type", plan.ContentType)
+	}
+	if plan.Size > 0 {
+		c.Header("Content-Length", strconv.FormatInt(plan.Size, 10))
+	}
+	if plan.ETag != "" {
+		c.Header("ETag", plan.ETag)
+	}
+}
+
+// headerWriter defers header emission to the first body write, guaranteeing the
+// headers precede the body no matter when the writer is first used.
+type headerWriter struct {
+	w      io.Writer
+	header func()
+	once   sync.Once
+	wrote  bool
+}
+
+func (hw *headerWriter) Write(p []byte) (int, error) {
+	hw.once.Do(func() {
+		hw.wrote = true
+		hw.header()
+	})
+	return hw.w.Write(p)
 }
 
 func (s *Server) handleCacheList(c *gin.Context) {
@@ -867,7 +698,8 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 
 // serveFromStorage serves a file from the storage backend
 func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
-	ctx := context.Background()
+	// Read-only serving: it is correct to abandon it when the client goes away.
+	ctx := c.Request.Context()
 
 	log.Debug().
 		Str("storage_key", storageKey).
@@ -938,7 +770,8 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 
 // serveFromStorageOptimized serves a file from storage with zero-copy optimizations when possible
 func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
-	ctx := context.Background()
+	// Read-only serving: it is correct to abandon it when the client goes away.
+	ctx := c.Request.Context()
 
 	// Try to get local file path for zero-copy operations (local storage only)
 	if streamStorage, ok := s.storage.(storage.StreamingStorage); ok && streamStorage.SupportsZeroCopy() {
