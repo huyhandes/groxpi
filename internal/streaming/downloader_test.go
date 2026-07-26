@@ -16,10 +16,9 @@ import (
 
 // Mock storage writer for testing
 type mockStorageWriter struct {
-	storage  map[string][]byte
-	mu       sync.RWMutex
-	putErr   error
-	putDelay time.Duration
+	storage map[string][]byte
+	mu      sync.RWMutex
+	putErr  error
 }
 
 func newMockStorageWriter() *mockStorageWriter {
@@ -29,14 +28,6 @@ func newMockStorageWriter() *mockStorageWriter {
 }
 
 func (m *mockStorageWriter) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
-	if m.putDelay > 0 {
-		select {
-		case <-time.After(m.putDelay):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
 	if m.putErr != nil {
 		return m.putErr
 	}
@@ -66,12 +57,6 @@ func (m *mockStorageWriter) SetError(err error) {
 	m.putErr = err
 }
 
-func (m *mockStorageWriter) SetDelay(delay time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.putDelay = delay
-}
-
 // Test HTTP server helper
 func createTestServer(responseData string, statusCode int, delay time.Duration) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,35 +69,14 @@ func createTestServer(responseData string, statusCode int, delay time.Duration) 
 	}))
 }
 
-func TestNewStreamingDownloader(t *testing.T) {
-	t.Run("creates downloader with custom client", func(t *testing.T) {
-		storage := newMockStorageWriter()
-		client := &http.Client{Timeout: 5 * time.Second}
-
-		downloader := NewStreamingDownloader(storage, client)
-		if downloader == nil {
-			t.Fatal("NewStreamingDownloader returned nil")
-		}
-	})
-
-	t.Run("creates downloader with default client", func(t *testing.T) {
-		storage := newMockStorageWriter()
-
-		downloader := NewStreamingDownloader(storage, nil)
-		if downloader == nil {
-			t.Fatal("NewStreamingDownloader returned nil")
-		}
-	})
-}
-
-func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
+func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 	t.Run("successful download and stream", func(t *testing.T) {
 		testData := "test file content for streaming"
 		server := createTestServer(testData, http.StatusOK, 0)
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -156,7 +120,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		storage := newMockStorageWriter()
 		storage.SetError(errors.New("storage write failed"))
 
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -195,7 +159,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -214,7 +178,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -233,7 +197,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 10 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 10 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -260,7 +224,7 @@ func TestStreamingDownloader_DownloadAndStream(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var wg sync.WaitGroup
 		concurrency := 10
@@ -344,141 +308,7 @@ func TestTeeStreamingDownloader_DownloadAndStream(t *testing.T) {
 	})
 }
 
-func TestHashingWriter(t *testing.T) {
-	t.Run("hashing writer calculates hash correctly", func(t *testing.T) {
-		var buffer bytes.Buffer
-		hasher := newMD5Hasher() // We'll need to implement this
-		hw := NewHashingWriter(&buffer, hasher)
-
-		testData := []byte("hash test data")
-		n, err := hw.Write(testData)
-		if err != nil {
-			t.Fatalf("HashingWriter write failed: %v", err)
-		}
-		if n != len(testData) {
-			t.Errorf("Write count mismatch: expected %d, got %d", len(testData), n)
-		}
-
-		// Verify data written to underlying writer
-		if buffer.String() != string(testData) {
-			t.Errorf("Buffer content mismatch: expected %q, got %q", testData, buffer.String())
-		}
-
-		// Verify hash is calculated
-		hash := hw.Sum()
-		if len(hash) == 0 {
-			t.Error("Hash should not be empty")
-		}
-	})
-
-	t.Run("partial write updates hash correctly", func(t *testing.T) {
-		var buffer bytes.Buffer
-		hasher := newMD5Hasher()
-
-		// Simulate partial write
-		testData := []byte("partial write test")
-
-		// Mock writer that only writes half the data
-		partialWriter := &partialWriter{underlying: &buffer, writeRatio: 0.5}
-		hw := NewHashingWriter(partialWriter, hasher)
-
-		n, err := hw.Write(testData)
-		if err != nil {
-			t.Fatalf("Partial write failed: %v", err)
-		}
-
-		// Hash should only include the actually written data
-		expectedWritten := len(testData) / 2
-		if n != expectedWritten {
-			t.Errorf("Expected %d bytes written, got %d", expectedWritten, n)
-		}
-	})
-}
-
-// Helper types for testing
-type partialWriter struct {
-	underlying io.Writer
-	writeRatio float64
-}
-
-func (pw *partialWriter) Write(p []byte) (n int, err error) {
-	writeLen := int(float64(len(p)) * pw.writeRatio)
-	if writeLen == 0 && len(p) > 0 {
-		writeLen = 1
-	}
-	return pw.underlying.Write(p[:writeLen])
-}
-
-// Simple MD5 hasher for testing
-type testHasher struct {
-	data []byte
-}
-
-func newMD5Hasher() *testHasher {
-	return &testHasher{}
-}
-
-func (h *testHasher) Write(p []byte) (n int, err error) {
-	h.data = append(h.data, p...)
-	return len(p), nil
-}
-
-func (h *testHasher) Sum(b []byte) []byte {
-	// Simple checksum for testing
-	sum := byte(0)
-	for _, b := range h.data {
-		sum ^= b
-	}
-	return append(b, sum)
-}
-
-func (h *testHasher) Reset() {
-	h.data = nil
-}
-
-func (h *testHasher) Size() int {
-	return 1
-}
-
-func (h *testHasher) BlockSize() int {
-	return 1
-}
-
 // Benchmark tests
-func BenchmarkStreamingDownloader_SmallFile(b *testing.B) {
-	testData := "small file benchmark data"
-	server := createTestServer(testData, http.StatusOK, 0)
-	defer server.Close()
-
-	storage := newMockStorageWriter()
-	downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		var buffer bytes.Buffer
-		key := fmt.Sprintf("bench-key-%d", i)
-		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
-	}
-}
-
-func BenchmarkStreamingDownloader_LargeFile(b *testing.B) {
-	testData := strings.Repeat("BENCHMARK", 10000) // ~90KB
-	server := createTestServer(testData, http.StatusOK, 0)
-	defer server.Close()
-
-	storage := newMockStorageWriter()
-	downloader := NewStreamingDownloader(storage, &http.Client{Timeout: 10 * time.Second})
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		var buffer bytes.Buffer
-		key := fmt.Sprintf("bench-large-key-%d", i)
-		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
-	}
-}
-
 func BenchmarkTeeStreamingDownloader_Comparison(b *testing.B) {
 	testData := "tee benchmark data"
 	server := createTestServer(testData, http.StatusOK, 0)
