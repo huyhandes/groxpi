@@ -11,8 +11,7 @@ import (
 // LocalStorage stores objects as plain files under a base directory.
 //
 // Because its objects are real files it can hand out a path the transport can
-// serve directly, so it implements ZeroCopyCapable. It has nothing to presign
-// and deliberately does not implement Presignable.
+// serve directly, so it implements ZeroCopyCapable.
 type LocalStorage struct {
 	baseDir string
 }
@@ -22,9 +21,10 @@ var (
 	_ ZeroCopyCapable = (*LocalStorage)(nil)
 )
 
-// localNotFound maps a filesystem error to the shared sentinel when it means
-// "no such object", and wraps it as an ordinary failure otherwise.
-func localNotFound(err error, key, op string) error {
+// localError wraps a filesystem failure during op on key, folding a genuine
+// absence into the shared ErrNotFound sentinel so callers can branch with
+// errors.Is. It is the local counterpart of s3Error.
+func localError(err error, key, op string) error {
 	if os.IsNotExist(err) {
 		return fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
@@ -52,7 +52,7 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, localNotFound(err, key, "open")
+		return nil, nil, localError(err, key, "open")
 	}
 
 	stat, err := file.Stat()
@@ -153,7 +153,7 @@ func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error
 
 	stat, err := os.Stat(path)
 	if err != nil {
-		return nil, localNotFound(err, key, "stat")
+		return nil, localError(err, key, "stat")
 	}
 
 	return &ObjectInfo{
@@ -223,7 +223,7 @@ func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, err
 
 	// Check if file exists
 	if _, err := os.Stat(path); err != nil {
-		return "", localNotFound(err, key, "stat")
+		return "", localError(err, key, "stat")
 	}
 
 	return path, nil

@@ -44,19 +44,19 @@ go test -bench=. ./internal/storage/
 - **LRU Eviction** (`lru_test.go`): a frequently-read file survives eviction pressure; eviction goes through the `objectDeleter` seam; size accounting matches disk after overwrites
 - **Tiering** (`tiered_test.go`): L1 back-fill lands and survives request cancellation; a real L1 error propagates instead of being masked as a miss; misses are the `ErrNotFound` sentinel
 - **Worker Pool** (`workerpool_test.go`): every submitted job runs, concurrency never exceeds the worker count, `Submit` drops when full, `Close` is idempotent and waits for in-flight jobs
-- **S3 Buffer Pools**: Tests buffer reuse for small-object writes
+- **S3 Part Sizing** (`s3_test.go`): `calculateOptimalPartSize` over the size bands plus degenerate inputs (zero, negative, exactly the AWS 5MB minimum), asserting the AWS minimum and the 10,000-part limit hold
+- **S3 Error Mapping** (`s3_test.go`): only a genuine absence becomes `ErrNotFound`; denied/throttled/transport failures do not
 - **Singleflight Patterns**: Tests request deduplication logic
 - **Configuration**: Tests various S3 configuration scenarios
 
 ### Integration Tests
 - **S3 Basic Operations**: Put, Get, Delete, Exists, Stat operations with real S3
-- **S3 Advanced Features**: Multipart uploads (handled internally by the SDK via part sizing) and presigned URLs
+- **S3 Advanced Features**: Multipart uploads (handled internally by the SDK via part sizing)
 - **S3 Concurrency**: Concurrent operations and singleflight deduplication
 - **S3 Error Handling**: Network failures, timeouts, invalid requests
 - **S3 Edge Cases**: Empty files, large files, Unicode content, special characters
 
 ### Performance Tests
-- **Buffer Pool Efficiency**: Memory allocation benchmarks
 - **Singleflight Effectiveness**: Request deduplication measurements  
 - **Real S3 Operations**: Network operation benchmarks
 - **Concurrent Access**: Multi-goroutine performance testing

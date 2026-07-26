@@ -19,7 +19,6 @@ type ObjectInfo struct {
 	LastModified time.Time
 	ETag         string
 	ContentType  string
-	Metadata     map[string]string
 }
 
 // ListOptions configures object listing
@@ -79,18 +78,3 @@ type ZeroCopyCapable interface {
 	// error matching ErrNotFound if the key does not exist.
 	GetFilePath(ctx context.Context, key string) (string, error)
 }
-
-// Presignable is implemented only by backends that can mint a time-limited URL
-// a client can fetch directly, bypassing this proxy.
-type Presignable interface {
-	// GetPresignedURL returns a URL valid for expiry.
-	GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error)
-}
-
-// StorageType represents the type of storage backend
-type StorageType string
-
-const (
-	StorageTypeLocal StorageType = "local"
-	StorageTypeS3    StorageType = "s3"
-)

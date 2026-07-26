@@ -194,10 +194,9 @@ func TestLRULocalStorage_ExpiresEntriesUnderQuota(t *testing.T) {
 }
 
 // TestLRULocalStorage_ForwardsCapabilities pins the wrapper's capability
-// contract: it must expose every capability its inner storage genuinely has and
-// none that it does not. A wrapper that silently drops zero-copy would push the
-// hottest read path onto a byte-by-byte copy; one that advertised presigning
-// would hand callers a URL nothing can serve.
+// contract: it must expose every capability its inner storage genuinely has. A
+// wrapper that silently drops zero-copy would push the hottest read path onto a
+// byte-by-byte copy.
 func TestLRULocalStorage_ForwardsCapabilities(t *testing.T) {
 	dir := t.TempDir()
 
@@ -209,9 +208,6 @@ func TestLRULocalStorage_ForwardsCapabilities(t *testing.T) {
 
 	zc, ok := backend.(ZeroCopyCapable)
 	require.True(t, ok, "wrapper dropped the inner storage's zero-copy capability")
-
-	_, isPresignable := backend.(Presignable)
-	assert.False(t, isPresignable, "wrapper advertised a capability local storage does not have")
 
 	putBlob(t, s, "served.bin", 64)
 

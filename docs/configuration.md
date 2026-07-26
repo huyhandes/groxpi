@@ -44,6 +44,20 @@ Groxpi supports multiple storage backends for file caching.
 | `GROXPI_S3_USE_SSL` | `true` | Enable SSL for S3 connections |
 | `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Force path-style URLs |
 
+#### Removed Settings
+
+The following variables were removed and are now **ignored**. They configured an
+"async write" queue that `S3Storage.Put` submitted to and then immediately
+blocked on, so the write was never asynchronous to the caller — the queue only
+moved a blocking upload onto another goroutine and waited for it. Uploads now go
+straight to S3. Remove these from your environment; setting them has no effect.
+
+| Removed variable | Former default |
+|------------------|----------------|
+| `GROXPI_S3_ASYNC_WRITES` | `true` |
+| `GROXPI_S3_ASYNC_WORKERS` | `10` |
+| `GROXPI_S3_ASYNC_QUEUE_SIZE` | `1000` |
+
 ### Hybrid/Tiered Storage (Local L1 + S3 L2)
 
 Hybrid storage provides a multi-tier caching system with fast local cache (L1) backed by persistent S3 storage (L2).

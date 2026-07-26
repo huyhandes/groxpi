@@ -23,20 +23,13 @@ type l1Storage interface {
 	ZeroCopyCapable
 }
 
-// l2Storage is the L2 tier contract: core storage plus presigning, which only
-// the remote tier can offer.
-type l2Storage interface {
-	Storage
-	Presignable
-}
-
 // TieredStorage implements a multi-tier caching system with local (L1) and S3 (L2) storage.
 //
-// It re-exposes each capability from the tier that genuinely has it: zero-copy
-// from L1 (real files on disk) and presigning from L2.
+// Zero-copy is re-exposed from L1, the only tier that genuinely has it (real
+// files on disk).
 type TieredStorage struct {
 	localCache    l1Storage           // L1 cache - fast local storage
-	remoteStorage l2Storage           // L2 cache - persistent S3 storage
+	remoteStorage Storage             // L2 cache - persistent S3 storage
 	syncQueue     *WorkerPool[string] // Keys queued for L1 cache population
 	sf            singleflight.Group
 }
@@ -44,7 +37,6 @@ type TieredStorage struct {
 var (
 	_ Storage         = (*TieredStorage)(nil)
 	_ ZeroCopyCapable = (*TieredStorage)(nil)
-	_ Presignable     = (*TieredStorage)(nil)
 )
 
 // newTieredSyncQueue builds the bounded worker pool that back-fills L1 from L2.
@@ -136,7 +128,7 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 
 // newTieredStorage wires the two tiers and starts the back-fill pool. It exists
 // so tests can supply tier doubles without a live S3.
-func newTieredStorage(l1 l1Storage, l2 l2Storage, queueSize, workers int) *TieredStorage {
+func newTieredStorage(l1 l1Storage, l2 Storage, queueSize, workers int) *TieredStorage {
 	ts := &TieredStorage{
 		localCache:    l1,
 		remoteStorage: l2,
@@ -327,12 +319,6 @@ func (ts *TieredStorage) Stat(ctx context.Context, key string) (*ObjectInfo, err
 func (ts *TieredStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
 	// Always list from L2 (S3) as it's the authoritative source
 	return ts.remoteStorage.List(ctx, opts)
-}
-
-// GetPresignedURL generates a presigned URL from L2
-func (ts *TieredStorage) GetPresignedURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
-	// Always generate presigned URLs from L2 (S3)
-	return ts.remoteStorage.GetPresignedURL(ctx, key, expiry)
 }
 
 // GetFilePath returns the local file path for zero-copy serving. Only L1 holds

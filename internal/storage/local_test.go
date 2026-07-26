@@ -379,8 +379,7 @@ func TestLocalStorage_NotFoundIsSentinel(t *testing.T) {
 }
 
 // TestLocalStorage_Capabilities pins which capabilities local storage claims.
-// Local objects are real files, so zero-copy is real; there is nothing to
-// presign, so it must not advertise Presignable.
+// Local objects are real files, so zero-copy is real.
 func TestLocalStorage_Capabilities(t *testing.T) {
 	s, err := NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
@@ -389,9 +388,6 @@ func TestLocalStorage_Capabilities(t *testing.T) {
 
 	_, isZeroCopy := backend.(ZeroCopyCapable)
 	assert.True(t, isZeroCopy, "LocalStorage must be ZeroCopyCapable")
-
-	_, isPresignable := backend.(Presignable)
-	assert.False(t, isPresignable, "LocalStorage must not advertise Presignable")
 }
 
 func TestLocalStorage_Close(t *testing.T) {

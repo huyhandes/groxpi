@@ -113,14 +113,7 @@ func (f *fakeTier) GetFilePath(_ context.Context, key string) (string, error) {
 	return "/fake/" + key, nil
 }
 
-func (f *fakeTier) GetPresignedURL(_ context.Context, key string, _ time.Duration) (string, error) {
-	return "https://fake.example/" + key, nil
-}
-
-var (
-	_ l1Storage = (*fakeTier)(nil)
-	_ l2Storage = (*fakeTier)(nil)
-)
+var _ l1Storage = (*fakeTier)(nil)
 
 // TestTieredStorage_L1BackfillLands covers the bug where the back-fill job was
 // submitted with a context the submitting goroutine cancelled on its way out:
@@ -245,9 +238,8 @@ func TestTieredStorage_MissIsSentinel(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestTieredStorage_Capabilities pins that the tiered backend exposes each
-// capability from the tier that genuinely has it: zero-copy from L1 (real local
-// files) and presigning from L2 (S3).
+// TestTieredStorage_Capabilities pins that the tiered backend exposes zero-copy
+// from L1, the tier that genuinely has it (real local files).
 func TestTieredStorage_Capabilities(t *testing.T) {
 	const key = "packages/numpy/numpy-1.26.0.tar.gz"
 
@@ -265,13 +257,6 @@ func TestTieredStorage_Capabilities(t *testing.T) {
 	path, err := zc.GetFilePath(context.Background(), key)
 	require.NoError(t, err)
 	assert.Equal(t, "/fake/"+key, path, "zero-copy must resolve against L1")
-
-	presigner, ok := backend.(Presignable)
-	require.True(t, ok, "TieredStorage must be Presignable via L2")
-
-	url, err := presigner.GetPresignedURL(context.Background(), key, time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, "https://fake.example/"+key, url)
 }
 
 // TestTieredStorage_BasicOperations tests basic tiered storage operations

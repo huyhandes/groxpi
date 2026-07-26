@@ -70,12 +70,9 @@ func TestS3Storage_ExistsIgnoresOnlyNotFound(t *testing.T) {
 }
 
 // TestS3Storage_Capabilities pins which capabilities S3 claims. S3 objects are
-// not local files, so zero-copy is impossible; presigning is real.
+// not local files, so zero-copy is impossible and must not be advertised.
 func TestS3Storage_Capabilities(t *testing.T) {
 	var backend Storage = newTestS3Storage(t)
-
-	_, isPresignable := backend.(Presignable)
-	assert.True(t, isPresignable, "S3Storage must be Presignable")
 
 	_, isZeroCopy := backend.(ZeroCopyCapable)
 	assert.False(t, isZeroCopy, "S3Storage must not advertise ZeroCopyCapable")
@@ -94,21 +91,9 @@ func TestS3Storage_ContextIsHonoured(t *testing.T) {
 	assert.NotErrorIs(t, err, ErrNotFound)
 }
 
-// TestS3Storage_CalculateOptimalPartSize tests the part size calculation logic
+// TestS3Storage_CalculateOptimalPartSize tests the part size calculation logic,
+// including the degenerate sizes a caller can pass in.
 func TestS3Storage_CalculateOptimalPartSize(t *testing.T) {
-	// Create S3 storage instance for testing
-	cfg := &S3Config{
-		Endpoint: "test.endpoint",
-		Bucket:   "test-bucket",
-		PartSize: 10 * 1024 * 1024, // 10MB default
-	}
-	storage, err := NewS3Storage(cfg)
-	if err != nil {
-		// Skip if we can't create storage (e.g., connection issues)
-		t.Skipf("Cannot create S3 storage for testing: %v", err)
-	}
-	defer func() { _ = storage.Close() }()
-
 	tests := []struct {
 		name        string
 		fileSize    int64
@@ -158,11 +143,39 @@ func TestS3Storage_CalculateOptimalPartSize(t *testing.T) {
 			expectedMax: 64 * 1024 * 1024,  // Should use optimized size
 			description: "Real-world pyspark file should have optimized part size",
 		},
+		{
+			name:        "zero_size",
+			fileSize:    0,
+			expectedMin: 5 * 1024 * 1024,
+			expectedMax: 10 * 1024 * 1024,
+			description: "Zero size should not crash, should return the smallest band",
+		},
+		{
+			name:        "negative_size",
+			fileSize:    -1,
+			expectedMin: 5 * 1024 * 1024,
+			expectedMax: 10 * 1024 * 1024,
+			description: "Negative size should not crash, should return the smallest band",
+		},
+		{
+			name:        "very_small_size_1KB",
+			fileSize:    1024,
+			expectedMin: 5 * 1024 * 1024,
+			expectedMax: 10 * 1024 * 1024,
+			description: "Very small files should use the smallest band",
+		},
+		{
+			name:        "exact_aws_minimum_5MB",
+			fileSize:    5 * 1024 * 1024,
+			expectedMin: 5 * 1024 * 1024,
+			expectedMax: 10 * 1024 * 1024,
+			description: "Exact AWS minimum should work correctly",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			partSize := storage.calculateOptimalPartSize(tt.fileSize)
+			partSize := calculateOptimalPartSize(tt.fileSize)
 
 			// Verify part size is within expected range
 			assert.GreaterOrEqual(t, partSize, tt.expectedMin,
@@ -183,96 +196,4 @@ func TestS3Storage_CalculateOptimalPartSize(t *testing.T) {
 				tt.fileSize/(1024*1024), partSize/(1024*1024), partCount)
 		})
 	}
-}
-
-// TestS3Storage_CalculateOptimalPartSize_EdgeCases tests edge cases
-func TestS3Storage_CalculateOptimalPartSize_EdgeCases(t *testing.T) {
-	cfg := &S3Config{
-		Endpoint: "test.endpoint",
-		Bucket:   "test-bucket",
-		PartSize: 10 * 1024 * 1024,
-	}
-	storage, err := NewS3Storage(cfg)
-	if err != nil {
-		t.Skipf("Cannot create S3 storage for testing: %v", err)
-	}
-	defer func() { _ = storage.Close() }()
-
-	edgeCases := []struct {
-		name        string
-		fileSize    int64
-		expectError bool
-		description string
-	}{
-		{
-			name:        "zero_size",
-			fileSize:    0,
-			expectError: false,
-			description: "Zero size should not crash, should return minimum",
-		},
-		{
-			name:        "negative_size",
-			fileSize:    -1,
-			expectError: false,
-			description: "Negative size should not crash, should return minimum",
-		},
-		{
-			name:        "very_small_size",
-			fileSize:    1024, // 1KB
-			expectError: false,
-			description: "Very small files should use minimum part size",
-		},
-		{
-			name:        "exact_aws_minimum",
-			fileSize:    5 * 1024 * 1024, // Exact 5MB
-			expectError: false,
-			description: "Exact AWS minimum should work correctly",
-		},
-	}
-
-	for _, tt := range edgeCases {
-		t.Run(tt.name, func(t *testing.T) {
-			// Should not panic
-			partSize := storage.calculateOptimalPartSize(tt.fileSize)
-
-			// Should always return at least AWS minimum
-			assert.GreaterOrEqual(t, partSize, int64(5*1024*1024),
-				"Even edge cases should return at least AWS S3 minimum part size")
-
-			t.Logf("File size: %d bytes, Part size: %dMB", tt.fileSize, partSize/(1024*1024))
-		})
-	}
-}
-
-// TestS3Storage_CalculateOptimalPartSize_Performance tests performance characteristics
-func TestS3Storage_CalculateOptimalPartSize_Performance(t *testing.T) {
-	cfg := &S3Config{
-		Endpoint: "test.endpoint",
-		Bucket:   "test-bucket",
-		PartSize: 10 * 1024 * 1024,
-	}
-	storage, err := NewS3Storage(cfg)
-	if err != nil {
-		t.Skipf("Cannot create S3 storage for testing: %v", err)
-	}
-	defer func() { _ = storage.Close() }()
-
-	// Test that calculation is fast and consistent
-	fileSize := int64(317 * 1024 * 1024) // pyspark size
-
-	// Run multiple times to ensure consistency
-	var results []int64
-	for range 100 {
-		result := storage.calculateOptimalPartSize(fileSize)
-		results = append(results, result)
-	}
-
-	// All results should be identical (deterministic)
-	for i := 1; i < len(results); i++ {
-		assert.Equal(t, results[0], results[i],
-			"calculateOptimalPartSize should be deterministic")
-	}
-
-	t.Logf("Calculated part size for %dMB file: %dMB",
-		fileSize/(1024*1024), results[0]/(1024*1024))
 }

@@ -46,13 +46,13 @@ flowchart TB
 Real seams (behaviour genuinely swaps across them):
 
 - **`storage.Storage`** (`storage.go`) — 7 methods (`Get`/`Put`/`Stat`/`Delete`/`Exists`/`List`/`Close`). Adapters: `LocalStorage`, `LRULocalStorage`, `S3Storage`, `TieredStorage`; selected by config. *This is the load-bearing seam of the app.*
-- **`storage.ZeroCopyCapable`** / **`storage.Presignable`** — opt-in capability interfaces. A backend implements one only when it can honour it for real: `LocalStorage`/`LRULocalStorage`/`TieredStorage` implement `GetFilePath`, `S3Storage`/`TieredStorage` implement `GetPresignedURL`. Callers discover them by type assertion, never by asking which backend they hold.
+- **`storage.ZeroCopyCapable`** — an opt-in capability interface. A backend implements it only when it can honour it for real: `LocalStorage`/`LRULocalStorage`/`TieredStorage` implement `GetFilePath`; `S3Storage` does not, because it has no local path to name. Callers discover it by type assertion, never by asking which backend they hold. A sibling `Presignable` interface existed until it was deleted for having no production caller — see [§5 remaining friction](#5-remaining-friction).
 - **`streaming.StreamingDownloader`** (`interfaces.go`) — one method, `DownloadAndStream`; production wires `NewTeeStreamingDownloader`.
 - **`streaming.StorageWriter`** (`downloader.go`) — narrow write-only view of storage, satisfied by `server.storageAdapter`. It exists to break the `streaming` → `storage` import cycle.
 
 Internal seams used for composition and testing:
 
-- **`storage.l1Storage` / `l2Storage`** (`tiered.go`) — tier contracts (`Storage` + `ZeroCopyCapable`, and `Storage` + `Presignable`). Let `newTieredStorage` take tier doubles without a live S3.
+- **`storage.l1Storage`** (`tiered.go`) — the L1 tier contract (`Storage` + `ZeroCopyCapable`). Lets `newTieredStorage` take tier doubles without a live S3. L2 is a plain `Storage`.
 - **`storage.objectDeleter`** (`lru.go`) — the evictor's only route to disk, so on-disk state has exactly one owner.
 - **`server.packageIndex`** (`packagefile.go`) — one method, `GetPackageFiles`; lets the decision tree be exercised without a live PyPI client.
 
@@ -159,7 +159,7 @@ flowchart LR
   SQ --> L1
 ```
 
-`TieredStorage` composes an `l1Storage` (`LRULocalStorage`) and an `l2Storage` (`S3Storage`), a `singleflight.Group` for puts, and a `WorkerPool[tieredSyncRequest]` that back-fills L1 from L2. It re-exposes each capability from the tier that genuinely has it: `GetFilePath` from L1, `GetPresignedURL` from L2.
+`TieredStorage` composes an `l1Storage` (`LRULocalStorage`) and an L2 `Storage` (`S3Storage`), a `singleflight.Group` for puts, and a `WorkerPool[tieredSyncRequest]` that back-fills L1 from L2. It re-exposes zero-copy from L1, the only tier that genuinely has it.
 
 Two bugs were fixed here in `511c415`/`551629b`:
 
@@ -176,7 +176,7 @@ L1 back-fill is best-effort: a full queue drops the request rather than blocking
 - `Exists` and `List` forward without recording — a presence check is a routing decision, and bulk enumeration would reorder the whole cache.
 - Eviction goes through `objectDeleter.Delete` (the same `LocalStorage` instance), so the on-disk file and the size accounting have one owner. The raw `os.Remove` plus `cleanupStaleEntries` reconciliation loop that patched the resulting drift is gone.
 - Eviction is two-phase when a TTL is set: expired entries first (in LRU order), then unexpired ones if still over the size limit. `maxSize == 0` means unlimited.
-- Capability forwarding is explicit and compile-checked (`var _ ZeroCopyCapable = (*LRULocalStorage)(nil)`, `var _ l1Storage = ...`): the wrapper exposes exactly its inner backend's capability set — zero-copy yes, presigning no.
+- Capability forwarding is explicit and compile-checked (`var _ ZeroCopyCapable = (*LRULocalStorage)(nil)`, `var _ l1Storage = ...`): the wrapper exposes exactly its inner backend's capability set.
 
 ## 5. Remaining friction
 
@@ -186,7 +186,7 @@ Current shallow/leaky spots. None of these is a known correctness bug; they are 
 - **Index resolution is implemented twice.** `server.handleListFiles` and `PackageFileService.resolveIndex` both do the same index-cache + `singleflight("package-files:"+name)` dance. The download path was given a home; the index path was not.
 - **The two serve paths emit different headers.** `serveFromStorage` sets `Content-Disposition`, `Cache-Control` and `ETag`; the `c.File` path sets none of them. Which headers a client sees depends on which backend is configured.
 - **One `singleflight.Group` spans three key namespaces.** `Server.sf` is keyed by `"package-list"`, `"package-files:<name>"` and raw storage keys (`"packages/<pkg>/<file>"`). Collision is unlikely but the namespacing is implicit, not enforced.
-- **S3 "async writes" are not async to the caller.** `S3Storage.Put` submits to the pool and then blocks on the result channel. The queue bounds concurrency; it does not make the write non-blocking, despite the name and the `GROXPI_S3_ASYNC_WRITES` flag implying otherwise.
+- **No presigned-URL redirect for S3 downloads.** `Presignable`, `S3Storage.GetPresignedURL` and the `TieredStorage` forward were deleted because nothing in production called them — the only clients were the tests asserting the interface existed. Handing an S3 client a presigned URL and redirecting to it, instead of proxying the bytes, remains a genuine optimisation worth building; it just needs a real caller in `serveFromStorage` first.
 - **Three hand-rolled caches, three eviction policies.** `storage/lru.go`, `cache/response.go` and `cache/index.go` each implement their own. A shared policy module was considered and not done (see plan task E stretch goal).
 - **`IndexCache` never reclaims expired entries.** `Get` reports a miss past `ExpiresAt` but nothing deletes the entry; the map shrinks only on explicit invalidation. Bounded in practice by the number of packages ever requested.
 - **`Server` constructs all its own dependencies.** `New(cfg)` builds caches, client, storage and downloader inline, so anything that is not reachable through `PackageFileService` still needs a whole server to test.
@@ -196,11 +196,11 @@ Current shallow/leaky spots. None of these is a known correctness bug; they are 
 
 - `Server.sf` (`singleflight.Group`) collapses concurrent index fetches *and* concurrent package-file downloads.
 - `TieredStorage` holds its own `singleflight.Group` for puts (`"put:"+key`). `S3Storage` holds `statSF` and `listSF` for metadata and listings; `Get` deliberately does **not** deduplicate, because an S3 reader can only be consumed once.
-- `WorkerPool[T]` (`workerpool.go`) is the single bounded-queue implementation: worker count *is* the concurrency cap, `Submit` never blocks (a full queue drops the job and returns `false`), `Close` is idempotent and safe to race against `Submit`. Both the S3 async-write queue and the tiered sync queue are instances of it.
+- `WorkerPool[T]` (`workerpool.go`) is the single bounded-queue implementation: worker count *is* the concurrency cap, `Submit` never blocks (a full queue drops the job and returns `false`), `Close` is idempotent and safe to race against `Submit`. The tiered sync queue is its one instance. The S3 "async write" queue was the other until it was deleted: `S3Storage.Put` submitted to it and then immediately blocked on the result channel, so the write was never asynchronous to the caller. Uploads now go straight to minio-go, and `GROXPI_S3_ASYNC_WRITES`/`_WORKERS`/`_QUEUE_SIZE` are gone (see `docs/configuration.md`).
 - `LRUCache` carries one `sync.RWMutex`; eviction runs on a dedicated goroutine woken through a depth-1 `evictionChan`.
 - `IndexCache` and `ResponseCache` each carry their own `sync.RWMutex`. `ResponseCache.Get` takes the read lock, then upgrades to the write lock to update LRU order.
 - `config`, `storage`, `pypiClient`, `streamDownloader`, `packageFiles`, `router` are immutable after `New()` and read without locks.
 
 ---
 
-*No `CONTEXT.md` domain glossary exists yet. The domain terms this refactor introduced — `ServePlan`, `ServeAction`, `PackageFileService`, `ZeroCopyCapable`/`Presignable`, `WorkerPool[T]` — belong there. This doc captures structure; the plan captures the deepening work.*
+*No `CONTEXT.md` domain glossary exists yet. The domain terms this refactor introduced — `ServePlan`, `ServeAction`, `PackageFileService`, `ZeroCopyCapable`, `WorkerPool[T]` — belong there. This doc captures structure; the plan captures the deepening work.*

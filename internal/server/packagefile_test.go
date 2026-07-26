@@ -30,9 +30,9 @@ import (
 // --- test doubles -----------------------------------------------------------
 
 // fakeStorage is a minimal in-memory storage.Storage for decision-tree tests.
-// It implements the core interface and nothing else: no GetFilePath, no
-// GetPresignedURL, so it must not be picked up as ZeroCopyCapable or
-// Presignable and the server has to take the plain open-then-stream path.
+// It implements the core interface and nothing else: no GetFilePath, so it must
+// not be picked up as ZeroCopyCapable and the server has to take the plain
+// open-then-stream path.
 type fakeStorage struct {
 	mu        sync.Mutex
 	objects   map[string][]byte

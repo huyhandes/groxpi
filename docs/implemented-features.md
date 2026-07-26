@@ -68,7 +68,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Non-Blocking L1 Sync**: L1 population doesn't block user requests; a full queue drops the back-fill rather than stalling the reader
 - **Typed Misses**: `storage.ErrNotFound` means L1 falls through to L2 only on a genuine miss — a real L1 failure is reported, not silently treated as a miss
 - **S3 as Primary**: L2 (S3) is authoritative source, L1 is performance layer
-- **Capability-Based Tiering**: the tier that genuinely has a capability provides it — `GetFilePath` from L1, `GetPresignedURL` from L2
+- **Capability-Based Tiering**: the tier that genuinely has a capability provides it — `GetFilePath` from L1, the only tier holding real files
 
 ## High-Performance File Transfer ✅
 

@@ -544,9 +544,6 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		MetaPoolSize:   cfg.S3MetaPoolSize,
 		EnableHTTP2:    cfg.S3EnableHTTP2,
 		TransferAccel:  cfg.S3TransferAccel,
-		AsyncWrites:    cfg.S3AsyncWrites,
-		AsyncWorkers:   cfg.S3AsyncWorkers,
-		AsyncQueueSize: cfg.S3AsyncQueueSize,
 		ConnectTimeout: cfg.ConnectTimeout,
 		RequestTimeout: cfg.DownloadTimeout,
 	}

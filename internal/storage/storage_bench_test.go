@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"testing"
-	"time"
 )
 
 // BenchmarkS3Storage benchmarks S3 storage operations
@@ -121,25 +120,6 @@ func BenchmarkS3Storage(b *testing.B) {
 		}
 	})
 
-	b.Run("PresignedURL", func(b *testing.B) {
-		// Setup: upload test file
-		key := "bench/presigned"
-		data := []byte("test data for presigned URL")
-		_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(len(data)), "text/plain")
-		if err != nil {
-			b.Fatalf("Failed to setup: %v", err)
-		}
-		defer func() { _ = storage.Delete(ctx, key) }()
-
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			_, err := storage.GetPresignedURL(ctx, key, 1*time.Hour)
-			if err != nil {
-				b.Fatalf("Failed to generate presigned URL: %v", err)
-			}
-		}
-	})
 }
 
 // BenchmarkLocalStorage benchmarks local storage operations

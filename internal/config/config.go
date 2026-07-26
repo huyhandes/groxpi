@@ -39,14 +39,11 @@ type Config struct {
 	TieredSyncQueueSize int           // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
-	S3ReadPoolSize   int  // Max connections for GET operations
-	S3WritePoolSize  int  // Max connections for PUT operations
-	S3MetaPoolSize   int  // Max connections for HEAD/STAT operations
-	S3EnableHTTP2    bool // Enable HTTP/2 for better multiplexing
-	S3TransferAccel  bool // Enable S3 Transfer Acceleration
-	S3AsyncWrites    bool // Enable async writes for non-blocking operations
-	S3AsyncWorkers   int  // Number of async write workers
-	S3AsyncQueueSize int  // Size of async write queue
+	S3ReadPoolSize  int  // Max connections for GET operations
+	S3WritePoolSize int  // Max connections for PUT operations
+	S3MetaPoolSize  int  // Max connections for HEAD/STAT operations
+	S3EnableHTTP2   bool // Enable HTTP/2 for better multiplexing
+	S3TransferAccel bool // Enable S3 Transfer Acceleration
 
 	// Timeout configuration
 	DownloadTimeout time.Duration
@@ -94,14 +91,11 @@ func Load() *Config {
 		S3MaxConnections:  int(getIntEnv("GROXPI_S3_MAX_CONNECTIONS", 100)),
 
 		// S3 Performance Configuration
-		S3ReadPoolSize:   int(getIntEnv("GROXPI_S3_READ_POOL_SIZE", 50)),
-		S3WritePoolSize:  int(getIntEnv("GROXPI_S3_WRITE_POOL_SIZE", 30)),
-		S3MetaPoolSize:   int(getIntEnv("GROXPI_S3_META_POOL_SIZE", 20)),
-		S3EnableHTTP2:    getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
-		S3TransferAccel:  getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
-		S3AsyncWrites:    getBoolEnv("GROXPI_S3_ASYNC_WRITES", true),
-		S3AsyncWorkers:   int(getIntEnv("GROXPI_S3_ASYNC_WORKERS", 10)),
-		S3AsyncQueueSize: int(getIntEnv("GROXPI_S3_ASYNC_QUEUE_SIZE", 1000)),
+		S3ReadPoolSize:  int(getIntEnv("GROXPI_S3_READ_POOL_SIZE", 50)),
+		S3WritePoolSize: int(getIntEnv("GROXPI_S3_WRITE_POOL_SIZE", 30)),
+		S3MetaPoolSize:  int(getIntEnv("GROXPI_S3_META_POOL_SIZE", 20)),
+		S3EnableHTTP2:   getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
+		S3TransferAccel: getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
 
 		// Hybrid/Tiered storage configuration
 		LocalCacheSize:      getIntEnv("GROXPI_LOCAL_CACHE_SIZE", 10*1024*1024*1024), // 10GB default
