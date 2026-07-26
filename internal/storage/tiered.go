@@ -385,9 +385,14 @@ func (ts *TieredStorage) Close() error {
 
 // populateLocalCache copies an object from L2 to L1
 func (ts *TieredStorage) populateLocalCache(ctx context.Context, key string) error {
-	// Check if already in L1
+	// Check if already in L1. The check is only a shortcut, so a failed check is
+	// treated as "unknown" and population goes ahead: Put writes to a temp file
+	// and renames, so re-populating an object that turned out to be present is
+	// harmless, whereas assuming presence would leave L1 cold.
 	exists, err := ts.localCache.Exists(ctx, key)
-	if err == nil && exists {
+	if err != nil {
+		log.Warn().Err(err).Str("key", key).Msg("L1 existence check failed, populating anyway")
+	} else if exists {
 		log.Debug().Str("key", key).Msg("Object already in L1 cache, skipping population")
 		return nil
 	}

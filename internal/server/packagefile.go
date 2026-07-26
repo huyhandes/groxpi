@@ -26,8 +26,6 @@ const (
 	ActionNotFound ServeAction = iota
 	// ActionFromStorage means the object is cached in the storage backend.
 	ActionFromStorage
-	// ActionFromFileCache means the legacy local file cache holds the file.
-	ActionFromFileCache
 	// ActionStreamAndCache means the file must be fetched upstream, streamed to
 	// the client and cached on the way through.
 	ActionStreamAndCache
@@ -39,8 +37,6 @@ func (a ServeAction) String() string {
 	switch a {
 	case ActionFromStorage:
 		return "from-storage"
-	case ActionFromFileCache:
-		return "from-file-cache"
 	case ActionStreamAndCache:
 		return "stream-and-cache"
 	case ActionRedirect:
@@ -57,7 +53,6 @@ type ServePlan struct {
 	PackageName string
 	FileName    string
 	StorageKey  string
-	FilePath    string        // ActionFromFileCache
 	URL         string        // ActionStreamAndCache / ActionRedirect
 	ContentType string        // derived from the filename
 	ETag        string        // from the index hashes, empty if unknown
@@ -76,7 +71,6 @@ type packageIndex interface {
 // HTTP layer.
 type PackageFileService struct {
 	storage         storage.Storage
-	fileCache       *cache.FileCache
 	indexCache      *cache.IndexCache
 	index           packageIndex
 	downloader      streaming.StreamingDownloader
@@ -88,7 +82,6 @@ type PackageFileService struct {
 func newPackageFileService(
 	cfg *config.Config,
 	st storage.Storage,
-	fileCache *cache.FileCache,
 	indexCache *cache.IndexCache,
 	index packageIndex,
 	downloader streaming.StreamingDownloader,
@@ -96,7 +89,6 @@ func newPackageFileService(
 ) *PackageFileService {
 	return &PackageFileService{
 		storage:         st,
-		fileCache:       fileCache,
 		indexCache:      indexCache,
 		index:           index,
 		downloader:      downloader,
@@ -128,17 +120,6 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 			Str("file", fileName).
 			Msg("✅ Serving from storage cache")
 		plan.Action = ActionFromStorage
-		return plan, nil
-	}
-
-	if filePath, ok := s.fileCache.Get(packageName + "/" + fileName); ok {
-		log.Debug().
-			Str("package", packageName).
-			Str("file", fileName).
-			Str("cache_path", filePath).
-			Msg("✅ Serving from file cache")
-		plan.Action = ActionFromFileCache
-		plan.FilePath = filePath
 		return plan, nil
 	}
 

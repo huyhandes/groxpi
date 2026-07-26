@@ -1303,8 +1303,8 @@ func TestServer_URLRewriting(t *testing.T) {
 }
 
 // zeroCopyStorage is a fakeStorage that can also name a real file on disk, so
-// it satisfies storage.ZeroCopyCapable and the server must sendfile it rather
-// than pulling the bytes through Get.
+// it satisfies storage.ZeroCopyCapable and the server must serve it by path
+// rather than pulling the bytes through Get.
 type zeroCopyStorage struct {
 	*fakeStorage
 	dir string
@@ -1369,7 +1369,7 @@ func TestServer_ServeFromStorage_HeadersPrecedeBody(t *testing.T) {
 		}
 	})
 
-	t.Run("zero-copy backend still sendfiles", func(t *testing.T) {
+	t.Run("zero-copy backend is served by path", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "numpy-1.26.0.tar.gz"), payload, 0o644); err != nil {
 			t.Fatalf("seed file: %v", err)

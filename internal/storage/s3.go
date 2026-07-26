@@ -269,7 +269,7 @@ func (s *S3Storage) submitAsyncWrite(ctx context.Context, key string, reader io.
 //
 // It can mint presigned URLs, so it implements Presignable. Its objects live
 // across the network rather than on the local filesystem, so it deliberately
-// does not implement ZeroCopyCapable: there is no path to hand the kernel.
+// does not implement ZeroCopyCapable: there is no local path to serve.
 type S3Storage struct {
 	readClient  *minio.Client // Client optimized for GET operations
 	writeClient *minio.Client // Client optimized for PUT operations
@@ -562,101 +562,6 @@ func (s *S3Storage) getInternal(ctx context.Context, key string) (io.ReadCloser,
 	return object, info, nil
 }
 
-// GetRange retrieves a byte range from an object with zero-copy optimization
-func (s *S3Storage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	log.Debug().
-		Str("key", key).
-		Str("full_key", fullKey).
-		Int64("offset", offset).
-		Int64("length", length).
-		Msg("Getting object range from S3")
-
-	opts := minio.GetObjectOptions{}
-	if offset >= 0 && length > 0 {
-		// Set the range header for partial content
-		_ = opts.SetRange(offset, offset+length-1)
-		log.Debug().
-			Int64("range_start", offset).
-			Int64("range_end", offset+length-1).
-			Msg("Setting range header for S3 request")
-	}
-
-	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, opts)
-	if err != nil {
-		log.Error().Err(err).Str("key", key).Msg("Failed to get object range from S3")
-		return nil, nil, s3Error(err, key)
-	}
-
-	// For range requests, we need to get object info without consuming the reader
-	// First get the full object info using a separate Stat call
-	fullObjectInfo, err := s.Stat(ctx, key)
-	if err != nil {
-		_ = object.Close()
-		log.Error().Err(err).Str("key", key).Msg("Failed to get object info for range request")
-		return nil, nil, fmt.Errorf("failed to get object info for range %s: %w", key, err)
-	}
-
-	// Create object info for the range request
-	info := &ObjectInfo{
-		Key:          key,
-		Size:         length, // Size is the requested range length
-		LastModified: fullObjectInfo.LastModified,
-		ETag:         fullObjectInfo.ETag,
-		ContentType:  fullObjectInfo.ContentType,
-		Metadata:     fullObjectInfo.Metadata,
-	}
-
-	log.Debug().
-		Str("key", key).
-		Int64("requested_length", length).
-		Int64("object_size", fullObjectInfo.Size).
-		Msg("S3 range request prepared")
-
-	// For small ranges, use appropriate buffer pool to reduce allocations
-	if length > 0 && length <= 256*1024 {
-		pool := getOptimalBufferPool(length)
-		bufPtr := pool.Get().(*[]byte)
-		buf := *bufPtr
-
-		// Create a buffered reader that returns buffer to pool when closed
-		bufferedReader := &s3BufferedReader{
-			Reader: object,
-			buffer: buf,
-			bufPtr: bufPtr,
-			pool:   pool,
-		}
-
-		return bufferedReader, info, nil
-	}
-
-	return object, info, nil
-}
-
-// s3BufferedReader wraps an io.ReadCloser with a buffer pool for zero-copy optimization
-type s3BufferedReader struct {
-	io.Reader
-	buffer []byte
-	bufPtr *[]byte // pointer to buffer for proper pool management
-	pool   *sync.Pool
-}
-
-// Close returns the buffer to the pool and closes the underlying reader
-func (r *s3BufferedReader) Close() error {
-	if r.pool != nil && r.bufPtr != nil {
-		r.pool.Put(r.bufPtr)
-		r.bufPtr = nil
-		r.buffer = nil
-		r.pool = nil
-	}
-
-	if closer, ok := r.Reader.(io.ReadCloser); ok {
-		return closer.Close()
-	}
-	return nil
-}
-
 // putInternal performs the actual S3 Put operation (used by both sync and async paths)
 func (s *S3Storage) putInternal(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
@@ -761,32 +666,6 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 
 	// Use synchronous operation for large files or when async is disabled
 	return s.putInternal(ctx, key, reader, size, contentType)
-}
-
-// PutMultipart uploads a large object using multipart upload with custom part size
-func (s *S3Storage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	if partSize == 0 {
-		partSize = s.partSize
-	}
-
-	opts := minio.PutObjectOptions{
-		ContentType: contentType,
-		PartSize:    uint64(partSize),
-	}
-
-	uploadInfo, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to put multipart object %s: %w", key, err)
-	}
-
-	return &ObjectInfo{
-		Key:         key,
-		Size:        uploadInfo.Size,
-		ETag:        uploadInfo.ETag,
-		ContentType: contentType,
-	}, nil
 }
 
 // Delete removes an object from S3
@@ -929,143 +808,6 @@ func (s *S3Storage) GetPresignedURL(ctx context.Context, key string, expiry time
 	}
 
 	return url.String(), nil
-}
-
-// StreamingPut stores an object with streaming support and concurrent reads
-func (s *S3Storage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	log.Debug().
-		Str("key", key).
-		Str("full_key", fullKey).
-		Int64("size", size).
-		Str("content_type", contentType).
-		Msg("Streaming put to S3")
-
-	// Use multipart upload for better streaming performance
-	if size > s.partSize {
-		optimalPartSize := s.calculateOptimalPartSize(size)
-		return s.streamingMultipartPut(ctx, fullKey, reader, size, contentType, optimalPartSize)
-	}
-
-	// For smaller objects, use regular put with buffer optimization
-	opts := minio.PutObjectOptions{
-		ContentType: contentType,
-	}
-
-	// Use appropriately sized pooled buffer for streaming
-	pool := getOptimalBufferPool(size)
-	bufPtr := pool.Get().(*[]byte)
-	bufReader := &bufferedReader{
-		reader: reader,
-		buffer: *bufPtr,
-		bufPtr: bufPtr,
-		pool:   pool,
-	}
-	defer func() {
-		if err := bufReader.Close(); err != nil {
-			// Log error but continue
-			_ = err
-		}
-	}()
-
-	start := time.Now()
-	info, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, bufReader, size, opts)
-	duration := time.Since(start)
-
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("key", key).
-			Int64("size", size).
-			Dur("duration", duration).
-			Msg("Failed to put object to S3")
-		return nil, fmt.Errorf("failed to put object %s: %w", key, err)
-	}
-
-	log.Info().
-		Str("key", key).
-		Str("etag", info.ETag).
-		Int64("size", info.Size).
-		Dur("duration", duration).
-		Float64("speed_mbps", float64(info.Size)/duration.Seconds()/(1024*1024)).
-		Msg("Successfully put object to S3")
-
-	return &ObjectInfo{
-		Key:         key,
-		Size:        info.Size,
-		ETag:        info.ETag,
-		ContentType: contentType,
-	}, nil
-}
-
-// streamingMultipartPut uses multipart upload for large objects
-func (s *S3Storage) streamingMultipartPut(ctx context.Context, fullKey string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
-	opts := minio.PutObjectOptions{
-		ContentType: contentType,
-		PartSize:    uint64(partSize),
-	}
-
-	log.Debug().
-		Str("full_key", fullKey).
-		Int64("size", size).
-		Int64("part_size", partSize).
-		Msg("Starting multipart upload with optimal part size")
-
-	start := time.Now()
-	info, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
-	duration := time.Since(start)
-
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("full_key", fullKey).
-			Int64("size", size).
-			Dur("duration", duration).
-			Msg("Failed multipart upload to S3")
-		return nil, fmt.Errorf("failed multipart upload: %w", err)
-	}
-
-	log.Info().
-		Str("full_key", fullKey).
-		Str("etag", info.ETag).
-		Int64("size", info.Size).
-		Dur("duration", duration).
-		Float64("speed_mbps", float64(info.Size)/duration.Seconds()/(1024*1024)).
-		Msg("Successfully completed multipart upload to S3")
-
-	return &ObjectInfo{
-		Size:        info.Size,
-		ETag:        info.ETag,
-		ContentType: contentType,
-	}, nil
-}
-
-// bufferedReader wraps a reader with pooled buffer for streaming optimization
-type bufferedReader struct {
-	reader io.Reader
-	buffer []byte
-	bufPtr *[]byte // pointer to buffer for proper pool management
-	pool   *sync.Pool
-	closed bool
-}
-
-func (br *bufferedReader) Read(p []byte) (n int, err error) {
-	return br.reader.Read(p)
-}
-
-func (br *bufferedReader) Close() error {
-	if !br.closed && br.bufPtr != nil {
-		br.pool.Put(br.bufPtr)
-		br.bufPtr = nil
-		br.buffer = nil
-		br.closed = true
-	}
-
-	if closer, ok := br.reader.(io.Closer); ok {
-		return closer.Close()
-	}
-	return nil
 }
 
 // Close releases any resources held by the storage backend

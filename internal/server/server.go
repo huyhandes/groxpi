@@ -36,7 +36,6 @@ var responseBufferPool = sync.Pool{
 type Server struct {
 	config           *config.Config
 	indexCache       *cache.IndexCache
-	fileCache        *cache.FileCache
 	responseCache    *cache.ResponseCache
 	pypiClient       *pypi.Client
 	storage          storage.Storage
@@ -93,7 +92,6 @@ func New(cfg *config.Config) *Server {
 	s := &Server{
 		config:           cfg,
 		indexCache:       cache.NewIndexCache(),
-		fileCache:        cache.NewFileCache(cfg.CacheDir, cfg.CacheSize),
 		responseCache:    cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
 		pypiClient:       pypi.NewClient(cfg),
 		storage:          storageBackend,
@@ -104,7 +102,6 @@ func New(cfg *config.Config) *Server {
 	s.packageFiles = newPackageFileService(
 		cfg,
 		storageBackend,
-		s.fileCache,
 		s.indexCache,
 		s.pypiClient,
 		s.streamDownloader,
@@ -453,8 +450,6 @@ func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 				c.String(http.StatusInternalServerError, "Failed to serve file")
 			}
 		}
-	case ActionFromFileCache:
-		c.File(plan.FilePath)
 	case ActionStreamAndCache:
 		s.streamAndCache(c, plan)
 	case ActionRedirect:
@@ -507,7 +502,7 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 // not (async or failed cache write), fall back to the upstream URL.
 func (s *Server) serveDeduplicated(c *gin.Context, plan ServePlan) {
 	next, err := s.packageFiles.Plan(c.Request.Context(), plan.PackageName, plan.FileName)
-	if err == nil && (next.Action == ActionFromStorage || next.Action == ActionFromFileCache) {
+	if err == nil && next.Action == ActionFromStorage {
 		log.Debug().
 			Str("package", plan.PackageName).
 			Str("file", plan.FileName).
@@ -781,9 +776,16 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	return nil
 }
 
-// serveFromStorageOptimized serves a file from storage, preferring the
-// zero-copy path when the backend can name a real file for the kernel to
-// sendfile. Backends that cannot fall back to open-then-stream.
+// serveFromStorageOptimized serves a file from storage. When the backend can
+// name a real file on disk, the path is handed to gin's c.File so net/http does
+// the serving: it adds range and If-Modified-Since handling for free and this
+// code never touches the body. Backends that cannot name a file fall back to
+// open-then-stream.
+//
+// This is not a kernel-level zero copy. The response writer is gin's own and
+// the gzip middleware wraps it further; neither exposes the file or ReaderFrom
+// hooks net/http needs to skip user space, so the bytes are still copied. The
+// win here is delegated correctness, not a saved copy.
 func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := c.Request.Context()
@@ -795,7 +797,7 @@ func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) er
 			log.Debug().
 				Str("storage_key", storageKey).
 				Str("file_path", filePath).
-				Msg("Using zero-copy file serving")
+				Msg("Serving local file by path via net/http")
 			c.File(filePath)
 			return nil
 		}

@@ -81,9 +81,8 @@ func waitForSize(t *testing.T, s *LRULocalStorage, maxSize int64) {
 // repeatedly through *any* read path must be treated as recently used and must
 // not be evicted while a colder file is still resident.
 //
-// It fails against an embedded LocalStorage, because GetFilePath / Stat /
-// GetRange fall through to the embedded type and never reach
-// RecordAccess.
+// It fails against an embedded LocalStorage, because GetFilePath / Stat fall
+// through to the embedded type and never reach RecordAccess.
 func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 	ctx := context.Background()
 
@@ -102,13 +101,6 @@ func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 			info, err := s.Stat(ctx, key)
 			require.NoError(t, err)
 			require.Equal(t, int64(blobSize), info.Size)
-		},
-		"GetRange": func(t *testing.T, s *LRULocalStorage, key string) {
-			rc, _, err := s.GetRange(ctx, key, 0, 10)
-			require.NoError(t, err)
-			_, err = io.Copy(io.Discard, rc)
-			require.NoError(t, err)
-			require.NoError(t, rc.Close())
 		},
 		"Get": func(t *testing.T, s *LRULocalStorage, key string) {
 			rc, _, err := s.Get(ctx, key)
@@ -340,10 +332,6 @@ func TestLRULocalStorage_ConcurrentReadsUnderEvictionPressure(t *testing.T) {
 				_, _ = s.GetFilePath(ctx, "shared.bin")
 				_, _ = s.Stat(ctx, "shared.bin")
 				if rc, _, err := s.Get(ctx, "shared.bin"); err == nil {
-					_, _ = io.Copy(io.Discard, rc)
-					_ = rc.Close()
-				}
-				if rc, _, err := s.GetRange(ctx, "shared.bin", 0, 10); err == nil {
 					_, _ = io.Copy(io.Discard, rc)
 					_ = rc.Close()
 				}

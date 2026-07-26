@@ -453,8 +453,8 @@ func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
 // The inner storage is held in an explicit field rather than embedded: every
 // method is written out, so a read path that forgets to record an access is a
 // compile error instead of a silent fall-through. That fall-through was a real
-// bug - a hot file read only through GetFilePath/Stat/GetRange
-// looked cold to the LRU and could be evicted while it was being served.
+// bug - a hot file read only through GetFilePath/Stat looked cold to the LRU
+// and could be evicted while it was being served.
 //
 // Read paths that return the object's size record an access; metadata-only or
 // bulk-listing calls forward without touching recency (see each method).
@@ -533,47 +533,9 @@ func (lru *LRULocalStorage) Get(ctx context.Context, key string) (io.ReadCloser,
 	return reader, info, nil
 }
 
-// GetRange reads a byte range and records the access. The whole object stays
-// resident to serve the range, so the full object size is what gets tracked.
-func (lru *LRULocalStorage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
-	reader, info, err := lru.inner.GetRange(ctx, key, offset, length)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	_ = lru.lruCache.RecordAccess(key, info.Size)
-
-	return reader, info, nil
-}
-
 // Put stores an object and records the write.
 func (lru *LRULocalStorage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	info, err := lru.inner.Put(ctx, key, reader, size, contentType)
-	if err != nil {
-		return nil, err
-	}
-
-	_ = lru.lruCache.RecordWrite(key, info.Size)
-
-	return info, nil
-}
-
-// PutMultipart stores a large object and records the write. Local storage has
-// no real multipart path, but the write must still be tracked.
-func (lru *LRULocalStorage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
-	info, err := lru.inner.PutMultipart(ctx, key, reader, size, contentType, partSize)
-	if err != nil {
-		return nil, err
-	}
-
-	_ = lru.lruCache.RecordWrite(key, info.Size)
-
-	return info, nil
-}
-
-// StreamingPut stores an object with streaming support and records the write.
-func (lru *LRULocalStorage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	info, err := lru.inner.StreamingPut(ctx, key, reader, size, contentType)
 	if err != nil {
 		return nil, err
 	}

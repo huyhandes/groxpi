@@ -6,17 +6,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
 // LocalStorage stores objects as plain files under a base directory.
 //
-// Because its objects are real files it can hand out a path for the transport
-// to sendfile, so it implements ZeroCopyCapable. It has nothing to presign and
-// deliberately does not implement Presignable.
+// Because its objects are real files it can hand out a path the transport can
+// serve directly, so it implements ZeroCopyCapable. It has nothing to presign
+// and deliberately does not implement Presignable.
 type LocalStorage struct {
-	baseDir     string
-	copyBufPool *sync.Pool
+	baseDir string
 }
 
 var (
@@ -40,15 +38,7 @@ func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
 	}
 
-	return &LocalStorage{
-		baseDir: baseDir,
-		copyBufPool: &sync.Pool{
-			New: func() any {
-				buf := make([]byte, 64*1024) // 64KB buffer
-				return &buf
-			},
-		},
-	}, nil
+	return &LocalStorage{baseDir: baseDir}, nil
 }
 
 // buildPath constructs the full filesystem path
@@ -78,48 +68,6 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 	}
 
 	return file, info, nil
-}
-
-// GetRange retrieves a byte range from a file
-func (l *LocalStorage) GetRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *ObjectInfo, error) {
-	path := l.buildPath(key)
-
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, nil, localNotFound(err, key, "open")
-	}
-
-	stat, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
-		return nil, nil, fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	// Seek to offset if specified
-	if offset > 0 {
-		_, err = file.Seek(offset, io.SeekStart)
-		if err != nil {
-			_ = file.Close()
-			return nil, nil, fmt.Errorf("failed to seek: %w", err)
-		}
-	}
-
-	// Wrap in a limited reader if length is specified
-	var reader io.ReadCloser = file
-	if length > 0 {
-		reader = &limitedReadCloser{
-			Reader: io.LimitReader(file, length),
-			Closer: file,
-		}
-	}
-
-	info := &ObjectInfo{
-		Key:          key,
-		Size:         stat.Size(),
-		LastModified: stat.ModTime(),
-	}
-
-	return reader, info, nil
 }
 
 // Put stores an object in local filesystem
@@ -170,11 +118,6 @@ func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, si
 		Size:        written,
 		ContentType: contentType,
 	}, nil
-}
-
-// PutMultipart is the same as Put for local storage
-func (l *LocalStorage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, partSize int64) (*ObjectInfo, error) {
-	return l.Put(ctx, key, reader, size, contentType)
 }
 
 // Delete removes an object from local filesystem
@@ -272,65 +215,9 @@ func (l *LocalStorage) Close() error {
 	return nil
 }
 
-// StreamingPut stores an object with streaming support and concurrent reads
-func (l *LocalStorage) StreamingPut(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	// For local storage, streaming put is same as regular put but with optimized copy
-	path := l.buildPath(key)
-
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Create temporary file first
-	tmpFile, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	// Ensure cleanup on error
-	defer func() {
-		if tmpFile != nil {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	// Use pooled buffer for optimized copy
-	copyBufPtr := l.copyBufPool.Get().(*[]byte)
-	defer l.copyBufPool.Put(copyBufPtr)
-	copyBuf := *copyBufPtr
-
-	// Copy data with pooled buffer
-	written, err := io.CopyBuffer(tmpFile, reader, copyBuf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write file: %w", err)
-	}
-
-	// Close temp file
-	if err := tmpFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close temp file: %w", err)
-	}
-	tmpFile = nil // Prevent defer cleanup
-
-	// Move to final location
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return nil, fmt.Errorf("failed to move file: %w", err)
-	}
-
-	return &ObjectInfo{
-		Key:         key,
-		Size:        written,
-		ContentType: contentType,
-	}, nil
-}
-
 // GetFilePath returns the local file path for zero-copy serving. The transport
-// hands this path to the kernel (sendfile) instead of copying the bytes through
-// user space, so this is the hot read path.
+// serves this path with net/http rather than opening the object and copying the
+// body itself, so this is the hot read path.
 func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, error) {
 	path := l.buildPath(key)
 
@@ -340,10 +227,4 @@ func (l *LocalStorage) GetFilePath(ctx context.Context, key string) (string, err
 	}
 
 	return path, nil
-}
-
-// limitedReadCloser wraps a limited reader with a closer
-type limitedReadCloser struct {
-	io.Reader
-	io.Closer
 }

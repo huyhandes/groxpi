@@ -61,8 +61,15 @@ type Storage interface {
 }
 
 // ZeroCopyCapable is implemented only by backends whose objects are real files
-// on the local filesystem, so the transport can hand the path to the kernel
-// (sendfile) instead of copying bytes through user space.
+// on the local filesystem, so the transport can serve them by path instead of
+// opening the object and copying the body itself. Serving by path lets net/http
+// handle range requests, If-Modified-Since and Content-Type detection, and lets
+// it use whatever fast copy the runtime can apply for the concrete writer.
+//
+// It is not a guarantee that the bytes bypass user space: whether any such
+// optimisation engages depends on the response writer in play, and a writer
+// wrapped by middleware (compression, for instance) will always be copied
+// through.
 //
 // Callers opt in with a type assertion:
 //

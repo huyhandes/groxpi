@@ -165,67 +165,6 @@ func TestLocalStorage_Get(t *testing.T) {
 	})
 }
 
-func TestLocalStorage_GetRange(t *testing.T) {
-	storage, _ := NewLocalStorage(t.TempDir())
-	ctx := context.Background()
-
-	// Setup: Create a larger test file
-	key := "test-range.txt"
-	originalContent := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	_, _ = storage.Put(ctx, key, strings.NewReader(originalContent), int64(len(originalContent)), "text/plain")
-
-	t.Run("retrieves_range_successfully", func(t *testing.T) {
-		offset := int64(5)
-		length := int64(10)
-
-		reader, info, err := storage.GetRange(ctx, key, offset, length)
-		if err != nil {
-			t.Fatalf("GetRange failed: %v", err)
-		}
-		defer func() { _ = reader.Close() }()
-
-		if info.Size != int64(len(originalContent)) {
-			t.Errorf("Expected original size %d, got %d", len(originalContent), info.Size)
-		}
-
-		// Read content and verify range
-		content, err := io.ReadAll(reader)
-		if err != nil {
-			t.Fatalf("Failed to read range content: %v", err)
-		}
-
-		expectedRange := originalContent[offset : offset+length]
-		if string(content) != expectedRange {
-			t.Errorf("Expected range content %q, got %q", expectedRange, string(content))
-		}
-	})
-
-	t.Run("retrieves_full_file_with_zero_length", func(t *testing.T) {
-		reader, _, err := storage.GetRange(ctx, key, 0, 0)
-		if err != nil {
-			t.Fatalf("GetRange with zero length failed: %v", err)
-		}
-		defer func() { _ = reader.Close() }()
-
-		// Should read entire file
-		content, err := io.ReadAll(reader)
-		if err != nil {
-			t.Fatalf("Failed to read content: %v", err)
-		}
-
-		if string(content) != originalContent {
-			t.Errorf("Expected full content, got %q", string(content))
-		}
-	})
-
-	t.Run("returns_error_for_non_existent_file", func(t *testing.T) {
-		_, _, err := storage.GetRange(ctx, "non-existent.txt", 0, 10)
-		if err == nil {
-			t.Error("Expected error for non-existent file")
-		}
-	})
-}
-
 func TestLocalStorage_Delete(t *testing.T) {
 	storage, _ := NewLocalStorage(t.TempDir())
 	ctx := context.Background()
@@ -422,11 +361,6 @@ func TestLocalStorage_NotFoundIsSentinel(t *testing.T) {
 		require.ErrorIs(t, err, ErrNotFound)
 	})
 
-	t.Run("GetRange", func(t *testing.T) {
-		_, _, err := s.GetRange(ctx, missing, 0, 10)
-		require.ErrorIs(t, err, ErrNotFound)
-	})
-
 	t.Run("Stat", func(t *testing.T) {
 		_, err := s.Stat(ctx, missing)
 		require.ErrorIs(t, err, ErrNotFound)
@@ -458,34 +392,6 @@ func TestLocalStorage_Capabilities(t *testing.T) {
 
 	_, isPresignable := backend.(Presignable)
 	assert.False(t, isPresignable, "LocalStorage must not advertise Presignable")
-}
-
-func TestLocalStorage_PutMultipart(t *testing.T) {
-	storage, _ := NewLocalStorage(t.TempDir())
-	ctx := context.Background()
-
-	// PutMultipart should behave the same as Put for local storage
-	key := "multipart-test.txt"
-	content := "multipart content"
-	reader := strings.NewReader(content)
-
-	info, err := storage.PutMultipart(ctx, key, reader, int64(len(content)), "text/plain", 1024)
-	if err != nil {
-		t.Fatalf("PutMultipart failed: %v", err)
-	}
-
-	if info.Key != key {
-		t.Errorf("Expected key %s, got %s", key, info.Key)
-	}
-	if info.Size != int64(len(content)) {
-		t.Errorf("Expected size %d, got %d", len(content), info.Size)
-	}
-
-	// Verify file was created
-	path := filepath.Join(storage.baseDir, key)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Error("Multipart file was not created")
-	}
 }
 
 func TestLocalStorage_Close(t *testing.T) {

@@ -78,14 +78,6 @@ func (f *fakeStorage) Get(_ context.Context, key string) (io.ReadCloser, *storag
 	return io.NopCloser(bytes.NewReader(data)), &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
 
-func (f *fakeStorage) GetRange(ctx context.Context, key string, _, _ int64) (io.ReadCloser, *storage.ObjectInfo, error) {
-	return f.Get(ctx, key)
-}
-
-func (f *fakeStorage) PutMultipart(ctx context.Context, key string, reader io.Reader, size int64, contentType string, _ int64) (*storage.ObjectInfo, error) {
-	return f.Put(ctx, key, reader, size, contentType)
-}
-
 func (f *fakeStorage) Delete(_ context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -175,7 +167,6 @@ func newTestService(t *testing.T, st storage.Storage, index *fakeIndex, dl strea
 	return newPackageFileService(
 		cfg,
 		st,
-		cache.NewFileCache(cfg.CacheDir, cfg.CacheSize),
 		cache.NewIndexCache(),
 		index,
 		dl,
@@ -206,7 +197,6 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 		storage         *fakeStorage
 		index           *fakeIndex
 		downloadTimeout time.Duration
-		seedFileCache   string
 		seedIndexCache  []pypi.FileInfo
 		wantAction      ServeAction
 		wantErr         bool
@@ -222,18 +212,6 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 			wantIndexCalls:  0,
 			check: func(t *testing.T, plan ServePlan) {
 				assert.Equal(t, key, plan.StorageKey)
-			},
-		},
-		{
-			name:            "legacy file cache hit serves the local path",
-			storage:         newFakeStorage(),
-			index:           indexWith(pkg, upstream),
-			downloadTimeout: time.Minute,
-			seedFileCache:   "/var/cache/groxpi/numpy-1.26.0.tar.gz",
-			wantAction:      ActionFromFileCache,
-			wantIndexCalls:  0,
-			check: func(t *testing.T, plan ServePlan) {
-				assert.Equal(t, "/var/cache/groxpi/numpy-1.26.0.tar.gz", plan.FilePath)
 			},
 		},
 		{
@@ -320,9 +298,6 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := newTestService(t, tt.storage, tt.index, &fakeDownloader{}, tt.downloadTimeout)
-			if tt.seedFileCache != "" {
-				svc.fileCache.Set(pkg+"/"+file, tt.seedFileCache, 1)
-			}
 			if tt.seedIndexCache != nil {
 				svc.indexCache.SetPackage(pkg, tt.seedIndexCache, time.Minute)
 			}
