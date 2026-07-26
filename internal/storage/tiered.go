@@ -35,9 +35,9 @@ type l2Storage interface {
 // It re-exposes each capability from the tier that genuinely has it: zero-copy
 // from L1 (real files on disk) and presigning from L2.
 type TieredStorage struct {
-	localCache    l1Storage                      // L1 cache - fast local storage
-	remoteStorage l2Storage                      // L2 cache - persistent S3 storage
-	syncQueue     *WorkerPool[tieredSyncRequest] // Async queue for L1 cache population
+	localCache    l1Storage           // L1 cache - fast local storage
+	remoteStorage l2Storage           // L2 cache - persistent S3 storage
+	syncQueue     *WorkerPool[string] // Keys queued for L1 cache population
 	sf            singleflight.Group
 }
 
@@ -47,49 +47,35 @@ var (
 	_ Presignable     = (*TieredStorage)(nil)
 )
 
-// tieredSyncRequest represents a pending L1 cache population request.
-type tieredSyncRequest struct {
-	Key string
-}
-
 // newTieredSyncQueue builds the bounded worker pool that back-fills L1 from L2.
 //
 // The job's context is derived from the pool's own lifetime context, never from
 // the request that queued it. Submitting used to hand over a context the
 // submitting goroutine cancelled on its way out, so every worker found a dead
 // context and the back-fill silently never happened.
-func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *WorkerPool[tieredSyncRequest] {
+func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *WorkerPool[string] {
 	return NewWorkerPool("tiered-sync", queueSize, workerCount,
-		func(poolCtx context.Context, req tieredSyncRequest) {
+		func(poolCtx context.Context, key string) {
 			jobCtx, cancel := context.WithTimeout(poolCtx, syncJobTimeout)
 			defer cancel()
 
 			start := time.Now()
-			err := storage.populateLocalCache(jobCtx, req.Key)
+			err := storage.populateLocalCache(jobCtx, key)
 			duration := time.Since(start)
 
 			if err != nil {
 				log.Error().
 					Err(err).
-					Str("key", req.Key).
+					Str("key", key).
 					Dur("duration", duration).
 					Msg("Failed to populate L1 cache from L2")
 			} else {
 				log.Debug().
-					Str("key", req.Key).
+					Str("key", key).
 					Dur("duration", duration).
 					Msg("Successfully populated L1 cache from L2")
 			}
 		})
-}
-
-// submitSync queues an L1 population request. L1 back-fill is best-effort, so a
-// full queue drops the request instead of blocking the caller. The job owns no
-// part of the caller's context: it must outlive the request that triggered it.
-func (ts *TieredStorage) submitSync(key string) {
-	if !ts.syncQueue.Submit(tieredSyncRequest{Key: key}) {
-		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
-	}
 }
 
 // TieredConfig holds configuration for tiered storage
@@ -191,8 +177,11 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 	log.Info().Str("key", key).Msg("✅ Tiered storage: L2 hit (S3), populating L1 async")
 
 	// Back-fill L1 for future requests without blocking this one. The job owns
-	// its own lifetime, so it survives this request finishing.
-	ts.submitSync(key)
+	// its own lifetime, so it survives this request finishing. Back-fill is
+	// best-effort: a full queue drops the key rather than blocking the caller.
+	if !ts.syncQueue.Submit(key) {
+		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
+	}
 
 	return reader, info, nil
 }
@@ -353,30 +342,14 @@ func (ts *TieredStorage) GetFilePath(ctx context.Context, key string) (string, e
 	return ts.localCache.GetFilePath(ctx, key)
 }
 
-// Close releases resources from both storage backends
+// Close releases resources from both storage backends. Both tiers are closed
+// even if the first fails, and every failure is reported.
 func (ts *TieredStorage) Close() error {
-	// Close sync queue first
-	if ts.syncQueue != nil {
-		ts.syncQueue.Close()
-	}
+	// Stop the back-fill pool before the tiers it writes through
+	ts.syncQueue.Close()
 
-	// Close both storage backends
-	var l1Err, l2Err error
-
-	if ts.localCache != nil {
-		l1Err = ts.localCache.Close()
-	}
-
-	if ts.remoteStorage != nil {
-		l2Err = ts.remoteStorage.Close()
-	}
-
-	// Return first error encountered
-	if l1Err != nil {
-		return l1Err
-	}
-	if l2Err != nil {
-		return l2Err
+	if err := errors.Join(ts.localCache.Close(), ts.remoteStorage.Close()); err != nil {
+		return fmt.Errorf("failed to close tiered storage: %w", err)
 	}
 
 	log.Info().Msg("Tiered storage closed successfully")

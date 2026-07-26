@@ -13,13 +13,12 @@ import (
 	"github.com/phuslu/log"
 )
 
-// LRUEntry represents an entry in the LRU cache
+// LRUEntry represents an entry in the LRU cache. Recency lives in the list
+// ordering, not in a timestamp; CreatedAt exists only to drive TTL expiry.
 type LRUEntry struct {
-	Key          string
-	Size         int64
-	LastAccessed time.Time
-	CreatedAt    time.Time
-	FilePath     string
+	Key       string
+	Size      int64
+	CreatedAt time.Time
 }
 
 // objectDeleter removes a stored object by key. It is the single owner of the
@@ -44,22 +43,29 @@ type LRUCache struct {
 	wg           sync.WaitGroup
 }
 
-// NewLRUCache creates a new LRU cache backed by its own LocalStorage deleter.
-func NewLRUCache(baseDir string, maxSize int64, ttl time.Duration) *LRUCache {
-	local, err := NewLocalStorage(baseDir)
-	if err != nil {
-		log.Error().
-			Err(err).
-			Str("base_dir", baseDir).
-			Msg("Failed to create local storage for LRU eviction; evictions will be skipped")
-		return newLRUCache(baseDir, maxSize, ttl, nil)
+// maxTTLSweepInterval caps how long the cache can go without checking for
+// expired entries, however long the TTL is.
+const maxTTLSweepInterval = time.Minute
+
+// ttlSweepInterval picks how often to sweep for expired entries: half the TTL,
+// so an entry outlives its TTL by at most 50%, capped so a long TTL does not
+// leave stale files on disk for hours.
+func ttlSweepInterval(ttl time.Duration) time.Duration {
+	interval := ttl / 2
+	if interval > maxTTLSweepInterval {
+		return maxTTLSweepInterval
 	}
-	return newLRUCache(baseDir, maxSize, ttl, local)
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
 }
 
 // newLRUCache builds an LRU cache that evicts through the supplied deleter.
-// The deleter is fixed at construction time so the eviction worker can read it
-// without synchronization.
+//
+// The deleter must be non-nil: it is fixed at construction time so the eviction
+// worker can read it without synchronization, and a cache that cannot delete
+// cannot evict, which silently unbounds the cache.
 func newLRUCache(baseDir string, maxSize int64, ttl time.Duration, deleter objectDeleter) *LRUCache {
 	cache := &LRUCache{
 		maxSize:      maxSize,
@@ -87,9 +93,24 @@ func newLRUCache(baseDir string, maxSize int64, ttl time.Duration, deleter objec
 	return cache
 }
 
-// evictionWorker runs in the background and performs evictions when needed
+// evictionWorker runs in the background and performs evictions when needed.
+//
+// Two independent triggers: a size-driven pass queued by triggerEvictionLocked,
+// and - only when a TTL is configured - a periodic sweep for expired entries.
+// The sweep is what makes the TTL mean anything: size-driven eviction returns
+// early while the cache is under quota, so without it a configured TTL would
+// never expire anything on a cache that does not fill up.
 func (lru *LRUCache) evictionWorker() {
 	defer lru.wg.Done()
+
+	// A nil channel blocks forever, which disables the sweep arm of the select
+	// when no TTL is configured.
+	var sweepC <-chan time.Time
+	if lru.ttl > 0 {
+		ticker := time.NewTicker(ttlSweepInterval(lru.ttl))
+		defer ticker.Stop()
+		sweepC = ticker.C
+	}
 
 	for {
 		select {
@@ -98,7 +119,50 @@ func (lru *LRUCache) evictionWorker() {
 			return
 		case <-lru.evictionChan:
 			lru.performEviction()
+		case <-sweepC:
+			lru.expireEntries()
 		}
+	}
+}
+
+// expireEntries evicts every entry past its TTL, regardless of how full the
+// cache is. Caller must not hold lru.mu.
+func (lru *LRUCache) expireEntries() {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	if lru.ttl <= 0 {
+		return
+	}
+
+	now := time.Now()
+	expiredCount := 0
+	expiredSize := int64(0)
+
+	// CreatedAt is not ordered by list position (a rewrite restarts an entry's
+	// TTL clock without moving it), so every entry is checked.
+	for elem := lru.lruList.Back(); elem != nil; {
+		prev := elem.Prev()
+
+		entry := elem.Value.(*LRUEntry)
+		if now.Sub(entry.CreatedAt) > lru.ttl {
+			size := entry.Size
+			if err := lru.evictEntry(elem, entry, true); err == nil {
+				expiredCount++
+				expiredSize += size
+			}
+		}
+
+		elem = prev
+	}
+
+	if expiredCount > 0 {
+		log.Info().
+			Int("expired_count", expiredCount).
+			Int64("expired_size_mb", expiredSize/(1024*1024)).
+			Int64("current_size_mb", lru.currentSize/(1024*1024)).
+			Dur("ttl", lru.ttl).
+			Msg("Expired entries from L1 cache")
 	}
 }
 
@@ -184,16 +248,12 @@ func (lru *LRUCache) performEviction() {
 // storage backend so that the on-disk state and the size accounting have
 // exactly one owner.
 func (lru *LRUCache) evictEntry(elem *list.Element, entry *LRUEntry, expired bool) error {
-	if lru.deleter == nil {
-		return fmt.Errorf("cannot evict %q: no deleter configured", entry.Key)
-	}
-
 	// Delete the file (a missing file is not an error for the backend)
 	if err := lru.deleter.Delete(context.Background(), entry.Key); err != nil {
 		log.Error().
 			Err(err).
 			Str("key", entry.Key).
-			Str("path", entry.FilePath).
+			Str("path", filepath.Join(lru.baseDir, entry.Key)).
 			Msg("Failed to delete file during eviction")
 		return fmt.Errorf("failed to delete %q during eviction: %w", entry.Key, err)
 	}
@@ -212,9 +272,9 @@ func (lru *LRUCache) evictEntry(elem *list.Element, entry *LRUEntry, expired boo
 	return nil
 }
 
-// Touch marks an already-tracked key as most recently used. It reports whether
+// touch marks an already-tracked key as most recently used. It reports whether
 // the key was tracked, letting read paths avoid a stat syscall on the hot path.
-func (lru *LRUCache) Touch(key string) bool {
+func (lru *LRUCache) touch(key string) bool {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
@@ -228,8 +288,6 @@ func (lru *LRUCache) touchLocked(key string) bool {
 		return false
 	}
 
-	entry := elem.Value.(*LRUEntry)
-	entry.LastAccessed = time.Now()
 	lru.lruList.MoveToFront(elem)
 
 	log.Debug().Str("key", key).Msg("Updated access time for existing entry")
@@ -239,13 +297,10 @@ func (lru *LRUCache) touchLocked(key string) bool {
 
 // addEntryLocked tracks a previously unknown key. Caller must hold lru.mu.
 func (lru *LRUCache) addEntryLocked(key string, size int64) {
-	now := time.Now()
 	entry := &LRUEntry{
-		Key:          key,
-		Size:         size,
-		LastAccessed: now,
-		CreatedAt:    now,
-		FilePath:     filepath.Join(lru.baseDir, key),
+		Key:       key,
+		Size:      size,
+		CreatedAt: time.Now(),
 	}
 
 	lru.entries[key] = lru.lruList.PushFront(entry)
@@ -276,39 +331,35 @@ func (lru *LRUCache) triggerEvictionLocked() {
 }
 
 // RecordAccess records an access to a file and updates LRU ordering
-func (lru *LRUCache) RecordAccess(key string, size int64) error {
+func (lru *LRUCache) RecordAccess(key string, size int64) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
 	if lru.touchLocked(key) {
-		return nil
+		return
 	}
 
 	lru.addEntryLocked(key, size)
-
-	return nil
 }
 
 // RecordWrite records a write operation and adds/updates the entry. Unlike
 // RecordAccess it reconciles the tracked size with the payload just written, so
 // overwriting a key with a different size cannot drift the accounting.
-func (lru *LRUCache) RecordWrite(key string, size int64) error {
+func (lru *LRUCache) RecordWrite(key string, size int64) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
 	elem, exists := lru.entries[key]
 	if !exists {
 		lru.addEntryLocked(key, size)
-		return nil
+		return
 	}
 
 	entry := elem.Value.(*LRUEntry)
-	now := time.Now()
 
 	lru.currentSize += size - entry.Size
 	entry.Size = size
-	entry.LastAccessed = now
-	entry.CreatedAt = now // Fresh content restarts the TTL clock
+	entry.CreatedAt = time.Now() // Fresh content restarts the TTL clock
 	lru.lruList.MoveToFront(elem)
 
 	log.Debug().
@@ -318,18 +369,16 @@ func (lru *LRUCache) RecordWrite(key string, size int64) error {
 		Msg("Updated existing entry in L1 cache")
 
 	lru.triggerEvictionLocked()
-
-	return nil
 }
 
 // RecordDelete removes an entry from tracking
-func (lru *LRUCache) RecordDelete(key string) error {
+func (lru *LRUCache) RecordDelete(key string) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
 	elem, exists := lru.entries[key]
 	if !exists {
-		return nil
+		return
 	}
 
 	entry := elem.Value.(*LRUEntry)
@@ -342,40 +391,6 @@ func (lru *LRUCache) RecordDelete(key string) error {
 		Str("key", key).
 		Int64("size", entry.Size).
 		Msg("Removed entry from L1 cache tracking")
-
-	return nil
-}
-
-// GetStats returns current cache statistics
-func (lru *LRUCache) GetStats() map[string]any {
-	lru.mu.RLock()
-	defer lru.mu.RUnlock()
-
-	stats := map[string]any{
-		"max_size_bytes":     lru.maxSize,
-		"max_size_mb":        lru.maxSize / (1024 * 1024),
-		"current_size_bytes": lru.currentSize,
-		"current_size_mb":    lru.currentSize / (1024 * 1024),
-		"entry_count":        lru.lruList.Len(),
-		"usage_percent":      float64(lru.currentSize) / float64(lru.maxSize) * 100,
-		"ttl_enabled":        lru.ttl > 0,
-		"ttl_seconds":        int64(lru.ttl.Seconds()),
-	}
-
-	// Count expired entries (if TTL enabled)
-	if lru.ttl > 0 {
-		now := time.Now()
-		expiredCount := 0
-		for elem := lru.lruList.Front(); elem != nil; elem = elem.Next() {
-			entry := elem.Value.(*LRUEntry)
-			if now.Sub(entry.CreatedAt) > lru.ttl {
-				expiredCount++
-			}
-		}
-		stats["expired_count"] = expiredCount
-	}
-
-	return stats
 }
 
 // Close stops the LRU cache and cleans up resources
@@ -388,7 +403,7 @@ func (lru *LRUCache) Close() error {
 }
 
 // ScanAndRebuild scans the base directory and rebuilds the LRU cache from existing files
-func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
+func (lru *LRUCache) ScanAndRebuild() error {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
@@ -415,11 +430,9 @@ func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
 
 		// Add to LRU cache (use ModTime as CreatedAt for existing files)
 		entry := &LRUEntry{
-			Key:          relPath,
-			Size:         info.Size(),
-			LastAccessed: info.ModTime(),
-			CreatedAt:    info.ModTime(),
-			FilePath:     path,
+			Key:       relPath,
+			Size:      info.Size(),
+			CreatedAt: info.ModTime(),
 		}
 
 		elem := lru.lruList.PushFront(entry)
@@ -450,18 +463,11 @@ func (lru *LRUCache) ScanAndRebuild(ctx context.Context) error {
 
 // LRULocalStorage wraps LocalStorage with LRU eviction.
 //
-// The inner storage is held in an explicit field rather than embedded: every
-// method is written out, so a read path that forgets to record an access is a
-// compile error instead of a silent fall-through. That fall-through was a real
-// bug - a hot file read only through GetFilePath/Stat looked cold to the LRU
-// and could be evicted while it was being served.
-//
-// Read paths that return the object's size record an access; metadata-only or
-// bulk-listing calls forward without touching recency (see each method).
-//
-// Capabilities are forwarded explicitly, never inherited: the wrapper exposes
-// exactly the capability set of its inner *LocalStorage — zero-copy yes,
-// presigning no — and the assertions below fail the build if that drifts.
+// The inner storage is an explicit field, never embedded, so a read path that
+// forgets to record an access is a compile error rather than a file that looks
+// cold to the evictor while it is being served. Capabilities are likewise
+// forwarded explicitly - zero-copy yes, presigning no - and the assertions
+// below fail the build if that drifts.
 type LRULocalStorage struct {
 	inner    *LocalStorage
 	lruCache *LRUCache
@@ -493,8 +499,7 @@ func NewLRULocalStorage(baseDir string, maxSize int64, ttl time.Duration) (*LRUL
 	}
 
 	// Scan and rebuild cache from existing files
-	ctx := context.Background()
-	if err := lruCache.ScanAndRebuild(ctx); err != nil {
+	if err := lruCache.ScanAndRebuild(); err != nil {
 		log.Warn().Err(err).Msg("Failed to rebuild L1 cache, starting fresh")
 	}
 
@@ -505,7 +510,7 @@ func NewLRULocalStorage(baseDir string, maxSize int64, ttl time.Duration) (*LRUL
 // without any syscall; an untracked key (for example a file written outside
 // this wrapper) is stat'd once so it can be accounted for.
 func (lru *LRULocalStorage) recordAccess(ctx context.Context, key string) {
-	if lru.lruCache.Touch(key) {
+	if lru.lruCache.touch(key) {
 		return
 	}
 
@@ -518,7 +523,7 @@ func (lru *LRULocalStorage) recordAccess(ctx context.Context, key string) {
 		return
 	}
 
-	_ = lru.lruCache.RecordAccess(key, info.Size)
+	lru.lruCache.RecordAccess(key, info.Size)
 }
 
 // Get reads an object and records the access.
@@ -528,7 +533,7 @@ func (lru *LRULocalStorage) Get(ctx context.Context, key string) (io.ReadCloser,
 		return nil, nil, err
 	}
 
-	_ = lru.lruCache.RecordAccess(key, info.Size)
+	lru.lruCache.RecordAccess(key, info.Size)
 
 	return reader, info, nil
 }
@@ -540,7 +545,7 @@ func (lru *LRULocalStorage) Put(ctx context.Context, key string, reader io.Reade
 		return nil, err
 	}
 
-	_ = lru.lruCache.RecordWrite(key, info.Size)
+	lru.lruCache.RecordWrite(key, info.Size)
 
 	return info, nil
 }
@@ -567,7 +572,7 @@ func (lru *LRULocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, 
 		return nil, err
 	}
 
-	_ = lru.lruCache.RecordAccess(key, info.Size)
+	lru.lruCache.RecordAccess(key, info.Size)
 
 	return info, nil
 }
@@ -578,7 +583,7 @@ func (lru *LRULocalStorage) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
-	_ = lru.lruCache.RecordDelete(key)
+	lru.lruCache.RecordDelete(key)
 
 	return nil
 }
@@ -593,11 +598,6 @@ func (lru *LRULocalStorage) Exists(ctx context.Context, key string) (bool, error
 // cache and make recency meaningless.
 func (lru *LRULocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
 	return lru.inner.List(ctx, opts)
-}
-
-// GetStats returns LRU cache statistics
-func (lru *LRULocalStorage) GetStats() map[string]any {
-	return lru.lruCache.GetStats()
 }
 
 // Close closes both the storage and LRU cache

@@ -63,9 +63,30 @@ func putBlob(t *testing.T, s *LRULocalStorage, key string, n int) {
 	require.Equal(t, int64(n), info.Size)
 }
 
+// cacheSize returns the cache's own view of how many bytes it holds.
+func cacheSize(c *LRUCache) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.currentSize
+}
+
+// cacheCount returns how many entries the cache is tracking.
+func cacheCount(c *LRUCache) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lruList.Len()
+}
+
 // trackedSize returns the LRU cache's own view of how many bytes it holds.
 func trackedSize(s *LRULocalStorage) int64 {
-	return s.GetStats()["current_size_bytes"].(int64)
+	return cacheSize(s.lruCache)
+}
+
+// trackedCount returns how many entries the wrapper's LRU cache is tracking.
+func trackedCount(s *LRULocalStorage) int {
+	return cacheCount(s.lruCache)
 }
 
 // waitForSize waits until the LRU has evicted down to at most maxSize.
@@ -146,6 +167,32 @@ func TestLRULocalStorage_HotFileSurvivesEviction(t *testing.T) {
 	}
 }
 
+// TestLRULocalStorage_ExpiresEntriesUnderQuota pins that TTL expiry is
+// independent of the size limit: an entry past its TTL must be evicted even
+// though the cache is nowhere near maxSize. Size-driven eviction on its own
+// leaves stale content resident for as long as the cache stays under quota,
+// which makes a configured TTL a no-op on any cache that never fills up.
+func TestLRULocalStorage_ExpiresEntriesUnderQuota(t *testing.T) {
+	dir := t.TempDir()
+
+	// maxSize is orders of magnitude larger than what is written, so nothing
+	// here can trigger size-driven eviction.
+	s, err := NewLRULocalStorage(dir, 1<<20, 100*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	putBlob(t, s, "stale.bin", 128)
+	require.Equal(t, int64(128), trackedSize(s))
+
+	require.Eventually(t, func() bool {
+		return trackedSize(s) == 0
+	}, 3*time.Second, 10*time.Millisecond,
+		"entry past its TTL was never expired while the cache was under quota")
+
+	_, err = os.Stat(filepath.Join(dir, "stale.bin"))
+	assert.True(t, os.IsNotExist(err), "expired entry left its file behind on disk")
+}
+
 // TestLRULocalStorage_ForwardsCapabilities pins the wrapper's capability
 // contract: it must expose every capability its inner storage genuinely has and
 // none that it does not. A wrapper that silently drops zero-copy would push the
@@ -213,7 +260,7 @@ func TestLRULocalStorage_SizeAccountingMatchesDisk(t *testing.T) {
 
 	assert.Equal(t, onDiskSize(t, dir), trackedSize(s),
 		"tracked size drifted from the bytes actually on disk")
-	assert.Equal(t, onDiskCount(t, dir), s.GetStats()["entry_count"].(int),
+	assert.Equal(t, onDiskCount(t, dir), trackedCount(s),
 		"tracked entry count drifted from the files actually on disk")
 	assert.LessOrEqual(t, trackedSize(s), maxSize)
 }
@@ -250,12 +297,18 @@ type spyDeleter struct {
 	keys  []string
 }
 
+// Delete records the key only once the backend has actually removed it, so a
+// caller that observes the key can also rely on the file being gone.
 func (s *spyDeleter) Delete(ctx context.Context, key string) error {
+	if err := s.inner.Delete(ctx, key); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	s.keys = append(s.keys, key)
 	s.mu.Unlock()
 
-	return s.inner.Delete(ctx, key)
+	return nil
 }
 
 func (s *spyDeleter) deleted() []string {
@@ -280,7 +333,7 @@ func TestLRUCache_EvictsThroughDeleter(t *testing.T) {
 	for _, key := range []string{"a.bin", "b.bin", "c.bin"} {
 		_, err := local.Put(context.Background(), key, bytes.NewReader(bytes.Repeat([]byte("x"), 250)), 250, "")
 		require.NoError(t, err)
-		require.NoError(t, cache.RecordWrite(key, 250))
+		cache.RecordWrite(key, 250)
 	}
 
 	require.Eventually(t, func() bool {

@@ -300,58 +300,49 @@ func TestLRUCache(t *testing.T) {
 	baseDir := t.TempDir()
 	maxSize := int64(1024) // 1KB max
 
-	lru := NewLRUCache(baseDir, maxSize, 0)
+	local, err := NewLocalStorage(baseDir)
+	if err != nil {
+		t.Fatalf("Failed to create local storage: %v", err)
+	}
+
+	lru := newLRUCache(baseDir, maxSize, 0, local)
 	defer func() { _ = lru.Close() }()
 
 	t.Run("records access", func(t *testing.T) {
-		err := lru.RecordAccess("test-key-1", 512)
-		if err != nil {
-			t.Fatalf("Failed to record access: %v", err)
-		}
+		lru.RecordAccess("test-key-1", 512)
 
-		stats := lru.GetStats()
-		if stats["entry_count"].(int) != 1 {
-			t.Errorf("Expected 1 entry, got %d", stats["entry_count"].(int))
+		if got := cacheCount(lru); got != 1 {
+			t.Errorf("Expected 1 entry, got %d", got)
 		}
-		if stats["current_size_bytes"].(int64) != 512 {
-			t.Errorf("Expected 512 bytes, got %d", stats["current_size_bytes"].(int64))
+		if got := cacheSize(lru); got != 512 {
+			t.Errorf("Expected 512 bytes, got %d", got)
 		}
 	})
 
 	t.Run("triggers eviction when over size", func(t *testing.T) {
 		// Add entries that exceed max size
-		_ = lru.RecordAccess("test-key-2", 400)
-		_ = lru.RecordAccess("test-key-3", 400)
+		lru.RecordAccess("test-key-2", 400)
+		lru.RecordAccess("test-key-3", 400)
 
 		// Wait a bit for eviction worker to run
 		time.Sleep(100 * time.Millisecond)
 
-		stats := lru.GetStats()
-		currentSize := stats["current_size_bytes"].(int64)
-
 		// Should have evicted to get under maxSize
-		if currentSize > maxSize {
+		if currentSize := cacheSize(lru); currentSize > maxSize {
 			t.Errorf("Expected size <= %d after eviction, got %d", maxSize, currentSize)
 		}
 	})
 
 	t.Run("deletes entry", func(t *testing.T) {
-		initialStats := lru.GetStats()
-		initialCount := initialStats["entry_count"].(int)
+		initialCount := cacheCount(lru)
 
 		// Add a new entry
-		_ = lru.RecordAccess("test-key-delete", 100)
+		lru.RecordAccess("test-key-delete", 100)
 
 		// Delete it
-		err := lru.RecordDelete("test-key-delete")
-		if err != nil {
-			t.Fatalf("Failed to delete entry: %v", err)
-		}
+		lru.RecordDelete("test-key-delete")
 
-		finalStats := lru.GetStats()
-		finalCount := finalStats["entry_count"].(int)
-
-		if finalCount != initialCount {
+		if finalCount := cacheCount(lru); finalCount != initialCount {
 			t.Errorf("Expected count to return to %d after delete, got %d", initialCount, finalCount)
 		}
 	})
@@ -400,9 +391,8 @@ func TestLRULocalStorage(t *testing.T) {
 			t.Errorf("Data mismatch: expected %s, got %s", testData, readData)
 		}
 
-		// Check LRU stats
-		stats := storage.GetStats()
-		if stats["entry_count"].(int) < 1 {
+		// Check LRU tracking
+		if trackedCount(storage) < 1 {
 			t.Error("Expected at least 1 entry in LRU cache")
 		}
 	})
@@ -450,8 +440,7 @@ func TestLRULocalStorage(t *testing.T) {
 		defer func() { _ = newStorage.Close() }()
 
 		// Check that the file was discovered
-		stats := newStorage.GetStats()
-		if stats["entry_count"].(int) < 1 {
+		if trackedCount(newStorage) < 1 {
 			t.Error("Expected cache to be rebuilt from existing files")
 		}
 	})

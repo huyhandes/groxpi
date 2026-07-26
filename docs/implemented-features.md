@@ -35,7 +35,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 
 ### Cache Strategies
 - **TTL-Based Expiration**: Configurable time-to-live for index and response caches
-- **LRU Eviction**: Least Recently Used eviction for the on-disk object cache, with an optional TTL phase that evicts expired entries before unexpired ones
+- **LRU Eviction**: Least Recently Used eviction for the on-disk object cache. When a TTL is configured, expired entries are swept periodically regardless of cache size, and a size-driven pass still prefers expired victims over unexpired ones
 - **Size-Based Limits**: Automatic eviction when cache size limits reached (`0` means unlimited)
 - **Eviction Safety**: Every read path that yields a size records an access, so a file currently being served cannot look cold to the evictor
 - **Cache Stats**: `LRULocalStorage.GetStats()` reports size, entry count, usage percent and expired-entry count
@@ -63,7 +63,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Automatic L1 Population**: L2 hits asynchronously populate L1 for future requests, on jobs that outlive the request that queued them
 - **Concurrent Writes**: New files written to both L1 and L2 simultaneously (`io.Pipe` tee under singleflight)
 - **Local-Path L1 Serving**: L1 objects are real files, so they are served by path and `net/http` handles range and conditional requests (see the note below — this is not a kernel zero copy)
-- **LRU L1 Eviction**: Size-based LRU with optional TTL, deleting through the storage backend so on-disk state and size accounting have one owner
+- **LRU L1 Eviction**: Size-based LRU plus an optional periodic TTL sweep, deleting through the storage backend so on-disk state and size accounting have one owner
 - **Background Sync Workers**: Configurable `WorkerPool[T]` for L1 cache population
 - **Non-Blocking L1 Sync**: L1 population doesn't block user requests; a full queue drops the back-fill rather than stalling the reader
 - **Typed Misses**: `storage.ErrNotFound` means L1 falls through to L2 only on a genuine miss — a real L1 failure is reported, not silently treated as a miss
