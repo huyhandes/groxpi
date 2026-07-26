@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/huyhandes/groxpi/internal/storage"
 )
 
 // Mock storage writer for testing
@@ -27,9 +29,9 @@ func newMockStorageWriter() *mockStorageWriter {
 	}
 }
 
-func (m *mockStorageWriter) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
+func (m *mockStorageWriter) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*storage.ObjectInfo, error) {
 	if m.putErr != nil {
-		return m.putErr
+		return nil, m.putErr
 	}
 
 	m.mu.Lock()
@@ -37,11 +39,11 @@ func (m *mockStorageWriter) Put(ctx context.Context, key string, reader io.Reade
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	m.storage[key] = data
-	return nil
+	return &storage.ObjectInfo{Key: key, Size: int64(len(data)), ContentType: contentType}, nil
 }
 
 func (m *mockStorageWriter) Get(key string) ([]byte, bool) {

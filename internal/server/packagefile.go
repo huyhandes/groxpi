@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,19 +34,6 @@ const (
 	ActionRedirect
 )
 
-func (a ServeAction) String() string {
-	switch a {
-	case ActionFromStorage:
-		return "from-storage"
-	case ActionStreamAndCache:
-		return "stream-and-cache"
-	case ActionRedirect:
-		return "redirect"
-	default:
-		return "not-found"
-	}
-}
-
 // ServePlan is the decision Plan reached for one package file. It is a value:
 // nothing has been written to the client when it is returned.
 type ServePlan struct {
@@ -63,18 +51,24 @@ type ServePlan struct {
 // packageIndex is the upstream index seam. It exists so the decision tree can be
 // exercised without a live PyPI client.
 type packageIndex interface {
+	GetPackageList() ([]string, error)
 	GetPackageFiles(packageName string) ([]pypi.FileInfo, error)
 }
 
-// PackageFileService owns the package-file miss pipeline: storage lookup,
-// caches, index resolution, deduplicated upstream fetch. It never touches the
-// HTTP layer.
+// packageListKey names the package list in both the index cache and the
+// singleflight group.
+const packageListKey = "package-list"
+
+// PackageFileService owns index resolution and the package-file miss pipeline:
+// storage lookup, caches, deduplicated upstream fetch. It never touches the HTTP
+// layer. It owns the only singleflight.Group in the server: every upstream
+// index fetch and every upstream download is deduplicated through it.
 type PackageFileService struct {
 	storage         storage.Storage
 	indexCache      *cache.IndexCache
 	index           packageIndex
 	downloader      streaming.StreamingDownloader
-	sf              *singleflight.Group
+	sf              singleflight.Group
 	indexTTL        time.Duration
 	downloadTimeout time.Duration
 }
@@ -85,14 +79,12 @@ func newPackageFileService(
 	indexCache *cache.IndexCache,
 	index packageIndex,
 	downloader streaming.StreamingDownloader,
-	sf *singleflight.Group,
 ) *PackageFileService {
 	return &PackageFileService{
 		storage:         st,
 		indexCache:      indexCache,
 		index:           index,
 		downloader:      downloader,
-		sf:              sf,
 		indexTTL:        cfg.IndexTTL,
 		downloadTimeout: cfg.DownloadTimeout,
 	}
@@ -138,9 +130,7 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	if info.Size > 0 {
 		plan.Size = info.Size
 	}
-	if hash, ok := info.Hashes["sha256"]; ok && hash != "" {
-		plan.ETag = fmt.Sprintf("%q", hash)
-	}
+	plan.ETag = quoteETag(info.Hashes["sha256"])
 
 	if s.downloadTimeout <= 0 {
 		log.Debug().
@@ -200,12 +190,39 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 		return nil, true, fmt.Errorf("failed to stream %q: %w", plan.URL, err)
 	}
 
-	result, _ := value.(*streaming.StreamResult)
+	// A leader that reports no error must have produced a result; anything else
+	// is a broken downloader, not something to dereference and find out.
+	result, ok := value.(*streaming.StreamResult)
+	if !ok || result == nil {
+		return nil, true, fmt.Errorf("download of %q returned no result (%T)", plan.StorageKey, value)
+	}
 	return result, true, nil
 }
 
+// PlanAfterFetch decides how to serve a request that waited on another request's
+// download. The object should now be cached, so it is re-planned onto storage;
+// when it is not there (async or failed cache write) the client goes upstream.
+func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan) ServePlan {
+	next, err := s.Plan(ctx, plan.PackageName, plan.FileName)
+	if err == nil && next.Action == ActionFromStorage {
+		log.Debug().
+			Str("package", plan.PackageName).
+			Str("file", plan.FileName).
+			Msg("✅ Serving from storage after coordinated download")
+		return next
+	}
+
+	log.Debug().
+		Str("package", plan.PackageName).
+		Str("file", plan.FileName).
+		Msg("⏭️ Redirecting to PyPI after download coordination")
+	plan.Action = ActionRedirect
+	return plan
+}
+
 // resolveIndex returns the index entries for a package, using the index cache
-// and deduplicating concurrent upstream fetches.
+// and deduplicating concurrent upstream fetches. It is the only path to the
+// upstream package index.
 func (s *PackageFileService) resolveIndex(packageName string) ([]pypi.FileInfo, error) {
 	if cached, found := s.indexCache.GetPackage(packageName); found {
 		if files, ok := cached.([]pypi.FileInfo); ok {
@@ -220,43 +237,57 @@ func (s *PackageFileService) resolveIndex(packageName string) ([]pypi.FileInfo, 
 		return nil, err
 	}
 
-	files, _ := result.([]pypi.FileInfo)
-	s.indexCache.SetPackage(packageName, files, s.indexTTL)
+	files, ok := result.([]pypi.FileInfo)
+	if !ok {
+		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
+	}
+	// Never cache an empty index: a transient upstream fault would otherwise
+	// poison this package for the whole TTL.
+	if len(files) > 0 {
+		s.indexCache.SetPackage(packageName, files, s.indexTTL)
+	}
 	return files, nil
 }
 
-// calculateDynamicTimeout calculates appropriate timeout based on file size.
+// resolvePackageList returns the full package list, using the index cache and
+// deduplicating concurrent upstream fetches. It is the only path to the upstream
+// package list.
+func (s *PackageFileService) resolvePackageList() ([]string, error) {
+	if cached, found := s.indexCache.Get(packageListKey); found {
+		if packages, ok := cached.([]string); ok {
+			return packages, nil
+		}
+	}
+
+	result, err, _ := s.sf.Do(packageListKey, func() (any, error) {
+		return s.index.GetPackageList()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve package list: %w", err)
+	}
+
+	packages, ok := result.([]string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected package list result type %T", result)
+	}
+	// Never cache an empty list, for the same reason as resolveIndex.
+	if len(packages) > 0 {
+		s.indexCache.Set(packageListKey, packages, s.indexTTL)
+	}
+	return packages, nil
+}
+
+// calculateDynamicTimeout budgets the download at a 100 KB/s floor, clamped to
+// [2min, 1h]: 2 minutes covers network overhead on small files, 1 hour stops a
+// stalled transfer from pinning the request forever. An unknown size (<= 0) gets
+// the configured timeout unchanged.
 func (s *PackageFileService) calculateDynamicTimeout(expectedSize int64) time.Duration {
 	if expectedSize <= 0 {
-		// Use default timeout for unknown sizes
 		return s.downloadTimeout
 	}
-
-	// Calculate timeout based on minimum transfer speed
-	// Use 100 KB/s as minimum acceptable speed for S3 uploads
 	const minSpeedBytesPerSec = 100 * 1024
-
-	// Calculate base timeout: file_size / min_speed
-	baseTimeout := time.Duration(expectedSize/minSpeedBytesPerSec) * time.Second
-
-	// Add minimum timeout of 2 minutes for network overhead
-	minTimeout := 2 * time.Minute
-	if baseTimeout < minTimeout {
-		baseTimeout = minTimeout
-	}
-
-	// Cap maximum timeout at 1 hour to prevent indefinite waits
-	maxTimeout := 60 * time.Minute
-	if baseTimeout > maxTimeout {
-		baseTimeout = maxTimeout
-	}
-
-	log.Debug().
-		Int64("expected_size", expectedSize).
-		Dur("calculated_timeout", baseTimeout).
-		Msg("🕐 Calculated dynamic timeout for download")
-
-	return baseTimeout
+	transfer := time.Duration(expectedSize/minSpeedBytesPerSec) * time.Second
+	return min(max(transfer, 2*time.Minute), 60*time.Minute)
 }
 
 func storageKeyFor(packageName, fileName string) string {
@@ -264,12 +295,25 @@ func storageKeyFor(packageName, fileName string) string {
 }
 
 func findFile(files []pypi.FileInfo, fileName string) (pypi.FileInfo, bool) {
-	for _, file := range files {
-		if file.Name == fileName {
-			return file, true
-		}
+	i := slices.IndexFunc(files, func(f pypi.FileInfo) bool { return f.Name == fileName })
+	if i < 0 {
+		return pypi.FileInfo{}, false
 	}
-	return pypi.FileInfo{}, false
+	return files[i], true
+}
+
+// quoteETag normalises an entity-tag to exactly one layer of quotes. Sources
+// disagree: an index hash arrives bare, an S3 backend may echo the API's already
+// quoted form. This is the only place either is quoted, so neither path can emit
+// `""abc""` and break conditional requests.
+func quoteETag(etag string) string {
+	if etag == "" {
+		return ""
+	}
+	if len(etag) > 1 && strings.HasPrefix(etag, `"`) && strings.HasSuffix(etag, `"`) {
+		return etag
+	}
+	return `"` + etag + `"`
 }
 
 // contentTypeForFile derives a content type from the distribution filename so

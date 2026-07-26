@@ -1,8 +1,6 @@
 package server
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +15,6 @@ import (
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/phuslu/log"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/cache"
 	"github.com/huyhandes/groxpi/internal/config"
@@ -26,23 +23,16 @@ import (
 	"github.com/huyhandes/groxpi/internal/streaming"
 )
 
-// Response buffer pool for reducing allocations
-var responseBufferPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
-}
-
 type Server struct {
-	config           *config.Config
-	indexCache       *cache.IndexCache
-	responseCache    *cache.ResponseCache
-	pypiClient       *pypi.Client
-	storage          storage.Storage
-	router           *gin.Engine
-	sf               singleflight.Group // For deduplicating concurrent requests
-	streamDownloader streaming.StreamingDownloader
-	packageFiles     *PackageFileService // Owns the package-file miss pipeline
+	config        *config.Config
+	indexCache    *cache.IndexCache
+	responseCache *cache.ResponseCache
+	pypiClient    *pypi.Client
+	storage       storage.Storage
+	router        *gin.Engine
+	// packageFiles owns index resolution, the package-file miss pipeline and the
+	// single singleflight.Group that deduplicates both.
+	packageFiles *PackageFileService
 }
 
 func New(cfg *config.Config) *Server {
@@ -53,8 +43,11 @@ func New(cfg *config.Config) *Server {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// Create Gin router
+	// Create Gin router. Let gin answer a known path reached with the wrong
+	// method: it responds 405 with an Allow header instead of falling through to
+	// the 404 handler.
 	router := gin.New()
+	router.HandleMethodNotAllowed = true
 
 	// Add middleware
 	router.Use(gin.Recovery())
@@ -90,13 +83,12 @@ func New(cfg *config.Config) *Server {
 	}
 
 	s := &Server{
-		config:           cfg,
-		indexCache:       cache.NewIndexCache(),
-		responseCache:    cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
-		pypiClient:       pypi.NewClient(cfg),
-		storage:          storageBackend,
-		router:           router,
-		streamDownloader: streaming.NewTeeStreamingDownloader(&storageAdapter{storageBackend}, streamClient),
+		config:        cfg,
+		indexCache:    cache.NewIndexCache(),
+		responseCache: cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
+		pypiClient:    pypi.NewClient(cfg),
+		storage:       storageBackend,
+		router:        router,
 	}
 
 	s.packageFiles = newPackageFileService(
@@ -104,8 +96,7 @@ func New(cfg *config.Config) *Server {
 		storageBackend,
 		s.indexCache,
 		s.pypiClient,
-		s.streamDownloader,
-		&s.sf,
+		streaming.NewTeeStreamingDownloader(storageBackend, streamClient),
 	)
 
 	s.setupRoutes()
@@ -129,15 +120,9 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/index/:package", s.handleListFiles)
 	s.router.GET("/index/:package/:file", s.handleDownloadFile)
 
-	// Cache management
+	// Cache management. Any other method on these paths is answered by gin's
+	// HandleMethodNotAllowed.
 	s.router.DELETE("/cache/list", s.handleCacheList)
-	// Explicit method handlers for unsupported methods (Gin doesn't allow Any after DELETE)
-	s.router.GET("/cache/list", s.handleCacheListMethodNotAllowed)
-	s.router.POST("/cache/list", s.handleCacheListMethodNotAllowed)
-	s.router.PUT("/cache/list", s.handleCacheListMethodNotAllowed)
-	s.router.PATCH("/cache/list", s.handleCacheListMethodNotAllowed)
-	s.router.HEAD("/cache/list", s.handleCacheListMethodNotAllowed)
-	s.router.OPTIONS("/cache/list", s.handleCacheListMethodNotAllowed)
 	s.router.DELETE("/cache/:package", s.handleCachePackage)
 
 	// Health check
@@ -181,28 +166,10 @@ func (s *Server) handleListPackages(c *gin.Context) {
 		}
 	}
 
-	// Check cache for parsed data
-	var packages []string
-	if cachedData, found := s.indexCache.Get("package-list"); found {
-		if cachedPackages, ok := cachedData.([]string); ok {
-			packages = cachedPackages
-		}
-	}
-
-	if len(packages) == 0 {
-		// Use singleflight to deduplicate concurrent requests
-		result, err, _ := s.sf.Do("package-list", func() (any, error) {
-			return s.pypiClient.GetPackageList()
-		})
-
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to fetch package list")
-			packages = []string{} // Use empty list on error
-		} else {
-			packages = result.([]string)
-			// Cache the result
-			s.indexCache.Set("package-list", packages, s.config.IndexTTL)
-		}
+	packages, err := s.packageFiles.resolvePackageList()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to fetch package list")
+		packages = []string{} // Use empty list on error
 	}
 
 	if wantsJSON(c) {
@@ -219,27 +186,13 @@ func (s *Server) handleListPackages(c *gin.Context) {
 			"projects": projects,
 		}
 
-		// Use streaming JSON encoder for zero-copy optimization
-		buf := responseBufferPool.Get().(*bytes.Buffer)
-		defer func() {
-			buf.Reset()
-			responseBufferPool.Put(buf)
-		}()
-
-		encoder := sonic.ConfigFastest.NewEncoder(buf)
-		if err := encoder.Encode(response); err != nil {
+		responseData, err := sonic.ConfigFastest.Marshal(response)
+		if err != nil {
 			c.String(http.StatusInternalServerError, "JSON encoding error")
 			return
 		}
 
-		// Cache the JSON response
-		jsonData := buf.Bytes()
-		cacheKey := "json:package-list"
-		// Make a copy for cache and response since buf will be reused
-		responseData := make([]byte, len(jsonData))
-		copy(responseData, jsonData)
-		s.responseCache.Set(cacheKey, responseData, s.config.IndexTTL)
-
+		s.responseCache.Set("json:package-list", responseData, s.config.IndexTTL)
 		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
 		return
 	}
@@ -273,49 +226,26 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		}
 	}
 
-	// Check cache for parsed data
-	if cachedData, found := s.indexCache.GetPackage(packageName); found {
-		if cachedFiles, ok := cachedData.([]pypi.FileInfo); ok {
-			s.renderPackageFiles(c, packageName, cachedFiles)
-			return
-		}
-	}
-
-	// Use singleflight to deduplicate concurrent requests for the same package
-	key := "package-files:" + packageName
-	result, err, _ := s.sf.Do(key, func() (any, error) {
-		return s.pypiClient.GetPackageFiles(packageName)
-	})
-
+	// One index-resolution path, shared with the download handler: cache lookup,
+	// deduplicated upstream fetch, cache fill.
+	files, err := s.packageFiles.resolveIndex(packageName)
 	if err != nil {
-		// If package not found, return 404
+		// TODO: internal/pypi has no not-found sentinel, so the miss can only be
+		// recognised by its message. Replace with errors.Is once it exposes one.
 		if strings.Contains(err.Error(), "not found") {
 			c.String(http.StatusNotFound, "Package not found")
 			return
 		}
-		// Log the error for debugging
-		fmt.Printf("Error fetching package %s: %v\n", packageName, err)
+		log.Error().Err(err).Str("package", packageName).Msg("Failed to fetch package files")
 		c.String(http.StatusInternalServerError, "Error fetching package: "+err.Error())
 		return
 	}
-
-	files := result.([]pypi.FileInfo)
-
-	// Cache the result
-	s.indexCache.SetPackage(packageName, files, s.config.IndexTTL)
 
 	s.renderPackageFiles(c, packageName, files)
 }
 
 func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []pypi.FileInfo) {
 	if wantsJSON(c) {
-		// Get buffer from pool
-		buf := responseBufferPool.Get().(*bytes.Buffer)
-		defer func() {
-			buf.Reset()
-			responseBufferPool.Put(buf)
-		}()
-
 		// Pre-allocate slice with exact capacity
 		fileList := make([]map[string]any, 0, len(files))
 
@@ -351,21 +281,13 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 			"files": fileList,
 		}
 
-		// Use streaming JSON encoder for zero-copy optimization
-		encoder := sonic.ConfigFastest.NewEncoder(buf)
-		if err := encoder.Encode(response); err != nil {
+		responseData, err := sonic.ConfigFastest.Marshal(response)
+		if err != nil {
 			c.String(http.StatusInternalServerError, "JSON encoding error")
 			return
 		}
 
-		// Cache the JSON response
-		jsonData := buf.Bytes()
-		cacheKey := "json:package:" + packageName
-		// Make a copy for cache and response since buf will be reused
-		responseData := make([]byte, len(jsonData))
-		copy(responseData, jsonData)
-		s.responseCache.Set(cacheKey, responseData, s.config.IndexTTL)
-
+		s.responseCache.Set("json:package:"+packageName, responseData, s.config.IndexTTL)
 		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
 		return
 	}
@@ -442,7 +364,7 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 	switch plan.Action {
 	case ActionFromStorage:
-		if err := s.serveFromStorageOptimized(c, plan.StorageKey); err != nil {
+		if err := s.serveFromStorage(c, plan.StorageKey); err != nil {
 			log.Error().Err(err).Str("storage_key", plan.StorageKey).Msg("Failed to serve from storage")
 			// Only a failure that happened before the first body byte can still
 			// be reported; anything later would append garbage to the payload.
@@ -486,7 +408,9 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 		}
 		c.Redirect(http.StatusFound, plan.URL)
 	case !led:
-		s.serveDeduplicated(c, plan)
+		// The leader's download populated the cache; the service decides whether
+		// this request can now be served from it or has to go upstream.
+		s.servePlan(c, s.packageFiles.PlanAfterFetch(c.Request.Context(), plan))
 	default:
 		log.Info().
 			Str("package", plan.PackageName).
@@ -495,27 +419,6 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 			Bool("cached", result.Error == nil).
 			Msg("✅ Successfully streamed file to client")
 	}
-}
-
-// serveDeduplicated handles a request that waited on another request's download:
-// the object should now be cached, so re-plan and serve it from there. If it is
-// not (async or failed cache write), fall back to the upstream URL.
-func (s *Server) serveDeduplicated(c *gin.Context, plan ServePlan) {
-	next, err := s.packageFiles.Plan(c.Request.Context(), plan.PackageName, plan.FileName)
-	if err == nil && next.Action == ActionFromStorage {
-		log.Debug().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Msg("✅ Serving from storage after coordinated download")
-		s.servePlan(c, next)
-		return
-	}
-
-	log.Debug().
-		Str("package", plan.PackageName).
-		Str("file", plan.FileName).
-		Msg("⏭️ Redirecting to PyPI after download coordination")
-	c.Redirect(http.StatusFound, plan.URL)
 }
 
 // applyDownloadHeaders sets everything knowable about the response before the
@@ -558,14 +461,6 @@ func (s *Server) handleCacheList(c *gin.Context) {
 		"status": "success",
 		"data":   nil,
 	})
-}
-
-func (s *Server) handleCacheListMethodNotAllowed(c *gin.Context) {
-	if c.Request.Method != "DELETE" {
-		c.String(http.StatusMethodNotAllowed, "Method Not Allowed")
-		return
-	}
-	c.Next()
 }
 
 func (s *Server) handleCachePackage(c *gin.Context) {
@@ -630,76 +525,76 @@ func normalizePackageName(name string) string {
 
 // initStorage creates the appropriate storage backend based on configuration
 func initStorage(cfg *config.Config) (storage.Storage, error) {
-	if cfg.StorageType == "hybrid" {
-		// Create hybrid/tiered storage with local L1 cache and S3 L2 cache
+	// Both S3-backed modes take the same client configuration; build it once.
+	s3Config := &storage.S3Config{
+		Endpoint:        cfg.S3Endpoint,
+		AccessKeyID:     cfg.S3AccessKeyID,
+		SecretAccessKey: cfg.S3SecretAccessKey,
+		Region:          cfg.S3Region,
+		Bucket:          cfg.S3Bucket,
+		Prefix:          cfg.S3Prefix,
+		UseSSL:          cfg.S3UseSSL,
+		ForcePathStyle:  cfg.S3ForcePathStyle,
+		PartSize:        cfg.S3PartSize,
+		MaxConnections:  cfg.S3MaxConnections,
+
+		// Performance configuration
+		ReadPoolSize:   cfg.S3ReadPoolSize,
+		WritePoolSize:  cfg.S3WritePoolSize,
+		MetaPoolSize:   cfg.S3MetaPoolSize,
+		EnableHTTP2:    cfg.S3EnableHTTP2,
+		TransferAccel:  cfg.S3TransferAccel,
+		AsyncWrites:    cfg.S3AsyncWrites,
+		AsyncWorkers:   cfg.S3AsyncWorkers,
+		AsyncQueueSize: cfg.S3AsyncQueueSize,
+		ConnectTimeout: cfg.ConnectTimeout,
+		RequestTimeout: cfg.DownloadTimeout,
+	}
+
+	switch cfg.StorageType {
+	case "hybrid":
+		// Hybrid/tiered storage with a local L1 cache and S3 as L2.
 		return storage.NewTieredStorage(&storage.TieredConfig{
 			LocalCacheDir:  cfg.LocalCacheDir,
 			LocalCacheSize: cfg.LocalCacheSize,
 			LocalCacheTTL:  cfg.LocalCacheTTL,
-			S3Config: &storage.S3Config{
-				Endpoint:        cfg.S3Endpoint,
-				AccessKeyID:     cfg.S3AccessKeyID,
-				SecretAccessKey: cfg.S3SecretAccessKey,
-				Region:          cfg.S3Region,
-				Bucket:          cfg.S3Bucket,
-				Prefix:          cfg.S3Prefix,
-				UseSSL:          cfg.S3UseSSL,
-				ForcePathStyle:  cfg.S3ForcePathStyle,
-				PartSize:        cfg.S3PartSize,
-				MaxConnections:  cfg.S3MaxConnections,
-
-				// Performance configuration
-				ReadPoolSize:   cfg.S3ReadPoolSize,
-				WritePoolSize:  cfg.S3WritePoolSize,
-				MetaPoolSize:   cfg.S3MetaPoolSize,
-				EnableHTTP2:    cfg.S3EnableHTTP2,
-				TransferAccel:  cfg.S3TransferAccel,
-				AsyncWrites:    cfg.S3AsyncWrites,
-				AsyncWorkers:   cfg.S3AsyncWorkers,
-				AsyncQueueSize: cfg.S3AsyncQueueSize,
-				ConnectTimeout: cfg.ConnectTimeout,
-				RequestTimeout: cfg.DownloadTimeout,
-			},
-			SyncWorkers:   cfg.TieredSyncWorkers,
-			SyncQueueSize: cfg.TieredSyncQueueSize,
+			S3Config:       s3Config,
+			SyncWorkers:    cfg.TieredSyncWorkers,
+			SyncQueueSize:  cfg.TieredSyncQueueSize,
 		})
+	case "s3":
+		return storage.NewS3Storage(s3Config)
+	default:
+		// Local storage with LRU eviction (no TTL for non-hybrid mode).
+		return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
 	}
-
-	if cfg.StorageType == "s3" {
-		return storage.NewS3Storage(&storage.S3Config{
-			Endpoint:        cfg.S3Endpoint,
-			AccessKeyID:     cfg.S3AccessKeyID,
-			SecretAccessKey: cfg.S3SecretAccessKey,
-			Region:          cfg.S3Region,
-			Bucket:          cfg.S3Bucket,
-			Prefix:          cfg.S3Prefix,
-			UseSSL:          cfg.S3UseSSL,
-			ForcePathStyle:  cfg.S3ForcePathStyle,
-			PartSize:        cfg.S3PartSize,
-			MaxConnections:  cfg.S3MaxConnections,
-
-			// Performance configuration
-			ReadPoolSize:   cfg.S3ReadPoolSize,
-			WritePoolSize:  cfg.S3WritePoolSize,
-			MetaPoolSize:   cfg.S3MetaPoolSize,
-			EnableHTTP2:    cfg.S3EnableHTTP2,
-			TransferAccel:  cfg.S3TransferAccel,
-			AsyncWrites:    cfg.S3AsyncWrites,
-			AsyncWorkers:   cfg.S3AsyncWorkers,
-			AsyncQueueSize: cfg.S3AsyncQueueSize,
-			ConnectTimeout: cfg.ConnectTimeout,
-			RequestTimeout: cfg.DownloadTimeout,
-		})
-	}
-
-	// Default to local storage with LRU eviction (no TTL for non-hybrid mode)
-	return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
 }
 
-// serveFromStorage serves a file from the storage backend
+// serveFromStorage serves a cached object. When the backend can name a real file
+// on disk the path is handed to gin's c.File so net/http does the serving, which
+// buys range and If-Modified-Since handling for free. Backends that cannot name a
+// file are opened and streamed here.
+//
+// Serving by path is not a kernel-level zero copy: gin's writer, wrapped further
+// by the gzip middleware, exposes neither the file nor the ReaderFrom hooks
+// net/http needs to skip user space. The win is delegated correctness, not a
+// saved copy.
 func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := c.Request.Context()
+
+	// Zero-copy is a capability, not a property of every backend: ask, do not
+	// assume, and do not branch on a boolean the backend has to lie about.
+	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
+		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
+			log.Debug().
+				Str("storage_key", storageKey).
+				Str("file_path", filePath).
+				Msg("Serving local file by path via net/http")
+			c.File(filePath)
+			return nil
+		}
+	}
 
 	log.Debug().
 		Str("storage_key", storageKey).
@@ -738,17 +633,8 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 
 	// Set cache headers for better performance
 	c.Header("Cache-Control", "public, max-age=3600")
-	if info.ETag != "" {
-		c.Header("ETag", fmt.Sprintf(`"%s"`, info.ETag))
-	}
-
-	// Handle HEAD requests without reading body
-	if c.Request.Method == "HEAD" {
-		log.Debug().
-			Str("storage_key", storageKey).
-			Int64("size", info.Size).
-			Msg("Serving HEAD request from storage")
-		return nil
+	if etag := quoteETag(info.ETag); etag != "" {
+		c.Header("ETag", etag)
 	}
 
 	log.Debug().
@@ -774,49 +660,4 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		Msg("File stream completed successfully")
 
 	return nil
-}
-
-// serveFromStorageOptimized serves a file from storage. When the backend can
-// name a real file on disk, the path is handed to gin's c.File so net/http does
-// the serving: it adds range and If-Modified-Since handling for free and this
-// code never touches the body. Backends that cannot name a file fall back to
-// open-then-stream.
-//
-// This is not a kernel-level zero copy. The response writer is gin's own and
-// the gzip middleware wraps it further; neither exposes the file or ReaderFrom
-// hooks net/http needs to skip user space, so the bytes are still copied. The
-// win here is delegated correctness, not a saved copy.
-func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
-	// Read-only serving: it is correct to abandon it when the client goes away.
-	ctx := c.Request.Context()
-
-	// Zero-copy is a capability, not a property of every backend: ask, do not
-	// assume, and do not branch on a boolean the backend has to lie about.
-	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
-		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
-			log.Debug().
-				Str("storage_key", storageKey).
-				Str("file_path", filePath).
-				Msg("Serving local file by path via net/http")
-			c.File(filePath)
-			return nil
-		}
-	}
-
-	// Fall back to streaming from storage
-	log.Debug().
-		Str("storage_key", storageKey).
-		Msg("Using streaming from storage backend")
-
-	return s.serveFromStorage(c, storageKey)
-}
-
-// storageAdapter adapts storage.Storage to streaming.StorageWriter
-type storageAdapter struct {
-	storage storage.Storage
-}
-
-func (sa *storageAdapter) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
-	_, err := sa.storage.Put(ctx, key, reader, size, contentType)
-	return err
 }

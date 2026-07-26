@@ -204,37 +204,6 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 	}
 }
 
-// BenchmarkCalculateDynamicTimeout tests timeout calculation performance
-func BenchmarkCalculateDynamicTimeout(b *testing.B) {
-	cfg := &config.Config{
-		IndexURL:        "http://example.com",
-		CacheDir:        "/tmp/bench",
-		DownloadTimeout: 30 * time.Second,
-		LogLevel:        "ERROR",
-	}
-
-	srv := New(cfg)
-
-	fileSizes := []int64{
-		1024,                    // 1KB
-		1024 * 1024,             // 1MB
-		10 * 1024 * 1024,        // 10MB
-		100 * 1024 * 1024,       // 100MB
-		317 * 1024 * 1024,       // 317MB (pyspark)
-		1024 * 1024 * 1024,      // 1GB
-		10 * 1024 * 1024 * 1024, // 10GB
-	}
-
-	for _, size := range fileSizes {
-		b.Run(fmt.Sprintf("size_%dMB", size/(1024*1024)), func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_ = srv.packageFiles.calculateDynamicTimeout(size)
-			}
-		})
-	}
-}
-
 // BenchmarkDownloadCoordination_LargeFile tests performance with larger files
 func BenchmarkDownloadCoordination_LargeFile(b *testing.B) {
 	packageName := "large-bench"

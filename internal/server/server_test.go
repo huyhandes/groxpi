@@ -1336,8 +1336,8 @@ func TestServer_ServeFromStorage_HeadersPrecedeBody(t *testing.T) {
 		c.Request = httptest.NewRequest(http.MethodGet, "/"+key, nil)
 
 		s := &Server{storage: st}
-		if err := s.serveFromStorageOptimized(c, key); err != nil {
-			t.Fatalf("serveFromStorageOptimized: %v", err)
+		if err := s.serveFromStorage(c, key); err != nil {
+			t.Fatalf("serveFromStorage: %v", err)
 		}
 		return w.Result()
 	}

@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/cache"
 	"github.com/huyhandes/groxpi/internal/config"
@@ -37,6 +37,7 @@ type fakeStorage struct {
 	mu        sync.Mutex
 	objects   map[string][]byte
 	existsErr error
+	etag      string // reported verbatim, so tests can mimic each backend's shape
 }
 
 func newFakeStorage(keys ...string) *fakeStorage {
@@ -75,7 +76,7 @@ func (f *fakeStorage) Get(_ context.Context, key string) (io.ReadCloser, *storag
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: %s", storage.ErrNotFound, key)
 	}
-	return io.NopCloser(bytes.NewReader(data)), &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
+	return io.NopCloser(bytes.NewReader(data)), &storage.ObjectInfo{Key: key, Size: int64(len(data)), ETag: f.etag}, nil
 }
 
 func (f *fakeStorage) Delete(_ context.Context, key string) error {
@@ -105,9 +106,18 @@ var _ storage.Storage = (*fakeStorage)(nil)
 
 // fakeIndex is a packageIndex double recording how often upstream was consulted.
 type fakeIndex struct {
-	files map[string][]pypi.FileInfo
-	err   error
-	calls atomic.Int64
+	files    map[string][]pypi.FileInfo
+	packages []string
+	err      error
+	calls    atomic.Int64
+}
+
+func (f *fakeIndex) GetPackageList() ([]string, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.packages, nil
 }
 
 func (f *fakeIndex) GetPackageFiles(packageName string) ([]pypi.FileInfo, error) {
@@ -124,11 +134,12 @@ func (f *fakeIndex) GetPackageFiles(packageName string) ([]pypi.FileInfo, error)
 
 // fakeDownloader is a streaming.StreamingDownloader double.
 type fakeDownloader struct {
-	body    []byte
-	err     error
-	delay   time.Duration
-	calls   atomic.Int64
-	storage *fakeStorage
+	body      []byte
+	err       error
+	nilResult bool // report success with no StreamResult
+	delay     time.Duration
+	calls     atomic.Int64
+	storage   *fakeStorage
 }
 
 func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey string, w io.Writer) (*streaming.StreamResult, error) {
@@ -142,6 +153,9 @@ func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey st
 	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.nilResult {
+		return nil, nil
 	}
 	n, err := w.Write(f.body)
 	if err != nil {
@@ -164,14 +178,7 @@ func newTestService(t *testing.T, st storage.Storage, index *fakeIndex, dl strea
 		IndexTTL:        5 * time.Minute,
 		DownloadTimeout: downloadTimeout,
 	}
-	return newPackageFileService(
-		cfg,
-		st,
-		cache.NewIndexCache(),
-		index,
-		dl,
-		&singleflight.Group{},
-	)
+	return newPackageFileService(cfg, st, cache.NewIndexCache(), index, dl)
 }
 
 func indexWith(pkg string, files ...pypi.FileInfo) *fakeIndex {
@@ -309,7 +316,7 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			assert.Equal(t, tt.wantAction, plan.Action, "action mismatch: got %s", plan.Action)
+			assert.Equal(t, tt.wantAction, plan.Action, "action mismatch: got %d", plan.Action)
 			assert.Equal(t, pkg, plan.PackageName)
 			assert.Equal(t, file, plan.FileName)
 			assert.Equal(t, key, plan.StorageKey)
@@ -476,6 +483,133 @@ func TestPackageFileService_Fetch_NoStaleDedupState(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, led, "dedup state must be released once the download completes")
 	assert.Equal(t, int64(2), dl.calls.Load())
+}
+
+// TestPackageFileService_Fetch_NilResultIsAnError pins the nil-deref bug: the
+// leader's singleflight value used to be type-asserted with the ok discarded, so
+// a downloader reporting success without a StreamResult produced a (nil, true,
+// nil) return that the caller dereferenced.
+func TestPackageFileService_Fetch_NilResultIsAnError(t *testing.T) {
+	st := newFakeStorage()
+	dl := &fakeDownloader{nilResult: true}
+	svc := newTestService(t, st, indexWith("p"), dl, time.Minute)
+
+	plan := ServePlan{Action: ActionStreamAndCache, StorageKey: "packages/p/f", URL: "http://x/f", Timeout: time.Minute}
+
+	result, led, err := svc.Fetch(context.Background(), plan, io.Discard)
+
+	require.Error(t, err, "a leader with no result must report an error, not hand back nil")
+	assert.True(t, led, "the caller still led the fetch")
+	assert.Nil(t, result)
+}
+
+// TestServer_StreamAndCache_NilDownloadResultDoesNotPanic is the transport half
+// of the same bug: reading result.Size on a nil result panicked the handler.
+func TestServer_StreamAndCache_NilDownloadResultDoesNotPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	svc := newTestService(t, newFakeStorage(), indexWith("p"), &fakeDownloader{nilResult: true}, time.Minute)
+	plan := ServePlan{
+		Action:      ActionStreamAndCache,
+		PackageName: "p",
+		FileName:    "f",
+		StorageKey:  "packages/p/f",
+		URL:         "https://upstream.example.org/f",
+		Timeout:     time.Minute,
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/index/p/f", nil)
+
+	srv := &Server{packageFiles: svc}
+	srv.streamAndCache(c, plan)
+
+	resp := w.Result()
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusFound, resp.StatusCode, "the failed fetch must fall back to upstream")
+	assert.Equal(t, plan.URL, resp.Header.Get("Location"))
+}
+
+// --- ETag quoting ------------------------------------------------------------
+
+func TestQuoteETag(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty stays empty", "", ""},
+		{"bare hash is quoted", "abc123", `"abc123"`},
+		{"already quoted is left alone", `"abc123"`, `"abc123"`},
+		{"lone quote is still quoted", `"`, `"""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, quoteETag(tt.in))
+		})
+	}
+}
+
+// TestServer_ServeFromStorage_ETagQuotedOnce pins the double-quoting bug: a local
+// backend reports a bare hash while an S3 backend echoes the API's already quoted
+// form, and serveFromStorage used to wrap both, emitting `""abc""`.
+func TestServer_ServeFromStorage_ETagQuotedOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+	tests := []struct {
+		name       string
+		backend    string
+		wantHeader string
+	}{
+		{"local-shaped bare hash", "abc123", `"abc123"`},
+		{"s3-shaped quoted etag", `"abc123"`, `"abc123"`},
+		{"no etag omits the header", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newFakeStorage()
+			st.etag = tt.backend
+			_, err := st.Put(context.Background(), key, strings.NewReader("payload"), 7, "")
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/"+key, nil)
+
+			srv := &Server{storage: st}
+			require.NoError(t, srv.serveFromStorage(c, key))
+
+			assert.Equal(t, tt.wantHeader, w.Result().Header.Get("ETag"))
+		})
+	}
+}
+
+// TestPackageFileService_Plan_ETagQuotedOnce is the other half of the same
+// contract: the download path must agree with the storage path.
+func TestPackageFileService_Plan_ETagQuotedOnce(t *testing.T) {
+	const pkg, file = "numpy", "numpy-1.26.0.tar.gz"
+
+	for name, hash := range map[string]string{
+		"bare index hash":   "abc123",
+		"quoted index hash": `"abc123"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			index := indexWith(pkg, pypi.FileInfo{
+				Name:   file,
+				URL:    "https://files.example.org/" + file,
+				Size:   4096,
+				Hashes: map[string]string{"sha256": hash},
+			})
+			svc := newTestService(t, newFakeStorage(), index, &fakeDownloader{}, time.Minute)
+
+			plan, err := svc.Plan(context.Background(), pkg, file)
+			require.NoError(t, err)
+			assert.Equal(t, `"abc123"`, plan.ETag)
+		})
+	}
 }
 
 // --- headers precede the body ------------------------------------------------

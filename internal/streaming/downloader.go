@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/huyhandes/groxpi/internal/storage"
 )
 
-// StorageWriter interface to avoid import cycle with storage package
+// StorageWriter is the write half of storage.Storage, narrowed to what the
+// downloader needs. The signature matches storage.Storage.Put exactly so any
+// backend satisfies it directly, with no adapter in between.
 type StorageWriter interface {
-	Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error
+	Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*storage.ObjectInfo, error)
 }
 
 // teeStreamingDownloader streams a download to the client while teeing it into storage.
@@ -90,7 +94,7 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 				_ = err
 			}
 		}()
-		err := tsd.storage.Put(ctx, storageKey, storageReader, resp.ContentLength, contentType)
+		_, err := tsd.storage.Put(ctx, storageKey, storageReader, resp.ContentLength, contentType)
 		storageErrCh <- err
 	}()
 
