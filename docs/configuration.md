@@ -50,7 +50,8 @@ The following variables were removed and are now **ignored**. They configured an
 "async write" queue that `S3Storage.Put` submitted to and then immediately
 blocked on, so the write was never asynchronous to the caller — the queue only
 moved a blocking upload onto another goroutine and waited for it. Uploads now go
-straight to S3. Remove these from your environment; setting them has no effect.
+straight to S3, and the four buffer pools that fed that path are gone with it.
+Remove these from your environment; setting them has no effect.
 
 | Removed variable | Former default |
 |------------------|----------------|
@@ -69,6 +70,7 @@ Hybrid storage provides a multi-tier caching system with fast local cache (L1) b
 | `GROXPI_STORAGE_TYPE` | `local` | Set to `hybrid` for tiered caching |
 | `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` | L1 local cache size limit (10GB) |
 | `GROXPI_LOCAL_CACHE_DIR` | Same as `GROXPI_CACHE_DIR` | L1 local cache directory |
+| `GROXPI_LOCAL_CACHE_TTL` | `0` (disabled) | L1 entry TTL in seconds. Expired entries are swept periodically — independently of the size limit — so a TTL takes effect even on a cache that never fills up |
 | `GROXPI_TIERED_SYNC_WORKERS` | `5` | Workers for async L1 population from L2 |
 | `GROXPI_TIERED_SYNC_QUEUE_SIZE` | `100` | Queue size for L1 sync operations |
 | `AWS_ENDPOINT_URL` | - | S3 endpoint URL (required for hybrid) |
@@ -81,10 +83,10 @@ Hybrid storage provides a multi-tier caching system with fast local cache (L1) b
 | `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Force path-style URLs |
 
 **Benefits of Hybrid Storage:**
-- ⚡ **Fast Local Access**: Zero-copy serving from L1 for frequently-used packages
+- ⚡ **Fast Local Access**: L1 objects are real files, so they are served by path and `net/http` handles range and conditional requests (not a kernel zero copy — see [performance.md](performance.md))
 - 💾 **S3 Persistence**: All packages stored durably in S3 (L2)
 - 🔄 **Auto L1 Population**: L2 hits automatically populate L1 for future requests
-- 📊 **LRU Eviction**: Intelligent L1 cache management based on access patterns
+- 📊 **LRU Eviction**: Intelligent L1 cache management based on access patterns, plus an optional TTL sweep (`GROXPI_LOCAL_CACHE_TTL`)
 - 💰 **Cost Efficient**: Only cache hot packages locally, everything else in S3
 
 ## Server Configuration
@@ -145,6 +147,7 @@ export GROXPI_STORAGE_TYPE=hybrid
 # Local L1 cache configuration
 export GROXPI_LOCAL_CACHE_SIZE=10737418240  # 10GB local cache
 export GROXPI_LOCAL_CACHE_DIR=/var/cache/groxpi
+export GROXPI_LOCAL_CACHE_TTL=86400  # 24h; 0 disables TTL expiry
 export GROXPI_TIERED_SYNC_WORKERS=5
 export GROXPI_TIERED_SYNC_QUEUE_SIZE=100
 

@@ -13,6 +13,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Content Negotiation**: Automatic JSON/HTML response based on Accept headers
 - **Hash Verification**: SHA256 hash support for package integrity
 - **Metadata Support**: Requires-Python and file size information
+- **ETag Normalisation**: `quoteETag` is the single place an entity-tag is quoted, so a bare index hash and an already-quoted backend ETag both emit exactly one layer of quotes — an already-quoted value is no longer double-quoted into `""abc""`
 
 ### HTTP Server Features
 - **Gin Framework**: High-performance HTTP server with radix tree routing
@@ -21,6 +22,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Error Recovery**: Automatic panic recovery with full stack traces
 - **Graceful Shutdown**: Proper connection draining and resource cleanup
 - **Health Checks**: Detailed health endpoint for monitoring
+- **Method-Aware Routing**: `HandleMethodNotAllowed` is enabled, so a known path reached with an unregistered method returns `405` with an `Allow` header instead of a misleading `404`. Only `GET` is registered on the index and download routes, so `HEAD` on them is currently `405` too — registering `HEAD` is an open follow-up, not intended behaviour
 
 ## Advanced Caching System ✅
 
@@ -35,10 +37,12 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 
 ### Cache Strategies
 - **TTL-Based Expiration**: Configurable time-to-live for index and response caches
+- **No Negative Caching**: an empty upstream index or package list is never cached, so a transient upstream fault cannot poison a package (or the whole `/simple/` listing) for the full `GROXPI_INDEX_TTL`
 - **LRU Eviction**: Least Recently Used eviction for the on-disk object cache. When a TTL is configured, expired entries are swept periodically regardless of cache size, and a size-driven pass still prefers expired victims over unexpired ones
 - **Size-Based Limits**: Automatic eviction when cache size limits reached (`0` means unlimited)
 - **Eviction Safety**: Every read path that yields a size records an access, so a file currently being served cannot look cold to the evictor
-- **Cache Stats**: `LRULocalStorage.GetStats()` reports size, entry count, usage percent and expired-entry count
+- **Standalone TTL Sweep**: the sweep ticks at half the TTL (capped at 1 minute) on the eviction goroutine and is disabled entirely when no TTL is set. Before `97282f1`, expiry only ran as a phase of size-driven eviction, so `GROXPI_LOCAL_CACHE_TTL` did nothing on an under-quota cache
+- **No Stats API**: there is no programmatic cache-stats accessor. `LRULocalStorage.GetStats()` existed with no production caller and was deleted in `ba2e0d6`; size and eviction activity are visible only in the structured logs
 
 ## Storage Backend Support ✅
 
@@ -57,13 +61,15 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 - **Path-Style URLs**: Configurable URL styles for different S3 implementations
 - **SSL/TLS Support**: Secure connections with configurable SSL settings
 - **Prefix Support**: Bucket prefixes for organized storage
+- **Synchronous Uploads**: `Put` hands the reader straight to minio-go, which sizes multipart uploads itself. The "async write" queue, its buffer pools and the `GROXPI_S3_ASYNC_WRITES`/`_WORKERS`/`_QUEUE_SIZE` variables were deleted in `ba2e0d6` — `Put` blocked on the queued result anyway, so nothing was ever asynchronous to the caller
+- **Separate Connection Pools**: distinct HTTP transports for read, write and metadata operations (`GROXPI_S3_READ_POOL_SIZE` / `_WRITE_POOL_SIZE` / `_META_POOL_SIZE`)
 
 ### Hybrid/Tiered Storage
 - **Multi-Tier Caching**: Local L1 cache + S3 L2 storage (`GROXPI_STORAGE_TYPE=hybrid`)
 - **Automatic L1 Population**: L2 hits asynchronously populate L1 for future requests, on jobs that outlive the request that queued them
 - **Concurrent Writes**: New files written to both L1 and L2 simultaneously (`io.Pipe` tee under singleflight)
 - **Local-Path L1 Serving**: L1 objects are real files, so they are served by path and `net/http` handles range and conditional requests (see the note below — this is not a kernel zero copy)
-- **LRU L1 Eviction**: Size-based LRU plus an optional periodic TTL sweep, deleting through the storage backend so on-disk state and size accounting have one owner
+- **LRU L1 Eviction**: Size-based LRU plus an independent periodic TTL sweep (`GROXPI_LOCAL_CACHE_TTL`), deleting through the storage backend so on-disk state and size accounting have one owner
 - **Background Sync Workers**: Configurable `WorkerPool[T]` for L1 cache population
 - **Non-Blocking L1 Sync**: L1 population doesn't block user requests; a full queue drops the back-fill rather than stalling the reader
 - **Typed Misses**: `storage.ErrNotFound` means L1 falls through to L2 only on a genuine miss — a real L1 failure is reported, not silently treated as a miss
@@ -75,7 +81,7 @@ Groxpi provides a complete, production-ready implementation of a high-performanc
 ### Memory Efficiency
 - **Streaming, Never Buffering**: files are piped through, never loaded whole into memory
 - **Metadata Before Body**: `Storage.Get` returns `*ObjectInfo` before the first body byte, so headers are emitted once and correctly
-- **Buffer Pools**: reused response buffers and 64KB copy buffers
+- **Buffer Pools**: 64KB copy buffers in the tee downloader and parse buffers in the upstream index client. Nothing is pooled on the response path or the S3 write path — the S3 backend's four buffer pools were deleted in `ba2e0d6` along with the async-write queue they served
 - **GC Optimization**: reduced allocation pressure from pooling and streaming
 
 ### About "zero copy"
@@ -93,7 +99,7 @@ Speculative streaming machinery — `ZeroCopyServer`, `BroadcastWriter`, `Hashin
 
 ## Multi-Index Support 🔄 (configuration only)
 
-`GROXPI_EXTRA_INDEX_URLS` and `GROXPI_EXTRA_INDEX_TTLS` are parsed and validated into `config.ExtraIndexURLs` / `ExtraIndexTTLs`, but **no code reads them** — `pypi.Client` queries `IndexURL` only. Verified at `6a11326`: the only references to these fields outside `internal/config` are its own tests.
+`GROXPI_EXTRA_INDEX_URLS` and `GROXPI_EXTRA_INDEX_TTLS` are parsed and validated into `config.ExtraIndexURLs` / `ExtraIndexTTLs`, but **no code reads them** — `pypi.Client` queries `IndexURL` only. Verified at `ba2e0d6`: the only references to these fields outside `internal/config` are its own tests.
 
 ### Index Configuration
 - **Main Index**: Primary PyPI index configuration ✅
@@ -180,7 +186,9 @@ Speculative streaming machinery — `ZeroCopyServer`, `BroadcastWriter`, `Hashin
 - **Redirect Fallback**: an upstream stream that fails before the first body byte falls back to a 302 to PyPI; once bytes are on the wire the request is aborted rather than corrupted ✅
 - **Typed Not-Found**: `storage.ErrNotFound` keeps a genuine miss distinguishable from a backend failure, so a broken disk is reported instead of silently degrading into an L2 round trip ✅
 - **Non-Fatal L1 Failures**: in hybrid mode an L1 write or delete failure is logged; L2 (authoritative) decides the outcome ✅
-- **Retry Logic / Circuit Breaker**: not implemented 🔄 — no retry, backoff or breaker code exists as of `6a11326`
+- **No Poisoned Index on a Transient Fault**: an empty upstream result is returned but not cached, so the next request retries instead of serving an empty index for the whole TTL ✅
+- **Stringly-Typed Upstream Miss**: `handleListFiles` still distinguishes "package not found" from a real failure by matching `"not found"` in the error text — `internal/pypi` exposes no sentinel. A `pypi.ErrPackageNotFound` is an open follow-up 🔄
+- **Retry Logic / Circuit Breaker**: not implemented 🔄 — no retry, backoff or breaker code exists as of `ba2e0d6`
 
 ## Client Compatibility ✅
 
@@ -238,7 +246,7 @@ Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberatel
 ## Performance Optimizations ✅
 
 ### Memory Management
-- **Buffer Pools**: Reused buffers for frequent operations
+- **Buffer Pools**: reused buffers on the download and index-parse paths only (see the note under Memory Efficiency)
 - **Package Name Normalization**: lowercase + `_`→`-` so equivalent spellings collapse to one cache key (key normalization, not string interning)
 - **GC Tuning**: Optimized garbage collection settings
 - **Memory Profiling**: Built-in memory usage monitoring
@@ -280,7 +288,7 @@ Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberatel
 
 ### Performance Results as of December 2024 — not re-measured since
 
-> ⚠️ These figures were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured after the architecture refactor in `d20f16c..6a11326` (2026-07-26). Treat them as unverified against current code; re-run `./benchmarks/benchmark.sh` before quoting them.
+> ⚠️ These figures were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured after the architecture refactor in `d20f16c..ba2e0d6` (2026-07-26). Treat them as unverified against current code; re-run `./benchmarks/benchmark.sh` before quoting them.
 
 - **12.8x Higher Throughput**: 52,880 vs 4,139 requests/sec for package index
 - **27x Better Latency**: 0.85ms vs 23.04ms P50 response times
@@ -316,4 +324,4 @@ Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberatel
 
 ---
 
-**Status**: Core features are production-ready and covered by unit, integration and benchmark tests (`go test ./...` green at `6a11326`). The system provides API compatibility with the original proxpi. Performance figures quoted above predate the 2026-07 architecture refactor and have not been re-measured; items marked 🔄 are configured but not implemented.
+**Status**: Core features are production-ready and covered by unit, integration and benchmark tests (`go test ./...` green at `ba2e0d6`: 378 tests across 8 packages). The system provides API compatibility with the original proxpi. Performance figures quoted above predate the 2026-07 architecture refactor and have not been re-measured; items marked 🔄 are configured but not implemented.

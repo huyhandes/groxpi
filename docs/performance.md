@@ -2,7 +2,7 @@
 
 Groxpi delivers strong performance through its Go-native architecture, buffer pooling, streaming file transfer and multi-level caching.
 
-> ⚠️ **All figures on this page are unverified against the current code.** They were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the architecture refactor landed in `d20f16c..6a11326` (2026-07-26), which reworked the download path, the storage interface and the L1 eviction logic. Re-run `./benchmarks/benchmark.sh` before quoting any number below.
+> ⚠️ **All figures on this page are unverified against the current code.** They were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the architecture refactor landed in `d20f16c..ba2e0d6` (2026-07-26), which reworked the download path, the storage interface, the L1 eviction logic and the S3 write path. Re-run `./benchmarks/benchmark.sh` before quoting any number below.
 
 ## Benchmark Results
 
@@ -32,7 +32,7 @@ Groxpi delivers strong performance through its Go-native architecture, buffer po
 #### Memory Efficiency
 - **Allocations**: 4 vs 789 (typical request)
 - **GC pressure**: reduced by buffer pooling and streaming (no whole-file buffering)
-- **Buffer pools**: Reused for frequent operations
+- **Buffer pools**: two remain — the upstream index client (`pypi/client.go`) and the 64KB copy buffers in the tee downloader. The S3 backend has none; its four pools were deleted in `ba2e0d6`
 - **Peak memory**: ~50MB under load
 
 #### Concurrent Performance
@@ -49,29 +49,45 @@ When the configured backend can name a real file on disk, the path is handed to 
 
 ```go
 // internal/server/server.go
-func (s *Server) serveFromStorageOptimized(c *gin.Context, storageKey string) error {
+func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
+    ctx := c.Request.Context()
+
     if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
-        if filePath, err := zeroCopy.GetFilePath(c.Request.Context(), storageKey); err == nil {
+        if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
             c.File(filePath) // net/http handles range + If-Modified-Since
             return nil
         }
     }
-    return s.serveFromStorage(c, storageKey) // open-then-stream fallback
+
+    // open-then-stream fallback: metadata before the first body byte
+    reader, info, err := s.storage.Get(ctx, storageKey)
+    // ... headers from info, then io.Copy(c.Writer, reader)
 }
 ```
+
+The capability check and the fallback used to be two methods (`serveFromStorageOptimized` wrapping `serveFromStorage`); they were merged into one in `1fde004`, since the wrapper never did anything the callee could not.
 
 **This is not a kernel-level zero copy.** Gin's `responseWriter` implements neither `File()` nor `io.ReaderFrom`, so `net/http`'s sendfile fast path cannot engage, and the gzip middleware wraps the writer regardless — the bytes still travel through user space. The benefit is delegated correctness (range requests, conditional requests, content-type sniffing handled by the standard library), not a saved copy. Earlier revisions of this page and a `trySendfile` helper in `storage/local.go` claimed OS-level zero copy; both were wrong and have been removed.
 
 The fallback path is also cheap in the way that matters: `Storage.Get` returns `(io.ReadCloser, *ObjectInfo, error)` with metadata complete *before* the first body byte, so headers are emitted once and never re-derived mid-stream.
 
 ### Buffer Pool Management
+
+Pooling survives in exactly two places, both on read paths:
+
 ```go
-var responseBufferPool = sync.Pool{
+// internal/streaming/downloader.go — 64KB copy buffers, reused across downloads
+copyBufPool: &sync.Pool{
     New: func() any {
-        return new(bytes.Buffer)
+        buf := make([]byte, 64*1024)
+        return &buf
     },
-}
+},
 ```
+
+plus `bufferPool` / `copyBufferPool` in `internal/pypi/client.go` for parsing upstream index responses.
+
+There is **no response buffer pool** and **no pooling on the S3 write path**. The four S3 buffer pools were deleted in `ba2e0d6` along with the async-write queue they fed; uploads now hand the reader straight to minio-go, which does its own buffering.
 
 ### SingleFlight Pattern
 - Deduplicates concurrent requests for the same index or package file
@@ -85,7 +101,7 @@ var responseBufferPool = sync.Pool{
 - **Deduplicated**: concurrent requests for the same file wait on the leader, then serve from cache
 
 ### Bounded worker pools
-`storage.WorkerPool[T]` backs both the S3 write queue and the tiered L1 back-fill. Worker count is the concurrency cap; `Submit` never blocks — a full queue drops the job. Note that `S3Storage.Put` still waits on its queued write's result, so the queue bounds concurrency rather than making writes non-blocking.
+`storage.WorkerPool[T]` has one instance left: the tiered L1 back-fill (`WorkerPool[string]`, payload = storage key). Worker count is the concurrency cap; `Submit` never blocks — a full queue drops the job rather than stalling the reader. The S3 write queue was the other instance until `ba2e0d6`: `S3Storage.Put` submitted to it and then immediately blocked on the result channel, so it bought latency and no asynchrony. S3 uploads are now direct and synchronous.
 
 ## Technology Stack Performance
 
@@ -120,7 +136,7 @@ var responseBufferPool = sync.Pool{
 ### On-Disk Object Cache (LRU)
 - **Hit ratio**: >85% for repeated downloads *(unverified — no measurement in this repo)*
 - **Size-based**: Configurable limits (default: 5GB)
-- **Eviction**: Least Recently Used, with an optional TTL phase that evicts expired entries first
+- **Eviction**: Least Recently Used. When a TTL is configured, a periodic sweep expires stale entries regardless of how full the cache is, and a size-driven pass still prefers expired victims over unexpired ones. Before `97282f1` expiry only ran while over quota, so a TTL had no effect on a cache that never filled up
 - **Storage**: Local filesystem, S3, or hybrid (local L1 + S3 L2)
 - **Recency correctness**: `LRULocalStorage` wraps `LocalStorage` and records an access on every read path that yields a size, so a file being served cannot read as cold to the evictor
 
@@ -197,12 +213,12 @@ Requests/sec:   4139.27
 
 ### CPU Optimization
 - **GOMAXPROCS**: Automatic CPU detection
-- **Worker pools**: `WorkerPool[T]` bounds S3 writes and tiered L1 back-fill (not client downloads, which are bounded by singleflight dedup)
+- **Worker pools**: `WorkerPool[T]` bounds the tiered L1 back-fill (not client downloads, which are bounded by singleflight dedup, and no longer S3 writes)
 - **Read-mostly locking**: `sync.RWMutex` on every cache; `ResponseCache.Get` upgrades to a write lock only to reorder LRU
 - **SIMD**: JSON processing acceleration via Sonic
 
 ### Memory Optimization
-- **Buffer reuse**: `sync.Pool` for response buffers and 64KB copy buffers
+- **Buffer reuse**: `sync.Pool` for 64KB download copy buffers and upstream index parsing; nothing pooled on the response or S3 write paths
 - **Package name normalization**: lowercase + `_`→`-`, so cache keys collapse equivalent spellings (this is key normalization, not string interning)
 - **Streaming**: No full-file memory loading
 - **GC tuning**: GOGC=100 for balanced performance

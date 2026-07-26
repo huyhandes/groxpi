@@ -68,9 +68,11 @@ Groxpi provides a fully compliant PyPI Simple API (PEP 503/691) with additional 
   - `package`: Package name
   - `file`: Filename
 - **Behavior**:
-  - If cached: Serves file directly with optimized streaming
+  - If cached: served from the storage backend — by filesystem path when the backend can name one (so `net/http` handles range and conditional requests), otherwise opened and streamed
   - If not cached: Downloads, caches, then serves (or redirects based on timeout)
-  - Uses SingleFlight pattern to deduplicate concurrent downloads
+  - Uses SingleFlight pattern to deduplicate concurrent downloads; the requests that waited are served the freshly cached object, or redirected upstream if the cache write did not land
+  - `ETag` is emitted with exactly one layer of quotes whether it came from the index hash or from the storage backend
+- **Methods**: `GET` only — `HEAD` currently returns `405` (see [Method Handling](#method-handling))
 
 ## Administrative Endpoints
 
@@ -130,16 +132,25 @@ Groxpi provides a fully compliant PyPI Simple API (PEP 503/691) with additional 
 - **Response**: `200 OK` with confirmation message
 - **Use Case**: Force refresh of package files/metadata
 
-### Method Not Allowed Handler
-- **Endpoint**: `ALL /cache/list` (except DELETE)
-- **Description**: Returns 405 Method Not Allowed for non-DELETE requests
-- **Response**: `405 Method Not Allowed`
+## Method Handling
+
+The router runs with gin's `HandleMethodNotAllowed` enabled, so this is **router-wide**, not a per-endpoint handler: any *known* path reached with a method that is not registered on it gets `405 Method Not Allowed` plus an `Allow` header listing the methods that are. Only an *unknown* path falls through to the 404 handler.
+
+| Request | Response |
+|---------|----------|
+| `POST /simple/`, `PUT /simple/{package}/` | `405` + `Allow: GET` |
+| `GET`/`POST`/`PUT`/`PATCH` on `/cache/list` or `/cache/{package}` | `405` + `Allow: DELETE` |
+| `HEAD /simple/{package}/{file}` | `405` + `Allow: GET` |
+| `GET /nonexistent` | `404 Not Found` |
+
+> ⚠️ **`HEAD` returning 405 is a gap, not a design choice.** Only `GET` is registered on the index and download routes, so `HEAD` — which clients legitimately use to check size, `ETag` or freshness without pulling the body — is rejected. Registering `HEAD` alongside each `GET` is an open follow-up (see [`tasks/architecture-improvement-plan.md`](../tasks/architecture-improvement-plan.md)).
 
 ## Error Responses
 
 ### 404 Not Found
-- **Condition**: Invalid routes or non-existent packages/files
+- **Condition**: an unknown route, or a package/file the upstream index does not list
 - **Response**: `404 Not Found` with plain text message
+- **Note**: a known route reached with the wrong method is `405`, not `404`
 
 ### 500 Internal Server Error
 - **Condition**: Server errors, upstream failures
@@ -168,11 +179,12 @@ Groxpi provides a fully compliant PyPI Simple API (PEP 503/691) with additional 
 - **TTL**: Configurable per index (default: 30 minutes)
 - **Strategy**: In-memory cache with automatic expiration
 - **Invalidation**: Manual via `/cache/list` endpoint
+- **Empty results are not cached**: a transient upstream fault returns an empty index for that request only, rather than being cached for the whole TTL
 
 ### File Caching
-- **Strategy**: LRU eviction with size limits
-- **Storage**: Configurable (local filesystem or S3)
-- **Streaming**: Zero-copy optimization for large files
+- **Strategy**: LRU eviction with size limits, plus an independent TTL sweep when one is configured
+- **Storage**: Configurable (local filesystem, S3, or hybrid local L1 + S3 L2)
+- **Streaming**: files are streamed, never buffered whole. Locally cached files are handed to `net/http` by path — this is *not* a kernel zero copy, see [performance.md](performance.md)
 
 ### Response Caching
 - **Duration**: Short-term response caching (5 minutes default)

@@ -133,7 +133,7 @@ Latest benchmark results demonstrate groxpi's exceptional performance:
 **Resource Efficiency:**
 - **Production validated** with popular packages (numpy, pandas, polars, pyspark, fastapi)
 - **Docker containerized** testing for fair comparison
-- **Zero-copy optimizations** for file streaming
+- **Serve-by-path** for locally cached files (not a kernel zero copy — see [performance.md](performance.md))
 - **60-second sustained** load testing with stable performance
 
 ## Use Cases
