@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,9 +53,10 @@ type ServePlan struct {
 }
 
 // packageIndex is the upstream index seam. It exists so the decision tree can be
-// exercised without a live PyPI client.
+// exercised without a live PyPI client. The index to query is a parameter: one
+// client serves every configured index.
 type packageIndex interface {
-	GetPackageFiles(packageName string) ([]pypi.FileInfo, error)
+	GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]pypi.FileInfo, error)
 }
 
 // jsonContentType is the PEP 691 media type of every index body served as JSON.
@@ -122,8 +124,11 @@ type PackageFileService struct {
 	index           packageIndex
 	downloader      streaming.StreamingDownloader
 	sf              singleflight.Group
-	indexTTL        time.Duration
 	downloadTimeout time.Duration
+
+	// indexes is the resolution order: extra indexes first, primary last. Each
+	// carries its own TTL.
+	indexes []config.Index
 
 	// The root index is proxied rather than parsed, so it needs an HTTP client of
 	// its own instead of the typed index client.
@@ -143,7 +148,7 @@ func newPackageFileService(
 		indexCache:      indexCache,
 		index:           index,
 		downloader:      downloader,
-		indexTTL:        cfg.IndexTTL,
+		indexes:         cfg.ResolutionOrder(),
 		downloadTimeout: cfg.DownloadTimeout,
 		rootURL:         strings.TrimSuffix(cfg.IndexURL, "/") + "/",
 		// ponytail: one fixed timeout for the whole proxied response. The root list
@@ -178,7 +183,7 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 		return plan, nil
 	}
 
-	entry, err := s.resolveIndex(packageName)
+	entry, err := s.resolveIndex(ctx, packageName)
 	if err != nil {
 		return plan, fmt.Errorf("failed to resolve index for package %q: %w", packageName, err)
 	}
@@ -232,7 +237,7 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 		log.Info().
 			Str("package", plan.PackageName).
 			Str("file", plan.FileName).
-			Str("file_url", plan.URL).
+			Str("file_url", config.RedactURL(plan.URL)).
 			Int64("file_size", plan.Size).
 			Dur("timeout", plan.Timeout).
 			Msg("🚀 Starting streaming download with simultaneous cache")
@@ -254,7 +259,7 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 	}
 
 	if err != nil {
-		return nil, true, fmt.Errorf("failed to stream %q: %w", plan.URL, err)
+		return nil, true, fmt.Errorf("failed to stream %q: %w", config.RedactURL(plan.URL), err)
 	}
 
 	// A leader that reports no error must have produced a result; anything else
@@ -291,13 +296,15 @@ func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan)
 // serialised bodies, produced together — using the index cache and
 // deduplicating concurrent upstream fetches. It is the only path to the upstream
 // package index.
-func (s *PackageFileService) resolveIndex(packageName string) (*cache.Entry, error) {
+func (s *PackageFileService) resolveIndex(ctx context.Context, packageName string) (*cache.Entry, error) {
 	if entry, found := s.indexCache.GetPackage(packageName); found {
 		return entry, nil
 	}
 
 	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
-		files, err := s.index.GetPackageFiles(packageName)
+		// The fetch fills the cache for every waiter, so it must not die with
+		// whichever client happened to trigger it.
+		index, files, err := s.queryIndexes(context.WithoutCancel(ctx), packageName)
 		if err != nil {
 			return nil, err
 		}
@@ -305,11 +312,12 @@ func (s *PackageFileService) resolveIndex(packageName string) (*cache.Entry, err
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode index for package %q: %w", packageName, err)
 		}
-		entry := cache.NewPackageEntry(files, body)
+		entry := cache.NewPackageEntry(files, body, index.Redacted())
 		// Never cache an empty index: a transient upstream fault would otherwise
-		// poison this package for the whole TTL.
+		// poison this package for the whole TTL. The TTL is the answering index's
+		// own, so a fast-moving private index is not held stale by PyPI's.
 		if len(files) > 0 {
-			s.indexCache.SetPackage(packageName, entry, s.indexTTL)
+			s.indexCache.SetPackage(packageName, entry, index.TTL)
 		}
 		return entry, nil
 	})
@@ -322,6 +330,97 @@ func (s *PackageFileService) resolveIndex(packageName string) (*cache.Entry, err
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
 	return entry, nil
+}
+
+// indexAnswer is one index's reply to one package query.
+type indexAnswer struct {
+	files []pypi.FileInfo
+	err   error
+}
+
+// queryIndexes asks the configured indexes for a package and returns the answer
+// of the highest-priority index that has it — extra indexes before the primary,
+// in configured order. The file list is returned whole: results from different
+// indexes are never merged, unioned or deduplicated, which is what makes
+// dependency confusion impossible rather than something to detect. See
+// docs/adr/0001-extras-first-index-resolution.md.
+//
+// The extras are queried concurrently. The primary is not: it is only asked once
+// every extra has missed, because a speculative query tells the public index
+// which internal package names exist even when its answer is thrown away.
+func (s *PackageFileService) queryIndexes(ctx context.Context, packageName string) (config.Index, []pypi.FileInfo, error) {
+	if len(s.indexes) == 0 {
+		return config.Index{}, nil, fmt.Errorf("%w: %s (no index configured)", pypi.ErrNotFound, packageName)
+	}
+	extras, primary := s.indexes[:len(s.indexes)-1], s.indexes[len(s.indexes)-1]
+
+	if len(extras) > 0 {
+		index, files, err := s.queryConcurrently(ctx, extras, packageName)
+		// Only a miss on every extra falls through to the primary. A success is the
+		// answer, and a failure aborts: if the private index is unreachable, serving
+		// the public index's files under an internal name is exactly the outcome the
+		// ordering exists to prevent.
+		if !errors.Is(err, pypi.ErrNotFound) {
+			return index, files, err
+		}
+	}
+	return s.queryConcurrently(ctx, []config.Index{primary}, packageName)
+}
+
+// queryConcurrently queries indexes in parallel and returns the answer of the
+// first one in slice order that has the package. Selection waits for each index in
+// turn, so arrival order cannot decide: a fast index never answers for a name a
+// slower higher-priority index also has. Once an index has answered, the
+// lower-priority queries still in flight are cancelled.
+func (s *PackageFileService) queryConcurrently(ctx context.Context, indexes []config.Index, packageName string) (config.Index, []pypi.FileInfo, error) {
+	answers := make([]indexAnswer, len(indexes))
+	done := make([]chan struct{}, len(indexes))
+	cancels := make([]context.CancelFunc, len(indexes))
+
+	for i, index := range indexes {
+		queryCtx, cancel := context.WithCancel(ctx)
+		done[i], cancels[i] = make(chan struct{}), cancel
+		go func(i int, index config.Index) {
+			defer close(done[i])
+			files, err := s.index.GetPackageFiles(queryCtx, index, packageName)
+			// Written before the channel closes and read after: no other
+			// synchronisation is needed.
+			answers[i] = indexAnswer{files: files, err: err}
+		}(i, index)
+	}
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
+
+	for i, index := range indexes {
+		select {
+		case <-done[i]:
+		case <-ctx.Done():
+			return config.Index{}, nil, ctx.Err()
+		}
+
+		switch answer := answers[i]; {
+		case answer.err == nil:
+			log.Debug().
+				Str("package", packageName).
+				Str("index", index.Redacted()).
+				Int("files", len(answer.files)).
+				Msg("Package resolved from index")
+			return index, answer.files, nil
+		case errors.Is(answer.err, pypi.ErrNotFound):
+			log.Debug().
+				Str("package", packageName).
+				Str("index", index.Redacted()).
+				Msg("Package not on index, trying the next")
+		default:
+			return config.Index{}, nil, fmt.Errorf("index %s failed for package %q: %w",
+				index.Redacted(), packageName, answer.err)
+		}
+	}
+
+	return config.Index{}, nil, fmt.Errorf("%w: %s", pypi.ErrNotFound, packageName)
 }
 
 // rootResponse is one upstream root-index response, held only as long as it

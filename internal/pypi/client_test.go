@@ -1,6 +1,8 @@
 package pypi
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,7 +68,7 @@ func TestClient_MakeRequest(t *testing.T) {
 	cfg := &config.Config{IndexURL: server.URL}
 	client := NewClient(cfg)
 
-	resp, err := client.makeRequest(server.URL, "application/vnd.pypi.simple.v1+json")
+	resp, err := client.makeRequest(context.Background(), server.URL, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
 		t.Fatalf("makeRequest failed: %v", err)
 	}
@@ -235,7 +237,7 @@ func TestClient_GetPackageFiles(t *testing.T) {
 	cfg := &config.Config{IndexURL: server.URL}
 	client := NewClient(cfg)
 
-	files, err := client.GetPackageFiles(packageName)
+	files, err := client.GetPackageFiles(context.Background(), config.Index{URL: server.URL}, packageName)
 	if err != nil {
 		t.Fatalf("GetPackageFiles failed: %v", err)
 	}
@@ -260,13 +262,13 @@ func TestClient_GetPackageFiles_NotFound(t *testing.T) {
 	cfg := &config.Config{IndexURL: server.URL}
 	client := NewClient(cfg)
 
-	_, err := client.GetPackageFiles("non-existent-package")
+	_, err := client.GetPackageFiles(context.Background(), config.Index{URL: server.URL}, "non-existent-package")
 	if err == nil {
 		t.Error("Expected error for non-existent package")
 	}
 
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("Expected 'not found' in error message, got: %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Expected ErrNotFound, got: %v", err)
 	}
 }
 

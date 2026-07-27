@@ -155,7 +155,7 @@ func (s *Server) handleHome(c *gin.Context) {
 	</ul>
 	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a></p>
 </body>
-</html>`, s.config.IndexURL, s.config.CacheSize/(1024*1024), s.config.IndexTTL.String())
+</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String())
 
 	c.Header("Content-Type", "text/html")
 	c.String(http.StatusOK, html)
@@ -190,11 +190,10 @@ func (s *Server) handleListFiles(c *gin.Context) {
 
 	// One index-resolution path, shared with the download handler: cache lookup,
 	// deduplicated upstream fetch, cache fill.
-	entry, err := s.packageFiles.resolveIndex(packageName)
+	entry, err := s.packageFiles.resolveIndex(c.Request.Context(), packageName)
 	if err != nil {
-		// TODO: internal/pypi has no not-found sentinel, so the miss can only be
-		// recognised by its message. Replace with errors.Is once it exposes one.
-		if strings.Contains(err.Error(), "not found") {
+		// A miss means every configured index was consulted and none had it.
+		if errors.Is(err, pypi.ErrNotFound) {
 			c.String(http.StatusNotFound, "Package not found")
 			return
 		}
@@ -439,13 +438,26 @@ func (s *Server) handleHealth(c *gin.Context) {
 		"status":    "success",
 		"timestamp": time.Now().Unix(),
 		"data": gin.H{
-			"cache_dir":         s.config.CacheDir,
-			"index_url":         s.config.IndexURL,
+			"cache_dir": s.config.CacheDir,
+			// Redacted at the call site: an unauthenticated probe must not be able to
+			// read an index's credentials out of this payload.
+			"index_url":         config.RedactURL(s.config.IndexURL),
+			"extra_index_urls":  redactedIndexes(s.config.ExtraIndexURLs),
 			"cache_size":        s.config.CacheSize,
 			"index_ttl_seconds": int(s.config.IndexTTL.Seconds()),
 			"storage_type":      s.config.StorageType,
 		},
 	})
+}
+
+// redactedIndexes renders a configured index list for display. Always non-nil so
+// the health payload carries an empty array rather than a null.
+func redactedIndexes(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		out = append(out, config.RedactURL(u))
+	}
+	return out
 }
 
 func wantsJSON(c *gin.Context) bool {

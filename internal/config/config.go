@@ -1,11 +1,65 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// defaultExtraIndexTTL is the TTL an extra index gets when its position in
+// GROXPI_EXTRA_INDEX_TTLS is missing or unparseable.
+const defaultExtraIndexTTL = 3 * time.Minute
+
+// Index is one configured upstream index: where to fetch from, and how long its
+// answers stay cached. The TTL is per index so a fast-moving private index can be
+// refreshed more often than PyPI.
+type Index struct {
+	URL string
+	TTL time.Duration
+}
+
+// Redacted renders the index URL with any credentials removed. Every log field,
+// error message and response body that names an index goes through this; the raw
+// URL is never formatted directly, because a URL reaches a log through wrapped
+// errors that never passed a logging call.
+func (i Index) Redacted() string { return RedactURL(i.URL) }
+
+// RedactURL replaces a URL's user-info with a fixed placeholder, leaving URLs
+// without credentials untouched. An unparseable URL is dropped whole: we cannot
+// tell where its credentials end.
+//
+// It lives here rather than beside the HTTP client because internal/pypi already
+// imports this package, so a helper both sides can reach has to sit on the side
+// without the dependency.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[unparseable-url]"
+	}
+	if u.User == nil {
+		return raw
+	}
+	u.User = url.User("redacted")
+	return u.String()
+}
+
+// ResolutionOrder returns the indexes to consult for a package: the extra
+// indexes first in configured order, then the primary last. The first index that
+// has the package wins and its file list is used whole — see
+// docs/adr/0001-extras-first-index-resolution.md.
+func (c *Config) ResolutionOrder() []Index {
+	indexes := make([]Index, 0, len(c.ExtraIndexURLs)+1)
+	for i, extra := range c.ExtraIndexURLs {
+		ttl := defaultExtraIndexTTL
+		if i < len(c.ExtraIndexTTLs) && c.ExtraIndexTTLs[i] > 0 {
+			ttl = c.ExtraIndexTTLs[i]
+		}
+		indexes = append(indexes, Index{URL: extra, TTL: ttl})
+	}
+	return append(indexes, Index{URL: c.IndexURL, TTL: c.IndexTTL})
+}
 
 type Config struct {
 	// Index configuration
@@ -109,14 +163,14 @@ func Load() *Config {
 			if ttl, err := strconv.Atoi(ttlStr); err == nil {
 				cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
 			} else {
-				cfg.ExtraIndexTTLs[i] = 3 * time.Minute // default
+				cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 			}
 		}
 	} else {
 		// Default TTL for extra indices
 		cfg.ExtraIndexTTLs = make([]time.Duration, len(cfg.ExtraIndexURLs))
 		for i := range cfg.ExtraIndexTTLs {
-			cfg.ExtraIndexTTLs[i] = 3 * time.Minute
+			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 		}
 	}
 
