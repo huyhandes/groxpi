@@ -17,6 +17,10 @@ type Config struct {
 	// Cache configuration
 	CacheSize int64
 	CacheDir  string
+	// IndexCacheSize bounds the in-memory index cache across every stored
+	// representation (parsed list, JSON body, gzipped body). The 256 MB default
+	// is provisional: it cannot be tuned honestly until cache metrics exist.
+	IndexCacheSize int64
 
 	// Storage configuration
 	StorageType       string // "local", "s3", or "hybrid"
@@ -59,7 +63,8 @@ func Load() *Config {
 	cfg := &Config{
 		IndexURL:               getEnv("GROXPI_INDEX_URL", "https://pypi.org/simple/"),
 		IndexTTL:               getDurationEnv("GROXPI_INDEX_TTL", 30*time.Minute),
-		CacheSize:              getIntEnv("GROXPI_CACHE_SIZE", 5*1024*1024*1024), // 5GB
+		CacheSize:              getIntEnv("GROXPI_CACHE_SIZE", 5*1024*1024*1024),    // 5GB
+		IndexCacheSize:         getIntEnv("GROXPI_INDEX_CACHE_SIZE", 256*1024*1024), // 256MB, provisional
 		CacheDir:               getEnv("GROXPI_CACHE_DIR", ""),
 		DownloadTimeout:        getFloatDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
 		Port:                   getEnv("PORT", "5000"),

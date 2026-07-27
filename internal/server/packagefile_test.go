@@ -174,7 +174,7 @@ func newTestService(t *testing.T, st storage.Storage, index *fakeIndex, dl strea
 		IndexTTL:        5 * time.Minute,
 		DownloadTimeout: downloadTimeout,
 	}
-	return newPackageFileService(cfg, st, cache.NewIndexCache(), index, dl)
+	return newPackageFileService(cfg, st, cache.NewIndexCache(0, 0), index, dl)
 }
 
 func indexWith(pkg string, files ...pypi.FileInfo) *fakeIndex {
@@ -302,7 +302,9 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := newTestService(t, tt.storage, tt.index, &fakeDownloader{}, tt.downloadTimeout)
 			if tt.seedIndexCache != nil {
-				svc.indexCache.SetPackage(pkg, tt.seedIndexCache, time.Minute)
+				body, err := encodePackageFiles(pkg, tt.seedIndexCache)
+				require.NoError(t, err)
+				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body), time.Minute)
 			}
 
 			plan, err := svc.Plan(context.Background(), pkg, file)

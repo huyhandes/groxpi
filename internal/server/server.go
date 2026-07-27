@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,12 +23,11 @@ import (
 )
 
 type Server struct {
-	config        *config.Config
-	indexCache    *cache.IndexCache
-	responseCache *cache.ResponseCache
-	pypiClient    *pypi.Client
-	storage       storage.Storage
-	router        *gin.Engine
+	config     *config.Config
+	indexCache *cache.IndexCache
+	pypiClient *pypi.Client
+	storage    storage.Storage
+	router     *gin.Engine
 	// packageFiles owns index resolution, the package-file miss pipeline and the
 	// single singleflight.Group that deduplicates both.
 	packageFiles *PackageFileService
@@ -83,12 +81,13 @@ func New(cfg *config.Config) *Server {
 	}
 
 	s := &Server{
-		config:        cfg,
-		indexCache:    cache.NewIndexCache(),
-		responseCache: cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
-		pypiClient:    pypi.NewClient(cfg),
-		storage:       storageBackend,
-		router:        router,
+		config: cfg,
+		// Expired entries are swept at the index TTL cadence: an entry outlives its
+		// TTL by at most one interval, and nothing scans on the read path.
+		indexCache: cache.NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL),
+		pypiClient: pypi.NewClient(cfg),
+		storage:    storageBackend,
+		router:     router,
 	}
 
 	s.packageFiles = newPackageFileService(
@@ -107,8 +106,10 @@ func (s *Server) Router() *gin.Engine {
 	return s.router
 }
 
-// Close releases the storage backend. Called from the shutdown path.
+// Close stops the index-cache sweeper and releases the storage backend. Called
+// from the shutdown path.
 func (s *Server) Close() error {
+	s.indexCache.Close()
 	return s.storage.Close()
 }
 
@@ -161,44 +162,22 @@ func (s *Server) handleHome(c *gin.Context) {
 	c.String(http.StatusOK, html)
 }
 
-func (s *Server) handleListPackages(c *gin.Context) {
-	// Check response cache first for JSON requests
-	if wantsJSON(c) {
-		cacheKey := "json:package-list"
-		if cachedJSON, found := s.responseCache.Get(cacheKey); found {
-			c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", cachedJSON)
-			return
-		}
-	}
+// emptyPackageListJSON is what a failed upstream list serves: the same shape
+// encodePackageList produces for no packages.
+const emptyPackageListJSON = `{"meta":{"api-version":"1.0"},"projects":[]}`
 
-	packages, err := s.packageFiles.resolvePackageList()
+func (s *Server) handleListPackages(c *gin.Context) {
+	// One entry per resource: the body was marshalled when the cache was filled,
+	// so a hit writes bytes and marshals nothing.
+	entry, err := s.packageFiles.resolvePackageList()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch package list")
-		packages = []string{} // Use empty list on error
-	}
-
-	if wantsJSON(c) {
-		// Pre-allocate with exact capacity
-		projects := make([]map[string]string, 0, len(packages))
-		for _, pkg := range packages {
-			projects = append(projects, map[string]string{"name": pkg})
-		}
-
-		response := map[string]any{
-			"meta": map[string]any{
-				"api-version": "1.0",
-			},
-			"projects": projects,
-		}
-
-		responseData, err := json.Marshal(response)
-		if err != nil {
-			c.String(http.StatusInternalServerError, "JSON encoding error")
+		if wantsJSON(c) {
+			c.Data(http.StatusOK, jsonContentType, []byte(emptyPackageListJSON))
 			return
 		}
-
-		s.responseCache.Set("json:package-list", responseData, s.config.IndexTTL)
-		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
+	} else if wantsJSON(c) {
+		c.Data(http.StatusOK, jsonContentType, entry.JSON)
 		return
 	}
 
@@ -219,18 +198,9 @@ func (s *Server) handleListPackages(c *gin.Context) {
 func (s *Server) handleListFiles(c *gin.Context) {
 	packageName := pypi.NormalizeName(c.Param("package"))
 
-	// Check response cache first for JSON requests
-	if wantsJSON(c) {
-		cacheKey := "json:package:" + packageName
-		if cachedJSON, found := s.responseCache.Get(cacheKey); found {
-			c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", cachedJSON)
-			return
-		}
-	}
-
 	// One index-resolution path, shared with the download handler: cache lookup,
 	// deduplicated upstream fetch, cache fill.
-	files, err := s.packageFiles.resolveIndex(packageName)
+	entry, err := s.packageFiles.resolveIndex(packageName)
 	if err != nil {
 		// TODO: internal/pypi has no not-found sentinel, so the miss can only be
 		// recognised by its message. Replace with errors.Is once it exposes one.
@@ -243,57 +213,17 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		return
 	}
 
-	s.renderPackageFiles(c, packageName, files)
-}
-
-func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []pypi.FileInfo) {
 	if wantsJSON(c) {
-		// Pre-allocate slice with exact capacity
-		fileList := make([]map[string]any, 0, len(files))
-
-		for _, file := range files {
-			// Use simple map
-			fileMap := make(map[string]any, 6)
-			fileMap["filename"] = file.Name
-			// Rewrite URL to point to proxy instead of direct PyPI
-			fileMap["url"] = fmt.Sprintf("/simple/%s/%s", packageName, file.Name)
-
-			if len(file.Hashes) > 0 {
-				fileMap["hashes"] = file.Hashes
-			}
-			if file.RequiresPython != "" {
-				fileMap["requires-python"] = file.RequiresPython
-			}
-			if file.IsYanked() {
-				fileMap["yanked"] = true
-				yankedReason := file.GetYankedReason()
-				if yankedReason != "" {
-					fileMap["yanked-reason"] = yankedReason
-				}
-			}
-			fileList = append(fileList, fileMap)
-		}
-
-		// Build response structure
-		response := map[string]any{
-			"meta": map[string]any{
-				"api-version": "1.0",
-			},
-			"name":  packageName,
-			"files": fileList,
-		}
-
-		responseData, err := json.Marshal(response)
-		if err != nil {
-			c.String(http.StatusInternalServerError, "JSON encoding error")
-			return
-		}
-
-		s.responseCache.Set("json:package:"+packageName, responseData, s.config.IndexTTL)
-		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
+		c.Data(http.StatusOK, jsonContentType, entry.JSON)
 		return
 	}
+	renderPackageFilesHTML(c, packageName, entry.Files)
+}
 
+// renderPackageFilesHTML renders the index page from the parsed file list. HTML
+// is the uncommon content type, so it is produced on demand rather than stored
+// as a third copy per package.
+func renderPackageFilesHTML(c *gin.Context, packageName string, files []pypi.FileInfo) {
 	// Return HTML for package files using string builder for efficiency
 	var sb strings.Builder
 	sb.Grow(1024 + len(files)*200) // Pre-allocate estimated size
@@ -312,7 +242,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
 		// Rewrite URL to point to proxy instead of direct PyPI
-		_, _ = fmt.Fprintf(&sb, "/simple/%s/%s", packageName, file.Name)
+		sb.WriteString(proxyFileURL(packageName, file.Name))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {
@@ -455,9 +385,7 @@ func (hw *headerWriter) Write(p []byte) (int, error) {
 }
 
 func (s *Server) handleCacheList(c *gin.Context) {
-	// Invalidate both index and response caches
 	s.indexCache.InvalidateList()
-	s.responseCache.Invalidate("json:package-list")
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
@@ -476,9 +404,7 @@ func (s *Server) handleCachePackage(c *gin.Context) {
 		return
 	}
 
-	// Invalidate both index and response caches
 	s.indexCache.InvalidatePackage(packageName)
-	s.responseCache.Invalidate("json:package:" + packageName)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",

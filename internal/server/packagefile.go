@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
@@ -58,7 +59,82 @@ type packageIndex interface {
 
 // packageListKey names the package list in both the index cache and the
 // singleflight group.
-const packageListKey = "package-list"
+const packageListKey = cache.ListKey
+
+// jsonContentType is the PEP 691 media type of every index body served as JSON.
+const jsonContentType = "application/vnd.pypi.simple.v1+json"
+
+// The wire shapes below are the typed replacement for the maps the index
+// responses used to be built from. Fields are declared in the key order
+// encoding/json emitted for those maps (alphabetical), so response bytes are
+// unchanged.
+
+type wireMeta struct {
+	APIVersion string `json:"api-version"`
+}
+
+type wireFile struct {
+	Filename       string            `json:"filename"`
+	Hashes         map[string]string `json:"hashes,omitempty"`
+	RequiresPython string            `json:"requires-python,omitempty"`
+	URL            string            `json:"url"`
+	Yanked         bool              `json:"yanked,omitempty"`
+	YankedReason   string            `json:"yanked-reason,omitempty"`
+}
+
+type wireFiles struct {
+	Files []wireFile `json:"files"`
+	Meta  wireMeta   `json:"meta"`
+	Name  string     `json:"name"`
+}
+
+type wireProject struct {
+	Name string `json:"name"`
+}
+
+type wireProjects struct {
+	Meta     wireMeta      `json:"meta"`
+	Projects []wireProject `json:"projects"`
+}
+
+// encodePackageFiles marshals a package's file list, rewriting every URL to
+// point at this proxy.
+func encodePackageFiles(packageName string, files []pypi.FileInfo) ([]byte, error) {
+	body := wireFiles{
+		Files: make([]wireFile, 0, len(files)),
+		Meta:  wireMeta{APIVersion: "1.0"},
+		Name:  packageName,
+	}
+	for _, file := range files {
+		wf := wireFile{
+			Filename:       file.Name,
+			Hashes:         file.Hashes,
+			RequiresPython: file.RequiresPython,
+			URL:            proxyFileURL(packageName, file.Name),
+		}
+		if file.IsYanked() {
+			wf.Yanked = true
+			wf.YankedReason = file.GetYankedReason()
+		}
+		body.Files = append(body.Files, wf)
+	}
+	return json.Marshal(body)
+}
+
+func encodePackageList(packages []string) ([]byte, error) {
+	body := wireProjects{
+		Meta:     wireMeta{APIVersion: "1.0"},
+		Projects: make([]wireProject, 0, len(packages)),
+	}
+	for _, name := range packages {
+		body.Projects = append(body.Projects, wireProject{Name: name})
+	}
+	return json.Marshal(body)
+}
+
+func proxyFileURL(packageName, fileName string) string {
+	return "/simple/" + packageName + "/" + fileName
+}
 
 // PackageFileService owns index resolution and the package-file miss pipeline:
 // storage lookup, caches, deduplicated upstream fetch. It never touches the HTTP
@@ -116,12 +192,12 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 		return plan, nil
 	}
 
-	files, err := s.resolveIndex(packageName)
+	entry, err := s.resolveIndex(packageName)
 	if err != nil {
 		return plan, fmt.Errorf("failed to resolve index for package %q: %w", packageName, err)
 	}
 
-	info, ok := findFile(files, fileName)
+	info, ok := findFile(entry.Files, fileName)
 	if !ok {
 		return plan, nil
 	}
@@ -225,61 +301,76 @@ func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan)
 	return plan
 }
 
-// resolveIndex returns the index entries for a package, using the index cache
-// and deduplicating concurrent upstream fetches. It is the only path to the
-// upstream package index.
-func (s *PackageFileService) resolveIndex(packageName string) ([]pypi.FileInfo, error) {
-	if cached, found := s.indexCache.GetPackage(packageName); found {
-		if files, ok := cached.([]pypi.FileInfo); ok {
-			return files, nil
-		}
+// resolveIndex returns the cache entry for a package — parsed file list and
+// serialised bodies, produced together — using the index cache and
+// deduplicating concurrent upstream fetches. It is the only path to the upstream
+// package index.
+func (s *PackageFileService) resolveIndex(packageName string) (*cache.Entry, error) {
+	if entry, found := s.indexCache.GetPackage(packageName); found {
+		return entry, nil
 	}
 
 	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
-		return s.index.GetPackageFiles(packageName)
+		files, err := s.index.GetPackageFiles(packageName)
+		if err != nil {
+			return nil, err
+		}
+		body, err := encodePackageFiles(packageName, files)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode index for package %q: %w", packageName, err)
+		}
+		entry := cache.NewPackageEntry(files, body)
+		// Never cache an empty index: a transient upstream fault would otherwise
+		// poison this package for the whole TTL.
+		if len(files) > 0 {
+			s.indexCache.SetPackage(packageName, entry, s.indexTTL)
+		}
+		return entry, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	files, ok := result.([]pypi.FileInfo)
+	entry, ok := result.(*cache.Entry)
 	if !ok {
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
-	// Never cache an empty index: a transient upstream fault would otherwise
-	// poison this package for the whole TTL.
-	if len(files) > 0 {
-		s.indexCache.SetPackage(packageName, files, s.indexTTL)
-	}
-	return files, nil
+	return entry, nil
 }
 
-// resolvePackageList returns the full package list, using the index cache and
-// deduplicating concurrent upstream fetches. It is the only path to the upstream
-// package list.
-func (s *PackageFileService) resolvePackageList() ([]string, error) {
-	if cached, found := s.indexCache.Get(packageListKey); found {
-		if packages, ok := cached.([]string); ok {
-			return packages, nil
-		}
+// resolvePackageList returns the cache entry for the full package list, using
+// the index cache and deduplicating concurrent upstream fetches. It is the only
+// path to the upstream package list.
+func (s *PackageFileService) resolvePackageList() (*cache.Entry, error) {
+	if entry, found := s.indexCache.Get(packageListKey); found {
+		return entry, nil
 	}
 
 	result, err, _ := s.sf.Do(packageListKey, func() (any, error) {
-		return s.index.GetPackageList()
+		packages, err := s.index.GetPackageList()
+		if err != nil {
+			return nil, err
+		}
+		body, err := encodePackageList(packages)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode package list: %w", err)
+		}
+		entry := cache.NewListEntry(packages, body)
+		// Never cache an empty list, for the same reason as resolveIndex.
+		if len(packages) > 0 {
+			s.indexCache.Set(packageListKey, entry, s.indexTTL)
+		}
+		return entry, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve package list: %w", err)
 	}
 
-	packages, ok := result.([]string)
+	entry, ok := result.(*cache.Entry)
 	if !ok {
 		return nil, fmt.Errorf("unexpected package list result type %T", result)
 	}
-	// Never cache an empty list, for the same reason as resolveIndex.
-	if len(packages) > 0 {
-		s.indexCache.Set(packageListKey, packages, s.indexTTL)
-	}
-	return packages, nil
+	return entry, nil
 }
 
 func storageKeyFor(packageName, fileName string) string {

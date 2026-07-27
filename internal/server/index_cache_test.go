@@ -1,0 +1,159 @@
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/huyhandes/groxpi/internal/config"
+)
+
+// fakeIndexServer is an upstream index that counts how often each package page
+// is fetched.
+type fakeIndexServer struct {
+	*httptest.Server
+	mu    sync.Mutex
+	hits  map[string]int
+	total int
+}
+
+func newFakeIndexServer(t *testing.T) *fakeIndexServer {
+	t.Helper()
+	f := &fakeIndexServer{hits: map[string]int{}}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path
+		f.mu.Lock()
+		f.hits[name]++
+		f.total++
+		f.mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body>
+<a href="/files/%s-1.0.tar.gz" data-requires-python="&gt;=3.8">%s-1.0.tar.gz</a>
+</body></html>`, name[1:len(name)-1], name[1:len(name)-1])
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+func (f *fakeIndexServer) hitsFor(pkg string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hits["/"+pkg+"/"]
+}
+
+func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/?format=application/vnd.pypi.simple.v1+json", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	resp := w.Result()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return body
+}
+
+// TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
+// merged entry: the body is marshalled once at fill time and every later request
+// writes the same bytes.
+func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
+	upstream := newFakeIndexServer(t)
+	srv := New(&config.Config{
+		IndexURL:        upstream.URL,
+		CacheDir:        t.TempDir(),
+		IndexTTL:        time.Hour,
+		IndexCacheSize:  1 << 20,
+		DownloadTimeout: time.Second,
+		LogLevel:        "ERROR",
+	})
+	defer func() { _ = srv.Close() }()
+
+	first := getIndex(t, srv.Router(), "numpy")
+	second := getIndex(t, srv.Router(), "numpy")
+
+	assert.Equal(t, string(first), string(second), "cached responses must be byte-identical")
+	assert.Equal(t, 1, upstream.hitsFor("numpy"), "the second request must be served from cache")
+
+	// The compressed representation stored alongside the body must decode to it.
+	entry, ok := srv.indexCache.GetPackage("numpy")
+	require.True(t, ok, "the package must be cached")
+	assert.Equal(t, string(first), string(entry.JSON))
+	zr, err := gzip.NewReader(bytes.NewReader(entry.GZIP))
+	require.NoError(t, err)
+	unzipped, err := io.ReadAll(zr)
+	require.NoError(t, err)
+	assert.Equal(t, string(entry.JSON), string(unzipped))
+
+	// HTML renders from the same parsed list.
+	req := httptest.NewRequest(http.MethodGet, "/simple/numpy/", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), "numpy-1.0.tar.gz")
+	assert.Equal(t, 1, upstream.hitsFor("numpy"), "HTML must not refetch")
+}
+
+// TestIndexCache_ByteBudgetForcesRefetch covers the bound: once the budget is
+// exceeded the least recently used package is dropped and has to be refetched.
+func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
+	upstream := newFakeIndexServer(t)
+	srv := New(&config.Config{
+		IndexURL: upstream.URL,
+		CacheDir: t.TempDir(),
+		IndexTTL: time.Hour,
+		// Small enough that a couple of one-file indices blow the budget.
+		IndexCacheSize:  400,
+		DownloadTimeout: time.Second,
+		LogLevel:        "ERROR",
+	})
+	defer func() { _ = srv.Close() }()
+
+	packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
+	for _, pkg := range packages {
+		getIndex(t, srv.Router(), pkg)
+		time.Sleep(2 * time.Millisecond) // distinguish recency
+	}
+	assert.LessOrEqual(t, srv.indexCache.Bytes(), int64(400), "cache must stay inside its budget")
+
+	getIndex(t, srv.Router(), packages[0])
+	assert.Equal(t, 2, upstream.hitsFor(packages[0]),
+		"the earliest package should have been evicted and refetched")
+}
+
+// TestIndexCache_SweepExpiresWithoutARequest covers the sweeper: an entry past
+// its TTL is gone before anybody asks for it, and the next request refetches.
+func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
+	upstream := newFakeIndexServer(t)
+	srv := New(&config.Config{
+		IndexURL:        upstream.URL,
+		CacheDir:        t.TempDir(),
+		IndexTTL:        20 * time.Millisecond,
+		IndexCacheSize:  1 << 20,
+		DownloadTimeout: time.Second,
+		LogLevel:        "ERROR",
+	})
+	defer func() { _ = srv.Close() }()
+
+	getIndex(t, srv.Router(), "numpy")
+	require.Equal(t, 1, srv.indexCache.Len())
+
+	// No requests at all while we wait: only the background sweep can empty this.
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.indexCache.Len() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Zero(t, srv.indexCache.Len(), "the sweep should have reclaimed the expired entry")
+
+	getIndex(t, srv.Router(), "numpy")
+	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an expired package must be refetched")
+}

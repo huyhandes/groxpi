@@ -1,226 +1,173 @@
 package cache
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/huyhandes/groxpi/internal/pypi"
 )
 
-func TestNewIndexCache(t *testing.T) {
-	indexCache := NewIndexCache()
+func testEntry(body string) *Entry {
+	return NewPackageEntry([]pypi.FileInfo{{Name: "a.whl"}}, []byte(body))
+}
 
-	if indexCache == nil {
-		t.Fatal("NewIndexCache() returned nil")
+func TestEntry_GzipDecodesToJSON(t *testing.T) {
+	body := `{"files":[{"filename":"a.whl","url":"/simple/a/a.whl"}],"meta":{"api-version":"1.0"},"name":"a"}`
+	e := testEntry(body)
+
+	zr, err := gzip.NewReader(bytes.NewReader(e.GZIP))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
 	}
-
-	// Skip internal field checks
+	got, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read gzip: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("gzip form decodes to %q, want %q", got, body)
+	}
+	if e.Size() <= 0 {
+		t.Fatal("entry size must be positive")
+	}
 }
 
 func TestIndexCache_SetAndGet(t *testing.T) {
-	indexCache := NewIndexCache()
+	c := NewIndexCache(0, 0)
+	defer c.Close()
 
-	t.Run("set and get valid entry", func(t *testing.T) {
-		key := "test-key"
-		data := "test-data"
-		ttl := 5 * time.Second
+	entry := testEntry(`{"a":1}`)
+	c.Set("k", entry, time.Minute)
 
-		indexCache.Set(key, data, ttl)
-
-		result, exists := indexCache.Get(key)
-		if !exists {
-			t.Error("Expected entry to exist")
-		}
-
-		if result != data {
-			t.Errorf("Expected '%s', got '%s'", data, result)
-		}
-	})
-
-	t.Run("get non-existent entry", func(t *testing.T) {
-		_, exists := indexCache.Get("non-existent-key")
-		if exists {
-			t.Error("Expected entry to not exist")
-		}
-	})
-
-	t.Run("get expired entry", func(t *testing.T) {
-		key := "expired-key"
-		data := "expired-data"
-		ttl := 10 * time.Millisecond
-
-		indexCache.Set(key, data, ttl)
-
-		// Wait for expiration
-		time.Sleep(20 * time.Millisecond)
-
-		_, exists := indexCache.Get(key)
-		if exists {
-			t.Error("Expected expired entry to not exist")
-		}
-	})
-
-	t.Run("overwrite existing entry", func(t *testing.T) {
-		key := "overwrite-key"
-		data1 := "first-data"
-		data2 := "second-data"
-		ttl := 5 * time.Second
-
-		indexCache.Set(key, data1, ttl)
-		indexCache.Set(key, data2, ttl)
-
-		result, exists := indexCache.Get(key)
-		if !exists {
-			t.Error("Expected entry to exist")
-		}
-
-		if result != data2 {
-			t.Errorf("Expected '%s', got '%s'", data2, result)
-		}
-	})
-}
-
-func TestIndexCache_InvalidateList(t *testing.T) {
-	indexCache := NewIndexCache()
-
-	// Set package list
-	indexCache.Set("package-list", []string{"package1", "package2"}, 5*time.Second)
-
-	// Verify it exists
-	_, exists := indexCache.Get("package-list")
-	if !exists {
-		t.Error("Expected package-list to exist before invalidation")
+	got, ok := c.Get("k")
+	if !ok || got != entry {
+		t.Fatalf("Get returned (%v, %v), want the stored entry", got, ok)
 	}
-
-	// Invalidate
-	indexCache.InvalidateList()
-
-	// Verify it's gone
-	_, exists = indexCache.Get("package-list")
-	if exists {
-		t.Error("Expected package-list to be invalidated")
+	if _, ok := c.Get("missing"); ok {
+		t.Fatal("Get of a missing key must miss")
 	}
 }
 
-func TestIndexCache_InvalidatePackage(t *testing.T) {
-	indexCache := NewIndexCache()
+func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
+	c := NewIndexCache(0, 0)
+	defer c.Close()
 
-	packageName := "test-package"
-	key := "package:" + packageName
+	for _, ttl := range []time.Duration{0, -time.Second, 10 * time.Millisecond} {
+		c.Set("k", testEntry(`{"a":1}`), ttl)
+		if ttl > 0 {
+			time.Sleep(ttl + 10*time.Millisecond)
+		}
+		if _, ok := c.Get("k"); ok {
+			t.Fatalf("entry with ttl %v must not be readable", ttl)
+		}
+	}
+}
 
-	// Set package data
-	indexCache.Set(key, []string{"file1.whl", "file2.tar.gz"}, 5*time.Second)
+func TestIndexCache_PackageAndListHelpers(t *testing.T) {
+	c := NewIndexCache(0, 0)
+	defer c.Close()
 
-	// Verify it exists
-	_, exists := indexCache.Get(key)
-	if !exists {
-		t.Error("Expected package data to exist before invalidation")
+	c.SetPackage("numpy", testEntry(`{"a":1}`), time.Minute)
+	if _, ok := c.GetPackage("numpy"); !ok {
+		t.Fatal("package entry should be cached")
+	}
+	c.InvalidatePackage("numpy")
+	if _, ok := c.GetPackage("numpy"); ok {
+		t.Fatal("package entry should be invalidated")
 	}
 
-	// Invalidate
-	indexCache.InvalidatePackage(packageName)
-
-	// Verify it's gone
-	_, exists = indexCache.Get(key)
-	if exists {
-		t.Error("Expected package data to be invalidated")
+	c.Set(ListKey, NewListEntry([]string{"numpy"}, []byte(`{"a":1}`)), time.Minute)
+	c.InvalidateList()
+	if _, ok := c.Get(ListKey); ok {
+		t.Fatal("package list should be invalidated")
 	}
+	if c.Bytes() != 0 {
+		t.Fatalf("invalidation must refund bytes, still holding %d", c.Bytes())
+	}
+}
+
+func TestIndexCache_ByteBudgetEvictsLeastRecentlyUsed(t *testing.T) {
+	one := testEntry(`{"a":1}`)
+	c := NewIndexCache(2*one.Size(), 0)
+	defer c.Close()
+
+	c.Set("a", testEntry(`{"a":1}`), time.Minute)
+	time.Sleep(2 * time.Millisecond)
+	c.Set("b", testEntry(`{"a":1}`), time.Minute)
+	time.Sleep(2 * time.Millisecond)
+
+	// Touch "a" so "b" becomes the least recently used.
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("a should still be cached")
+	}
+	time.Sleep(2 * time.Millisecond)
+	c.Set("c", testEntry(`{"a":1}`), time.Minute)
+
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("b was least recently used and should have been evicted")
+	}
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("a was touched and should have survived")
+	}
+	if c.Bytes() > 2*one.Size() {
+		t.Fatalf("cache holds %d bytes, over the %d budget", c.Bytes(), 2*one.Size())
+	}
+}
+
+func TestIndexCache_ReplacingAKeyDoesNotDoubleCount(t *testing.T) {
+	c := NewIndexCache(0, 0)
+	defer c.Close()
+
+	entry := testEntry(`{"a":1}`)
+	for range 5 {
+		c.Set("k", testEntry(`{"a":1}`), time.Minute)
+	}
+	if c.Len() != 1 {
+		t.Fatalf("Len = %d, want 1", c.Len())
+	}
+	if c.Bytes() != entry.Size() {
+		t.Fatalf("Bytes = %d, want %d", c.Bytes(), entry.Size())
+	}
+}
+
+func TestIndexCache_SweepDropsExpiredWithoutARead(t *testing.T) {
+	c := NewIndexCache(0, 5*time.Millisecond)
+	defer c.Close()
+
+	c.Set("k", testEntry(`{"a":1}`), 10*time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.Len() == 0 {
+			if c.Bytes() != 0 {
+				t.Fatalf("sweep left %d bytes accounted", c.Bytes())
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("background sweep did not remove the expired entry")
 }
 
 func TestIndexCache_ConcurrentAccess(t *testing.T) {
-	indexCache := NewIndexCache()
-	done := make(chan bool)
+	c := NewIndexCache(1024*1024, 0)
+	defer c.Close()
 
-	// Test concurrent reads and writes
+	var wg sync.WaitGroup
 	for i := range 10 {
-		go func(id int) {
-			defer func() { done <- true }()
-
-			key := fmt.Sprintf("key-%d", id)
-			data := fmt.Sprintf("data-%d", id)
-
-			// Write
-			indexCache.Set(key, data, 5*time.Second)
-
-			// Read
-			result, exists := indexCache.Get(key)
-			if !exists {
-				t.Errorf("Expected key %s to exist", key)
-				return
-			}
-
-			if result != data {
-				t.Errorf("Expected '%s', got '%s'", data, result)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := range 100 {
+				key := fmt.Sprintf("k-%d-%d", i, j)
+				c.Set(key, testEntry(`{"a":1}`), time.Minute)
+				c.Get(key)
 			}
 		}(i)
 	}
-
-	// Wait for all goroutines to complete
-	for range 10 {
-		<-done
-	}
-}
-
-func TestIndexCache_DifferentDataTypes(t *testing.T) {
-	indexCache := NewIndexCache()
-
-	testCases := []struct {
-		name string
-		key  string
-		data any
-	}{
-		{"string", "str-key", "string-value"},
-		{"int", "int-key", 42},
-		{"slice", "slice-key", []string{"a", "b", "c"}},
-		{"map", "map-key", map[string]int{"x": 1, "y": 2}},
-		{"struct", "struct-key", struct{ Name string }{"test"}},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			indexCache.Set(tc.key, tc.data, 5*time.Second)
-
-			result, exists := indexCache.Get(tc.key)
-			if !exists {
-				t.Errorf("Expected entry for key %s to exist", tc.key)
-			}
-
-			// For complex types, we can't do deep comparison easily
-			// Just verify something was stored
-			if result == nil {
-				t.Errorf("Expected non-nil result for key %s", tc.key)
-			}
-		})
-	}
-}
-
-func TestIndexCache_ZeroTTL(t *testing.T) {
-	indexCache := NewIndexCache()
-
-	key := "zero-ttl-key"
-	data := "zero-ttl-data"
-
-	// Set with zero TTL (should expire immediately)
-	indexCache.Set(key, data, 0)
-
-	// Should be expired immediately
-	_, exists := indexCache.Get(key)
-	if exists {
-		t.Error("Expected entry with zero TTL to be expired immediately")
-	}
-}
-
-func TestIndexCache_NegativeTTL(t *testing.T) {
-	indexCache := NewIndexCache()
-
-	key := "negative-ttl-key"
-	data := "negative-ttl-data"
-
-	// Set with negative TTL (should expire immediately)
-	indexCache.Set(key, data, -1*time.Second)
-
-	// Should be expired immediately
-	_, exists := indexCache.Get(key)
-	if exists {
-		t.Error("Expected entry with negative TTL to be expired immediately")
-	}
+	wg.Wait()
 }
