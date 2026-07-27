@@ -39,8 +39,9 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # Copy the binary
 COPY --from=builder /build/groxpi /groxpi
 
-# Copy templates
-COPY --from=builder /build/templates /templates
+# No templates are copied: the administrative interface and its interaction
+# library are embedded in the binary with go:embed, so the image needs nothing
+# but the binary.
 
 # Create cache directory
 VOLUME ["/cache"]

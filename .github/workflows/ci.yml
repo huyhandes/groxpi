@@ -129,9 +129,11 @@ jobs:
         cache: true
 
     - name: golangci-lint
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v8
       with:
-        version: latest
+        # v6 resolves "latest" to the v1 line, which is built with go1.24 and
+        # refuses a go1.26 target. Pin the v2 release used locally.
+        version: v2.12.2
         args: --timeout=10m
 
   s3-integration-test:

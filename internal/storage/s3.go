@@ -2,17 +2,25 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/phuslu/log"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // S3Config holds S3 storage configuration
@@ -27,69 +35,31 @@ type S3Config struct {
 	ForcePathStyle  bool
 
 	// Performance tuning
-	PartSize       int64 // Multipart upload part size (default: 10MB)
-	MaxConnections int   // Max concurrent connections (legacy - use specific pools below)
 	ConnectTimeout time.Duration
 	RequestTimeout time.Duration
-
-	// Connection pool configuration
-	ReadPoolSize  int  // Max connections for GET operations (default: 50)
-	WritePoolSize int  // Max connections for PUT operations (default: 30)
-	MetaPoolSize  int  // Max connections for HEAD/STAT operations (default: 20)
-	EnableHTTP2   bool // Enable HTTP/2 for better multiplexing (default: true)
-	TransferAccel bool // Enable S3 Transfer Acceleration (default: false)
+	EnableHTTP2    bool // Enable HTTP/2 for better multiplexing (default: true)
 }
 
-// S3ConnectionPool manages HTTP connections for different types of S3 operations
-type S3ConnectionPool struct {
-	readTransport  *http.Transport // For GET operations
-	writeTransport *http.Transport // For PUT operations
-	metaTransport  *http.Transport // For HEAD/STAT operations
-}
+// s3MaxConns bounds the single HTTP connection pool shared by every S3 operation.
+const s3MaxConns = 100
 
-// NewS3ConnectionPool creates optimized HTTP transports for different operation types
-func NewS3ConnectionPool(cfg *S3Config) *S3ConnectionPool {
-	// Set defaults
-	if cfg.ReadPoolSize == 0 {
-		cfg.ReadPoolSize = 50
+// newS3Transport builds the one HTTP transport all S3 operations share.
+func newS3Transport(cfg *S3Config) *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:          s3MaxConns,
+		MaxIdleConnsPerHost:   s3MaxConns,
+		MaxConnsPerHost:       s3MaxConns,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    true, // S3 handles compression
+		ResponseHeaderTimeout: cfg.RequestTimeout,
+		TLSHandshakeTimeout:   cfg.ConnectTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     cfg.EnableHTTP2,
+		DialContext: (&net.Dialer{
+			Timeout:   cfg.ConnectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
-	if cfg.WritePoolSize == 0 {
-		cfg.WritePoolSize = 30
-	}
-	if cfg.MetaPoolSize == 0 {
-		cfg.MetaPoolSize = 20
-	}
-
-	baseTransport := func(maxConns int) *http.Transport {
-		return &http.Transport{
-			MaxIdleConns:          maxConns,
-			MaxIdleConnsPerHost:   maxConns,
-			MaxConnsPerHost:       maxConns,
-			IdleConnTimeout:       90 * time.Second,
-			DisableCompression:    true, // S3 handles compression
-			ResponseHeaderTimeout: cfg.RequestTimeout,
-			TLSHandshakeTimeout:   cfg.ConnectTimeout,
-			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:     cfg.EnableHTTP2,
-			DialContext: (&net.Dialer{
-				Timeout:   cfg.ConnectTimeout,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		}
-	}
-
-	return &S3ConnectionPool{
-		readTransport:  baseTransport(cfg.ReadPoolSize),
-		writeTransport: baseTransport(cfg.WritePoolSize),
-		metaTransport:  baseTransport(cfg.MetaPoolSize),
-	}
-}
-
-// Close closes all idle connections in the pools
-func (pool *S3ConnectionPool) Close() {
-	pool.readTransport.CloseIdleConnections()
-	pool.writeTransport.CloseIdleConnections()
-	pool.metaTransport.CloseIdleConnections()
 }
 
 // S3Storage implements Storage for S3-compatible backends.
@@ -98,30 +68,40 @@ func (pool *S3ConnectionPool) Close() {
 // deliberately does not implement ZeroCopyCapable: there is no local path to
 // serve.
 type S3Storage struct {
-	readClient  *minio.Client // Client optimized for GET operations
-	writeClient *minio.Client // Client optimized for PUT operations
-	metaClient  *minio.Client // Client optimized for metadata operations
-	bucket      string
-	prefix      string
-	partSize    int64
-	connPool    *S3ConnectionPool
+	client    *s3.Client
+	uploader  *transfermanager.Client
+	transport *http.Transport
+	bucket    string
+	prefix    string
 
-	// Singleflight groups for deduplicating concurrent operations
-	statSF singleflight.Group // For Stat/Exists operations
-	listSF singleflight.Group // For List operations
+	// existsSF deduplicates concurrent metadata lookups
+	existsSF singleflight.Group
 }
 
-var _ Storage = (*S3Storage)(nil)
+var (
+	_ Storage       = (*S3Storage)(nil)
+	_ PrefixDeleter = (*S3Storage)(nil)
+)
 
-// NewS3Storage creates a new S3 storage backend
+// endpointURL turns a bare host, or a host that already carries a scheme, into
+// the absolute URL the SDK wants as a base endpoint.
+func endpointURL(endpoint string, useSSL bool) string {
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return endpoint
+	}
+	if useSSL {
+		return "https://" + endpoint
+	}
+	return "http://" + endpoint
+}
+
+// NewS3Storage creates a new S3 storage backend.
+//
+// Credentials come from the AWS default chain — environment, shared config,
+// instance metadata, container credentials, web identity — unless a static key
+// pair is configured explicitly. Nothing here requires static keys, which is
+// what makes instance and task roles usable.
 func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
-	// Set defaults
-	if cfg.PartSize == 0 {
-		cfg.PartSize = 10 * 1024 * 1024 // 10MB default
-	}
-	if cfg.MaxConnections == 0 {
-		cfg.MaxConnections = 100
-	}
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 10 * time.Second
 	}
@@ -131,120 +111,67 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}
-
-	// Normalize endpoint URL - remove protocol if present
-	endpoint := cfg.Endpoint
-	if after, ok := strings.CutPrefix(endpoint, "https://"); ok {
-		endpoint = after
+	// An explicit scheme on the endpoint wins over the UseSSL flag.
+	if strings.HasPrefix(cfg.Endpoint, "https://") {
 		cfg.UseSSL = true
-	} else if after, ok := strings.CutPrefix(endpoint, "http://"); ok {
-		endpoint = after
+	} else if strings.HasPrefix(cfg.Endpoint, "http://") {
 		cfg.UseSSL = false
 	}
 
-	log.Debug().
-		Str("original_endpoint", cfg.Endpoint).
-		Str("normalized_endpoint", endpoint).
-		Str("bucket", cfg.Bucket).
-		Str("region", cfg.Region).
-		Bool("ssl", cfg.UseSSL).
-		Msg("Creating S3 storage backend")
+	transport := newS3Transport(cfg)
 
-	// Create connection pool for different operation types
-	connPool := NewS3ConnectionPool(cfg)
-
-	// Handle S3 Transfer Acceleration
-	s3Endpoint := endpoint
-	if cfg.TransferAccel {
-		// Use transfer acceleration endpoint if enabled
-		if !strings.Contains(endpoint, "amazonaws.com") {
-			log.Warn().Msg("Transfer acceleration only works with AWS S3, ignoring setting")
-		} else {
-			// Replace s3.region.amazonaws.com with s3-accelerate.amazonaws.com
-			parts := strings.Split(endpoint, ".")
-			if len(parts) >= 3 && parts[0] == "s3" {
-				s3Endpoint = "s3-accelerate.amazonaws.com"
-				log.Info().Str("endpoint", s3Endpoint).Msg("Using S3 Transfer Acceleration")
-			}
-		}
+	loadOpts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
+	}
+	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
+		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
+		))
 	}
 
-	// Helper function to create MinIO client with specific transport
-	createClient := func(transport *http.Transport, clientType string) (*minio.Client, error) {
-		opts := &minio.Options{
-			Creds:     credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
-			Secure:    cfg.UseSSL,
-			Region:    cfg.Region,
-			Transport: transport,
-		}
-
-		// Enable path-style addressing for MinIO
-		if cfg.ForcePathStyle {
-			opts.BucketLookup = minio.BucketLookupPath
-		}
-
-		client, err := minio.New(s3Endpoint, opts)
-		if err != nil {
-			log.Error().Err(err).Str("client_type", clientType).Msg("Failed to create S3 client")
-			return nil, fmt.Errorf("failed to create S3 %s client: %w", clientType, err)
-		}
-
-		return client, nil
-	}
-
-	// Create specialized clients for different operations
-	readClient, err := createClient(connPool.readTransport, "read")
-	if err != nil {
-		return nil, err
-	}
-
-	writeClient, err := createClient(connPool.writeTransport, "write")
-	if err != nil {
-		return nil, err
-	}
-
-	metaClient, err := createClient(connPool.metaTransport, "metadata")
-	if err != nil {
-		return nil, err
-	}
-
-	// Ensure bucket exists using metadata client
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
 	defer cancel()
 
-	exists, err := metaClient.BucketExists(ctx, cfg.Bucket)
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
-		log.Error().Err(err).Str("bucket", cfg.Bucket).Msg("Failed to check bucket existence")
-		return nil, fmt.Errorf("failed to check bucket existence: %w", err)
-	}
-	if !exists {
-		log.Error().Str("bucket", cfg.Bucket).Msg("Bucket does not exist")
-		return nil, fmt.Errorf("bucket %s does not exist", cfg.Bucket)
+		return nil, fmt.Errorf("failed to load AWS configuration: %w", err)
 	}
 
-	// Create S3 storage instance
-	storage := &S3Storage{
-		readClient:  readClient,
-		writeClient: writeClient,
-		metaClient:  metaClient,
-		bucket:      cfg.Bucket,
-		prefix:      strings.TrimSuffix(cfg.Prefix, "/"),
-		partSize:    cfg.PartSize,
-		connPool:    connPool,
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(endpointURL(cfg.Endpoint, cfg.UseSSL))
+		}
+		// MinIO cannot resolve virtual-hosted bucket names, and older releases
+		// reject the checksum trailers the SDK now emits by default.
+		o.UsePathStyle = cfg.ForcePathStyle
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	})
+
+	// Confirm the bucket is reachable before serving traffic.
+	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(cfg.Bucket)}); err != nil {
+		return nil, fmt.Errorf("failed to reach bucket %s: %w", cfg.Bucket, err)
 	}
 
-	log.Info().
-		Str("endpoint", cfg.Endpoint).
-		Str("bucket", cfg.Bucket).
-		Str("prefix", cfg.Prefix).
-		Int("read_pool_size", cfg.ReadPoolSize).
-		Int("write_pool_size", cfg.WritePoolSize).
-		Int("meta_pool_size", cfg.MetaPoolSize).
-		Bool("http2_enabled", cfg.EnableHTTP2).
-		Bool("transfer_accel", cfg.TransferAccel).
-		Msg("S3 storage backend initialized successfully with performance optimizations")
+	slog.Info("S3 storage backend initialized",
+		"endpoint", cfg.Endpoint,
+		"bucket", cfg.Bucket,
+		"prefix", cfg.Prefix,
+		"path_style", cfg.ForcePathStyle,
+		"static_credentials", cfg.AccessKeyID != "")
 
-	return storage, nil
+	return &S3Storage{
+		client: client,
+		// The transfer manager keeps its own checksum setting, which overrides
+		// the client's, so it has to be pinned here too.
+		uploader: transfermanager.New(client, func(o *transfermanager.Options) {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}),
+		transport: transport,
+		bucket:    cfg.Bucket,
+		prefix:    strings.TrimSuffix(cfg.Prefix, "/"),
+	}, nil
 }
 
 // buildKey constructs the full S3 key with prefix
@@ -255,38 +182,35 @@ func (s *S3Storage) buildKey(key string) string {
 	return fmt.Sprintf("%s/%s", s.prefix, key)
 }
 
-// calculateOptimalPartSize picks a multipart part size for fileSize: bigger
-// parts for bigger files, then raised if necessary to stay under S3's limit of
-// 10,000 parts. Every part size below is already well above S3's 5MB minimum,
-// and the part-count floor only overtakes the table above roughly 1.28 TB, so in
-// practice the size band decides.
-func calculateOptimalPartSize(fileSize int64) int64 {
-	const maxParts = 10000
-
-	var partSize int64
-	switch {
-	case fileSize < 100*1024*1024: // < 100MB
-		partSize = 10 * 1024 * 1024 // 10MB
-	case fileSize < 1024*1024*1024: // < 1GB
-		partSize = 32 * 1024 * 1024 // 32MB
-	case fileSize < 10*1024*1024*1024: // < 10GB
-		partSize = 64 * 1024 * 1024 // 64MB
-	default: // >= 10GB
-		partSize = 128 * 1024 * 1024 // 128MB
+// isNotFoundResponse reports whether err is the SDK's way of saying the object
+// is simply absent, as opposed to any other failure (denied, throttled,
+// network). Only this case may be reported as a miss.
+func isNotFoundResponse(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	var notFound *types.NotFound
+	if errors.As(err, &noSuchKey) || errors.As(err, &notFound) {
+		return true
 	}
 
-	return max(partSize, fileSize/maxParts)
+	// HeadObject on a missing key answers with a bodyless 404, which the SDK
+	// deserializes into an unmodelled API error whose code it derives from the
+	// status line. Only the codes that mean "this object" may be folded into a
+	// miss: a 404 also covers NoSuchBucket, and reading a deleted bucket as an
+	// absent object turns a broken configuration into a silent permanent 100%
+	// miss - every read re-downloads and every write is thrown away.
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "NoSuchKey", "NotFound":
+		return true
+	default:
+		return false
+	}
 }
 
-// isNotFoundResponse reports whether err is MinIO's way of saying the object is
-// simply absent, as opposed to any other failure (denied, throttled, network).
-// Only this case may be reported as a miss.
-func isNotFoundResponse(err error) bool {
-	resp := minio.ToErrorResponse(err)
-	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
-}
-
-// s3Error wraps a MinIO failure for key, folding a genuine absence into the
+// s3Error wraps a backend failure for key, folding a genuine absence into the
 // shared ErrNotFound sentinel so callers can branch with errors.Is.
 func s3Error(err error, key string) error {
 	if isNotFoundResponse(err) {
@@ -298,222 +222,204 @@ func s3Error(err error, key string) error {
 // Get retrieves an object from S3.
 //
 // Reads are deliberately not deduplicated: an S3 reader can only be consumed
-// once, so concurrent callers each need their own. Singleflight is applied to
-// the metadata operations, where the result is shareable.
+// once, so concurrent callers each need their own.
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	log.Debug().Str("key", key).Str("full_key", fullKey).Msg("Getting object from S3")
-
-	// Get object using read-optimized client
-	object, err := s.readClient.GetObject(ctx, s.bucket, fullKey, minio.GetObjectOptions{})
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.buildKey(key)),
+	})
 	if err != nil {
-		log.Error().Err(err).Str("key", key).Msg("Failed to get object")
 		return nil, nil, s3Error(err, key)
 	}
 
-	// Stat resolves the response headers without consuming the body, so the
-	// metadata below is complete before the caller reads a single byte.
-	stat, err := object.Stat()
-	if err != nil {
-		_ = object.Close()
-		return nil, nil, s3Error(err, key)
-	}
-
+	// The response headers are complete before any byte of the body is read,
+	// so the caller can emit its own headers and only then copy.
 	info := &ObjectInfo{
-		Key:          key,
-		Size:         stat.Size,
-		LastModified: stat.LastModified,
-		ETag:         stat.ETag,
-		ContentType:  stat.ContentType,
+		Key:         key,
+		Size:        aws.ToInt64(out.ContentLength),
+		ETag:        aws.ToString(out.ETag),
+		ContentType: aws.ToString(out.ContentType),
+	}
+	if out.LastModified != nil {
+		info.LastModified = *out.LastModified
 	}
 
-	return object, info, nil
+	return out.Body, info, nil
 }
 
-// Put stores an object in S3
+// Put stores an object in S3.
+//
+// A seekable body of known size is a plain single-object put; anything else — a
+// live download, a pipe — goes through the transfer manager, the only path able
+// to upload a stream whose length is not known up front.
 func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
 	fullKey := s.buildKey(key)
 
-	log.Debug().
-		Str("key", key).
-		Int64("size", size).
-		Str("content_type", contentType).
-		Msg("Storing object in S3")
-
-	opts := minio.PutObjectOptions{
-		ContentType: contentType,
+	var etag string
+	if seeker, ok := reader.(io.ReadSeeker); ok && size >= 0 {
+		out, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:        aws.String(s.bucket),
+			Key:           aws.String(fullKey),
+			Body:          seeker,
+			ContentLength: aws.Int64(size),
+			ContentType:   aws.String(contentType),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to put object %s: %w", key, err)
+		}
+		etag = aws.ToString(out.ETag)
+	} else {
+		counter := &countingReader{r: reader}
+		out, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
+			Bucket:      aws.String(s.bucket),
+			Key:         aws.String(fullKey),
+			Body:        counter,
+			ContentType: aws.String(contentType),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to put object %s: %w", key, err)
+		}
+		etag = aws.ToString(out.ETag)
+		size = counter.n
 	}
 
-	// Use optimized multipart for large files
-	if size > s.partSize {
-		partSize := calculateOptimalPartSize(size)
-		opts.PartSize = uint64(partSize)
-		log.Debug().
-			Int64("file_size", size).
-			Int64("part_size", partSize).
-			Msg("Using optimized multipart upload")
-	}
-
-	// reader is handed to minio-go as-is: PutObject already buffers a sized
-	// reader itself, so staging the body here would only add a copy.
-	start := time.Now()
-	uploadInfo, err := s.writeClient.PutObject(ctx, s.bucket, fullKey, reader, size, opts)
-	if err != nil {
-		log.Error().Err(err).Str("key", key).Msg("Failed to put object")
-		return nil, fmt.Errorf("failed to put object %s: %w", key, err)
-	}
-
-	duration := time.Since(start)
-	log.Info().
-		Str("key", key).
-		Int64("size", uploadInfo.Size).
-		Str("etag", uploadInfo.ETag).
-		Dur("duration", duration).
-		Float64("speed_mbps", float64(uploadInfo.Size)/duration.Seconds()/(1024*1024)).
-		Msg("Object stored successfully")
+	slog.Debug("Object stored in S3", "key", key, "size", size)
 
 	return &ObjectInfo{
 		Key:         key,
-		Size:        uploadInfo.Size,
-		ETag:        uploadInfo.ETag,
+		Size:        size,
+		ETag:        etag,
 		ContentType: contentType,
 	}, nil
+}
+
+// countingReader reports how many bytes went out when the caller could not say
+// up front.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // Delete removes an object from S3
 func (s *S3Storage) Delete(ctx context.Context, key string) error {
-	fullKey := s.buildKey(key)
-
-	log.Debug().Str("key", key).Msg("Deleting object from S3")
-
-	err := s.writeClient.RemoveObject(ctx, s.bucket, fullKey, minio.RemoveObjectOptions{})
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.buildKey(key)),
+	})
 	if err != nil {
-		log.Error().Err(err).Str("key", key).Msg("Failed to delete object")
 		return fmt.Errorf("failed to delete object %s: %w", key, err)
 	}
-
-	log.Debug().Str("key", key).Msg("Object deleted successfully")
 	return nil
 }
 
-// Exists checks if an object exists in S3 with singleflight deduplication
-func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
-	// Use singleflight to deduplicate concurrent stat requests
-	result, err, _ := s.statSF.Do("exists:"+key, func() (any, error) {
-		return s.existsInternal(ctx, key)
+// deleteBatchSize is the most keys S3 accepts in one DeleteObjects request.
+const deleteBatchSize = 1000
+
+// DeletePrefix removes every object under prefix and reports how many went. It is
+// what makes evicting a package mean anything in pure-S3 mode: the transport
+// evicts only through PrefixDeleter, so without this the admin endpoint answered
+// 200 having deleted nothing.
+//
+// Listing and deleting are interleaved page by page rather than collected first,
+// so evicting a package with thousands of files costs one page of keys in memory
+// instead of all of them.
+func (s *S3Storage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(s.buildKey(prefix)),
+		MaxKeys: aws.Int32(deleteBatchSize),
 	})
 
+	deleted := 0
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to list objects under %s: %w", prefix, err)
+		}
+		if len(page.Contents) == 0 {
+			continue
+		}
+
+		ids := make([]types.ObjectIdentifier, 0, len(page.Contents))
+		for _, object := range page.Contents {
+			ids = append(ids, types.ObjectIdentifier{Key: object.Key})
+		}
+
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			// Quiet mode answers with the failures only, which is also what makes
+			// the response size independent of the batch size.
+			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return deleted, fmt.Errorf("failed to delete objects under %s: %w", prefix, err)
+		}
+
+		deleted += len(ids) - len(out.Errors)
+		if len(out.Errors) > 0 {
+			return deleted, fmt.Errorf("failed to delete %d of %d objects under %s: %s",
+				len(out.Errors), len(ids), prefix, aws.ToString(out.Errors[0].Message))
+		}
+	}
+
+	slog.Debug("Deleted object prefix from S3", "prefix", prefix, "deleted", deleted)
+
+	return deleted, nil
+}
+
+// Exists checks if an object exists in S3, deduplicating concurrent lookups.
+func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
+	// A caller who arrived with a dead context is answered from its own context,
+	// never by starting or joining a flight.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	result, err, _ := s.existsSF.Do(key, func() (any, error) {
+		// The flight is shared, so it must not be cancellable by whichever caller
+		// happened to start it: one client disconnecting used to fail every other
+		// caller waiting on the same key with context.Canceled, which the read path
+		// reads as a miss and re-downloads a file that is sitting in the bucket.
+		// Values (the trace context) are kept; the deadline comes from the
+		// transport's response-header timeout instead.
+		_, err := s.client.HeadObject(context.WithoutCancel(ctx), &s3.HeadObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(s.buildKey(key)),
+		})
+		if err != nil {
+			// Absence is the answer, not a failure. Anything else is a failure
+			// and must not be reported as "does not exist".
+			if isNotFoundResponse(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
+		}
+		return true, nil
+	})
 	if err != nil {
 		return false, err
 	}
 
-	return result.(bool), nil
-}
-
-// existsInternal performs the actual S3 Exists operation
-func (s *S3Storage) existsInternal(ctx context.Context, key string) (bool, error) {
-	fullKey := s.buildKey(key)
-
-	_, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
-	if err != nil {
-		// Absence is the answer, not a failure. Anything else is a failure and
-		// must not be reported as "does not exist".
-		if isNotFoundResponse(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
+	// Counted per caller rather than per flight: every caller that got an answer
+	// out of this either hit or missed, whether or not it did the lookup.
+	exists := result.(bool)
+	if exists {
+		telemetry.CacheHit(ctx, telemetry.LayerRemote)
+	} else {
+		telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 	}
 
-	return true, nil
-}
-
-// Stat retrieves object metadata without downloading content with singleflight deduplication
-func (s *S3Storage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
-	// Use singleflight to deduplicate concurrent stat requests
-	result, err, _ := s.statSF.Do("stat:"+key, func() (any, error) {
-		return s.statInternal(ctx, key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.(*ObjectInfo), nil
-}
-
-// statInternal performs the actual S3 Stat operation
-func (s *S3Storage) statInternal(ctx context.Context, key string) (*ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	stat, err := s.metaClient.StatObject(ctx, s.bucket, fullKey, minio.StatObjectOptions{})
-	if err != nil {
-		return nil, s3Error(err, key)
-	}
-
-	return &ObjectInfo{
-		Key:          key,
-		Size:         stat.Size,
-		LastModified: stat.LastModified,
-		ETag:         stat.ETag,
-		ContentType:  stat.ContentType,
-	}, nil
-}
-
-// List returns a list of objects matching the options with singleflight deduplication
-func (s *S3Storage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
-	// Create cache key from list options
-	listKey := fmt.Sprintf("list:%s:%d:%s", opts.Prefix, opts.MaxKeys, opts.StartAfter)
-
-	// Use singleflight to deduplicate concurrent list requests
-	result, err, _ := s.listSF.Do(listKey, func() (any, error) {
-		return s.listInternal(ctx, opts)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.([]*ObjectInfo), nil
-}
-
-// listInternal performs the actual S3 List operation
-func (s *S3Storage) listInternal(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
-	prefix := s.buildKey(opts.Prefix)
-
-	listOpts := minio.ListObjectsOptions{
-		Prefix:     prefix,
-		Recursive:  false,
-		MaxKeys:    opts.MaxKeys,
-		StartAfter: opts.StartAfter,
-	}
-
-	var objects []*ObjectInfo
-	for object := range s.metaClient.ListObjects(ctx, s.bucket, listOpts) {
-		if object.Err != nil {
-			return nil, fmt.Errorf("failed to list objects: %w", object.Err)
-		}
-
-		// Strip prefix from key
-		key := strings.TrimPrefix(object.Key, s.prefix+"/")
-
-		objects = append(objects, &ObjectInfo{
-			Key:          key,
-			Size:         object.Size,
-			LastModified: object.LastModified,
-			ETag:         object.ETag,
-			ContentType:  object.ContentType,
-		})
-	}
-
-	return objects, nil
+	return exists, nil
 }
 
 // Close releases any resources held by the storage backend
 func (s *S3Storage) Close() error {
-	// Close all connection pools
-	if s.connPool != nil {
-		s.connPool.Close()
-	}
+	s.transport.CloseIdleConnections()
 	return nil
 }

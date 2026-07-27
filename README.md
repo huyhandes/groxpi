@@ -1,506 +1,121 @@
-# groxpi - Go PyPI Proxy
+# groxpi
 
-A high-performance PyPI caching proxy server written in Go, reimplemented from the Python-based [proxpi](https://github.com/EpicWink/proxpi) project using Gin framework and Sonic JSON.
+A caching PyPI proxy written in Go, reimplemented from the Python
+[proxpi](https://github.com/EpicWink/proxpi) project.
 
 [![Go Version](https://img.shields.io/badge/go-1.26+-blue.svg)](https://golang.org)
-[![Gin](https://img.shields.io/badge/gin-v1.11+-green.svg)](https://gin-gonic.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## ✨ Features
+- PyPI Simple API, PEP 503 and PEP 691 — a drop-in index URL for pip, uv, Poetry and pipenv
+- Downloads stream to the client and into the cache in one pass, with every cached file verified
+  against the hash or length the index declared
+- Multiple upstream indexes with per-index TTLs, extras taking priority over the primary
+- Local filesystem, S3-compatible, or hybrid local-over-S3 storage
+- OpenTelemetry traces, metrics and logs over OTLP; inert when no collector is configured
+- Optional password-protected cache admin page with prefetch and eviction
 
-### 🚀 **Performance** (benchmark run of December 2024 — see caveat)
-- **53,000+ requests/sec** package index throughput (vs proxpi which fails under load)
-- **Sub-millisecond** P50 latency for cached requests (0.86ms)
-- **21x faster** single request response times (18ms vs 397ms for package queries)
-- **Instant startup** with compiled Go binary (<2s vs ~10s)
+> No performance figures are published here. Everything the repository once quoted predates the current
+> architecture and was deleted rather than restated. See [docs/benchmarking.md](docs/benchmarking.md) to
+> measure it yourself.
 
-> ⚠️ These numbers were recorded in commit `ca9c979` (2025-12-29, labelled "December 2024") and have **not** been re-measured since the architecture refactor of 2026-07-26, which reworked the download path, the storage interface and L1 eviction. Re-run `./benchmarks/benchmark.sh` before relying on them. See [docs/performance.md](docs/performance.md).
-
-### 🛠️ **Advanced Technology Stack**
-- **Go + Gin Framework**: Ultra-fast HTTP server with minimal overhead
-- **ByteDance Sonic JSON**: 3x faster JSON processing than standard library
-- **Multi-stage Docker**: Optimized containers running on scratch base image
-- **Memory Efficient**: Compiled binary with optimal resource utilization
-
-### 📦 **Complete PyPI Compatibility** 
-- **Drop-in replacement** for pip, poetry, pipenv - no client changes needed
-- **PEP 503/691 compliance** with full Simple Repository API support
-- **Identical URL structure** and behavior as original proxpi
-- **Seamless migration** with environment variable compatibility
-
-### ☁️ **Enterprise Storage Support**
-- **S3-Compatible Storage**: AWS S3, MinIO, or any S3-compatible backend
-- **Local Filesystem**: High-performance local caching
-- **Hybrid Caching**: In-memory index cache + persistent file storage
-- **10x cache performance** improvement over repeated PyPI calls
-
-### 🌐 **Production Features**
-- **Content Negotiation**: Automatic JSON/HTML responses based on client
-- **Built-in Monitoring**: Health checks, statistics, and performance metrics
-- **Compression Support**: Automatic gzip/deflate for optimal bandwidth usage
-- **Graceful Shutdown**: Production-ready container lifecycle management
-
-## 🚀 Quick Start
-
-### 🐳 Docker (Recommended - Production Ready)
-
-Get groxpi running in seconds with optimal performance:
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/groxpi.git
-cd groxpi
-
-# Start groxpi (optimized Docker container)
-docker-compose up -d
-
-# Or with S3/MinIO storage for enhanced caching
-docker-compose -f docker-compose.minio.yml up -d
-
-# Test the blazing-fast performance
-curl http://localhost:5000/simple/numpy
+docker compose up -d
+pip install --index-url http://localhost:5005/simple/ numpy
 ```
 
-**✅ Server starts in <1 second with 2.57MB memory footprint**
-
-### ⚡ Local Development
+Or from source:
 
 ```bash
-# Build the optimized binary
-go build -ldflags="-s -w" -o groxpi cmd/groxpi/main.go
-./groxpi
-
-# Or run directly (development mode)
-go run cmd/groxpi/main.go
+go run ./cmd/groxpi
 ```
 
-**✅ Instant startup, sub-millisecond response times**
+groxpi listens on port `5000` by default (the bundled Compose file publishes it on `5005`).
 
-### 🔗 Connect Your Package Manager
+## Configure a client
 
 ```bash
-# Test with pip (4x faster than proxpi)
 pip install --index-url http://localhost:5000/simple/ numpy
+UV_INDEX_URL=http://localhost:5000/simple/ uv pip install numpy
+```
 
-# Configure permanently in pip.conf
+```ini
+# pip.conf / pip.ini
 [global]
 index-url = http://localhost:5000/simple/
 ```
 
-**✅ Drop-in replacement - no client changes needed**
-
-### Running Benchmarks
-
-```bash
-# Run complete benchmark suite (API + UV package installation)
-cd benchmarks
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006
-
-# Run specific tests
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --api-only
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --uv-only
-
-# With environment variables
-export GROXPI_URL=http://localhost:5005
-export PROXPI_URL=http://localhost:5006
-./benchmark.sh
-```
-
-## 📋 Installation
-
-### Binary Installation -- Release soon
-
-Download the latest binary from the [releases page](https://github.com/yourusername/groxpi/releases).
-
-### From Source
-
-```bash
-go install github.com/huyhandes/groxpi/cmd/groxpi@latest
-```
-
-### Docker -- Release soon
-
-```bash
-docker pull huyhandes/proxpi
-```
-
-## ⚙️ Configuration
-
-All configuration is done through environment variables:
-
-### Core Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Main PyPI index URL |
-| `GROXPI_INDEX_TTL` | `1800` | Index cache TTL (seconds) |
-| `GROXPI_CACHE_SIZE` | `5368709120` | File cache size (5GB) |
-| `GROXPI_CACHE_DIR` | temp dir | Local cache directory |
-| `GROXPI_LOGGING_LEVEL` | `INFO` | Log level (DEBUG, INFO, WARN, ERROR) |
-| `PORT` | `5000` | HTTP server port |
-
-### Storage Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GROXPI_STORAGE_TYPE` | `local` | Storage backend (`local`, `s3`, or `hybrid` = local L1 + S3 L2) |
-| `AWS_ENDPOINT_URL` | - | S3-compatible endpoint URL |
-| `AWS_ACCESS_KEY_ID` | - | S3 access key ID |
-| `AWS_SECRET_ACCESS_KEY` | - | S3 secret access key |
-| `AWS_REGION` | `us-east-1` | AWS region |
-| `GROXPI_S3_BUCKET` | - | S3 bucket name |
-| `GROXPI_S3_PREFIX` | `groxpi` | Object prefix in bucket |
-| `GROXPI_S3_USE_SSL` | `true` | Enable SSL for S3 connections |
-| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Force path-style URLs (for MinIO) |
-
-### Advanced Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Timeout before redirect (seconds) |
-| `GROXPI_CONNECT_TIMEOUT` | `3.1` | Socket connect timeout (seconds) |
-| `GROXPI_READ_TIMEOUT` | `20` | Data read timeout (seconds) |
-| `GROXPI_EXTRA_INDEX_URLS` | - | Additional PyPI indices (comma-separated) |
-| `GROXPI_EXTRA_INDEX_TTLS` | - | TTLs for extra indices (comma-separated) |
-| `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip SSL verification |
-
-## 🗂️ Storage Backends
-
-### Local Filesystem
-
-Default storage backend that saves files to local disk:
-
-```bash
-export GROXPI_STORAGE_TYPE=local
-export GROXPI_CACHE_DIR=/var/cache/groxpi
-```
-
-### S3-Compatible Storage
-
-Support for AWS S3, MinIO, and other S3-compatible storage:
-
-```bash
-export GROXPI_STORAGE_TYPE=s3
-export AWS_ENDPOINT_URL=https://s3.amazonaws.com
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export GROXPI_S3_BUCKET=your-bucket-name
-```
-
-#### MinIO Configuration
-
-```bash
-export GROXPI_STORAGE_TYPE=s3
-export AWS_ENDPOINT_URL=http://minio:9000
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
-export GROXPI_S3_BUCKET=groxpi
-export GROXPI_S3_USE_SSL=false
-export GROXPI_S3_FORCE_PATH_STYLE=true
-```
-
-## 🔌 API Endpoints
-
-groxpi implements the [PEP 503](https://peps.python.org/pep-0503/) Simple Repository API:
-
-| Endpoint | Method | Description |
-|----------|---------|-------------|
-| `/` | GET | Home page with server statistics |
-| `/simple/` | GET | List all packages (JSON/HTML) |
-| `/simple/{package}/` | GET | List package files (JSON/HTML) |
-| `/simple/{package}/{file}` | GET | Download package file |
-| `/health` | GET | Health check with detailed system info |
-| `/cache/list` | DELETE | Clear package list cache |
-| `/cache/{package}` | DELETE | Clear specific package cache |
-
-### Content Negotiation
-
-- **HTML**: For browsers and human-readable package browsing
-- **JSON**: For pip, poetry, pipenv, and other package managers
-- **Compression**: Automatic gzip/deflate based on client support
-
-## 🐳 Docker Deployment
-
-### Basic Setup
-
-```yaml
-# docker-compose.yml
-version: '3.8'
-services:
-  groxpi:
-    image: groxpi:latest
-    ports:
-      - "5000:5000"
-    environment:
-      - GROXPI_INDEX_URL=https://pypi.org/simple/
-      - GROXPI_CACHE_SIZE=5368709120
-      - GROXPI_LOGGING_LEVEL=INFO
-    volumes:
-      - groxpi_cache:/cache
-
-volumes:
-  groxpi_cache:
-```
-
-### S3 Storage Setup
-
-```yaml
-# docker-compose.yml with S3
-version: '3.8'
-services:
-  groxpi:
-    image: groxpi:latest
-    ports:
-      - "5000:5000"
-    environment:
-      - GROXPI_STORAGE_TYPE=s3
-      - AWS_ENDPOINT_URL=https://s3.amazonaws.com
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - GROXPI_S3_BUCKET=my-pypi-cache
-```
-
-### MinIO Setup
-
-Use the provided `docker-compose.minio.yml` for a complete MinIO setup:
-
-```bash
-docker-compose -f docker-compose.minio.yml up -d
-```
-
-This sets up:
-- MinIO S3-compatible storage
-- groxpi configured to use MinIO
-- Web UI at http://localhost:9001
-
-### 🛠️ Technology Stack Benefits
-
-- **Go + Gin Framework**: High-performance HTTP server, faster than Flask/Gunicorn
-- **ByteDance Sonic JSON**: 3x faster JSON processing than stdlib
-- **Compiled Binary**: No runtime overhead, optimal memory usage
-- **Container Optimized**: Multi-stage Docker build, scratch-based final image
-
-### 🎯 S3 Storage Performance
-
-With S3-compatible storage backends:
-- **First request**: Downloads from PyPI, caches to S3 (~100-200ms)
-- **Cached requests**: Serves directly from S3 (~10-20ms)  
-- **Cache hit improvement**: **5-10x faster** than repeated PyPI calls
-
-**Benchmark results as recorded December 2024 (commit `ca9c979`) — not re-measured since the 2026-07 refactor:**
-- **Test Method**: WRK load testing (30-60s duration, 8 threads, 100 connections)
-- **Package Index**: 53,095 RPS (groxpi) vs proxpi fails under high load
-- **Package Files (numpy)**: 4,145 RPS (groxpi) with P50 latency 14.45ms
-- **P50 Latency**: 0.86ms (groxpi) for cached package index
-- **Single Request**: 18ms (groxpi) vs 397ms (proxpi) = **21x faster**
-- **Environment**: Docker containers with identical configuration on macOS (Apple Silicon)
-
-### 🧪 Run Your Own Benchmarks
-
-Want to verify these performance claims? Run the included benchmark suite:
-
-```bash
-# Clone the repository
-git clone https://github.com/huyhandes/groxpi.git
-cd groxpi/benchmarks
-
-# Start both services
-docker-compose -f docker/docker-compose.benchmark.yml up -d
-
-# Run the comprehensive benchmark suite
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006
-
-# Or run specific benchmark types
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --api-only
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006 --uv-only
-```
-
-The benchmark suite includes:
-- **WRK load testing**: High-concurrency HTTP performance (60s, 8 threads, 100 connections)
-- **UV package installation**: Real-world package install times (numpy, pandas, polars, pyspark, fastapi)
-- **Resource monitoring**: CPU, memory, I/O usage tracking via Docker stats
-- **Cache performance**: Cold vs warm cache scenarios with automatic cache management
-- **DuckDB analysis**: SQL-based results analysis with CSV exports
-
-## 🔧 Client Configuration
-
-Configure your Python package managers to use groxpi:
-
-### pip
-
-```bash
-pip install --index-url http://localhost:5000/simple/ package-name
-
-# Or set permanently in pip.conf
-[global]
-index-url = http://localhost:5000/simple/
-```
-
-### poetry
-
-```bash
-# In pyproject.toml
+```toml
+# pyproject.toml, Poetry
 [[tool.poetry.source]]
 name = "groxpi"
 url = "http://localhost:5000/simple/"
 priority = "primary"
 ```
 
-### pipenv
-
-```bash
-# In Pipfile
-[[source]]
-url = "http://localhost:5000/simple/"
-verify_ssl = false
-name = "groxpi"
-```
-
-### uv
-
-```bash
-# In pyproject.toml
+```toml
+# pyproject.toml, uv
 [[tool.uv.index]]
 name = "groxpi"
 url = "http://localhost:5000/simple/"
 default = true
 ```
 
-## 🏗️ Development
-
-### Prerequisites
-
-- Go 1.26+
-- Docker & Docker Compose (optional)
-
-### Building
-
-```bash
-# Development build
-go build -o groxpi cmd/groxpi/main.go
-
-# Production build with optimizations
-go build -ldflags="-s -w" -o groxpi cmd/groxpi/main.go
-
-# Multi-architecture Docker build
-docker buildx build --platform linux/amd64,linux/arm64 -t groxpi .
+```toml
+# Pipfile
+[[source]]
+name = "groxpi"
+url = "http://localhost:5000/simple/"
+verify_ssl = false
 ```
 
-### Testing
+## Common settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Upstream index |
+| `GROXPI_INDEX_TTL` | `1800` | Index cache TTL, seconds |
+| `GROXPI_CACHE_DIR` | OS temp dir | Where cached files live |
+| `GROXPI_CACHE_SIZE` | `5368709120` | File cache byte budget |
+| `GROXPI_STORAGE_TYPE` | `local` | `local`, `s3`, `hybrid` |
+| `PORT` | `5000` | Listen port |
+
+[docs/configuration.md](docs/configuration.md) is the full reference — every variable groxpi reads, and
+nothing it does not.
+
+## Migrating from Python proxpi
+
+The URLs are the same, so clients need no changes. Environment variables keep their names where the
+setting still exists; `PROXPI_`-prefixed spellings are not read. Two things changed behaviour:
+
+- **Extra indexes now participate in resolution**, queried before the primary, first hit winning whole.
+  A package that used to resolve to PyPI may now resolve to an extra index.
+- **`DELETE /cache/list` and `DELETE /cache/<package>` require credentials** and answer `404` in the
+  default configuration, where none are set. They were open in proxpi. Set `GROXPI_ADMIN_USERNAME` and
+  `GROXPI_ADMIN_PASSWORD` to get them back, and send basic auth from whatever calls them.
+
+Both are covered in [docs/configuration.md](docs/configuration.md) and
+[docs/api-endpoints.md](docs/api-endpoints.md).
+
+## Development
 
 ```bash
-# Run tests
-go test ./...
-
-# Test with coverage
-go test -cover ./...
-
-# Unit tests only (skips tests needing a live S3)
-go test -short ./...
-
-# Storage and download benchmarks
-go test -bench=. -benchmem ./internal/storage/ ./internal/server/
+go build -o groxpi ./cmd/groxpi
+go test ./...            # full suite
+go test -short ./...     # skips tests needing a live S3
+gofmt -l . && go vet ./... && golangci-lint run
 ```
 
-## 🚚 Migration from proxpi
+## Documentation
 
-**Migrate in minutes, get 4x performance immediately!**
+- [Configuration](docs/configuration.md) — every environment variable
+- [API](docs/api-endpoints.md) — every route, content negotiation, error codes
+- [Architecture](docs/architecture.md) — modules, caches, storage seam, request flows, telemetry
+- [Deployment](docs/deployment.md) — Docker, Kubernetes, TLS, observability wiring
+- [Benchmarking](docs/benchmarking.md) — how to measure it
+- [Decision records](docs/adr/) — why index resolution and telemetry work the way they do
 
-groxpi is designed as a drop-in replacement with zero client changes:
+## License
 
-### ✅ **What Stays the Same**
-- **URLs**: Identical `/simple/` API structure 
-- **Clients**: pip, poetry, pipenv work without changes
-- **Features**: All original proxpi functionality
-- **Configuration**: Same environment variables (just change prefix)
-
-### ⚡ **What Gets Better** (figures from the December 2024 benchmark run; not re-measured since)
-- **53,000+ req/sec throughput** for package index (proxpi fails under high load)
-- **21x faster single request** response times (18ms vs 397ms)
-- **Sub-millisecond P50 latency** (0.86ms) for cached requests
-- **Instant startup** vs slow Python initialization (<2s vs ~10s)
-- **S3 storage support** for enterprise scaling
-
-### 🛠️ **Migration Steps (2 minutes)**
-
-```bash
-# 1. Stop proxpi
-docker-compose down
-
-# 2. Convert environment variables 
-sed 's/PROXPI_/GROXPI_/g' .env > .env.new && mv .env.new .env
-
-# 3. Update Docker Compose
-sed 's/PROXPI_/GROXPI_/g' docker-compose.yml > docker-compose.yml.new
-mv docker-compose.yml.new docker-compose.yml
-
-# 4. Start groxpi (same ports, same functionality)
-docker-compose up -d
-
-# 5. Verify performance improvement
-curl -w "Time: %{time_total}s\n" http://localhost:5000/simple/numpy
-```
-
-**🎉 Migration complete! Your PyPI proxy is now 21x faster with sub-millisecond response times.**
-
-## 📈 Monitoring
-
-### Health Checks
-
-```bash
-# Basic health check
-curl http://localhost:5000/health
-
-# Detailed system information
-curl -H "Accept: application/json" http://localhost:5000/health
-```
-
-### Cache Statistics
-
-Visit `http://localhost:5000/` for:
-- Cache hit/miss ratios
-- Storage backend status
-- Performance metrics
-- System information
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## 🙏 Acknowledgments
-
-- Original [proxpi](https://github.com/EpicWink/proxpi) project by EpicWink
-- [Gin](https://gin-gonic.com/) web framework
-- [ByteDance Sonic](https://github.com/bytedance/sonic) JSON library
-- [MinIO Go SDK](https://github.com/minio/minio-go) for S3 support
-
-## 📞 Support
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/huyhandes/groxpi/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/huyhandes/groxpi/discussions)
-- 📖 **Documentation**: [READNE.md](https://github.com/yourusername/groxpi/README.md)
-
----
-
-## 🏆 **Why Choose groxpi?**
-
-- **⚡ 53,000+ req/sec**: Massive throughput that proxpi can't match
-- **🚀 21x Faster Requests**: 18ms vs 397ms single request response
-- **🔥 Sub-millisecond P50**: 0.86ms latency for cached package index
-- **🚀 Production Ready**: Built with Go for enterprise reliability
-- **🔄 Zero Migration**: Drop-in replacement for proxpi
-- **☁️ Enterprise Features**: S3 storage, monitoring, compression
-
----
-
-**groxpi** - *Making PyPI caching blazingly fast, incredibly efficient, and enterprise ready* 🚀
+MIT — see [LICENSE](LICENSE). Original [proxpi](https://github.com/EpicWink/proxpi) by EpicWink.

@@ -3,9 +3,14 @@ package pypi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,16 +18,20 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/phuslu/log"
-	"golang.org/x/sync/singleflight"
 )
 
+// ErrNotFound reports that an index does not list a package. Index resolution has
+// to tell a miss from a failure: a miss falls through to the next index, a
+// failure does not.
+var ErrNotFound = errors.New("package not found")
+
+// Client fetches index pages from an upstream PyPI-compatible index. Concurrent
+// requests for the same package are coalesced by the package-file service, not
+// here.
 type Client struct {
 	config     *config.Config
 	httpClient *http.Client
-	sf         singleflight.Group // For deduplicating concurrent requests
 }
 
 type FileInfo struct {
@@ -66,9 +75,6 @@ type PyPISimpleResponse struct {
 	Meta struct {
 		APIVersion string `json:"api-version"`
 	} `json:"meta"`
-	Projects []struct {
-		Name string `json:"name"`
-	} `json:"projects,omitempty"`
 	Name  string     `json:"name,omitempty"`
 	Files []FileInfo `json:"files,omitempty"`
 }
@@ -137,11 +143,12 @@ func NewClient(cfg *config.Config) *Client {
 		Timeout:   60 * time.Second, // Increased for large responses
 	}
 
-	if cfg.ConnectTimeout > 0 || cfg.ReadTimeout > 0 {
-		timeout := cfg.ConnectTimeout + cfg.ReadTimeout
-		if timeout > 0 {
-			httpClient.Timeout = timeout
-		}
+	// http.Client.Timeout is one budget for the whole request - connect, headers
+	// and body - so the two configured phases are summed rather than applied
+	// separately: an index that takes ConnectTimeout to connect is still allowed
+	// its ReadTimeout to answer. Both default to 0, which leaves the 60s above.
+	if budget := cfg.ConnectTimeout + cfg.ReadTimeout; budget > 0 {
+		httpClient.Timeout = budget
 	}
 
 	return &Client{
@@ -150,69 +157,16 @@ func NewClient(cfg *config.Config) *Client {
 	}
 }
 
-func (c *Client) GetPackageList() ([]string, error) {
-	// Use singleflight to deduplicate concurrent requests
-	result, err, _ := c.sf.Do("package-list", func() (any, error) {
-		return c.getPackageListInternal()
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.([]string), nil
-}
-
-func (c *Client) getPackageListInternal() ([]string, error) {
-	url := strings.TrimSuffix(c.config.IndexURL, "/")
+// GetPackageFiles fetches one package's file list from one index. The index is a
+// parameter rather than client state because resolution asks several of them for
+// the same package; the client itself is stateless about which.
+func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
+	indexURL := strings.TrimSuffix(index.URL, "/") + "/" + packageName + "/"
 
 	// Try JSON first
-	resp, err := c.makeRequest(url, "application/vnd.pypi.simple.v1+json")
+	resp, err := c.makeRequest(ctx, indexURL, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch package list: %w", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			// Log error but don't fail the operation
-			_ = err
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-
-	// Check if response is JSON
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "json") {
-		return c.parseJSONPackageList(resp.Body)
-	}
-
-	// Fall back to HTML parsing
-	return c.parseHTMLPackageList(resp.Body)
-}
-
-func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
-	// Use singleflight to deduplicate concurrent requests for the same package
-	key := "package-files:" + packageName
-	result, err, _ := c.sf.Do(key, func() (any, error) {
-		return c.getPackageFilesInternal(packageName)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.([]FileInfo), nil
-}
-
-func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error) {
-	indexURL := strings.TrimSuffix(c.config.IndexURL, "/") + "/" + packageName + "/"
-
-	// Try JSON first
-	resp, err := c.makeRequest(indexURL, "application/vnd.pypi.simple.v1+json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch package files for %s: %w", packageName, err)
+		return nil, fmt.Errorf("failed to fetch package files for %s from %s: %w", packageName, index.Redacted(), err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -222,11 +176,11 @@ func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error)
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("package %s not found", packageName)
+		return nil, fmt.Errorf("%w: %s on %s", ErrNotFound, packageName, index.Redacted())
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, indexURL)
+		return nil, fmt.Errorf("HTTP %d from %s for package %s", resp.StatusCode, index.Redacted(), packageName)
 	}
 
 	// Check if response is JSON
@@ -245,61 +199,17 @@ func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error)
 	return c.parseHTMLPackageFiles(resp.Body, baseURL)
 }
 
-func (c *Client) DownloadFile(url string, dest string) error {
-	resp, err := c.httpClient.Get(url)
+func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
-		return fmt.Errorf("failed to download %s: %w", url, err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			// Log error but don't fail the operation
-			_ = err
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-
-	// TODO: Implement actual file download to dest
-	// For now, this is a placeholder
-	return nil
-}
-
-func (c *Client) makeRequest(url, accept string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
+		return nil, config.RedactURLError(err)
 	}
 
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
-	return c.httpClient.Do(req)
-}
-
-func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {
-	var packages []string
-
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		if err := copyToBuffer(buf, body); err != nil {
-			return err
-		}
-
-		var response PyPISimpleResponse
-		if err := sonic.ConfigFastest.Unmarshal(buf.Bytes(), &response); err != nil {
-			return fmt.Errorf("failed to parse JSON response: %w", err)
-		}
-
-		packages = make([]string, len(response.Projects))
-		for i, project := range response.Projects {
-			packages[i] = project.Name
-		}
-
-		return nil
-	})
-
-	return packages, err
+	resp, err := c.httpClient.Do(req)
+	return resp, config.RedactURLError(err)
 }
 
 func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
@@ -313,9 +223,8 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 			return err
 		}
 
-		// Use sonic's ConfigFastest for maximum performance
 		var response PyPISimpleResponse
-		if err := sonic.ConfigFastest.Unmarshal(buf.Bytes(), &response); err != nil {
+		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
 			return fmt.Errorf("failed to parse JSON response: %w", err)
 		}
 
@@ -324,41 +233,6 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 	})
 
 	return files, err
-}
-
-func (c *Client) parseHTMLPackageList(body io.Reader) ([]string, error) {
-	var packages []string
-
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		if err := copyToBuffer(buf, body); err != nil {
-			return err
-		}
-
-		html := buf.String()
-		packages = make([]string, 0, 1000)
-
-		// Simple HTML parsing for package list
-		lines := strings.SplitSeq(html, "\n")
-		for line := range lines {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "<a ") {
-				continue
-			}
-
-			// Extract package name from anchor text
-			textStart := strings.Index(line, ">")
-			textEnd := strings.Index(line, "</a>")
-			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
-				continue
-			}
-			packageName := line[textStart+1 : textEnd]
-			packages = append(packages, packageName)
-		}
-
-		return nil
-	})
-
-	return packages, err
 }
 
 // parseHTMLPackageFiles parses a PEP 503 HTML index page. baseURL is the URL the
@@ -371,8 +245,9 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 	// emitting hrefs verbatim rather than dropping the whole index.
 	base, baseErr := url.Parse(baseURL)
 	if baseErr != nil {
-		log.Warn().Err(baseErr).Str("base_url", baseURL).
-			Msg("Cannot parse index URL, leaving package file hrefs unresolved")
+		slog.Warn("Cannot parse index URL, leaving package file hrefs unresolved",
+			"error", baseErr,
+			"base_url", config.RedactURL(baseURL))
 		base = nil
 	}
 
@@ -381,11 +256,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			return err
 		}
 
-		html := buf.String()
+		page := buf.String()
 		files = make([]FileInfo, 0, 50)
 
 		// Simple HTML parsing for package files
-		lines := strings.SplitSeq(html, "\n")
+		lines := strings.SplitSeq(page, "\n")
 		for line := range lines {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "<a ") {
@@ -402,7 +277,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if hrefEnd == -1 {
 				continue
 			}
-			href := line[hrefStart : hrefStart+hrefEnd]
+			// Attribute values and anchor text arrive HTML-escaped: a PEP 503
+			// index must write "&gt;=3.8", and re-emitting that escape into the
+			// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
+			// "&amp;" in a query string.
+			href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
 
 			// Resolve the href against the index page URL. ResolveReference
 			// correctly handles absolute, protocol-relative, root-relative and
@@ -411,8 +290,10 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if base != nil {
 				ref, err := url.Parse(href)
 				if err != nil {
-					log.Warn().Err(err).Str("href", href).Str("base_url", baseURL).
-						Msg("Skipping package file with unparseable href")
+					slog.Warn("Skipping package file with unparseable href",
+						"error", err,
+						"href", href,
+						"base_url", config.RedactURL(baseURL))
 					continue
 				}
 				fileURL = base.ResolveReference(ref).String()
@@ -424,14 +305,14 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
 				continue
 			}
-			filename := line[textStart+1 : textEnd]
+			filename := html.UnescapeString(line[textStart+1 : textEnd])
 
 			// Extract data-requires-python if present
 			var requiresPython string
 			if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
 				rpStart += 22
 				if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
-					requiresPython = line[rpStart : rpStart+rpEnd]
+					requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
 				}
 			}
 
@@ -440,7 +321,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
 				yankStart += 13
 				if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
-					yankedStr := line[yankStart : yankStart+yankEnd]
+					yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
 					if yankedStr == "" {
 						yanked = true
 					} else {
@@ -449,9 +330,20 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 				}
 			}
 
+			// PEP 503 carries the digest in the href fragment as
+			// #sha256=<hex>; lift it into the same hash map shape the JSON
+			// index produces so downstream code needs no format branch.
+			var hashes map[string]string
+			if _, fragment, found := strings.Cut(href, "#"); found {
+				if sum, ok := strings.CutPrefix(fragment, "sha256="); ok && sum != "" {
+					hashes = map[string]string{"sha256": sum}
+				}
+			}
+
 			files = append(files, FileInfo{
 				Name:           filename,
 				URL:            fileURL,
+				Hashes:         hashes,
 				RequiresPython: requiresPython,
 				Yanked:         yanked,
 			})

@@ -1,26 +1,66 @@
-package main_test
+// This is an internal test package so that TestFormatBytes can exercise the
+// real FormatBytes: package main cannot be imported from an external test.
+package main
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/logger"
+	"github.com/huyhandes/groxpi/internal/server"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
-// Helper function to test formatBytes logic
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+// TestStartupWithoutOTLPEndpoint is the regression guard for observability
+// becoming a startup dependency: with no collector configured, telemetry setup
+// installs nothing, the logger initialises, and the server serves a request.
+func TestStartupWithoutOTLPEndpoint(t *testing.T) {
+	for _, key := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SERVICE_NAME"} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
+	t.Setenv("GROXPI_CACHE_DIR", t.TempDir())
+	t.Setenv("GROXPI_LOGGING_LEVEL", "ERROR")
+
+	cfg := config.Load()
+	if cfg.OTLPEndpoint != "" {
+		t.Fatalf("expected no OTLP endpoint, got %q", cfg.OTLPEndpoint)
 	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	if err != nil {
+		t.Fatalf("telemetry setup must not fail without a collector: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdownTelemetry(context.Background()) })
+
+	logger.Init(logger.LogConfig{Level: cfg.LogLevel, Format: cfg.LogFormat, Color: cfg.LogColor})
+
+	srv := server.New(cfg)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: srv.Router()}
+	go func() { _ = httpServer.Serve(listener) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("server did not serve a request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health = %d, want 200", resp.StatusCode)
+	}
 }
 
 func TestFormatBytes(t *testing.T) {
@@ -30,6 +70,7 @@ func TestFormatBytes(t *testing.T) {
 		expected string
 	}{
 		{"zero bytes", 0, "0 B"},
+		{"single byte", 1, "1 B"},
 		{"bytes", 512, "512 B"},
 		{"kilobytes", 1024, "1.0 KB"},
 		{"kilobytes with decimal", 1536, "1.5 KB"},
@@ -38,14 +79,15 @@ func TestFormatBytes(t *testing.T) {
 		{"gigabytes", 1024 * 1024 * 1024, "1.0 GB"},
 		{"large gigabytes", 5 * 1024 * 1024 * 1024, "5.0 GB"},
 		{"terabytes", 1024 * 1024 * 1024 * 1024, "1.0 TB"},
-		{"negative bytes", -1024, "-1024 B"}, // formatBytes doesn't handle negatives properly
+		{"terabytes from gigabytes", 2048 * 1024 * 1024 * 1024, "2.0 TB"},
+		{"negative bytes", -1024, "-1024 B"}, // FormatBytes doesn't handle negatives
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := formatBytes(tc.bytes)
+			result := FormatBytes(tc.bytes)
 			if result != tc.expected {
-				t.Errorf("formatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
+				t.Errorf("FormatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
 			}
 		})
 	}
@@ -466,10 +508,9 @@ func TestConfigLoadingWithAllDefaults(t *testing.T) {
 		"GROXPI_CACHE_DIR", "GROXPI_LOGGING_LEVEL", "GROXPI_LOG_FORMAT",
 		"GROXPI_LOG_COLOR", "GROXPI_STORAGE_TYPE", "GROXPI_DOWNLOAD_TIMEOUT",
 		"GROXPI_CONNECT_TIMEOUT", "GROXPI_READ_TIMEOUT", "GROXPI_DISABLE_INDEX_SSL_VERIFICATION",
-		"GROXPI_BINARY_FILE_MIME_TYPE", "AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID",
+		"AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID",
 		"AWS_SECRET_ACCESS_KEY", "AWS_REGION", "GROXPI_S3_BUCKET", "GROXPI_S3_PREFIX",
-		"GROXPI_S3_FORCE_PATH_STYLE", "GROXPI_S3_USE_SSL", "GROXPI_S3_PART_SIZE",
-		"GROXPI_S3_MAX_CONNECTIONS",
+		"GROXPI_S3_FORCE_PATH_STYLE", "GROXPI_S3_USE_SSL",
 	}
 
 	originalEnv := make(map[string]string)

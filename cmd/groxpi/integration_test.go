@@ -70,29 +70,3 @@ func TestMainIntegration(t *testing.T) {
 		t.Log("Main function completed without panic")
 	}
 }
-
-// TestFormatBytes ensures the formatBytes utility function works correctly
-func TestFormatBytesExtended(t *testing.T) {
-	testCases := []struct {
-		name     string
-		bytes    int64
-		expected string
-	}{
-		{"zero bytes", 0, "0 B"},
-		{"single byte", 1, "1 B"},
-		{"kilobytes", 1536, "1.5 KB"},
-		{"megabytes", 1572864, "1.5 MB"},
-		{"gigabytes", 1610612736, "1.5 GB"},
-		{"terabytes edge case", 1024 * 1024 * 1024 * 1024, "1.0 TB"},
-		{"large value", 2048 * 1024 * 1024 * 1024, "2.0 TB"},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := formatBytes(tc.bytes)
-			if result != tc.expected {
-				t.Errorf("formatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
-			}
-		})
-	}
-}

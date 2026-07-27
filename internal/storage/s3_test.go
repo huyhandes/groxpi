@@ -1,54 +1,137 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/minio/minio-go/v7"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// newTestS3Storage builds an S3 backend pointed at an endpoint that is never
-// contacted. Anything needing a live bucket belongs in s3_integration_test.go,
-// which skips in short mode; these tests only exercise pure logic.
-func newTestS3Storage(t *testing.T) *S3Storage {
+// recordingS3Server stands in for an S3 endpoint and records the requests it
+// saw. It answers everything with 200, which is enough for the SDK to consider
+// a HEAD or a PUT successful.
+type recordingS3Server struct {
+	*httptest.Server
+
+	mu       sync.Mutex
+	requests []*http.Request
+}
+
+func newRecordingS3Server(t *testing.T) *recordingS3Server {
+	t.Helper()
+
+	rec := &recordingS3Server{}
+	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		rec.mu.Lock()
+		rec.requests = append(rec.requests, r)
+		rec.mu.Unlock()
+
+		w.Header().Set("ETag", `"deadbeef"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(rec.Close)
+
+	return rec
+}
+
+// lastRequest returns the most recent request the fake endpoint served.
+func (r *recordingS3Server) lastRequest(t *testing.T) *http.Request {
+	t.Helper()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	require.NotEmpty(t, r.requests, "the fake endpoint was never contacted")
+	return r.requests[len(r.requests)-1]
+}
+
+// newFakeS3Storage builds an S3 backend pointed at an in-process fake endpoint.
+// Anything needing a live bucket belongs in s3_integration_test.go.
+func newFakeS3Storage(t *testing.T, rec *recordingS3Server) *S3Storage {
 	t.Helper()
 
 	s, err := NewS3Storage(&S3Config{
-		Endpoint: "test.endpoint",
-		Bucket:   "test-bucket",
-		PartSize: 10 * 1024 * 1024,
+		Endpoint:        rec.URL,
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		Bucket:          "test-bucket",
+		Prefix:          "groxpi",
+		ForcePathStyle:  true,
 	})
-	if err != nil {
-		t.Skipf("Cannot create S3 storage for testing: %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
 	return s
 }
 
-// TestS3Storage_NotFoundIsSentinel pins the translation from MinIO's error
+func responseError(status int) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      errors.New("api error"),
+	}
+}
+
+// apiError builds what the SDK hands callers for a modelled S3 error: an API
+// error code wrapped in the HTTP response it arrived on.
+func apiError(code string, status int) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: code},
+	}
+}
+
+// TestS3Storage_NotFoundIsSentinel pins the translation from the SDK's error
 // shapes to the shared sentinel. Without it TieredStorage cannot tell an absent
 // object from a broken bucket.
 func TestS3Storage_NotFoundIsSentinel(t *testing.T) {
 	const key = "packages/numpy/numpy-1.26.0.tar.gz"
 
 	t.Run("NoSuchKey", func(t *testing.T) {
-		err := s3Error(minio.ErrorResponse{Code: "NoSuchKey"}, key)
+		err := s3Error(&types.NoSuchKey{}, key)
 		require.ErrorIs(t, err, ErrNotFound)
 		assert.Contains(t, err.Error(), key)
 	})
 
-	t.Run("404 without a code", func(t *testing.T) {
-		err := s3Error(minio.ErrorResponse{StatusCode: http.StatusNotFound}, key)
-		require.ErrorIs(t, err, ErrNotFound)
+	t.Run("NotFound from HeadObject", func(t *testing.T) {
+		require.ErrorIs(t, s3Error(&types.NotFound{}, key), ErrNotFound)
+	})
+
+	// A bodyless 404 is what HeadObject answers with; the SDK derives the error
+	// code from the status line alone.
+	t.Run("bodyless 404 carrying a NotFound code", func(t *testing.T) {
+		require.ErrorIs(t, s3Error(apiError("NotFound", http.StatusNotFound), key), ErrNotFound)
+	})
+
+	// A deleted or misnamed bucket also answers 404. Reading that as "the object
+	// is absent" turns a broken configuration into a silent permanent 100% miss:
+	// every request re-downloads from upstream and every write is discarded.
+	t.Run("NoSuchBucket is not a miss", func(t *testing.T) {
+		err := s3Error(apiError("NoSuchBucket", http.StatusNotFound), key)
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrNotFound)
 	})
 
 	t.Run("other failures are not misses", func(t *testing.T) {
-		err := s3Error(minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusForbidden}, key)
+		err := s3Error(responseError(http.StatusForbidden), key)
 		require.Error(t, err)
 		assert.NotErrorIs(t, err, ErrNotFound)
 	})
@@ -60,140 +143,274 @@ func TestS3Storage_NotFoundIsSentinel(t *testing.T) {
 	})
 }
 
-// TestS3Storage_ExistsIgnoresOnlyNotFound proves Exists reports absence as
-// (false, nil) but never hides a real failure behind it.
-func TestS3Storage_ExistsIgnoresOnlyNotFound(t *testing.T) {
-	assert.True(t, isNotFoundResponse(minio.ErrorResponse{Code: "NoSuchKey"}))
-	assert.True(t, isNotFoundResponse(minio.ErrorResponse{StatusCode: http.StatusNotFound}))
-	assert.False(t, isNotFoundResponse(minio.ErrorResponse{Code: "AccessDenied", StatusCode: http.StatusForbidden}))
-	assert.False(t, isNotFoundResponse(errors.New("dial tcp: connection refused")))
-}
-
 // TestS3Storage_Capabilities pins which capabilities S3 claims. S3 objects are
 // not local files, so zero-copy is impossible and must not be advertised.
 func TestS3Storage_Capabilities(t *testing.T) {
-	var backend Storage = newTestS3Storage(t)
+	var backend Storage = newFakeS3Storage(t, newRecordingS3Server(t))
 
 	_, isZeroCopy := backend.(ZeroCopyCapable)
 	assert.False(t, isZeroCopy, "S3Storage must not advertise ZeroCopyCapable")
 }
 
+// TestS3Storage_PathStyleAddressing pins that the bucket is addressed in the
+// path rather than as a virtual host, which is what MinIO requires.
+func TestS3Storage_PathStyleAddressing(t *testing.T) {
+	rec := newRecordingS3Server(t)
+	s := newFakeS3Storage(t, rec)
+
+	_, err := s.Put(context.Background(), "packages/x/x-1.0.tar.gz",
+		bytes.NewReader([]byte("payload")), 7, "application/gzip")
+	require.NoError(t, err)
+
+	assert.Equal(t, "/test-bucket/groxpi/packages/x/x-1.0.tar.gz", rec.lastRequest(t).URL.Path)
+}
+
+// TestS3Storage_NoChecksumTrailers pins the MinIO compatibility setting: older
+// releases reject the aws-chunked checksum trailers the SDK now sends by
+// default, so a put must carry none.
+func TestS3Storage_NoChecksumTrailers(t *testing.T) {
+	rec := newRecordingS3Server(t)
+	s := newFakeS3Storage(t, rec)
+
+	_, err := s.Put(context.Background(), "packages/x/x-1.0.tar.gz",
+		bytes.NewReader([]byte("payload")), 7, "application/gzip")
+	require.NoError(t, err)
+
+	put := rec.lastRequest(t)
+	assert.Empty(t, put.Header.Get("X-Amz-Trailer"), "checksum trailer must not be declared")
+	assert.NotContains(t, strings.ToLower(put.Header.Get("Content-Encoding")), "aws-chunked")
+	for name := range put.Header {
+		assert.NotContains(t, strings.ToLower(name), "x-amz-checksum-",
+			"no checksum header may be sent when the server does not require one")
+	}
+}
+
+// fakeBucket is an in-process stand-in for a bucket that answers the two
+// operations a prefix delete needs: a paginated listing and a batch delete.
+// Everything else answers 200, which is enough for the SDK's bucket check.
+type fakeBucket struct {
+	*httptest.Server
+
+	// pageSize truncates listings so the paginating path is exercised.
+	pageSize int
+
+	mu      sync.Mutex
+	objects map[string]bool
+}
+
+func newFakeBucket(t *testing.T, pageSize int, keys ...string) *fakeBucket {
+	t.Helper()
+
+	b := &fakeBucket{pageSize: pageSize, objects: make(map[string]bool, len(keys))}
+	for _, key := range keys {
+		b.objects[key] = true
+	}
+
+	b.Server = httptest.NewServer(http.HandlerFunc(b.serve))
+	t.Cleanup(b.Close)
+
+	return b
+}
+
+func (b *fakeBucket) serve(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+
+	switch {
+	case query.Get("list-type") == "2":
+		b.list(w, query)
+	case r.Method == http.MethodPost && query.Has("delete"):
+		b.delete(w, r)
+	default:
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// list answers with at most pageSize keys under the requested prefix, in sorted
+// order, continuing from the supplied token.
+func (b *fakeBucket) list(w http.ResponseWriter, query url.Values) {
+	b.mu.Lock()
+	matching := make([]string, 0, len(b.objects))
+	for key := range b.objects {
+		if strings.HasPrefix(key, query.Get("prefix")) && key > query.Get("continuation-token") {
+			matching = append(matching, key)
+		}
+	}
+	b.mu.Unlock()
+	sort.Strings(matching)
+
+	truncated := len(matching) > b.pageSize
+	if truncated {
+		matching = matching[:b.pageSize]
+	}
+
+	var body strings.Builder
+	body.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` +
+		`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	fmt.Fprintf(&body, `<IsTruncated>%t</IsTruncated>`, truncated)
+	for _, key := range matching {
+		fmt.Fprintf(&body, `<Contents><Key>%s</Key><Size>1</Size></Contents>`, key)
+	}
+	if truncated {
+		fmt.Fprintf(&body, `<NextContinuationToken>%s</NextContinuationToken>`, matching[len(matching)-1])
+	}
+	body.WriteString(`</ListBucketResult>`)
+
+	w.Header().Set("Content-Type", "application/xml")
+	_, _ = io.WriteString(w, body.String())
+}
+
+func (b *fakeBucket) delete(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Objects []struct{ Key string } `xml:"Object"`
+	}
+	if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	b.mu.Lock()
+	for _, object := range request.Objects {
+		delete(b.objects, object.Key)
+	}
+	b.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/xml")
+	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+		`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`)
+}
+
+func (b *fakeBucket) remaining() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	keys := make([]string, 0, len(b.objects))
+	for key := range b.objects {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	return keys
+}
+
+// TestS3Storage_DeletePrefix pins that evicting a package reaches the object
+// store. Without it, pure-S3 deployments answered an admin eviction with 200
+// having deleted nothing: the transport only evicts through PrefixDeleter, and
+// S3Storage did not implement it.
+func TestS3Storage_DeletePrefix(t *testing.T) {
+	// Two pages' worth of one package, plus a package whose name merely starts
+	// with the evicted one, plus an unrelated one.
+	bucket := newFakeBucket(t, 2,
+		"groxpi/packages/numpy/numpy-1.0.tar.gz",
+		"groxpi/packages/numpy/numpy-2.0.tar.gz",
+		"groxpi/packages/numpy/numpy-3.0.tar.gz",
+		"groxpi/packages/numpy-stubs/numpy-stubs-1.0.tar.gz",
+		"groxpi/packages/pandas/pandas-2.0.tar.gz",
+	)
+
+	s, err := NewS3Storage(&S3Config{
+		Endpoint:        bucket.URL,
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		Bucket:          "test-bucket",
+		Prefix:          "groxpi",
+		ForcePathStyle:  true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	deleter, ok := any(s).(PrefixDeleter)
+	require.True(t, ok, "S3Storage must be able to evict a package prefix")
+
+	deleted, err := deleter.DeletePrefix(context.Background(), "packages/numpy/")
+	require.NoError(t, err)
+	assert.Equal(t, 3, deleted, "every page of the prefix must be deleted")
+
+	assert.Equal(t, []string{
+		"groxpi/packages/numpy-stubs/numpy-stubs-1.0.tar.gz",
+		"groxpi/packages/pandas/pandas-2.0.tar.gz",
+	}, bucket.remaining(), "prefix delete removed the wrong objects")
+
+	// A prefix that matches nothing is not an error.
+	deleted, err = deleter.DeletePrefix(context.Background(), "packages/absent/")
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+}
+
+// TestS3Storage_ExistsSurvivesAnotherCallersCancellation pins that the
+// deduplicated lookup belongs to no single caller. The flight used to run on the
+// context of whichever caller started it, so one client disconnecting failed
+// every other caller waiting on the same key with context.Canceled - which the
+// read path reads as a miss and re-downloads a file that is in the bucket.
+func TestS3Storage_ExistsSurvivesAnotherCallersCancellation(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var heads atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The bucket check at construction time is also a HEAD; only object heads
+		// are the ones under test.
+		if r.Method != http.MethodHead || !strings.Contains(r.URL.Path, "/packages/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if heads.Add(1) == 1 {
+			close(arrived)
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	s, err := NewS3Storage(&S3Config{
+		Endpoint:        server.URL,
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		Bucket:          "test-bucket",
+		ForcePathStyle:  true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+
+	// Caller A starts the flight and then goes away, as a client that hung up
+	// mid-request does.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	go func() { _, _ = s.Exists(ctxA, key) }()
+	<-arrived
+
+	// Caller B joins A's in-flight lookup: A cannot have finished, it is parked in
+	// the handler.
+	type answer struct {
+		exists bool
+		err    error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		exists, err := s.Exists(context.Background(), key)
+		answers <- answer{exists, err}
+	}()
+
+	// Give B time to join the flight, then take A away and let the lookup finish.
+	time.Sleep(50 * time.Millisecond)
+	cancelA()
+	close(release)
+
+	got := <-answers
+	require.NoError(t, got.err, "a second caller was failed by the first one disconnecting")
+	assert.True(t, got.exists, "the object is in the bucket and must not be reported absent")
+	assert.Equal(t, int64(1), heads.Load(), "the lookup must still be deduplicated")
+}
+
 // TestS3Storage_ContextIsHonoured is a cheap guard that read paths propagate a
-// dead context rather than blocking; it needs no live bucket.
+// dead context rather than blocking.
 func TestS3Storage_ContextIsHonoured(t *testing.T) {
-	s := newTestS3Storage(t)
+	s := newFakeS3Storage(t, newRecordingS3Server(t))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := s.Stat(ctx, "whatever")
+	_, err := s.Exists(ctx, "whatever")
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrNotFound)
-}
-
-// TestS3Storage_CalculateOptimalPartSize tests the part size calculation logic,
-// including the degenerate sizes a caller can pass in.
-func TestS3Storage_CalculateOptimalPartSize(t *testing.T) {
-	tests := []struct {
-		name        string
-		fileSize    int64
-		expectedMin int64
-		expectedMax int64
-		description string
-	}{
-		{
-			name:        "small_file_10MB",
-			fileSize:    10 * 1024 * 1024, // 10MB
-			expectedMin: 5 * 1024 * 1024,  // 5MB minimum
-			expectedMax: 32 * 1024 * 1024, // Should use default or small part size
-			description: "Small files should use minimum viable part size",
-		},
-		{
-			name:        "medium_file_50MB",
-			fileSize:    50 * 1024 * 1024, // 50MB
-			expectedMin: 5 * 1024 * 1024,  // 5MB minimum
-			expectedMax: 32 * 1024 * 1024, // Should use default part size
-			description: "Medium files should use default part size",
-		},
-		{
-			name:        "large_file_500MB",
-			fileSize:    500 * 1024 * 1024, // 500MB
-			expectedMin: 10 * 1024 * 1024,  // Should be at least 10MB
-			expectedMax: 64 * 1024 * 1024,  // Should scale up for better throughput
-			description: "Large files should use larger part sizes for throughput",
-		},
-		{
-			name:        "extra_large_file_5GB",
-			fileSize:    5 * 1024 * 1024 * 1024, // 5GB
-			expectedMin: 32 * 1024 * 1024,       // Should use larger parts
-			expectedMax: 128 * 1024 * 1024,      // But not too large
-			description: "Extra large files should balance part count vs throughput",
-		},
-		{
-			name:        "huge_file_50GB",
-			fileSize:    50 * 1024 * 1024 * 1024, // 50GB
-			expectedMin: 64 * 1024 * 1024,        // Must be large enough to stay under 10k parts
-			expectedMax: 256 * 1024 * 1024,       // But reasonable for memory usage
-			description: "Huge files must respect 10,000 part limit",
-		},
-		{
-			name:        "pyspark_size_317MB",
-			fileSize:    317 * 1024 * 1024, // 317MB (real-world pyspark example)
-			expectedMin: 10 * 1024 * 1024,  // At least 10MB
-			expectedMax: 64 * 1024 * 1024,  // Should use optimized size
-			description: "Real-world pyspark file should have optimized part size",
-		},
-		{
-			name:        "zero_size",
-			fileSize:    0,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Zero size should not crash, should return the smallest band",
-		},
-		{
-			name:        "negative_size",
-			fileSize:    -1,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Negative size should not crash, should return the smallest band",
-		},
-		{
-			name:        "very_small_size_1KB",
-			fileSize:    1024,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Very small files should use the smallest band",
-		},
-		{
-			name:        "exact_aws_minimum_5MB",
-			fileSize:    5 * 1024 * 1024,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Exact AWS minimum should work correctly",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			partSize := calculateOptimalPartSize(tt.fileSize)
-
-			// Verify part size is within expected range
-			assert.GreaterOrEqual(t, partSize, tt.expectedMin,
-				"Part size should be at least %d bytes for %s", tt.expectedMin, tt.description)
-			assert.LessOrEqual(t, partSize, tt.expectedMax,
-				"Part size should be at most %d bytes for %s", tt.expectedMax, tt.description)
-
-			// Verify AWS S3 constraints
-			assert.GreaterOrEqual(t, partSize, int64(5*1024*1024),
-				"Part size must meet AWS S3 minimum of 5MB")
-
-			// Verify part count doesn't exceed AWS limit
-			partCount := (tt.fileSize + partSize - 1) / partSize // Ceiling division
-			assert.LessOrEqual(t, partCount, int64(10000),
-				"Part count (%d) must not exceed AWS S3 limit of 10,000 parts", partCount)
-
-			t.Logf("File size: %dMB, Part size: %dMB, Part count: %d",
-				tt.fileSize/(1024*1024), partSize/(1024*1024), partCount)
-		})
-	}
 }

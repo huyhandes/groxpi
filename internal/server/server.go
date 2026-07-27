@@ -3,7 +3,9 @@ package server
 import (
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"strconv"
@@ -11,31 +13,59 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
-	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
-	"github.com/phuslu/log"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/huyhandes/groxpi/internal/cache"
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/logger"
 	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/streaming"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 type Server struct {
-	config        *config.Config
-	indexCache    *cache.IndexCache
-	responseCache *cache.ResponseCache
-	pypiClient    *pypi.Client
-	storage       storage.Storage
-	router        *gin.Engine
+	config     *config.Config
+	indexCache *cache.IndexCache
+	pypiClient *pypi.Client
+	storage    storage.Storage
+	router     *gin.Engine
 	// packageFiles owns index resolution, the package-file miss pipeline and the
 	// single singleflight.Group that deduplicates both.
 	packageFiles *PackageFileService
+
+	// Administrative surface. Nil templates mean it was never mounted.
+	adminTemplates *template.Template
+	adminErrors    adminErrors
+	// prefetches counts the detached prefetch goroutines so shutdown can wait for
+	// them: one of them may be inside storage.Put when the signal arrives.
+	prefetches sync.WaitGroup
 }
 
+// New builds a server or terminates the process. It is the entry point's
+// constructor; anything that needs to observe a construction failure calls
+// NewServer.
 func New(cfg *config.Config) *Server {
+	s, err := NewServer(cfg)
+	if err != nil {
+		logger.Fatal("Failed to construct server", "error", err)
+	}
+	return s
+}
+
+// NewServer builds a server, returning an error rather than producing one that
+// cannot be trusted. A misconfigured administrative surface fails here: serving
+// an open management panel because a password was missing is worse than not
+// starting.
+func NewServer(cfg *config.Config) (*Server, error) {
+	if cfg.AdminEnabled && !cfg.AdminConfigured() {
+		return nil, errors.New("admin interface is enabled but GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD are not both set")
+	}
+
 	// Set Gin mode based on log level
 	if cfg.LogLevel == "DEBUG" {
 		gin.SetMode(gin.DebugMode)
@@ -51,6 +81,7 @@ func New(cfg *config.Config) *Server {
 
 	// Add middleware
 	router.Use(gin.Recovery())
+	router.Use(traceRequests())
 	router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		return fmt.Sprintf("[%s] %d - %v %s %s\n",
 			param.TimeStamp.Format(time.RFC3339),
@@ -61,16 +92,13 @@ func New(cfg *config.Config) *Server {
 		)
 	}))
 
-	// Add compression middleware
-	router.Use(gzip.Gzip(gzip.BestSpeed))
-
-	// Note: Templates are not currently used - handlers generate HTML inline
-	// This avoids issues with template syntax differences between frameworks
+	// No compression middleware: package files are already-compressed archives and
+	// index bodies carry their compressed form in the cache entry.
 
 	// Initialize storage backend
 	storageBackend, err := initStorage(cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize storage")
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
 
 	// Create HTTP client for streaming downloader with configured timeout
@@ -83,12 +111,13 @@ func New(cfg *config.Config) *Server {
 	}
 
 	s := &Server{
-		config:        cfg,
-		indexCache:    cache.NewIndexCache(),
-		responseCache: cache.NewResponseCache(50 * 1024 * 1024), // 50MB response cache
-		pypiClient:    pypi.NewClient(cfg),
-		storage:       storageBackend,
-		router:        router,
+		config: cfg,
+		// Expired entries are swept at the index TTL cadence: an entry outlives its
+		// TTL by at most one interval, and nothing scans on the read path.
+		indexCache: cache.NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL),
+		pypiClient: pypi.NewClient(cfg),
+		storage:    storageBackend,
+		router:     router,
 	}
 
 	s.packageFiles = newPackageFileService(
@@ -99,12 +128,53 @@ func New(cfg *config.Config) *Server {
 		streaming.NewTeeStreamingDownloader(storageBackend, streamClient),
 	)
 
+	if cfg.AdminConfigured() {
+		if s.adminTemplates, err = parseAdminTemplates(); err != nil {
+			return nil, fmt.Errorf("failed to parse admin templates: %w", err)
+		}
+	}
+
 	s.setupRoutes()
-	return s
+	return s, nil
 }
 
 func (s *Server) Router() *gin.Engine {
 	return s.router
+}
+
+// traceRequests opens the root span of every request and puts it on the request
+// context, so every span the handlers open hangs off it. An upstream trace is
+// continued when the client sent W3C headers. It is instrumentation only: it
+// reads the response status and changes nothing about it.
+func traceRequests() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := otel.GetTextMapPropagator().Extract(c.Request.Context(),
+			propagation.HeaderCarrier(c.Request.Header))
+
+		// The route pattern, not the path: a span name per package name would be a
+		// cardinality explosion in any backend.
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+		ctx, span := telemetry.Tracer().Start(ctx, c.Request.Method+" "+route,
+			trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+
+		span.SetAttributes(attribute.Int("http.response.status_code", c.Writer.Status()))
+	}
+}
+
+// Close waits for detached prefetches, stops the index-cache sweeper and
+// releases the storage backend. Called from the shutdown path: closing the
+// backend under a prefetch that is still writing to it would fail that write.
+func (s *Server) Close() error {
+	s.prefetches.Wait()
+	s.indexCache.Close()
+	return s.storage.Close()
 }
 
 func (s *Server) setupRoutes() {
@@ -120,13 +190,10 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/index/:package", s.handleListFiles)
 	s.router.GET("/index/:package/:file", s.handleDownloadFile)
 
-	// Cache management. Any other method on these paths is answered by gin's
-	// HandleMethodNotAllowed.
-	s.router.DELETE("/cache/list", s.handleCacheList)
-	s.router.DELETE("/cache/:package", s.handleCachePackage)
-
 	// Health check
 	s.router.GET("/health", s.handleHealth)
+
+	s.setupAdminRoutes()
 
 	// 404 handler
 	s.router.NoRoute(func(c *gin.Context) {
@@ -134,7 +201,50 @@ func (s *Server) setupRoutes() {
 	})
 }
 
+// setupAdminRoutes mounts the administrative surface behind basic
+// authentication, or not at all.
+//
+// With no credentials configured nothing is registered, so every path below
+// falls through to NoRoute and answers 404 — the surface does not exist rather
+// than existing unauthenticated. That deliberately includes the pre-existing
+// /cache routes, which were open and are now in the same group: an authenticated
+// front door on a building with an open side entrance is not authentication.
+// Requiring credentials there is a breaking change against the Python
+// implementation's API.
+//
+// The group covers only these paths. The package index routes pip uses are
+// registered above and are never inside it, in any configuration.
+func (s *Server) setupAdminRoutes() {
+	if !s.config.AdminConfigured() {
+		return
+	}
+
+	// Basic auth rather than a bearer token: the browser prompts for the
+	// credential and resends it on every subsequent request, including the ones
+	// the page's interaction library issues, so there is no login form and no
+	// token in client-side storage. It travels in cleartext, so a deployment needs
+	// a TLS-terminating proxy.
+	admin := s.router.Group("", gin.BasicAuth(gin.Accounts{
+		s.config.AdminUsername: s.config.AdminPassword,
+	}))
+
+	admin.GET("/admin", s.handleAdminPage)
+	admin.GET("/admin/rows", s.handleAdminRows)
+	admin.GET("/admin/htmx.min.js", s.handleAdminAsset)
+	admin.POST("/admin/prefetch", s.handleAdminPrefetch)
+
+	// Eviction is the pre-existing cache route: the page's Evict button issues the
+	// same DELETE an operator can curl.
+	admin.DELETE("/cache/list", s.handleCacheList)
+	admin.DELETE("/cache/:package", s.handleCachePackage)
+}
+
 func (s *Server) handleHome(c *gin.Context) {
+	adminLink := ""
+	if s.config.AdminConfigured() {
+		adminLink = ` | <a href="/admin">Cache admin</a>`
+	}
+
 	// For now, return simple HTML without layout
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -148,150 +258,91 @@ func (s *Server) handleHome(c *gin.Context) {
 		<li>Index TTL: %s</li>
 		<li>Version: 1.0.0</li>
 	</ul>
-	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a></p>
+	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a>%s</p>
 </body>
-</html>`, s.config.IndexURL, s.config.CacheSize/(1024*1024), s.config.IndexTTL.String())
+</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
 
 	c.Header("Content-Type", "text/html")
 	c.String(http.StatusOK, html)
 }
 
+// handleListPackages proxies the upstream root index byte for byte. It is not
+// cached and not decoded: the full project list is tens of megabytes, and every
+// representation the client can ask for is one the upstream already produces.
 func (s *Server) handleListPackages(c *gin.Context) {
-	// Check response cache first for JSON requests
+	// ?format= overrides Accept here exactly as it does on a package page, but
+	// neither value is forwarded verbatim: both are attacker-controlled and both
+	// are part of the singleflight key, so N distinct spellings would be N
+	// concurrent multi-megabyte fetches all resident in memory. They collapse to
+	// the two representations and one encoding this route actually asks upstream
+	// for, which is the whole set it can serve.
+	accept := "text/html"
 	if wantsJSON(c) {
-		cacheKey := "json:package-list"
-		if cachedJSON, found := s.responseCache.Get(cacheKey); found {
-			c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", cachedJSON)
-			return
-		}
+		accept = jsonContentType
+	}
+	acceptEncoding := ""
+	if strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		acceptEncoding = "gzip"
 	}
 
-	packages, err := s.packageFiles.resolvePackageList()
+	root, err := s.packageFiles.ProxyRoot(c.Request.Context(), accept, acceptEncoding)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to fetch package list")
-		packages = []string{} // Use empty list on error
-	}
-
-	if wantsJSON(c) {
-		// Pre-allocate with exact capacity
-		projects := make([]map[string]string, 0, len(packages))
-		for _, pkg := range packages {
-			projects = append(projects, map[string]string{"name": pkg})
-		}
-
-		response := map[string]any{
-			"meta": map[string]any{
-				"api-version": "1.0",
-			},
-			"projects": projects,
-		}
-
-		responseData, err := sonic.ConfigFastest.Marshal(response)
-		if err != nil {
-			c.String(http.StatusInternalServerError, "JSON encoding error")
-			return
-		}
-
-		s.responseCache.Set("json:package-list", responseData, s.config.IndexTTL)
-		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
+		slog.ErrorContext(c.Request.Context(), "Failed to proxy root index", "error", redactErrorText(err))
+		c.String(http.StatusBadGateway, "Failed to fetch package list")
 		return
 	}
 
-	// Return simple HTML for packages
-	html := `<!DOCTYPE html>
-<html>
-<head><title>Package Index</title></head>
-<body>
-	<h1>Simple index</h1>
-	<p>No packages cached yet. Install a package to populate the cache.</p>
-	<p><a href="/">← Back to home</a></p>
-</body>
-</html>`
-	c.Header("Content-Type", "text/html")
-	c.String(http.StatusOK, html)
+	c.Header("Vary", "Accept, Accept-Encoding")
+	if root.contentEncoding != "" {
+		c.Header("Content-Encoding", root.contentEncoding)
+	}
+	c.Data(root.status, root.contentType, root.body)
 }
 
 func (s *Server) handleListFiles(c *gin.Context) {
-	packageName := c.Param("package")
-
-	// Normalize package name
-	packageName = normalizePackageName(packageName)
-
-	// Check response cache first for JSON requests
-	if wantsJSON(c) {
-		cacheKey := "json:package:" + packageName
-		if cachedJSON, found := s.responseCache.Get(cacheKey); found {
-			c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", cachedJSON)
-			return
-		}
-	}
+	packageName := pypi.NormalizeName(c.Param("package"))
 
 	// One index-resolution path, shared with the download handler: cache lookup,
 	// deduplicated upstream fetch, cache fill.
-	files, err := s.packageFiles.resolveIndex(packageName)
+	entry, err := s.packageFiles.resolveIndex(c.Request.Context(), packageName)
 	if err != nil {
-		// TODO: internal/pypi has no not-found sentinel, so the miss can only be
-		// recognised by its message. Replace with errors.Is once it exposes one.
-		if strings.Contains(err.Error(), "not found") {
+		// A miss means every configured index was consulted and none had it.
+		if errors.Is(err, pypi.ErrNotFound) {
 			c.String(http.StatusNotFound, "Package not found")
 			return
 		}
-		log.Error().Err(err).Str("package", packageName).Msg("Failed to fetch package files")
-		c.String(http.StatusInternalServerError, "Error fetching package: "+err.Error())
+		slog.ErrorContext(c.Request.Context(), "Failed to fetch package files",
+			"error", redactErrorText(err), "package", packageName)
+		c.String(http.StatusInternalServerError, "Error fetching package: "+redactErrorText(err))
 		return
 	}
 
-	s.renderPackageFiles(c, packageName, files)
+	if wantsJSON(c) {
+		writeIndexJSON(c, entry)
+		return
+	}
+	renderPackageFilesHTML(c, packageName, entry.Files)
 }
 
-func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []pypi.FileInfo) {
-	if wantsJSON(c) {
-		// Pre-allocate slice with exact capacity
-		fileList := make([]map[string]any, 0, len(files))
-
-		for _, file := range files {
-			// Use simple map
-			fileMap := make(map[string]any, 6)
-			fileMap["filename"] = file.Name
-			// Rewrite URL to point to proxy instead of direct PyPI
-			fileMap["url"] = fmt.Sprintf("/simple/%s/%s", packageName, file.Name)
-
-			if len(file.Hashes) > 0 {
-				fileMap["hashes"] = file.Hashes
-			}
-			if file.RequiresPython != "" {
-				fileMap["requires-python"] = file.RequiresPython
-			}
-			if file.IsYanked() {
-				fileMap["yanked"] = true
-				yankedReason := file.GetYankedReason()
-				if yankedReason != "" {
-					fileMap["yanked-reason"] = yankedReason
-				}
-			}
-			fileList = append(fileList, fileMap)
-		}
-
-		// Build response structure
-		response := map[string]any{
-			"meta": map[string]any{
-				"api-version": "1.0",
-			},
-			"name":  packageName,
-			"files": fileList,
-		}
-
-		responseData, err := sonic.ConfigFastest.Marshal(response)
-		if err != nil {
-			c.String(http.StatusInternalServerError, "JSON encoding error")
-			return
-		}
-
-		s.responseCache.Set("json:package:"+packageName, responseData, s.config.IndexTTL)
-		c.Data(http.StatusOK, "application/vnd.pypi.simple.v1+json", responseData)
+// writeIndexJSON serves the body built when the entry was filled, preferring its
+// pre-compressed form when the client accepts it. Nothing is compressed on the
+// request path.
+func writeIndexJSON(c *gin.Context, entry *cache.Entry) {
+	c.Header("Vary", "Accept-Encoding")
+	// ponytail: substring match, not a q-value parse. "gzip;q=0" is rare enough
+	// that the parser can wait for a client that actually sends it.
+	if len(entry.GZIP) > 0 && strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		c.Header("Content-Encoding", "gzip")
+		c.Data(http.StatusOK, jsonContentType, entry.GZIP)
 		return
 	}
+	c.Data(http.StatusOK, jsonContentType, entry.JSON)
+}
 
+// renderPackageFilesHTML renders the index page from the parsed file list. HTML
+// is the uncommon content type, so it is produced on demand rather than stored
+// as a third copy per package.
+func renderPackageFilesHTML(c *gin.Context, packageName string, files []pypi.FileInfo) {
 	// Return HTML for package files using string builder for efficiency
 	var sb strings.Builder
 	sb.Grow(1024 + len(files)*200) // Pre-allocate estimated size
@@ -310,7 +361,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
 		// Rewrite URL to point to proxy instead of direct PyPI
-		_, _ = fmt.Fprintf(&sb, "/simple/%s/%s", packageName, file.Name)
+		sb.WriteString(proxyFileURL(packageName, file.Name))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {
@@ -339,19 +390,19 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 }
 
 func (s *Server) handleDownloadFile(c *gin.Context) {
-	packageName := normalizePackageName(c.Param("package"))
+	packageName := pypi.NormalizeName(c.Param("package"))
 	fileName := c.Param("file")
 
-	log.Debug().
-		Str("package", packageName).
-		Str("file", fileName).
-		Str("user_agent", c.GetHeader("User-Agent")).
-		Str("client_ip", c.ClientIP()).
-		Msg("📦 File download request received")
+	slog.DebugContext(c.Request.Context(), "📦 File download request received",
+		"package", packageName,
+		"file", fileName,
+		"user_agent", c.GetHeader("User-Agent"),
+		"client_ip", c.ClientIP())
 
 	plan, err := s.packageFiles.Plan(c.Request.Context(), packageName, fileName)
 	if err != nil {
-		log.Debug().Err(err).Str("package", packageName).Str("file", fileName).Msg("Package index unavailable")
+		slog.DebugContext(c.Request.Context(), "Package index unavailable",
+			"error", redactErrorText(err), "package", packageName, "file", fileName)
 		c.String(http.StatusNotFound, "Package not found")
 		return
 	}
@@ -365,7 +416,8 @@ func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 	switch plan.Action {
 	case ActionFromStorage:
 		if err := s.serveFromStorage(c, plan.StorageKey); err != nil {
-			log.Error().Err(err).Str("storage_key", plan.StorageKey).Msg("Failed to serve from storage")
+			slog.ErrorContext(c.Request.Context(), "Failed to serve from storage",
+				"error", err, "storage_key", plan.StorageKey)
 			// Only a failure that happened before the first body byte can still
 			// be reported; anything later would append garbage to the payload.
 			if !c.Writer.Written() {
@@ -393,31 +445,33 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 
 	switch {
 	case err != nil:
-		log.Error().
-			Err(err).
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Str("file_url", plan.URL).
-			Int64("file_size", plan.Size).
-			Dur("timeout", plan.Timeout).
-			Msg("Failed to stream download, redirecting to PyPI")
+		// Both the message and the URL are redacted: a file URL resolved against a
+		// credentialed index carries that index's password, and the downloader's
+		// error string embeds the URL it failed on.
+		slog.ErrorContext(c.Request.Context(), "Failed to stream download, redirecting to PyPI",
+			"error", redactErrorText(err),
+			"package", plan.PackageName,
+			"file", plan.FileName,
+			"file_url", config.RedactURL(plan.URL),
+			"file_size", plan.Size,
+			"timeout", plan.Timeout)
 		if body.wrote {
 			// The body is already partly on the wire; a redirect would corrupt it.
 			c.Abort()
 			return
 		}
+		telemetry.Redirect(c.Request.Context(), telemetry.RedirectFetchFailed)
 		c.Redirect(http.StatusFound, plan.URL)
 	case !led:
 		// The leader's download populated the cache; the service decides whether
 		// this request can now be served from it or has to go upstream.
 		s.servePlan(c, s.packageFiles.PlanAfterFetch(c.Request.Context(), plan))
 	default:
-		log.Info().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Int64("size", result.Size).
-			Bool("cached", result.Error == nil).
-			Msg("✅ Successfully streamed file to client")
+		slog.InfoContext(c.Request.Context(), "✅ Successfully streamed file to client",
+			"package", plan.PackageName,
+			"file", plan.FileName,
+			"size", result.Size,
+			"cached", result.Error == nil)
 	}
 }
 
@@ -452,11 +506,10 @@ func (hw *headerWriter) Write(p []byte) (int, error) {
 	return hw.w.Write(p)
 }
 
+// handleCacheList is a no-op kept for API compatibility with the Python
+// implementation: the root index is proxied, so there is no cached list to
+// invalidate.
 func (s *Server) handleCacheList(c *gin.Context) {
-	// Invalidate both index and response caches
-	s.indexCache.InvalidateList()
-	s.responseCache.Invalidate("json:package-list")
-
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   nil,
@@ -464,7 +517,7 @@ func (s *Server) handleCacheList(c *gin.Context) {
 }
 
 func (s *Server) handleCachePackage(c *gin.Context) {
-	packageName := c.Param("package")
+	packageName := pypi.NormalizeName(c.Param("package"))
 
 	if packageName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -474,9 +527,27 @@ func (s *Server) handleCachePackage(c *gin.Context) {
 		return
 	}
 
-	// Invalidate both index and response caches
 	s.indexCache.InvalidatePackage(packageName)
-	s.responseCache.Invalidate("json:package:" + packageName)
+
+	// Dropping the index entry alone would report success while leaving every
+	// cached file on disk. Deleting goes through the cache's own path, keyed off
+	// the package prefix every storage key already carries.
+	if deleter, ok := s.storage.(storage.PrefixDeleter); ok {
+		deleted, err := deleter.DeletePrefix(c.Request.Context(), storageKeyFor(packageName, ""))
+		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "Failed to delete cached files",
+				"error", err,
+				"package", packageName)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"status":  "error",
+				"message": "Failed to delete cached files",
+			})
+			return
+		}
+		slog.InfoContext(c.Request.Context(), "Evicted package from cache",
+			"package", packageName,
+			"files_deleted", deleted)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
@@ -489,13 +560,26 @@ func (s *Server) handleHealth(c *gin.Context) {
 		"status":    "success",
 		"timestamp": time.Now().Unix(),
 		"data": gin.H{
-			"cache_dir":         s.config.CacheDir,
-			"index_url":         s.config.IndexURL,
+			"cache_dir": s.config.CacheDir,
+			// Redacted at the call site: an unauthenticated probe must not be able to
+			// read an index's credentials out of this payload.
+			"index_url":         config.RedactURL(s.config.IndexURL),
+			"extra_index_urls":  redactedIndexes(s.config.ExtraIndexURLs),
 			"cache_size":        s.config.CacheSize,
 			"index_ttl_seconds": int(s.config.IndexTTL.Seconds()),
 			"storage_type":      s.config.StorageType,
 		},
 	})
+}
+
+// redactedIndexes renders a configured index list for display. Always non-nil so
+// the health payload carries an empty array rather than a null.
+func redactedIndexes(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		out = append(out, config.RedactURL(u))
+	}
+	return out
 }
 
 func wantsJSON(c *gin.Context) bool {
@@ -515,14 +599,6 @@ func wantsJSON(c *gin.Context) bool {
 		strings.Contains(accept, "json")
 }
 
-func normalizePackageName(name string) string {
-	// PyPI package names are case-insensitive and
-	// treat hyphens and underscores as equivalent
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, "_", "-")
-	return name
-}
-
 // initStorage creates the appropriate storage backend based on configuration
 func initStorage(cfg *config.Config) (storage.Storage, error) {
 	// Both S3-backed modes take the same client configuration; build it once.
@@ -535,17 +611,9 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		Prefix:          cfg.S3Prefix,
 		UseSSL:          cfg.S3UseSSL,
 		ForcePathStyle:  cfg.S3ForcePathStyle,
-		PartSize:        cfg.S3PartSize,
-		MaxConnections:  cfg.S3MaxConnections,
-
-		// Performance configuration
-		ReadPoolSize:   cfg.S3ReadPoolSize,
-		WritePoolSize:  cfg.S3WritePoolSize,
-		MetaPoolSize:   cfg.S3MetaPoolSize,
-		EnableHTTP2:    cfg.S3EnableHTTP2,
-		TransferAccel:  cfg.S3TransferAccel,
-		ConnectTimeout: cfg.ConnectTimeout,
-		RequestTimeout: cfg.DownloadTimeout,
+		EnableHTTP2:     cfg.S3EnableHTTP2,
+		ConnectTimeout:  cfg.ConnectTimeout,
+		RequestTimeout:  cfg.DownloadTimeout,
 	}
 
 	switch cfg.StorageType {
@@ -572,10 +640,10 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 // buys range and If-Modified-Since handling for free. Backends that cannot name a
 // file are opened and streamed here.
 //
-// Serving by path is not a kernel-level zero copy: gin's writer, wrapped further
-// by the gzip middleware, exposes neither the file nor the ReaderFrom hooks
-// net/http needs to skip user space. The win is delegated correctness, not a
-// saved copy.
+// Serving by path is not a kernel-level zero copy: gin's writer exposes neither
+// the file nor the ReaderFrom hooks net/http needs to skip user space, so the
+// bytes still pass through it. The win is delegated correctness, not a saved
+// copy.
 func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := c.Request.Context()
@@ -584,30 +652,28 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// assume, and do not branch on a boolean the backend has to lie about.
 	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
 		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
-			log.Debug().
-				Str("storage_key", storageKey).
-				Str("file_path", filePath).
-				Msg("Serving local file by path via net/http")
+			slog.DebugContext(ctx, "Serving local file by path via net/http",
+				"storage_key", storageKey,
+				"file_path", filePath)
 			c.File(filePath)
 			return nil
 		}
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Str("method", c.Request.Method).
-		Msg("Starting file serve from storage")
+	slog.DebugContext(ctx, "Starting file serve from storage",
+		"storage_key", storageKey,
+		"method", c.Request.Method)
 
 	// Open first: the reader and the metadata both arrive before a single body
 	// byte is written, so every header below is still settable.
 	reader, info, err := s.storage.Get(ctx, storageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			log.Debug().Str("key", storageKey).Msg("Object missing from storage")
+			slog.DebugContext(ctx, "Object missing from storage", "key", storageKey)
 			c.String(http.StatusNotFound, "File not found")
 			return nil
 		}
-		log.Error().Err(err).Str("key", storageKey).Msg("Failed to get from storage")
+		slog.ErrorContext(ctx, "Failed to get from storage", "error", err, "key", storageKey)
 		c.String(http.StatusInternalServerError, "Storage error")
 		return nil
 	}
@@ -634,27 +700,22 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		c.Header("ETag", etag)
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Int64("size", info.Size).
-		Msg("Starting file stream from storage")
+	slog.DebugContext(ctx, "Starting file stream from storage", "storage_key", storageKey, "size", info.Size)
 
 	// Use io.Copy to manually stream the file to the response writer
 	// c.Writer is safe for concurrent use (unlike Fiber's context)
 	written, err := io.Copy(c.Writer, reader)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("storage_key", storageKey).
-			Int64("bytes_written", written).
-			Msg("Failed to stream file from storage")
+		slog.ErrorContext(ctx, "Failed to stream file from storage",
+			"error", err,
+			"storage_key", storageKey,
+			"bytes_written", written)
 		return err
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Int64("bytes_written", written).
-		Msg("File stream completed successfully")
+	slog.DebugContext(ctx, "File stream completed successfully",
+		"storage_key", storageKey,
+		"bytes_written", written)
 
 	return nil
 }

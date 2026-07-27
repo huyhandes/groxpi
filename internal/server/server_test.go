@@ -138,14 +138,8 @@ func TestServer_HandleHealth(t *testing.T) {
 }
 
 func TestServer_HandleListPackages_HTML(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
-		LogLevel: "INFO",
-	}
-
-	srv := New(cfg)
-	router := srv.Router()
+	up := newFakeRootIndex(t, 0)
+	router := newProxyServer(t, up.URL)
 
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "text/html")
@@ -167,21 +161,14 @@ func TestServer_HandleListPackages_HTML(t *testing.T) {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	bodyStr := string(body)
-	if !strings.Contains(bodyStr, "Simple index") {
-		t.Error("Response should contain 'Simple index'")
+	if !strings.Contains(string(body), "flask") {
+		t.Error("Response should contain the upstream's package list")
 	}
 }
 
 func TestServer_HandleListPackages_JSON(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
-		LogLevel: "INFO",
-	}
-
-	srv := New(cfg)
-	router := srv.Router()
+	up := newFakeRootIndex(t, 0)
+	router := newProxyServer(t, up.URL)
 
 	req := httptest.NewRequest("GET", "/index/", nil)
 	req.Header.Set("Accept", "application/vnd.pypi.simple.v1+json")
@@ -213,19 +200,11 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 	}
 
 	projects, ok := response["projects"].([]any)
-	if !ok {
-		t.Error("Expected projects to be an array")
+	if !ok || len(projects) != 1 {
+		t.Fatalf("Expected the upstream's one project, got %v", response["projects"])
 	}
-
-	// Should have some projects if connected to real PyPI, or empty if mock/offline
-	// We accept both scenarios as valid for this test
-	if projects == nil {
-		t.Error("Expected projects array to be present")
-	}
-
-	// Verify API version regardless of content
-	if meta["api-version"] != "1.0" {
-		t.Errorf("Expected api-version '1.0', got %v", meta["api-version"])
+	if name := projects[0].(map[string]any)["name"]; name != "flask" {
+		t.Errorf("Expected project 'flask', got %v", name)
 	}
 }
 
@@ -271,15 +250,18 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 
 func TestServer_HandleCacheList(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
 	router := srv.Router()
 
-	// Test DELETE method
+	// The cache routes are part of the authenticated administrative group.
 	req := httptest.NewRequest("DELETE", "/cache/list", nil)
+	req.SetBasicAuth(adminUser, adminPass)
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
@@ -308,8 +290,10 @@ func TestServer_HandleCacheList(t *testing.T) {
 
 func TestServer_HandleCachePackage(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
@@ -317,6 +301,7 @@ func TestServer_HandleCachePackage(t *testing.T) {
 
 	// Test DELETE method with package name
 	req := httptest.NewRequest("DELETE", "/cache/numpy", nil)
+	req.SetBasicAuth(adminUser, adminPass)
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
@@ -355,13 +340,8 @@ func TestServer_Handle404(t *testing.T) {
 // Removed problematic tests that access unexported functions
 
 func TestServer_ContentNegotiation(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
-	}
-
-	srv := New(cfg)
-	router := srv.Router()
+	up := newFakeRootIndex(t, 0)
+	router := newProxyServer(t, up.URL)
 
 	t.Run("JSON request returns JSON", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/index/", nil)
@@ -578,8 +558,10 @@ func TestServer_NormalizePackageName(t *testing.T) {
 
 func TestServer_HandleCacheEdgeCases(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
@@ -602,6 +584,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 		packages := []string{"test-package", "test_package", "Test.Package"}
 		for _, pkg := range packages {
 			req := httptest.NewRequest("DELETE", "/cache/"+pkg, nil)
+			req.SetBasicAuth(adminUser, adminPass)
 			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
@@ -953,13 +936,11 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", finalRequestCount)
 	}
 
-	// Verify all server responses indicate the error was handled consistently
+	// The root index is a byte-level proxy, so the upstream failure is reported
+	// verbatim rather than dressed up as an empty list.
 	for i := range numConcurrentRequests {
-
-		// The server may return 200 with empty list on PyPI error, which is valid behavior
-		// What matters is that singleflight prevented duplicate requests to PyPI
-		if responses[i].StatusCode != http.StatusOK {
-			t.Errorf("Request %d got status %d, expected 200 (server handles PyPI errors gracefully)", i, responses[i].StatusCode)
+		if responses[i].StatusCode != http.StatusInternalServerError {
+			t.Errorf("Request %d got status %d, expected the upstream's 500", i, responses[i].StatusCode)
 		}
 
 		body, err := io.ReadAll(responses[i].Body)
@@ -968,23 +949,8 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
 		}
-
-		// Verify response is valid JSON with empty projects list (server handles PyPI errors)
-		var response map[string]any
-		if err := json.Unmarshal(body, &response); err != nil {
-			t.Errorf("Failed to parse JSON response for request %d: %v", i, err)
-			continue
-		}
-
-		projects, ok := response["projects"].([]any)
-		if !ok {
-			t.Errorf("Request %d: expected projects array", i)
-			continue
-		}
-
-		// Should be empty due to PyPI error, but all responses should be consistent
-		if len(projects) != 0 {
-			t.Errorf("Request %d: expected empty projects due to PyPI error, got %d", i, len(projects))
+		if string(body) != "Internal Server Error" {
+			t.Errorf("Request %d: expected the upstream body, got %q", i, body)
 		}
 	}
 }

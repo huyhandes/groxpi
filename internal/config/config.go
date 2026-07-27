@@ -1,11 +1,79 @@
 package config
 
 import (
+	"errors"
+	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// defaultExtraIndexTTL is the TTL an extra index gets when its position in
+// GROXPI_EXTRA_INDEX_TTLS is missing or unparseable.
+const defaultExtraIndexTTL = 3 * time.Minute
+
+// Index is one configured upstream index: where to fetch from, and how long its
+// answers stay cached. The TTL is per index so a fast-moving private index can be
+// refreshed more often than PyPI.
+type Index struct {
+	URL string
+	TTL time.Duration
+}
+
+// Redacted renders the index URL with any credentials removed. Every log field,
+// error message and response body that names an index goes through this; the raw
+// URL is never formatted directly, because a URL reaches a log through wrapped
+// errors that never passed a logging call.
+func (i Index) Redacted() string { return RedactURL(i.URL) }
+
+// RedactURL replaces a URL's user-info with a fixed placeholder, leaving URLs
+// without credentials untouched. An unparseable URL is dropped whole: we cannot
+// tell where its credentials end.
+//
+// It lives here rather than beside the HTTP client because internal/pypi already
+// imports this package, so a helper both sides can reach has to sit on the side
+// without the dependency.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[unparseable-url]"
+	}
+	if u.User == nil {
+		return raw
+	}
+	u.User = url.User("redacted")
+	return u.String()
+}
+
+// RedactURLError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// returning one unredacted leaks a private index's password into any log or
+// response that records the error.
+func RedactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		uerr.URL = RedactURL(uerr.URL)
+	}
+	return err
+}
+
+// ResolutionOrder returns the indexes to consult for a package: the extra
+// indexes first in configured order, then the primary last. The first index that
+// has the package wins and its file list is used whole — see
+// docs/adr/0001-extras-first-index-resolution.md.
+func (c *Config) ResolutionOrder() []Index {
+	indexes := make([]Index, 0, len(c.ExtraIndexURLs)+1)
+	for i, extra := range c.ExtraIndexURLs {
+		ttl := defaultExtraIndexTTL
+		if i < len(c.ExtraIndexTTLs) && c.ExtraIndexTTLs[i] > 0 {
+			ttl = c.ExtraIndexTTLs[i]
+		}
+		indexes = append(indexes, Index{URL: extra, TTL: ttl})
+	}
+	return append(indexes, Index{URL: c.IndexURL, TTL: c.IndexTTL})
+}
 
 type Config struct {
 	// Index configuration
@@ -17,6 +85,10 @@ type Config struct {
 	// Cache configuration
 	CacheSize int64
 	CacheDir  string
+	// IndexCacheSize bounds the in-memory index cache across every stored
+	// representation (parsed list, JSON body, gzipped body). The 256 MB default
+	// is provisional: it cannot be tuned honestly until cache metrics exist.
+	IndexCacheSize int64
 
 	// Storage configuration
 	StorageType       string // "local", "s3", or "hybrid"
@@ -28,8 +100,6 @@ type Config struct {
 	S3Prefix          string
 	S3ForcePathStyle  bool
 	S3UseSSL          bool
-	S3PartSize        int64 // Multipart upload part size
-	S3MaxConnections  int   // Max concurrent S3 connections (legacy)
 
 	// Hybrid/Tiered storage configuration
 	LocalCacheSize      int64         // Size limit for local L1 cache (hybrid mode only)
@@ -39,11 +109,7 @@ type Config struct {
 	TieredSyncQueueSize int           // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
-	S3ReadPoolSize  int  // Max connections for GET operations
-	S3WritePoolSize int  // Max connections for PUT operations
-	S3MetaPoolSize  int  // Max connections for HEAD/STAT operations
-	S3EnableHTTP2   bool // Enable HTTP/2 for better multiplexing
-	S3TransferAccel bool // Enable S3 Transfer Acceleration
+	S3EnableHTTP2 bool // Enable HTTP/2 for better multiplexing
 
 	// Timeout configuration
 	DownloadTimeout time.Duration
@@ -56,26 +122,55 @@ type Config struct {
 	LogFormat string // console or json
 	LogColor  bool   // enable color for console logs
 
+	// Observability configuration. Read from the standard OpenTelemetry
+	// environment variables so a collector is configured the same way here as in
+	// the rest of an operator's fleet. An empty endpoint leaves all three signals
+	// inert: no providers, no connection attempt, no startup dependency.
+	OTLPEndpoint string
+	ServiceName  string
+
 	// SSL configuration
 	DisableSSLVerification bool
 
-	// Response configuration
-	BinaryFileMimeType bool
+	// Administrative interface. The surface is off unless credentials are
+	// configured: with none set the routes do not exist. AdminEnabled is the
+	// operator asserting they want it, which makes missing credentials a startup
+	// failure rather than an open panel.
+	//
+	// Basic authentication sends the credentials in cleartext, so a deployment
+	// needs a TLS-terminating proxy in front.
+	AdminEnabled  bool
+	AdminUsername string
+	AdminPassword string
+}
+
+// AdminConfigured reports whether the administrative surface should be mounted.
+// Credentials alone are the switch; AdminEnabled only escalates their absence
+// into a startup failure.
+func (c *Config) AdminConfigured() bool {
+	return c.AdminUsername != "" && c.AdminPassword != ""
 }
 
 func Load() *Config {
 	cfg := &Config{
 		IndexURL:               getEnv("GROXPI_INDEX_URL", "https://pypi.org/simple/"),
 		IndexTTL:               getDurationEnv("GROXPI_INDEX_TTL", 30*time.Minute),
-		CacheSize:              getIntEnv("GROXPI_CACHE_SIZE", 5*1024*1024*1024), // 5GB
+		CacheSize:              getIntEnv("GROXPI_CACHE_SIZE", 5*1024*1024*1024),    // 5GB
+		IndexCacheSize:         getIntEnv("GROXPI_INDEX_CACHE_SIZE", 256*1024*1024), // 256MB, provisional
 		CacheDir:               getEnv("GROXPI_CACHE_DIR", ""),
-		DownloadTimeout:        getFloatDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
+		DownloadTimeout:        getDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
 		Port:                   getEnv("PORT", "5000"),
 		LogLevel:               getEnv("GROXPI_LOGGING_LEVEL", "INFO"),
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
 		LogColor:               getBoolEnv("GROXPI_LOG_COLOR", true),
+		OTLPEndpoint:           getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		ServiceName:            getEnv("OTEL_SERVICE_NAME", "groxpi"),
 		DisableSSLVerification: getBoolEnv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", false),
-		BinaryFileMimeType:     getBoolEnv("GROXPI_BINARY_FILE_MIME_TYPE", false),
+		AdminEnabled:           getBoolEnv("GROXPI_ADMIN_ENABLED", false),
+		AdminUsername:          getEnv("GROXPI_ADMIN_USERNAME", ""),
+		AdminPassword:          getEnv("GROXPI_ADMIN_PASSWORD", ""),
+		ConnectTimeout:         getDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
+		ReadTimeout:            getDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
 		// Storage configuration
 		StorageType:       getEnv("GROXPI_STORAGE_TYPE", "local"),
@@ -87,15 +182,9 @@ func Load() *Config {
 		S3Prefix:          getEnv("GROXPI_S3_PREFIX", "groxpi"),
 		S3ForcePathStyle:  getBoolEnv("GROXPI_S3_FORCE_PATH_STYLE", false),
 		S3UseSSL:          getBoolEnv("GROXPI_S3_USE_SSL", true),
-		S3PartSize:        getIntEnv("GROXPI_S3_PART_SIZE", 10*1024*1024), // 10MB
-		S3MaxConnections:  int(getIntEnv("GROXPI_S3_MAX_CONNECTIONS", 100)),
 
 		// S3 Performance Configuration
-		S3ReadPoolSize:  int(getIntEnv("GROXPI_S3_READ_POOL_SIZE", 50)),
-		S3WritePoolSize: int(getIntEnv("GROXPI_S3_WRITE_POOL_SIZE", 30)),
-		S3MetaPoolSize:  int(getIntEnv("GROXPI_S3_META_POOL_SIZE", 20)),
-		S3EnableHTTP2:   getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
-		S3TransferAccel: getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
+		S3EnableHTTP2: getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
 
 		// Hybrid/Tiered storage configuration
 		LocalCacheSize:      getIntEnv("GROXPI_LOCAL_CACHE_SIZE", 10*1024*1024*1024), // 10GB default
@@ -115,31 +204,20 @@ func Load() *Config {
 		ttlStrs := splitAndTrim(extraTTLs, ",")
 		cfg.ExtraIndexTTLs = make([]time.Duration, len(ttlStrs))
 		for i, ttlStr := range ttlStrs {
-			if ttl, err := strconv.Atoi(ttlStr); err == nil {
-				cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
-			} else {
-				cfg.ExtraIndexTTLs[i] = 3 * time.Minute // default
+			ttl, err := strconv.Atoi(ttlStr)
+			if err != nil || ttl < 0 {
+				invalidEnv("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
+				cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
+				continue
 			}
+			cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
 		}
 	} else {
 		// Default TTL for extra indices
 		cfg.ExtraIndexTTLs = make([]time.Duration, len(cfg.ExtraIndexURLs))
 		for i := range cfg.ExtraIndexTTLs {
-			cfg.ExtraIndexTTLs[i] = 3 * time.Minute
+			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 		}
-	}
-
-	// Parse timeout configurations
-	if connectTimeout := getEnv("GROXPI_CONNECT_TIMEOUT", ""); connectTimeout != "" {
-		cfg.ConnectTimeout = getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0)
-	} else if cfg.ReadTimeout > 0 {
-		cfg.ConnectTimeout = 3100 * time.Millisecond
-	}
-
-	if readTimeout := getEnv("GROXPI_READ_TIMEOUT", ""); readTimeout != "" {
-		cfg.ReadTimeout = getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0)
-	} else if cfg.ConnectTimeout > 0 {
-		cfg.ReadTimeout = 20 * time.Second
 	}
 
 	// Set default cache dir if not specified
@@ -159,12 +237,11 @@ func Load() *Config {
 			cfg.S3Endpoint = "s3.amazonaws.com"
 		}
 
-		// Validate required S3 settings
+		// Only the bucket is required. Credentials are deliberately not
+		// checked: with none configured the AWS default chain takes over, which
+		// is how instance, task and web-identity roles work.
 		if cfg.S3Bucket == "" {
 			panic("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
-		}
-		if cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
-			panic("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set when using S3 or hybrid storage")
 		}
 	}
 
@@ -178,31 +255,55 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// invalidEnv reports a setting that could not be used and names the value taken
+// instead. Load has no error return - a mistyped cache size must not stop the
+// proxy from starting - so the substitution has to be visible in the log, or an
+// operator who wrote "512MB" never learns their tuning was ignored.
+func invalidEnv(key, value string, fallback any) {
+	slog.Warn("Ignoring malformed environment variable, using default instead",
+		"variable", key,
+		"value", value,
+		"default", fallback)
+}
+
 func getIntEnv(key string, defaultValue int64) int64 {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
-			return intVal
-		}
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
-	return defaultValue
+
+	intVal, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || intVal < 0 {
+		invalidEnv(key, value, defaultValue)
+		return defaultValue
+	}
+	return intVal
 }
 
+// getDurationEnv reads a duration written either with a unit ("300s", "5m") or
+// as a bare number of seconds ("300", "2.5"). Both spellings have to work: the
+// bare-seconds form is proxpi's, and the unit form is what anyone reading Go
+// durations elsewhere in the configuration will reach for.
 func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.Atoi(value); err == nil {
-			return time.Duration(intVal) * time.Second
-		}
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
-	return defaultValue
-}
 
-func getFloatDurationEnv(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
-			return time.Duration(floatVal * float64(time.Second))
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		seconds, floatErr := strconv.ParseFloat(value, 64)
+		if floatErr != nil {
+			invalidEnv(key, value, defaultValue)
+			return defaultValue
 		}
+		d = time.Duration(seconds * float64(time.Second))
 	}
-	return defaultValue
+	if d < 0 {
+		invalidEnv(key, value, defaultValue)
+		return defaultValue
+	}
+	return d
 }
 
 func getBoolEnv(key string, defaultValue bool) bool {

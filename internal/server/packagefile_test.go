@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -96,38 +96,25 @@ func (f *fakeStorage) Stat(_ context.Context, key string) (*storage.ObjectInfo, 
 	return &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
 
-func (f *fakeStorage) List(_ context.Context, _ storage.ListOptions) ([]*storage.ObjectInfo, error) {
-	return nil, nil
-}
-
 func (f *fakeStorage) Close() error { return nil }
 
 var _ storage.Storage = (*fakeStorage)(nil)
 
 // fakeIndex is a packageIndex double recording how often upstream was consulted.
 type fakeIndex struct {
-	files    map[string][]pypi.FileInfo
-	packages []string
-	err      error
-	calls    atomic.Int64
+	files map[string][]pypi.FileInfo
+	err   error
+	calls atomic.Int64
 }
 
-func (f *fakeIndex) GetPackageList() ([]string, error) {
-	f.calls.Add(1)
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.packages, nil
-}
-
-func (f *fakeIndex) GetPackageFiles(packageName string) ([]pypi.FileInfo, error) {
+func (f *fakeIndex) GetPackageFiles(_ context.Context, _ config.Index, packageName string) ([]pypi.FileInfo, error) {
 	f.calls.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
 	files, ok := f.files[packageName]
 	if !ok {
-		return nil, fmt.Errorf("package not found: %s", packageName)
+		return nil, fmt.Errorf("%w: %s", pypi.ErrNotFound, packageName)
 	}
 	return files, nil
 }
@@ -142,7 +129,7 @@ type fakeDownloader struct {
 	storage   *fakeStorage
 }
 
-func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey string, w io.Writer) (*streaming.StreamResult, error) {
+func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey string, w io.Writer, _ streaming.Expectation) (*streaming.StreamResult, error) {
 	f.calls.Add(1)
 	if f.delay > 0 {
 		select {
@@ -178,7 +165,7 @@ func newTestService(t *testing.T, st storage.Storage, index *fakeIndex, dl strea
 		IndexTTL:        5 * time.Minute,
 		DownloadTimeout: downloadTimeout,
 	}
-	return newPackageFileService(cfg, st, cache.NewIndexCache(), index, dl)
+	return newPackageFileService(cfg, st, cache.NewIndexCache(0, 0), index, dl)
 }
 
 func indexWith(pkg string, files ...pypi.FileInfo) *fakeIndex {
@@ -306,7 +293,9 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := newTestService(t, tt.storage, tt.index, &fakeDownloader{}, tt.downloadTimeout)
 			if tt.seedIndexCache != nil {
-				svc.indexCache.SetPackage(pkg, tt.seedIndexCache, time.Minute)
+				body, err := encodePackageFiles(pkg, tt.seedIndexCache)
+				require.NoError(t, err)
+				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body), time.Minute)
 			}
 
 			plan, err := svc.Plan(context.Background(), pkg, file)
@@ -637,7 +626,7 @@ func TestServer_DownloadStream_HeadersPrecedeBody(t *testing.T) {
 					},
 				},
 			}
-			jsonData, _ := sonic.Marshal(response)
+			jsonData, _ := json.Marshal(response)
 			_, _ = w.Write(jsonData)
 			return
 		}
@@ -697,7 +686,7 @@ func TestServer_HandleDownloadFile_ServesFollowersFromStorage(t *testing.T) {
 					},
 				},
 			}
-			jsonData, _ := sonic.Marshal(response)
+			jsonData, _ := json.Marshal(response)
 			_, _ = w.Write(jsonData)
 			return
 		}

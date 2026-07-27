@@ -1,220 +1,223 @@
-# groxpi Architecture
+# Architecture
 
-Firm reference for the current design: what the modules are, how a request flows through them, where the seams sit, and where the remaining friction lives. Improvement work is tracked separately in [`tasks/architecture-improvement-plan.md`](../tasks/architecture-improvement-plan.md).
+groxpi is a caching PyPI proxy: a Gin HTTP transport over an index cache, an object store and one
+upstream client.
 
-*Describes the tree at commit `ba2e0d6` (2026-07-26), after the A–E architecture refactor and the three follow-up fixes (`97282f1`, `1fde004`, `ba2e0d6`).*
+## Module map
 
-Vocabulary follows the `/codebase-design` glossary — **module** (interface + implementation), **interface** (everything a caller must know), **seam** (where behaviour can be swapped), **adapter** (a thing satisfying an interface at a seam), **depth** (behaviour per unit of interface), **leverage**, **locality**.
-
-## 1. Top-level shape
-
-groxpi is a single Go binary: a Gin HTTP server that proxies and caches the PyPI Simple API (PEP 503/691). Every request is served by handlers that orchestrate four internal modules — `cache`, `pypi`, `storage`, `streaming` — behind an in-memory cache plus an on-disk (and optionally S3) object store.
-
-```mermaid
-flowchart TB
-  main["cmd/groxpi/main.go<br/>load config · init logger · signal shutdown"]
-  main --> srv["internal/server<br/>Gin router + handlers + PackageFileService"]
-
-  srv --> cache["internal/cache<br/>index (TTL) · response (LRU)"]
-  srv --> pypi["internal/pypi<br/>upstream client (Sonic JSON)"]
-  srv --> storage["internal/storage<br/>local | lru-local | s3 | tiered"]
-  srv --> streaming["internal/streaming<br/>tee download-and-cache"]
-
-  storage --> local[(local FS)]
-  storage --> s3[(S3 / MinIO)]
-  pypi --> upstream[(pypi.org)]
+```
+cmd/groxpi/            main: config, telemetry, logger, server, graceful shutdown
+internal/
+  cache/     index.go        bounded index cache (LRU by last access + background TTL sweep)
+  config/    config.go       every environment variable, URL redaction, index resolution order
+  logger/    logger.go       slog setup: stdout handler plus the OpenTelemetry log bridge
+  pypi/      client.go       upstream index client (JSON first, HTML fallback)
+             normalize.go    PEP 503 name normalisation
+  server/    server.go       routes, handlers, storage construction
+             packagefile.go  PackageFileService: index resolution, serve planning, root proxy
+             admin.go        admin page view model
+             prefetch.go     prefetch and newest-release selection
+  storage/   storage.go      Storage interface plus capability interfaces
+             local.go        plain filesystem backend
+             lru.go          filesystem backend with LRU eviction
+             s3.go           AWS SDK v2 backend
+             tiered.go       hybrid: local L1 over S3 L2
+             workerpool.go   bounded worker pool used by the tiered backend
+  streaming/ interfaces.go   StreamingDownloader
+             downloader.go   tee download: client and cache from one upstream read
+  telemetry/ telemetry.go    OTLP providers for traces, metrics and logs
+             instruments.go  the metrics groxpi records
+templates/                   admin.html, rows.html, htmx.min.js — embedded with go:embed
+monitoring/prometheus.yml    scrapes an OpenTelemetry collector, never groxpi
+benchmarks/                  benchmark harness (see benchmarking.md)
+docs/adr/                    architecture decision records
 ```
 
-**Bootstrap** (`cmd/groxpi/main.go`): `config.Load()` → `logger.Init()` → `server.New(cfg)` → `http.Server.ListenAndServe`, with a 5s graceful shutdown on SIGINT/SIGTERM.
+JSON is the standard library's `encoding/json`. groxpi does not use Sonic; it appears in `go.mod` only
+as an indirect dependency of gin.
 
-**Wiring** (`server.New`, `server.go`): builds the two in-memory caches, the pypi client, the storage backend (`initStorage` picks `local` / `s3` / `hybrid` from `cfg.StorageType`), the tee streaming downloader, and the `PackageFileService`, then registers routes. All dependencies are constructed inside `New` and held on the `Server` struct — see [§5 remaining friction](#5-remaining-friction) for the testability cost.
+## The index cache
 
-**Routing** (`setupRoutes`): `router.HandleMethodNotAllowed = true`, so a known path reached with an unregistered method is answered by gin with `405` plus an `Allow` header instead of falling through to the `NoRoute` 404 handler. `POST /simple/` and `GET /cache/list` are both 405. Only `GET` is registered on the index and download routes, so `HEAD` on them is also 405 — see [§5 remaining friction](#5-remaining-friction).
+One cache, one byte budget. Each entry holds, for one package: the parsed file list, the JSON response
+body, and the gzipped JSON response body. All three are accounted against `GROXPI_INDEX_CACHE_SIZE`.
+Entries leave by TTL — a background sweep, so an expired entry's memory is actually reclaimed rather
+than waiting for the next lookup — or by LRU on last access when the budget is exceeded.
 
-## 2. Module map
+Producing the serialised bodies at fill time is what removes the separate response cache: the request
+path never marshals and never compresses. A client that accepts gzip is handed bytes that were
+compressed once, when the entry was built.
 
-| Module | Files | Role | Depth |
-|---|---|---|---|
-| `config` | `config.go` | env-var config load, proxpi-compatible | shallow (data) |
-| `logger` | `logger.go` | phuslu/log setup | shallow (data) |
-| `cache` | `index.go`, `response.go` | 2 in-memory caches: TTL map for parsed indexes, LRU for pre-marshaled JSON | shallow–moderate |
-| `pypi` | `client.go` | upstream Simple API client; Sonic JSON parse, PEP 503 HTML fallback | moderate |
-| `storage` | `storage.go`, `local.go`, `lru.go`, `s3.go`, `tiered.go`, `workerpool.go` | pluggable object storage; L1/L2 tiering; generic bounded worker pool | deep |
-| `streaming` | `interfaces.go`, `downloader.go` | one seam: download while teeing into storage | one deep seam |
-| `server` | `server.go`, `packagefile.go` | Gin transport (`server.go`) + package-file decision pipeline (`packagefile.go`) | moderate |
+## The storage seam
 
-## 3. Seams
-
-Real seams (behaviour genuinely swaps across them):
-
-- **`storage.Storage`** (`storage.go`) — 7 methods (`Get`/`Put`/`Stat`/`Delete`/`Exists`/`List`/`Close`). Adapters: `LocalStorage`, `LRULocalStorage`, `S3Storage`, `TieredStorage`; selected by config. *This is the load-bearing seam of the app.*
-- **`storage.ZeroCopyCapable`** — an opt-in capability interface. A backend implements it only when it can honour it for real: `LocalStorage`/`LRULocalStorage`/`TieredStorage` implement `GetFilePath`; `S3Storage` does not, because it has no local path to name. Callers discover it by type assertion, never by asking which backend they hold. A sibling `Presignable` interface existed until it was deleted for having no production caller — see [§5 remaining friction](#5-remaining-friction).
-- **`streaming.StreamingDownloader`** (`interfaces.go`) — one method, `DownloadAndStream`; production wires `NewTeeStreamingDownloader`.
-- **`streaming.StorageWriter`** (`downloader.go`) — narrow write-only view of storage: one method whose signature is `storage.Storage.Put` verbatim, so every backend satisfies it directly and `NewTeeStreamingDownloader` is handed the storage backend itself. `streaming` imports `storage` for `*storage.ObjectInfo`; the adapter that used to sit between them existed to avoid an import cycle that was never there, and was deleted in `1fde004`.
-
-Internal seams used for composition and testing:
-
-- **`storage.l1Storage`** (`tiered.go`) — the L1 tier contract (`Storage` + `ZeroCopyCapable`). Lets `newTieredStorage` take tier doubles without a live S3. L2 is a plain `Storage`.
-- **`storage.objectDeleter`** (`lru.go`) — the evictor's only route to disk, so on-disk state has exactly one owner.
-- **`server.packageIndex`** (`packagefile.go`) — one method, `GetPackageFiles`; lets the decision tree be exercised without a live PyPI client.
-
-No hypothetical seams remain in `streaming`: `ZeroCopyServer`, `BroadcastWriter`, `HashingWriter` and the non-tee `streamingDownloader` were deleted in `6243e0a` because nothing in production called them.
-
-## 4. Request flows
-
-### 4a. Package index (`GET /simple/`, `GET /simple/:package/`)
-
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant H as handler
-  participant RC as responseCache
-  participant PFS as PackageFileService
-  participant IC as indexCache
-  participant SF as singleflight
-  participant PY as pypi client
-  H->>RC: Get(cacheKey)
-  alt response cached
-    RC-->>C: pre-marshaled bytes
-  else
-    H->>PFS: resolveIndex(name) / resolvePackageList()
-    PFS->>IC: GetPackage(name)
-    alt index cached
-      IC-->>PFS: files
-    else
-      PFS->>SF: Do("package-files:"+name)
-      SF->>PY: GetPackageFiles(name)
-      PY-->>PFS: files
-      PFS->>IC: SetPackage(name, files, ttl) — only if non-empty
-    end
-    PFS-->>H: files
-    H->>RC: Set(cacheKey, rendered)
-    H-->>C: JSON or HTML
-  end
+```go
+type Storage interface {
+    Get(ctx, key) (io.ReadCloser, *ObjectInfo, error)
+    Put(ctx, key, reader, size, contentType) (*ObjectInfo, error)
+    Delete(ctx, key) error
+    Exists(ctx, key) (bool, error)
+    Close() error
+}
 ```
 
-Modules touched: **cache** (response + index), **pypi**, plus `singleflight` to collapse concurrent upstream fetches. Rendering is factored into `renderPackageFiles`.
+Five methods. Anything a single backend can do that the others cannot is a separate, optional
+interface, asked for with a type assertion rather than answered by a boolean the backend has to lie
+about:
 
-Index resolution has exactly one home: `PackageFileService.resolveIndex` (per-package) and `resolvePackageList` (the `/simple/` listing, keyed by the `packageListKey` const). `handleListFiles`, `handleListPackages` and the download path all go through them, so the cache-lookup + `singleflight` + cache-fill dance is written once (`1fde004`). Neither one caches an empty upstream result: a transient upstream fault used to be cached and poisoned the package (or the whole list) for the full `IndexTTL`.
+| Capability | Method | Implemented by |
+|---|---|---|
+| `ZeroCopyCapable` | `GetFilePath` | the filesystem backends |
+| `PrefixDeleter` | `DeletePrefix` | the filesystem backends, and the tiered backend for its L1 |
+| `cacheSnapshotter` | `Snapshot` | the LRU filesystem backend (feeds the admin page) |
 
-`handleListFiles` still recognises an upstream miss by matching `"not found"` in the error text, because `internal/pypi` exposes no not-found sentinel — see [§5 remaining friction](#5-remaining-friction).
+Storage keys are `packages/<normalised-name>/<filename>`. The package prefix is what makes
+`DELETE /cache/<package>` a prefix delete rather than a second index.
 
-When the upstream serves HTML rather than PEP 691 JSON, `pypi.parseHTMLPackageFiles` resolves each `href` against the URL the page was actually served from (post-redirect), via `url.URL.ResolveReference`. Relative, root-relative and protocol-relative hrefs therefore all yield a usable absolute `FileInfo.URL`; before `af59111` they were emitted verbatim and the download path could not fetch them. PEP 691 JSON payloads already carry absolute URLs and are left alone.
+Serving a cached file whose backend can name a local path hands that path to `c.File`, so `net/http`
+does range and conditional-request handling. This is **not** a kernel-level zero copy: gin's response
+writer exposes neither the file nor the `io.ReaderFrom` hook `net/http` needs to skip user space, so
+the bytes still pass through it. The win is delegated correctness, not a saved copy.
 
-### 4b. File download (`GET /simple/:package/:file`)
+### `s3`
 
-`handleDownloadFile` is transport-only. All policy lives in `PackageFileService`, which returns a `ServePlan` **value** — nothing has been written to the client when it comes back.
+The official AWS SDK for Go v2. A seekable body of known size is a single `PutObject`; a live download
+of unknown length goes through the SDK's transfer manager, which is the only path that can upload a
+stream whose length is not known up front. Only a genuine `404`/`NoSuchKey` is reported as a miss —
+denied, throttled and transport failures propagate as errors, so a permissions problem never looks like
+an empty cache.
 
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant H as handleDownloadFile / servePlan
-  participant PFS as PackageFileService
-  participant ST as storage
-  participant PY as packageIndex
-  participant STR as streaming downloader
-  H->>PFS: Plan(ctx, pkg, file)
-  PFS->>ST: Exists(storageKey)
-  alt cached
-    PFS-->>H: ActionFromStorage
-    H->>ST: serveFromStorage
-    ST-->>C: bytes
-  else
-    PFS->>PY: resolveIndex(pkg) (indexCache + singleflight)
-    alt file not in index
-      PFS-->>H: ActionNotFound → 404
-    else timeout == 0
-      PFS-->>H: ActionRedirect → 302 upstream
-    else
-      PFS-->>H: ActionStreamAndCache (+ dynamic timeout)
-      H->>PFS: Fetch(ctx, plan, headerWriter)
-      PFS->>STR: singleflight.Do(storageKey) → DownloadAndStream
-      STR->>ST: Put (tee via io.Pipe)
-      STR-->>C: bytes (headers emitted just before first byte)
-    end
-  end
+There is no local path, so the backend deliberately does not implement `ZeroCopyCapable`. It also does
+not implement `PrefixDeleter`.
+
+### `hybrid`
+
+L1 is authoritative for writes: the download commits to the local store and the request completes.
+The L2 upload is queued on a bounded worker pool and is best-effort; the pool is drained on shutdown.
+Reads that miss L1 and hit L2 queue an L1 back-fill on the same pool, and the back-fill survives
+cancellation of the request that triggered it.
+
+`DeletePrefix` on the tiered backend deletes L1 only. Evicting from the durable tier on an operator's
+cache-clear would defeat the point of having one.
+
+## Request flows
+
+### Root index — `GET /simple/`
+
+Byte-level pass-through of the upstream response, nothing decoded and nothing cached. Concurrent
+requests for the same `Accept`/`Accept-Encoding` pair share one upstream fetch via singleflight, and the
+fetch runs on a context detached from whichever client triggered it, bounded by the client's own
+timeout.
+
+### Index resolution — `GET /simple/<package>/`
+
+```
+cache hit?  ──yes──▶ serve stored body
+    │no
+    ▼
+singleflight on the package name
+    ▼
+query indexes: extras concurrently in priority order, primary last
+    ▼
+first index that has it wins, whole file list
+    ▼
+build entry (files + JSON + gzip), store, serve
 ```
 
-`ServePlan.Action` is one of `ActionNotFound`, `ActionFromStorage`, `ActionStreamAndCache`, `ActionRedirect`. `servePlan` translates it to HTTP and makes no decisions of its own.
+A miss from every index is `404`. An error from an index with higher priority than the winner fails the
+request instead of falling through. Losing queries are cancelled once a higher-priority index has
+answered, which is what `index.result=cancelled` counts.
 
-Behaviour worth knowing about this path:
+The upstream client prefers the PEP 691 JSON representation and falls back to parsing HTML, resolving
+relative hrefs against the URL actually served and lifting `#sha256=` fragments into the file's hashes.
 
-- **One dedup mechanism.** `singleflight` keyed on the storage key. `Fetch` reports `led` so the winner streams and every loser goes back to the service: `PackageFileService.PlanAfterFetch` re-`Plan`s and returns `ActionFromStorage` for the now-cached object, or `ActionRedirect` if it is somehow still absent. That decision is policy, so it lives in the service, not in the handler. The hand-rolled `downloadCoordinator` that used to sit alongside `singleflight` is gone (`5cb9f18`).
-- **The download outlives its trigger.** `Fetch` derives its context with `context.WithoutCancel` plus the plan's dynamic timeout, because the fetch populates the cache for every waiter and must not die with whichever client happened to trigger it.
-- **Headers precede the body, always.** `headerWriter` defers `applyDownloadHeaders` to the first `Write`. Gin flushes headers on the first write and silently drops anything set afterwards, which used to lose `Content-Type`/`Content-Length`/`ETag` on the stream path.
-- **No redirect after a partial body.** If the stream fails, the handler redirects only when `headerWriter.wrote` is false; otherwise it aborts, because a 302 appended to a half-sent payload corrupts it.
-- **Missing storage key is a 404, not a 500.** `serveFromStorage` branches on `errors.Is(err, storage.ErrNotFound)`.
-- **One place quotes the ETag.** `quoteETag` normalises an entity-tag to exactly one layer of quotes. An index hash arrives bare, an S3 backend may echo the API's already-quoted form; both the plan (`Plan`) and the storage serve path (`serveFromStorage`) run through this one helper, so neither can emit `""abc""` and break conditional requests (`1fde004`).
+### Download — `GET /simple/<package>/<file>`
 
-### 4c. Serving a cached object
-
-`serveFromStorage` asks the backend for the capability rather than for its identity — the two former methods (`serveFromStorage` plus a `serveFromStorageOptimized` wrapper) were merged into one in `1fde004`:
-
-1. If the backend is `storage.ZeroCopyCapable` and `GetFilePath` succeeds, hand the path to `c.File` so `net/http` serves it — that brings range requests, `If-Modified-Since` and content-type sniffing for free.
-2. Otherwise open and stream: `Get` returns `(io.ReadCloser, *ObjectInfo, error)` with metadata complete *before* the first body byte, so every header is still settable, then `io.Copy`.
-
-**This is not a kernel-level zero copy, and the name `ZeroCopyCapable` oversells it.** Gin's `responseWriter` implements neither `File()` nor `io.ReaderFrom`, so `net/http`'s sendfile fast path cannot engage; the gzip middleware wraps the writer further regardless. The bytes still travel through user space. The `trySendfile` helper that claimed otherwise was removed. The real value of the capability is **delegated correctness** — a genuine filesystem path lets `net/http` handle range and conditional requests — not a saved copy.
-
-Only the open-then-stream branch sets `Content-Disposition`, `Cache-Control` and `ETag`; the `c.File` branch sets none of them, which is the header asymmetry noted in [§5](#5-remaining-friction).
-
-### 4d. Tiered storage internals (when `STORAGE_TYPE=hybrid`)
-
-```mermaid
-flowchart LR
-  put["Put(key)"] -->|tee via io.Pipe| L1[(local L1)]
-  put -->|tee via io.Pipe| L2[(S3 L2)]
-  get["Get(key)"] --> tryL1{L1 hit?}
-  tryL1 -->|yes| L1
-  tryL1 -->|ErrNotFound only| L2
-  tryL1 -->|other error| err["propagate"]
-  L2 -.async back-fill.-> SQ[["WorkerPool[string]"]]
-  SQ --> L1
+```
+storage.Exists ──hit──▶ serve from storage
+    │miss
+    ▼
+resolve index, find the file  ──not listed──▶ 404
+    ▼
+download timeout 0?  ──yes──▶ 302 upstream
+    ▼
+singleflight on the storage key
+    ├─ leader: stream to client and tee into storage
+    └─ waiter: block, then re-plan onto storage (or 302)
 ```
 
-`TieredStorage` composes an `l1Storage` (`LRULocalStorage`) and an L2 `Storage` (`S3Storage`), a `singleflight.Group` for puts, and a `WorkerPool[string]` that back-fills L1 from L2. The job payload is the storage key and nothing else — the `tieredSyncRequest` struct that used to carry a context alongside it was deleted in `ba2e0d6`, since the job derives its own context from the pool. It re-exposes zero-copy from L1, the only tier that genuinely has it.
+The tee is one upstream read feeding two sinks: the client's socket and an `io.Pipe` the storage
+backend consumes. The bytes are hashed on the way through; the pipe is closed cleanly only if the
+digest and length check out, so a file that fails verification is never committed — the backend sees a
+pipe error and discards its partial write.
 
-Two bugs were fixed here in `511c415`/`551629b`:
+The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
+only fire while groxpi is still waiting for upstream response headers. A body already streaming to the
+client is never cut off by it.
 
-- **Only a genuine miss falls through.** `Get`/`Stat` fall through to L2 only when `errors.Is(err, ErrNotFound)`; any other L1 error is returned. Previously not-found was a per-backend string convention, so a broken local disk read as a cache miss and every read silently became an L2 round trip. `Exists` propagates errors for the same reason — absence is already `(false, nil)`.
-- **The back-fill actually runs.** Sync jobs derive their context from the pool's lifetime context (plus a 5-minute `syncJobTimeout`), not from the request that queued them. The old queue handed over a context the submitting goroutine cancelled on its way out, so every worker found a dead context and L1 was never populated.
+The leader's download runs on a context detached from its client's request: it is populating the cache
+for every waiter, so it must not die with whichever request happened to trigger it.
 
-L1 back-fill is best-effort: a full queue drops the request rather than blocking the reader.
+## Observability
 
-### 4e. L1 eviction (`LRULocalStorage`)
+Logs go through the standard library's `log/slog`, fanned out to stdout and — when a collector is
+configured — to OpenTelemetry through the `otelslog` bridge, carrying the trace and span identifiers of
+the request that produced them. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset, all three signals are inert:
+no providers, no connection attempt, no startup dependency.
 
-`LRULocalStorage` **wraps** `*LocalStorage` in an explicit field — it does not embed it. Every method is written out, so a read path that forgets to record an access is a compile error rather than a silent fall-through. That fall-through was a real bug (`e0a26c7`): a hot file read only through `GetFilePath`/`Stat` looked cold to the evictor and could be deleted mid-serve.
+All three signals leave over OTLP/HTTP to one endpoint. There is **no** Prometheus scrape endpoint and
+no `/metrics` route; `monitoring/prometheus.yml` scrapes a collector. See
+[adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md).
 
-- Read paths that yield a size record an access: `Get`, `Stat`, `GetFilePath`, and `Put` (via `RecordWrite`, which reconciles the tracked size so overwrites cannot drift the counter).
-- `Exists` and `List` forward without recording — a presence check is a routing decision, and bulk enumeration would reorder the whole cache.
-- Eviction goes through `objectDeleter.Delete` (the same `LocalStorage` instance), so the on-disk file and the size accounting have one owner. The raw `os.Remove` plus `cleanupStaleEntries` reconciliation loop that patched the resulting drift is gone.
-- **TTL and size are independent triggers.** The eviction worker selects over two arms: a size-driven pass queued by `triggerEvictionLocked`, and — only when a TTL is configured — a periodic sweep (`expireEntries`) on a ticker at `ttlSweepInterval(ttl)`, which is half the TTL capped at `maxTTLSweepInterval` (1 minute) and floored at 1ms. The sweep is what makes a TTL mean anything: `performEviction` returns early while the cache is under quota, so before `97282f1` a configured TTL expired nothing at all on a cache that never filled up. `CreatedAt` is not ordered by list position (a rewrite restarts an entry's TTL clock via `RecordWrite` without moving it), so the sweep checks every entry.
-- The size-driven pass is still two-phase when a TTL is set: expired entries first (in LRU order), then unexpired ones if still over the size limit. `maxSize == 0` means unlimited, and a nil sweep channel disables the TTL arm entirely when `ttl <= 0`.
-- Capability forwarding is explicit and compile-checked (`var _ ZeroCopyCapable = (*LRULocalStorage)(nil)`, `var _ l1Storage = ...`): the wrapper exposes exactly its inner backend's capability set.
+### Metrics
 
-## 5. Remaining friction
+| Instrument | Kind | Attributes |
+|---|---|---|
+| `groxpi.cache.hits` | counter | `cache.layer` = `index`, `local`, `remote` |
+| `groxpi.cache.misses` | counter | `cache.layer` |
+| `groxpi.cache.evictions` | counter | `cache.layer` |
+| `groxpi.cache.occupancy` | gauge (bytes) | `cache.layer` |
+| `groxpi.index.resolutions` | counter | `index` (redacted URL), `index.result` = `hit`, `miss`, `error`, `cancelled` |
+| `groxpi.upstream.fetch.duration` | histogram (seconds) | `fetch.outcome` = `ok`, `error` |
+| `groxpi.redirects` | counter | `redirect.reason` = `caching_disabled`, `fetch_failed`, `not_cached` |
+| `groxpi.verification.failures` | counter | — |
 
-Current shallow/leaky spots. None of these is a known correctness bug; they are locality and honesty costs.
+`groxpi.redirects` is the counter that distinguishes a working cache from a time-to-first-byte budget
+set too tight: every increment is a request that was not served from cache.
 
-- **`ZeroCopyCapable` is a misnomer.** What it provides is "I can name a real file on disk", which is useful for delegating range/conditional handling to `net/http`. Nothing in the codebase avoids a copy. Renaming it (e.g. `FilePathCapable`) would stop the name re-introducing the claim the refactor removed.
-- **No not-found sentinel in `internal/pypi`.** `handleListFiles` recognises an upstream miss by `strings.Contains(err.Error(), "not found")`, because `pypi.Client` returns a plain `fmt.Errorf`. A `pypi.ErrPackageNotFound` sentinel plus `errors.Is` would remove the last stringly-typed error branch in the server; the `TODO` marking it sits at the call site.
-- **`HEAD` on a download or index route is 405.** Only `GET` is registered, and `HandleMethodNotAllowed` is on, so `HEAD /simple/:package/:file` returns `405` with `Allow: GET`. That is honest routing, not desirable behaviour — a client probing size or freshness without a body has no way to. Registering `HEAD` alongside each `GET` is an open follow-up.
-- **The two serve branches emit different headers.** The open-then-stream branch of `serveFromStorage` sets `Content-Disposition`, `Cache-Control` and `ETag`; the `c.File` branch sets none of them. Which headers a client sees depends on which backend is configured.
-- **One `singleflight.Group` spans three key namespaces.** `PackageFileService.sf` is keyed by `"package-list"` (the `packageListKey` const), `"package-files:<name>"` and raw storage keys (`"packages/<pkg>/<file>"`). Collision is unlikely but the namespacing is implicit, not enforced.
-- **No presigned-URL redirect for S3 downloads.** `Presignable`, `S3Storage.GetPresignedURL` and the `TieredStorage` forward were deleted because nothing in production called them — the only clients were the tests asserting the interface existed. Handing an S3 client a presigned URL and redirecting to it, instead of proxying the bytes, remains a genuine optimisation worth building; it just needs a real caller in `serveFromStorage` first.
-- **Three hand-rolled caches, three eviction policies.** `storage/lru.go`, `cache/response.go` and `cache/index.go` each implement their own. A shared policy module was considered and not done (see plan task E stretch goal).
-- **`IndexCache` never reclaims expired entries.** `Get` reports a miss past `ExpiresAt` but nothing deletes the entry; the map shrinks only on explicit invalidation. Bounded in practice by the number of packages ever requested.
-- **`Server` constructs all its own dependencies.** `New(cfg)` builds caches, client, storage and downloader inline, so anything that is not reachable through `PackageFileService` still needs a whole server to test.
-- **`templates/` is unused.** `server.New` notes handlers generate HTML inline.
+An index is always identified by its redacted URL, never the configured one — a metric attribute lives
+as long as the collector keeps the series.
 
-## 6. Concurrency notes
+### Spans
 
-- `PackageFileService.sf` (`singleflight.Group`) collapses concurrent index fetches *and* concurrent package-file downloads. It is the only group in the server; `Server` holds none of its own, and reaches it only through the service.
-- `TieredStorage` holds its own `singleflight.Group` for puts (`"put:"+key`). `S3Storage` holds `statSF` and `listSF` for metadata and listings; `Get` deliberately does **not** deduplicate, because an S3 reader can only be consumed once.
-- `WorkerPool[T]` (`workerpool.go`) is the single bounded-queue implementation: worker count *is* the concurrency cap, `Submit` never blocks (a full queue drops the job and returns `false`), `Close` is idempotent and safe to race against `Submit`. The tiered sync queue is its one instance. The S3 "async write" queue was the other until it was deleted: `S3Storage.Put` submitted to it and then immediately blocked on the result channel, so the write was never asynchronous to the caller. Uploads now go straight to minio-go, and `GROXPI_S3_ASYNC_WRITES`/`_WORKERS`/`_QUEUE_SIZE` are gone (see `docs/configuration.md`).
-- `LRUCache` carries one `sync.RWMutex`; eviction runs on a dedicated goroutine (`evictionWorker`) woken either through a depth-1 `evictionChan` (size) or a TTL ticker (expiry). Both arms take the same write lock, so a sweep and a size pass never overlap.
-- `IndexCache` and `ResponseCache` each carry their own `sync.RWMutex`. `ResponseCache.Get` takes the read lock, then upgrades to the write lock to update LRU order.
-- `config`, `indexCache`, `responseCache`, `pypiClient`, `storage`, `packageFiles`, `router` are the whole `Server` struct; every field is immutable after `New()` and read without locks. The streaming downloader is no longer held on `Server` — it is constructed in `New` and handed to `PackageFileService`, which is its only caller.
+```
+{METHOD} {route}
+├─ index.resolve
+│  └─ index.query          (one per index consulted)
+├─ storage.exists
+└─ upstream.fetch
+   └─ storage.put
+```
 
----
+## Embedded assets
 
-*No `CONTEXT.md` domain glossary exists yet. The domain terms this refactor introduced — `ServePlan`, `ServeAction`, `PackageFileService`, `ZeroCopyCapable`, `WorkerPool[T]` — belong there. This doc captures structure; the plan captures the deepening work.*
+The admin page's templates and its interaction library are compiled into the binary with `go:embed`.
+Nothing is read from disk at runtime and there is no asset build step: building groxpi stays a single
+`go build`, and the page works in an air-gapped network with no CDN reachable.
+
+The cost is binary size. Measured on darwin/arm64 at this commit: about 48 MB for a plain `go build`,
+about 33 MB with `-ldflags="-w -s"` (the Dockerfile strips). Most of that is the OpenTelemetry and AWS
+SDKs, not the templates — `html/template` is pulled in by gin whether or not the admin page exists, so
+deleting the templates would reclaim close to nothing. Do not "optimize" them away on a size argument.
+
+## Decisions
+
+- [adr/0001-extras-first-index-resolution.md](adr/0001-extras-first-index-resolution.md) — why extra
+  indexes are queried first and file lists are never merged.
+- [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md) — why there is no
+  scrape endpoint.
+
+## Known gaps
+
+- In pure `s3` mode the S3 backend implements neither `PrefixDeleter` nor `Snapshot`, so
+  `DELETE /cache/<package>` drops the index entry, leaves every object in the bucket and still reports
+  success, and `GET /admin` renders no rows however much the bucket holds.
+- The landing page at `/` reports a hardcoded version string.

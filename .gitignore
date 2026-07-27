@@ -47,4 +47,4 @@ benchmarks/results/
 
 # Local storage
 /storage/
-/data/
+/data/.claude/worktrees/
