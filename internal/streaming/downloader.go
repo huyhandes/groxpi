@@ -19,7 +19,8 @@ import (
 )
 
 // ErrVerification marks a download whose bytes did not match what the index
-// declared. Such a download is never committed to storage.
+// declared. Such a download is never committed to storage. It says nothing about
+// what the client received: see DownloadAndStream.
 var ErrVerification = errors.New("integrity check failed")
 
 // StorageWriter is the write half of storage.Storage, narrowed to what the
@@ -71,10 +72,20 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 }
 
 // DownloadAndStream downloads using TeeReader for better streaming performance.
+//
 // The bytes are hashed on the way through and checked against expect before the
 // storage pipe is closed cleanly, so a file that fails verification is never
 // committed: the pipe is closed with an error instead and the backend discards
 // its partial write.
+//
+// The verification guarantee is cache-only. Bytes reach the client as they
+// arrive, which is the point of streaming, so by the time the digest can be
+// computed the client already has all of them and a 200 has already been sent.
+// What a failed check buys is that the bad bytes are not kept and not served to
+// anyone else.
+//
+// A cache-write failure is not the client's problem: it is reported in
+// StreamResult.Error and the transfer completes.
 func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, storageKey string, writer io.Writer, expect Expectation) (*StreamResult, error) {
 	// A deadline on the request context would outlive the headers and kill the
 	// body read, so the budget is a timer that cancels and is then stopped: it
@@ -112,7 +123,11 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 
 	hasher := sha256.New()
 	storageReader, storageWriter := io.Pipe()
-	teeReader := io.TeeReader(resp.Body, io.MultiWriter(storageWriter, hasher))
+	// The cache side of the tee is fenced off from the client side: caching is
+	// best-effort, so a backend that gives up mid-stream (a full disk, say) must
+	// cost this download its cache entry and nothing else.
+	cacheSink := &bestEffortWriter{w: storageWriter}
+	teeReader := io.TeeReader(resp.Body, io.MultiWriter(cacheSink, hasher))
 
 	storageErrCh := make(chan error, 1)
 	go func() {
@@ -150,6 +165,9 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	}
 
 	storageErr := <-storageErrCh
+	if storageErr == nil {
+		storageErr = cacheSink.err
+	}
 
 	if streamErr != nil {
 		return nil, fmt.Errorf("tee streaming failed: %w", streamErr)
@@ -164,6 +182,35 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 		ETag:        `"` + digest + `"`,
 		Error:       storageErr,
 	}, nil
+}
+
+// bestEffortWriter forwards to the cache until the cache stops accepting, then
+// swallows the rest while remembering why.
+//
+// It is what keeps a storage failure off the client's transfer. Without it the
+// tee's write error propagated out of the io.Copy driving the response: the
+// backend returning early closed the pipe, the next tee write got
+// io.ErrClosedPipe, and the client was handed a truncated 200. A full disk broke
+// every concurrent download instead of merely not caching them.
+//
+// Write is only ever called from the goroutine driving that copy, so err needs no
+// synchronisation; it is read once the copy has returned.
+type bestEffortWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (b *bestEffortWriter) Write(p []byte) (int, error) {
+	if b.err != nil {
+		return len(p), nil
+	}
+
+	if _, err := b.w.Write(p); err != nil {
+		b.err = err
+		return len(p), nil
+	}
+
+	return len(p), nil
 }
 
 // verify checks the received bytes against what the index declared: SHA-256 when
