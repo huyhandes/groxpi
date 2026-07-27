@@ -146,11 +146,12 @@ func NewClient(cfg *config.Config) *Client {
 		Timeout:   60 * time.Second, // Increased for large responses
 	}
 
-	if cfg.ConnectTimeout > 0 || cfg.ReadTimeout > 0 {
-		timeout := cfg.ConnectTimeout + cfg.ReadTimeout
-		if timeout > 0 {
-			httpClient.Timeout = timeout
-		}
+	// http.Client.Timeout is one budget for the whole request - connect, headers
+	// and body - so the two configured phases are summed rather than applied
+	// separately: an index that takes ConnectTimeout to connect is still allowed
+	// its ReadTimeout to answer. Both default to 0, which leaves the 60s above.
+	if budget := cfg.ConnectTimeout + cfg.ReadTimeout; budget > 0 {
+		httpClient.Timeout = budget
 	}
 
 	return &Client{

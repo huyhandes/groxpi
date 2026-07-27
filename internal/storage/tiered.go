@@ -78,24 +78,14 @@ type TieredConfig struct {
 	// S3 (L2) configuration
 	S3Config *S3Config
 
-	// Background transfer configuration, shared by L1 back-fill and L2 upload
-	SyncWorkers   int // Number of workers per pool (default: 5)
-	SyncQueueSize int // Queue depth per pool (default: 100)
+	// Background transfer configuration, shared by L1 back-fill and L2 upload.
+	// Defaulted by config.Load; NewWorkerPool clamps anything unusable.
+	SyncWorkers   int // Number of workers per pool
+	SyncQueueSize int // Queue depth per pool
 }
 
 // NewTieredStorage creates a new tiered storage backend
 func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
-	// Set defaults
-	if cfg.SyncWorkers == 0 {
-		cfg.SyncWorkers = 5
-	}
-	if cfg.SyncQueueSize == 0 {
-		cfg.SyncQueueSize = 100
-	}
-	if cfg.LocalCacheSize == 0 {
-		cfg.LocalCacheSize = 10 * 1024 * 1024 * 1024 // 10GB default
-	}
-
 	// Create local storage with LRU eviction (L1 cache)
 	localStorage, err := NewLRULocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
 	if err != nil {
