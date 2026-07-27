@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/phuslu/log"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/cache"
@@ -168,12 +168,9 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	exists, err := s.storage.Exists(ctx, plan.StorageKey)
 	if err != nil {
 		// A backend hiccup must not fail the request: fall through to upstream.
-		log.Error().Err(err).Str("key", plan.StorageKey).Msg("Failed to check storage")
+		slog.Error("Failed to check storage", "error", err, "key", plan.StorageKey)
 	} else if exists {
-		log.Debug().
-			Str("package", packageName).
-			Str("file", fileName).
-			Msg("✅ Serving from storage cache")
+		slog.Debug("✅ Serving from storage cache", "package", packageName, "file", fileName)
 		plan.Action = ActionFromStorage
 		return plan, nil
 	}
@@ -197,10 +194,9 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	plan.ETag = quoteETag(plan.SHA256)
 
 	if s.downloadTimeout <= 0 {
-		log.Debug().
-			Str("package", packageName).
-			Str("file", fileName).
-			Msg("Download timeout is 0, redirecting directly to PyPI")
+		slog.Debug("Download timeout is 0, redirecting directly to PyPI",
+			"package", packageName,
+			"file", fileName)
 		plan.Action = ActionRedirect
 		return plan, nil
 	}
@@ -229,13 +225,12 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 
 	value, err, _ := s.sf.Do(plan.StorageKey, func() (any, error) {
 		led = true
-		log.Info().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Str("file_url", plan.URL).
-			Int64("file_size", plan.Size).
-			Dur("timeout", plan.Timeout).
-			Msg("🚀 Starting streaming download with simultaneous cache")
+		slog.Info("🚀 Starting streaming download with simultaneous cache",
+			"package", plan.PackageName,
+			"file", plan.FileName,
+			"file_url", plan.URL,
+			"file_size", plan.Size,
+			"timeout", plan.Timeout)
 		return s.downloader.DownloadAndStream(fetchCtx, plan.URL, plan.StorageKey, dst, streaming.Expectation{
 			SHA256: plan.SHA256,
 			Size:   plan.Size,
@@ -243,10 +238,7 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 	})
 
 	if !led {
-		log.Debug().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Msg("🔄 Waited for in-flight download")
+		slog.Debug("🔄 Waited for in-flight download", "package", plan.PackageName, "file", plan.FileName)
 		if err != nil {
 			return nil, false, fmt.Errorf("shared download of %q failed: %w", plan.StorageKey, err)
 		}
@@ -272,17 +264,15 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan) ServePlan {
 	next, err := s.Plan(ctx, plan.PackageName, plan.FileName)
 	if err == nil && next.Action == ActionFromStorage {
-		log.Debug().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Msg("✅ Serving from storage after coordinated download")
+		slog.Debug("✅ Serving from storage after coordinated download",
+			"package", plan.PackageName,
+			"file", plan.FileName)
 		return next
 	}
 
-	log.Debug().
-		Str("package", plan.PackageName).
-		Str("file", plan.FileName).
-		Msg("⏭️ Redirecting to PyPI after download coordination")
+	slog.Debug("⏭️ Redirecting to PyPI after download coordination",
+		"package", plan.PackageName,
+		"file", plan.FileName)
 	plan.Action = ActionRedirect
 	return plan
 }

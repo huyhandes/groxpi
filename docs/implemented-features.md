@@ -227,7 +227,6 @@ Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberatel
 - **Hot Reload**: Development server with auto-restart
 - **Debug Mode**: Enhanced logging for development
 - **Profile Support**: CPU and memory profiling
-- **Metrics Export**: Development metrics and statistics
 
 ## Deployment Features ✅
 
@@ -311,8 +310,10 @@ Handlers generate HTML inline with a `strings.Builder`; `server.New` deliberatel
 ## Future Enhancements 🔄
 
 ### Planned Features
-- **Prometheus Metrics**: Application-level metrics export
-- **Distributed Tracing**: OpenTelemetry integration
+- **Telemetry Coverage**: spans and metric instruments on the request, index-fetch,
+  download and cache paths. The OpenTelemetry export pipeline itself is implemented —
+  logs, metrics and traces over OTLP, see [monitoring](monitoring.md) — but the code
+  paths are not yet instrumented, so only log records are produced today.
 - **Advanced Templates**: Enhanced web interface
 - **CI/CD Pipeline**: Automated testing and releases
 

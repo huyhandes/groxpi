@@ -7,12 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/phuslu/log"
 
 	"github.com/huyhandes/groxpi/internal/storage"
 )
@@ -174,9 +173,8 @@ func verify(storageKey string, expect Expectation, digest string, received, upst
 		return nil
 	}
 
-	log.Warn().
-		Str("key", storageKey).
-		Int64("size", received).
-		Msg("⚠️ Caching unverified file: index supplied neither a hash nor a length")
+	slog.Warn("⚠️ Caching unverified file: index supplied neither a hash nor a length",
+		"key", storageKey,
+		"size", received)
 	return nil
 }

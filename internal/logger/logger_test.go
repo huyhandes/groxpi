@@ -2,32 +2,34 @@ package logger
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/phuslu/log"
 )
 
 func TestParseLevel(t *testing.T) {
 	testCases := []struct {
 		input    string
-		expected log.Level
+		expected slog.Level
 	}{
-		{"DEBUG", log.DebugLevel},
-		{"debug", log.DebugLevel},
-		{"Debug", log.DebugLevel},
-		{"INFO", log.InfoLevel},
-		{"info", log.InfoLevel},
-		{"WARN", log.WarnLevel},
-		{"WARNING", log.WarnLevel},
-		{"warn", log.WarnLevel},
-		{"ERROR", log.ErrorLevel},
-		{"error", log.ErrorLevel},
-		{"FATAL", log.FatalLevel},
-		{"fatal", log.FatalLevel},
-		{"INVALID", log.InfoLevel}, // default fallback
-		{"", log.InfoLevel},        // default fallback
+		{"DEBUG", slog.LevelDebug},
+		{"debug", slog.LevelDebug},
+		{"Debug", slog.LevelDebug},
+		{"INFO", slog.LevelInfo},
+		{"info", slog.LevelInfo},
+		{"WARN", slog.LevelWarn},
+		{"WARNING", slog.LevelWarn},
+		{"warn", slog.LevelWarn},
+		{"ERROR", slog.LevelError},
+		{"error", slog.LevelError},
+		{"FATAL", LevelFatal},
+		{"fatal", LevelFatal},
+		{"INVALID", slog.LevelInfo}, // default fallback
+		{"", slog.LevelInfo},        // default fallback
 	}
 
 	for _, tc := range testCases {
@@ -69,7 +71,7 @@ func TestInit_JSONFormat(t *testing.T) {
 	Init(cfg)
 
 	// Test logging
-	Logger.Info().Msg("test message")
+	Logger.Info("test message")
 
 	// Close writer and read output
 	_ = w.Close()
@@ -87,6 +89,61 @@ func TestInit_JSONFormat(t *testing.T) {
 	if !strings.Contains(output, `"message":"test message"`) {
 		t.Error("Expected message in JSON output")
 	}
+}
+
+// TestInit_JSONFieldSemantics pins the field names log collectors are already
+// configured for: "time", "level" (lower case), "message", and errors rendered
+// as strings under an "error" key.
+func TestInit_JSONFieldSemantics(t *testing.T) {
+	output := captureStdout(t, func() {
+		Init(LogConfig{Level: "INFO", Format: "json"})
+		Logger.Error("boom", "error", errors.New("disk on fire"), "count", 3)
+	})
+
+	var record map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &record); err != nil {
+		t.Fatalf("output is not JSON: %v (%q)", err, output)
+	}
+
+	if record["level"] != "error" {
+		t.Errorf(`level = %v, want "error"`, record["level"])
+	}
+	if record["message"] != "boom" {
+		t.Errorf(`message = %v, want "boom"`, record["message"])
+	}
+	if record["error"] != "disk on fire" {
+		t.Errorf(`error = %v, want "disk on fire"`, record["error"])
+	}
+	if record["count"] != float64(3) {
+		t.Errorf("count = %v, want 3", record["count"])
+	}
+	if _, ok := record["time"]; !ok {
+		t.Error("expected a time field")
+	}
+	if _, ok := record["msg"]; ok {
+		t.Error(`slog's "msg" key leaked; it must be renamed to "message"`)
+	}
+}
+
+// captureStdout runs fn with os.Stdout replaced by a pipe and returns what was
+// written. Init binds the handler to os.Stdout, so the swap must happen first.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	original := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	fn()
+	_ = w.Close()
+	os.Stdout = original
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
 }
 
 func TestInit_ConsoleFormat(t *testing.T) {
@@ -110,7 +167,7 @@ func TestInit_ConsoleFormat(t *testing.T) {
 	Init(cfg)
 
 	// Test logging
-	Logger.Info().Msg("console test message")
+	Logger.Info("console test message")
 
 	// Close writer and read output
 	_ = w.Close()
@@ -152,10 +209,10 @@ func TestInit_LevelFiltering(t *testing.T) {
 	Init(cfg)
 
 	// Log at different levels
-	Logger.Debug().Msg("debug message")
-	Logger.Info().Msg("info message")
-	Logger.Warn().Msg("warn message")
-	Logger.Error().Msg("error message")
+	Logger.Debug("debug message")
+	Logger.Info("info message")
+	Logger.Warn("warn message")
+	Logger.Error("error message")
 
 	// Close writer and read output
 	_ = w.Close()
@@ -242,7 +299,7 @@ func TestGetLogger(t *testing.T) {
 	}
 
 	// Verify it's the same instance
-	if logger != &Logger {
+	if logger != Logger {
 		t.Error("GetLogger() did not return the global Logger instance")
 	}
 }
@@ -258,9 +315,13 @@ func TestInit_DefaultFormat(t *testing.T) {
 	// Should not panic
 	Init(cfg)
 
-	// Verify logger is initialized
-	if Logger.Level != log.InfoLevel {
-		t.Error("Logger level not set correctly")
+	// Verify logger is initialized at the configured level
+	ctx := context.Background()
+	if !Logger.Enabled(ctx, slog.LevelInfo) {
+		t.Error("Logger should be enabled at INFO")
+	}
+	if Logger.Enabled(ctx, slog.LevelDebug) {
+		t.Error("Logger should not be enabled at DEBUG when configured for INFO")
 	}
 }
 

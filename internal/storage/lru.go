@@ -5,12 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/phuslu/log"
 )
 
 // LRUEntry represents an entry in the LRU cache. Recency lives in the list
@@ -83,12 +82,11 @@ func newLRUCache(baseDir string, maxSize int64, ttl time.Duration, deleter objec
 	cache.wg.Add(1)
 	go cache.evictionWorker()
 
-	log.Info().
-		Str("base_dir", baseDir).
-		Int64("max_size_bytes", maxSize).
-		Int64("max_size_mb", maxSize/(1024*1024)).
-		Dur("ttl", ttl).
-		Msg("LRU cache initialized")
+	slog.Info("LRU cache initialized",
+		"base_dir", baseDir,
+		"max_size_bytes", maxSize,
+		"max_size_mb", maxSize/(1024*1024),
+		"ttl", ttl)
 
 	return cache
 }
@@ -115,7 +113,7 @@ func (lru *LRUCache) evictionWorker() {
 	for {
 		select {
 		case <-lru.stopChan:
-			log.Info().Msg("LRU eviction worker stopping")
+			slog.Info("LRU eviction worker stopping")
 			return
 		case <-lru.evictionChan:
 			lru.performEviction()
@@ -157,12 +155,11 @@ func (lru *LRUCache) expireEntries() {
 	}
 
 	if expiredCount > 0 {
-		log.Info().
-			Int("expired_count", expiredCount).
-			Int64("expired_size_mb", expiredSize/(1024*1024)).
-			Int64("current_size_mb", lru.currentSize/(1024*1024)).
-			Dur("ttl", lru.ttl).
-			Msg("Expired entries from L1 cache")
+		slog.Info("Expired entries from L1 cache",
+			"expired_count", expiredCount,
+			"expired_size_mb", expiredSize/(1024*1024),
+			"current_size_mb", lru.currentSize/(1024*1024),
+			"ttl", lru.ttl)
 	}
 }
 
@@ -183,11 +180,10 @@ func (lru *LRUCache) performEviction() {
 	evictedSize := int64(0)
 	now := time.Now()
 
-	log.Info().
-		Int64("current_size_mb", lru.currentSize/(1024*1024)).
-		Int64("max_size_mb", lru.maxSize/(1024*1024)).
-		Dur("ttl", lru.ttl).
-		Msg("Starting LRU eviction")
+	slog.Info("Starting LRU eviction",
+		"current_size_mb", lru.currentSize/(1024*1024),
+		"max_size_mb", lru.maxSize/(1024*1024),
+		"ttl", lru.ttl)
 
 	// Phase 1: Evict only expired entries (if TTL is enabled)
 	if lru.ttl > 0 {
@@ -217,10 +213,9 @@ func (lru *LRUCache) performEviction() {
 	// Phase 2: If still over limit, fall back to pure LRU eviction
 	if lru.currentSize > lru.maxSize {
 		if lru.ttl > 0 {
-			log.Warn().
-				Int64("current_size_mb", lru.currentSize/(1024*1024)).
-				Int64("max_size_mb", lru.maxSize/(1024*1024)).
-				Msg("Evicting unexpired entries to meet size limit (all expired entries already evicted)")
+			slog.Warn("Evicting unexpired entries to meet size limit (all expired entries already evicted)",
+				"current_size_mb", lru.currentSize/(1024*1024),
+				"max_size_mb", lru.maxSize/(1024*1024))
 		}
 
 		for lru.currentSize > lru.maxSize && lru.lruList.Len() > 0 {
@@ -237,11 +232,10 @@ func (lru *LRUCache) performEviction() {
 		}
 	}
 
-	log.Info().
-		Int("evicted_count", evictedCount).
-		Int64("evicted_size_mb", evictedSize/(1024*1024)).
-		Int64("new_size_mb", lru.currentSize/(1024*1024)).
-		Msg("LRU eviction completed")
+	slog.Info("LRU eviction completed",
+		"evicted_count", evictedCount,
+		"evicted_size_mb", evictedSize/(1024*1024),
+		"new_size_mb", lru.currentSize/(1024*1024))
 }
 
 // evictEntry removes a single entry from the cache. Deletion goes through the
@@ -250,11 +244,10 @@ func (lru *LRUCache) performEviction() {
 func (lru *LRUCache) evictEntry(elem *list.Element, entry *LRUEntry, expired bool) error {
 	// Delete the file (a missing file is not an error for the backend)
 	if err := lru.deleter.Delete(context.Background(), entry.Key); err != nil {
-		log.Error().
-			Err(err).
-			Str("key", entry.Key).
-			Str("path", filepath.Join(lru.baseDir, entry.Key)).
-			Msg("Failed to delete file during eviction")
+		slog.Error("Failed to delete file during eviction",
+			"error", err,
+			"key", entry.Key,
+			"path", filepath.Join(lru.baseDir, entry.Key))
 		return fmt.Errorf("failed to delete %q during eviction: %w", entry.Key, err)
 	}
 
@@ -263,11 +256,7 @@ func (lru *LRUCache) evictEntry(elem *list.Element, entry *LRUEntry, expired boo
 	delete(lru.entries, entry.Key)
 	lru.lruList.Remove(elem)
 
-	log.Debug().
-		Str("key", entry.Key).
-		Int64("size", entry.Size).
-		Bool("expired", expired).
-		Msg("Evicted entry from L1 cache")
+	slog.Debug("Evicted entry from L1 cache", "key", entry.Key, "size", entry.Size, "expired", expired)
 
 	return nil
 }
@@ -290,7 +279,7 @@ func (lru *LRUCache) touchLocked(key string) bool {
 
 	lru.lruList.MoveToFront(elem)
 
-	log.Debug().Str("key", key).Msg("Updated access time for existing entry")
+	slog.Debug("Updated access time for existing entry", "key", key)
 
 	return true
 }
@@ -306,11 +295,10 @@ func (lru *LRUCache) addEntryLocked(key string, size int64) {
 	lru.entries[key] = lru.lruList.PushFront(entry)
 	lru.currentSize += size
 
-	log.Debug().
-		Str("key", key).
-		Int64("size", size).
-		Int64("current_size_mb", lru.currentSize/(1024*1024)).
-		Msg("Added new entry to L1 cache")
+	slog.Debug("Added new entry to L1 cache",
+		"key", key,
+		"size", size,
+		"current_size_mb", lru.currentSize/(1024*1024))
 
 	lru.triggerEvictionLocked()
 }
@@ -362,11 +350,10 @@ func (lru *LRUCache) RecordWrite(key string, size int64) {
 	entry.CreatedAt = time.Now() // Fresh content restarts the TTL clock
 	lru.lruList.MoveToFront(elem)
 
-	log.Debug().
-		Str("key", key).
-		Int64("size", size).
-		Int64("current_size_mb", lru.currentSize/(1024*1024)).
-		Msg("Updated existing entry in L1 cache")
+	slog.Debug("Updated existing entry in L1 cache",
+		"key", key,
+		"size", size,
+		"current_size_mb", lru.currentSize/(1024*1024))
 
 	lru.triggerEvictionLocked()
 }
@@ -387,10 +374,7 @@ func (lru *LRUCache) RecordDelete(key string) {
 	delete(lru.entries, key)
 	lru.lruList.Remove(elem)
 
-	log.Debug().
-		Str("key", key).
-		Int64("size", entry.Size).
-		Msg("Removed entry from L1 cache tracking")
+	slog.Debug("Removed entry from L1 cache tracking", "key", key, "size", entry.Size)
 }
 
 // Close stops the LRU cache and cleans up resources
@@ -398,7 +382,7 @@ func (lru *LRUCache) Close() error {
 	close(lru.stopChan)
 	lru.wg.Wait()
 
-	log.Info().Msg("LRU cache closed")
+	slog.Info("LRU cache closed")
 	return nil
 }
 
@@ -407,7 +391,7 @@ func (lru *LRUCache) ScanAndRebuild() error {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
-	log.Info().Str("base_dir", lru.baseDir).Msg("Scanning directory to rebuild L1 cache")
+	slog.Info("Scanning directory to rebuild L1 cache", "base_dir", lru.baseDir)
 
 	scannedCount := 0
 	scannedSize := int64(0)
@@ -449,12 +433,11 @@ func (lru *LRUCache) ScanAndRebuild() error {
 		return fmt.Errorf("failed to scan directory: %w", err)
 	}
 
-	log.Info().
-		Int("file_count", scannedCount).
-		Int64("total_size_mb", scannedSize/(1024*1024)).
-		Int64("current_size_mb", lru.currentSize/(1024*1024)).
-		Int64("max_size_mb", lru.maxSize/(1024*1024)).
-		Msg("L1 cache rebuild completed")
+	slog.Info("L1 cache rebuild completed",
+		"file_count", scannedCount,
+		"total_size_mb", scannedSize/(1024*1024),
+		"current_size_mb", lru.currentSize/(1024*1024),
+		"max_size_mb", lru.maxSize/(1024*1024))
 
 	lru.triggerEvictionLocked()
 
@@ -500,7 +483,7 @@ func NewLRULocalStorage(baseDir string, maxSize int64, ttl time.Duration) (*LRUL
 
 	// Scan and rebuild cache from existing files
 	if err := lruCache.ScanAndRebuild(); err != nil {
-		log.Warn().Err(err).Msg("Failed to rebuild L1 cache, starting fresh")
+		slog.Warn("Failed to rebuild L1 cache, starting fresh", "error", err)
 	}
 
 	return storage, nil
@@ -516,10 +499,7 @@ func (lru *LRULocalStorage) recordAccess(ctx context.Context, key string) {
 
 	info, err := lru.inner.stat(ctx, key)
 	if err != nil {
-		log.Debug().
-			Err(err).
-			Str("key", key).
-			Msg("Could not stat file to track L1 access")
+		slog.Debug("Could not stat file to track L1 access", "error", err, "key", key)
 		return
 	}
 

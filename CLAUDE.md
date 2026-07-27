@@ -17,7 +17,8 @@ A high-performance PyPI caching proxy server written in Go, reimplemented from t
 - **Templates**: Go HTML templates with Gin integration
 - **Cache**: In-memory TTL index cache + LRU response cache; LRU eviction over the on-disk object store
 - **Storage**: Local filesystem, S3-compatible (MinIO/AWS S3), or hybrid (local L1 + S3 L2)
-- **Logging**: [phuslu/log](https://github.com/phuslu/log) - High-performance structured logging
+- **Logging**: stdlib `log/slog`, bridged to OpenTelemetry via [otelslog](https://pkg.go.dev/go.opentelemetry.io/contrib/bridges/otelslog)
+- **Telemetry**: OpenTelemetry SDK, all three signals over OTLP/HTTP; inert with no endpoint configured
 - **Middleware**: Recovery, structured logging, compression
 
 ## Architecture Principles
@@ -44,7 +45,8 @@ groxpi/
 ├── internal/            # Private application code
 │   ├── cache/          # index.go (TTL map) + response.go (LRU of marshaled JSON)
 │   ├── config/         # Configuration management
-│   ├── logger/         # Structured logging with phuslu/log
+│   ├── logger/         # slog setup: stdout handler + OpenTelemetry log bridge
+│   ├── telemetry/      # OTel provider setup (traces, metrics, logs) over OTLP
 │   ├── pypi/           # PyPI client with Sonic JSON
 │   ├── server/         # server.go (Gin transport) + packagefile.go (PackageFileService)
 │   ├── storage/        # Storage seam: storage.go (Storage + capability interfaces),
@@ -52,9 +54,7 @@ groxpi/
 │   └── streaming/      # interfaces.go + downloader.go (tee download-and-cache)
 ├── docs/               # Detailed documentation
 ├── benchmarks/         # Performance benchmarking suite
-├── monitoring/         # Monitoring and observability
-│   ├── grafana/        # Grafana dashboards and datasources
-│   └── prometheus.yml  # Prometheus configuration
+├── monitoring/         # prometheus.yml (scrapes an OTel collector, not groxpi)
 ├── templates/          # HTML templates with layouts
 │   ├── layouts/        # Main layout templates
 │   └── partials/       # Reusable template components

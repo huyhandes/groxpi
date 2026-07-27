@@ -530,10 +530,10 @@ helm/
 - **Level**: INFO for production
 - **Output**: stdout/stderr for container logging
 
-### Metrics Collection (Planned)
-- **Endpoint**: `/metrics`
-- **Format**: Prometheus exposition format
-- **Integration**: Prometheus + Grafana
+### Telemetry
+- **Transport**: OTLP over HTTP to a collector you run — groxpi serves no `/metrics` endpoint
+- **Signals**: logs, metrics and traces to one endpoint
+- **Configuration**: `OTEL_EXPORTER_OTLP_ENDPOINT`; unset leaves telemetry inert
 
 ## Security Considerations
 

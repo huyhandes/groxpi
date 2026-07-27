@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -16,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/phuslu/log"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -148,13 +148,12 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		return nil, fmt.Errorf("failed to reach bucket %s: %w", cfg.Bucket, err)
 	}
 
-	log.Info().
-		Str("endpoint", cfg.Endpoint).
-		Str("bucket", cfg.Bucket).
-		Str("prefix", cfg.Prefix).
-		Bool("path_style", cfg.ForcePathStyle).
-		Bool("static_credentials", cfg.AccessKeyID != "").
-		Msg("S3 storage backend initialized")
+	slog.Info("S3 storage backend initialized",
+		"endpoint", cfg.Endpoint,
+		"bucket", cfg.Bucket,
+		"prefix", cfg.Prefix,
+		"path_style", cfg.ForcePathStyle,
+		"static_credentials", cfg.AccessKeyID != "")
 
 	return &S3Storage{
 		client: client,
@@ -268,7 +267,7 @@ func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size 
 		size = counter.n
 	}
 
-	log.Debug().Str("key", key).Int64("size", size).Msg("Object stored in S3")
+	slog.Debug("Object stored in S3", "key", key, "size", size)
 
 	return &ObjectInfo{
 		Key:         key,

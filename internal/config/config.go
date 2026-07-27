@@ -54,6 +54,13 @@ type Config struct {
 	LogFormat string // console or json
 	LogColor  bool   // enable color for console logs
 
+	// Observability configuration. Read from the standard OpenTelemetry
+	// environment variables so a collector is configured the same way here as in
+	// the rest of an operator's fleet. An empty endpoint leaves all three signals
+	// inert: no providers, no connection attempt, no startup dependency.
+	OTLPEndpoint string
+	ServiceName  string
+
 	// SSL configuration
 	DisableSSLVerification bool
 }
@@ -70,6 +77,8 @@ func Load() *Config {
 		LogLevel:               getEnv("GROXPI_LOGGING_LEVEL", "INFO"),
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
 		LogColor:               getBoolEnv("GROXPI_LOG_COLOR", true),
+		OTLPEndpoint:           getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		ServiceName:            getEnv("OTEL_SERVICE_NAME", "groxpi"),
 		DisableSSLVerification: getBoolEnv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", false),
 		ConnectTimeout:         getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
 		ReadTimeout:            getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0),

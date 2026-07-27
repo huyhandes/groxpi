@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"strconv"
@@ -12,10 +13,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/phuslu/log"
 
 	"github.com/huyhandes/groxpi/internal/cache"
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/logger"
 	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/streaming"
@@ -67,7 +68,7 @@ func New(cfg *config.Config) *Server {
 	// Initialize storage backend
 	storageBackend, err := initStorage(cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize storage")
+		logger.Fatal("Failed to initialize storage", "error", err)
 	}
 
 	// Create HTTP client for streaming downloader with configured timeout
@@ -173,7 +174,7 @@ func (s *Server) handleListPackages(c *gin.Context) {
 
 	root, err := s.packageFiles.ProxyRoot(c.Request.Context(), accept, c.GetHeader("Accept-Encoding"))
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to proxy root index")
+		slog.Error("Failed to proxy root index", "error", err)
 		c.String(http.StatusBadGateway, "Failed to fetch package list")
 		return
 	}
@@ -198,7 +199,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			c.String(http.StatusNotFound, "Package not found")
 			return
 		}
-		log.Error().Err(err).Str("package", packageName).Msg("Failed to fetch package files")
+		slog.Error("Failed to fetch package files", "error", err, "package", packageName)
 		c.String(http.StatusInternalServerError, "Error fetching package: "+err.Error())
 		return
 	}
@@ -279,16 +280,15 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 	packageName := pypi.NormalizeName(c.Param("package"))
 	fileName := c.Param("file")
 
-	log.Debug().
-		Str("package", packageName).
-		Str("file", fileName).
-		Str("user_agent", c.GetHeader("User-Agent")).
-		Str("client_ip", c.ClientIP()).
-		Msg("📦 File download request received")
+	slog.Debug("📦 File download request received",
+		"package", packageName,
+		"file", fileName,
+		"user_agent", c.GetHeader("User-Agent"),
+		"client_ip", c.ClientIP())
 
 	plan, err := s.packageFiles.Plan(c.Request.Context(), packageName, fileName)
 	if err != nil {
-		log.Debug().Err(err).Str("package", packageName).Str("file", fileName).Msg("Package index unavailable")
+		slog.Debug("Package index unavailable", "error", err, "package", packageName, "file", fileName)
 		c.String(http.StatusNotFound, "Package not found")
 		return
 	}
@@ -302,7 +302,7 @@ func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 	switch plan.Action {
 	case ActionFromStorage:
 		if err := s.serveFromStorage(c, plan.StorageKey); err != nil {
-			log.Error().Err(err).Str("storage_key", plan.StorageKey).Msg("Failed to serve from storage")
+			slog.Error("Failed to serve from storage", "error", err, "storage_key", plan.StorageKey)
 			// Only a failure that happened before the first body byte can still
 			// be reported; anything later would append garbage to the payload.
 			if !c.Writer.Written() {
@@ -330,14 +330,13 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 
 	switch {
 	case err != nil:
-		log.Error().
-			Err(err).
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Str("file_url", plan.URL).
-			Int64("file_size", plan.Size).
-			Dur("timeout", plan.Timeout).
-			Msg("Failed to stream download, redirecting to PyPI")
+		slog.Error("Failed to stream download, redirecting to PyPI",
+			"error", err,
+			"package", plan.PackageName,
+			"file", plan.FileName,
+			"file_url", plan.URL,
+			"file_size", plan.Size,
+			"timeout", plan.Timeout)
 		if body.wrote {
 			// The body is already partly on the wire; a redirect would corrupt it.
 			c.Abort()
@@ -349,12 +348,11 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 		// this request can now be served from it or has to go upstream.
 		s.servePlan(c, s.packageFiles.PlanAfterFetch(c.Request.Context(), plan))
 	default:
-		log.Info().
-			Str("package", plan.PackageName).
-			Str("file", plan.FileName).
-			Int64("size", result.Size).
-			Bool("cached", result.Error == nil).
-			Msg("✅ Successfully streamed file to client")
+		slog.Info("✅ Successfully streamed file to client",
+			"package", plan.PackageName,
+			"file", plan.FileName,
+			"size", result.Size,
+			"cached", result.Error == nil)
 	}
 }
 
@@ -502,30 +500,28 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// assume, and do not branch on a boolean the backend has to lie about.
 	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
 		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
-			log.Debug().
-				Str("storage_key", storageKey).
-				Str("file_path", filePath).
-				Msg("Serving local file by path via net/http")
+			slog.Debug("Serving local file by path via net/http",
+				"storage_key", storageKey,
+				"file_path", filePath)
 			c.File(filePath)
 			return nil
 		}
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Str("method", c.Request.Method).
-		Msg("Starting file serve from storage")
+	slog.Debug("Starting file serve from storage",
+		"storage_key", storageKey,
+		"method", c.Request.Method)
 
 	// Open first: the reader and the metadata both arrive before a single body
 	// byte is written, so every header below is still settable.
 	reader, info, err := s.storage.Get(ctx, storageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			log.Debug().Str("key", storageKey).Msg("Object missing from storage")
+			slog.Debug("Object missing from storage", "key", storageKey)
 			c.String(http.StatusNotFound, "File not found")
 			return nil
 		}
-		log.Error().Err(err).Str("key", storageKey).Msg("Failed to get from storage")
+		slog.Error("Failed to get from storage", "error", err, "key", storageKey)
 		c.String(http.StatusInternalServerError, "Storage error")
 		return nil
 	}
@@ -552,27 +548,22 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		c.Header("ETag", etag)
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Int64("size", info.Size).
-		Msg("Starting file stream from storage")
+	slog.Debug("Starting file stream from storage", "storage_key", storageKey, "size", info.Size)
 
 	// Use io.Copy to manually stream the file to the response writer
 	// c.Writer is safe for concurrent use (unlike Fiber's context)
 	written, err := io.Copy(c.Writer, reader)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Str("storage_key", storageKey).
-			Int64("bytes_written", written).
-			Msg("Failed to stream file from storage")
+		slog.Error("Failed to stream file from storage",
+			"error", err,
+			"storage_key", storageKey,
+			"bytes_written", written)
 		return err
 	}
 
-	log.Debug().
-		Str("storage_key", storageKey).
-		Int64("bytes_written", written).
-		Msg("File stream completed successfully")
+	slog.Debug("File stream completed successfully",
+		"storage_key", storageKey,
+		"bytes_written", written)
 
 	return nil
 }

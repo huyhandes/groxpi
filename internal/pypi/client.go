@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/phuslu/log"
 )
 
 // Client fetches index pages from an upstream PyPI-compatible index. Concurrent
@@ -323,8 +323,9 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 	// emitting hrefs verbatim rather than dropping the whole index.
 	base, baseErr := url.Parse(baseURL)
 	if baseErr != nil {
-		log.Warn().Err(baseErr).Str("base_url", baseURL).
-			Msg("Cannot parse index URL, leaving package file hrefs unresolved")
+		slog.Warn("Cannot parse index URL, leaving package file hrefs unresolved",
+			"error", baseErr,
+			"base_url", baseURL)
 		base = nil
 	}
 
@@ -363,8 +364,10 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if base != nil {
 				ref, err := url.Parse(href)
 				if err != nil {
-					log.Warn().Err(err).Str("href", href).Str("base_url", baseURL).
-						Msg("Skipping package file with unparseable href")
+					slog.Warn("Skipping package file with unparseable href",
+						"error", err,
+						"href", href,
+						"base_url", baseURL)
 					continue
 				}
 				fileURL = base.ResolveReference(ref).String()
