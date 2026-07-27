@@ -546,19 +546,22 @@ func TestClient_ParseHTMLPackageFiles_SHA256Fragment(t *testing.T) {
 }
 
 // TestClient_ParseHTMLPackageFiles_PreservesAttributes ensures resolution did not
-// disturb the other data pulled off the anchor tag.
+// disturb the other data pulled off the anchor tag, and that HTML entities are
+// decoded. A PEP 503 index must escape ">" in data-requires-python; carrying the
+// escape through into the PEP 691 body we serve makes pip raise InvalidSpecifier
+// on "&gt;=3.8".
 func TestClient_ParseHTMLPackageFiles_PreservesAttributes(t *testing.T) {
 	client := &Client{}
-	html := `<a href="../../packages/ab/cd/foo-1.0.tar.gz#sha256=abc123" data-requires-python="&gt;=3.8" data-yanked="broken sdist">foo-1.0.tar.gz</a>`
+	html := `<a href="../../packages/ab/cd/foo-1.0.tar.gz?token=a&amp;v=2#sha256=abc123" data-requires-python="&gt;=3.8,&lt;4" data-yanked="broken &amp; unusable">foo-1.0&amp;bar.tar.gz</a>`
 
 	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://pypi.org/simple/foo/")
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 
-	assert.Equal(t, "foo-1.0.tar.gz", files[0].Name)
-	assert.Equal(t, "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123", files[0].URL)
-	assert.Equal(t, "&gt;=3.8", files[0].RequiresPython)
-	assert.Equal(t, "broken sdist", files[0].Yanked)
+	assert.Equal(t, "foo-1.0&bar.tar.gz", files[0].Name)
+	assert.Equal(t, "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz?token=a&v=2#sha256=abc123", files[0].URL)
+	assert.Equal(t, ">=3.8,<4", files[0].RequiresPython)
+	assert.Equal(t, "broken & unusable", files[0].Yanked)
 }
 
 // TestClient_ParseHTMLPackageFiles_MalformedHref verifies an unparseable href is

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net"
@@ -346,11 +347,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			return err
 		}
 
-		html := buf.String()
+		page := buf.String()
 		files = make([]FileInfo, 0, 50)
 
 		// Simple HTML parsing for package files
-		lines := strings.SplitSeq(html, "\n")
+		lines := strings.SplitSeq(page, "\n")
 		for line := range lines {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "<a ") {
@@ -367,7 +368,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if hrefEnd == -1 {
 				continue
 			}
-			href := line[hrefStart : hrefStart+hrefEnd]
+			// Attribute values and anchor text arrive HTML-escaped: a PEP 503
+			// index must write "&gt;=3.8", and re-emitting that escape into the
+			// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
+			// "&amp;" in a query string.
+			href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
 
 			// Resolve the href against the index page URL. ResolveReference
 			// correctly handles absolute, protocol-relative, root-relative and
@@ -391,14 +396,14 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
 				continue
 			}
-			filename := line[textStart+1 : textEnd]
+			filename := html.UnescapeString(line[textStart+1 : textEnd])
 
 			// Extract data-requires-python if present
 			var requiresPython string
 			if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
 				rpStart += 22
 				if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
-					requiresPython = line[rpStart : rpStart+rpEnd]
+					requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
 				}
 			}
 
@@ -407,7 +412,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
 				yankStart += 13
 				if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
-					yankedStr := line[yankStart : yankStart+yankEnd]
+					yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
 					if yankedStr == "" {
 						yanked = true
 					} else {
