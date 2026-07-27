@@ -67,6 +67,24 @@ func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
 	}
 }
 
+// TestIndexCache_MissDropsTheStaleEntry pins that a read which finds an expired
+// entry also reclaims it. Leaving it charged against maxBytes until the sweep
+// (half an hour away) means live entries get evicted to make room for bytes
+// already known to be worthless.
+func TestIndexCache_MissDropsTheStaleEntry(t *testing.T) {
+	c := NewIndexCache(0, 0)
+	defer c.Close()
+
+	c.Set("k", testEntry(`{"a":1}`), -time.Second)
+
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("an expired entry must not be readable")
+	}
+	if c.Len() != 0 || c.Bytes() != 0 {
+		t.Fatalf("stale entry still charged: %d entries, %d bytes", c.Len(), c.Bytes())
+	}
+}
+
 func TestIndexCache_PackageHelpers(t *testing.T) {
 	c := NewIndexCache(0, 0)
 	defer c.Close()

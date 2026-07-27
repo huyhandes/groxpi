@@ -133,7 +133,19 @@ func (c *IndexCache) Get(key string) (*Entry, bool) {
 	entry, exists := c.entries[key]
 	c.mu.RUnlock()
 
-	if !exists || time.Now().After(entry.expiresAt) {
+	if !exists {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		// A miss is the moment the entry's bytes are known to be worthless, so
+		// they are refunded here rather than left charged against maxBytes until
+		// the next sweep - which is half an hour away by default, long enough to
+		// evict live entries to make room for dead ones.
+		c.mu.Lock()
+		if current, still := c.entries[key]; still && current == entry {
+			c.removeLocked(key)
+		}
+		c.mu.Unlock()
 		return nil, false
 	}
 	entry.lastAccess.Store(time.Now().UnixNano())
