@@ -28,12 +28,13 @@ const (
 
 // l1Storage is the L1 tier contract: core storage plus the local-path
 // capability that is the whole point of having an L1, plus the prefix delete
-// that package eviction needs. All three are things only a tier holding real
-// local files can do.
+// that package eviction needs, plus the snapshot the cache listing reads. All
+// of those are things only a tier holding real local files can do.
 type l1Storage interface {
 	Storage
 	ZeroCopyCapable
 	PrefixDeleter
+	Snapshot() []LRUEntry
 }
 
 // uploadJob names a finished local file to copy up to the object store.
@@ -289,6 +290,17 @@ func (ts *TieredStorage) Exists(ctx context.Context, key string) (bool, error) {
 // policy's job, not the proxy's.
 func (ts *TieredStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	return ts.localCache.DeletePrefix(ctx, prefix)
+}
+
+// Snapshot forwards the cache listing to L1, the only tier that knows its own
+// contents. Without this, the listing page rendered zero rows in hybrid mode
+// even with files cached locally, because the top-level backend is this one.
+//
+// L2 objects are not reported, for the same reason DeletePrefix leaves them
+// alone: naming them would need a listing operation the storage interface
+// deliberately does without.
+func (ts *TieredStorage) Snapshot() []LRUEntry {
+	return ts.localCache.Snapshot()
 }
 
 // GetFilePath returns the local file path for zero-copy serving. Only L1 holds
