@@ -13,7 +13,7 @@ import (
 )
 
 func testEntry(body string) *Entry {
-	return NewPackageEntry([]pypi.FileInfo{{Name: "a.whl"}}, []byte(body), "https://pypi.org/simple/")
+	return NewPackageEntry([]pypi.FileInfo{{Name: "a.whl"}}, []byte(body))
 }
 
 func TestEntry_GzipDecodesToJSON(t *testing.T) {

@@ -327,7 +327,7 @@ func (s *PackageFileService) resolveIndex(ctx context.Context, packageName strin
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode index for package %q: %w", packageName, err)
 		}
-		entry := cache.NewPackageEntry(files, body, index.Redacted())
+		entry := cache.NewPackageEntry(files, body)
 		// Never cache an empty index: a transient upstream fault would otherwise
 		// poison this package for the whole TTL. The TTL is the answering index's
 		// own, so a fast-moving private index is not held stale by PyPI's.

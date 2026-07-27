@@ -295,7 +295,7 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 			if tt.seedIndexCache != nil {
 				body, err := encodePackageFiles(pkg, tt.seedIndexCache)
 				require.NoError(t, err)
-				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body, "seed"), time.Minute)
+				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body), time.Minute)
 			}
 
 			plan, err := svc.Plan(context.Background(), pkg, file)
