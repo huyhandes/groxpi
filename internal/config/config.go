@@ -37,8 +37,7 @@ type Config struct {
 	TieredSyncQueueSize int           // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
-	S3EnableHTTP2   bool // Enable HTTP/2 for better multiplexing
-	S3TransferAccel bool // Enable S3 Transfer Acceleration
+	S3EnableHTTP2 bool // Enable HTTP/2 for better multiplexing
 
 	// Timeout configuration
 	DownloadTimeout time.Duration
@@ -82,8 +81,7 @@ func Load() *Config {
 		S3UseSSL:          getBoolEnv("GROXPI_S3_USE_SSL", true),
 
 		// S3 Performance Configuration
-		S3EnableHTTP2:   getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
-		S3TransferAccel: getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
+		S3EnableHTTP2: getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
 
 		// Hybrid/Tiered storage configuration
 		LocalCacheSize:      getIntEnv("GROXPI_LOCAL_CACHE_SIZE", 10*1024*1024*1024), // 10GB default
@@ -134,12 +132,11 @@ func Load() *Config {
 			cfg.S3Endpoint = "s3.amazonaws.com"
 		}
 
-		// Validate required S3 settings
+		// Only the bucket is required. Credentials are deliberately not
+		// checked: with none configured the AWS default chain takes over, which
+		// is how instance, task and web-identity roles work.
 		if cfg.S3Bucket == "" {
 			panic("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
-		}
-		if cfg.S3AccessKeyID == "" || cfg.S3SecretAccessKey == "" {
-			panic("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set when using S3 or hybrid storage")
 		}
 	}
 

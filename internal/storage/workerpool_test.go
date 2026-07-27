@@ -130,6 +130,71 @@ func TestWorkerPool_CloseWaitsForInFlightJobs(t *testing.T) {
 	assert.True(t, finished.Load(), "Close returned before the in-flight job finished")
 }
 
+// TestWorkerPool_DrainRunsQueuedJobs verifies Drain finishes queued work before
+// closing, which is what stops a shutdown from silently discarding it.
+func TestWorkerPool_DrainRunsQueuedJobs(t *testing.T) {
+	const jobs = 20
+
+	var executed atomic.Int64
+
+	pool := NewWorkerPool("test-drain", jobs, 1, func(_ context.Context, _ int) {
+		time.Sleep(time.Millisecond)
+		executed.Add(1)
+	})
+
+	for i := range jobs {
+		require.True(t, pool.Submit(i))
+	}
+
+	pool.Drain(5 * time.Second)
+
+	assert.Equal(t, int64(jobs), executed.Load(), "Drain closed before the queue was empty")
+}
+
+// TestWorkerPool_DrainTimesOutCleanly verifies a queue that cannot be emptied in
+// time is abandoned rather than hanging shutdown, and that Drain still waits for
+// the job already running.
+func TestWorkerPool_DrainTimesOutCleanly(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	var finished atomic.Bool
+
+	pool := NewWorkerPool("test-drain-timeout", 8, 1, func(_ context.Context, _ int) {
+		once.Do(func() { close(started) })
+		<-release
+		finished.Store(true)
+	})
+
+	for i := range 5 {
+		require.True(t, pool.Submit(i))
+	}
+	<-started // the only worker is parked, so the rest cannot drain
+
+	done := make(chan struct{})
+	go func() {
+		pool.Drain(50 * time.Millisecond)
+		close(done)
+	}()
+
+	// Drain must not return while the running job is still going.
+	select {
+	case <-done:
+		t.Fatal("Drain abandoned an in-flight job")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain never returned")
+	}
+
+	assert.True(t, finished.Load(), "the in-flight job was cancelled instead of finished")
+}
+
 // TestWorkerPool_CloseIsIdempotentAndReleasesWorkers verifies a double Close is
 // safe, Submit is rejected afterwards, and no worker goroutine is leaked.
 func TestWorkerPool_CloseIsIdempotentAndReleasesWorkers(t *testing.T) {

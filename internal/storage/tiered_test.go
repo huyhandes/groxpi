@@ -25,6 +25,8 @@ type fakeTier struct {
 	mu       sync.Mutex
 	objects  map[string][]byte
 	failWith error // returned by every read path instead of consulting objects
+	putErr   error // returned by Put instead of storing
+	putGate  chan struct{}
 
 	gets atomic.Int64
 	puts atomic.Int64
@@ -65,6 +67,13 @@ func (f *fakeTier) Get(_ context.Context, key string) (io.ReadCloser, *ObjectInf
 func (f *fakeTier) Put(_ context.Context, key string, reader io.Reader, _ int64, _ string) (*ObjectInfo, error) {
 	f.puts.Add(1)
 
+	if f.putGate != nil {
+		<-f.putGate
+	}
+	if f.putErr != nil {
+		return nil, f.putErr
+	}
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
@@ -74,14 +83,6 @@ func (f *fakeTier) Put(_ context.Context, key string, reader io.Reader, _ int64,
 	defer f.mu.Unlock()
 	f.objects[key] = data
 
-	return &ObjectInfo{Key: key, Size: int64(len(data))}, nil
-}
-
-func (f *fakeTier) Stat(_ context.Context, key string) (*ObjectInfo, error) {
-	data, err := f.load(key)
-	if err != nil {
-		return nil, err
-	}
 	return &ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
 
@@ -217,9 +218,111 @@ func TestTieredStorage_PropagatesRealL1Error(t *testing.T) {
 	})
 }
 
+// TestTieredStorage_PutIsLocalFirst pins the ordering: the write returns as
+// soon as the local file is complete, and the upload to the object store
+// happens afterwards in the background.
+func TestTieredStorage_PutIsLocalFirst(t *testing.T) {
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+	payload := []byte("wheel bytes")
+
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	l2 := newFakeTier(nil)
+	l2.putGate = make(chan struct{}) // no upload may finish until released
+
+	ts := newTieredStorage(l1, l2, 4, 1)
+
+	ctx := context.Background()
+
+	info, err := ts.Put(ctx, key, bytes.NewReader(payload), int64(len(payload)), "application/gzip")
+	require.NoError(t, err, "Put must not wait on the object store")
+	assert.Equal(t, int64(len(payload)), info.Size)
+
+	// The client can be served right now: the local copy is complete while the
+	// upload is still parked.
+	exists, err := l1.Exists(ctx, key)
+	require.NoError(t, err)
+	assert.True(t, exists, "local write must be complete when Put returns")
+
+	uploaded, err := l2.Exists(ctx, key)
+	require.NoError(t, err)
+	assert.False(t, uploaded, "Put must not have waited for the object store")
+
+	// Releasing the object store lets the background upload land.
+	close(l2.putGate)
+	require.Eventually(t, func() bool {
+		ok, err := l2.Exists(ctx, key)
+		return err == nil && ok
+	}, 5*time.Second, 10*time.Millisecond, "background upload never reached the object store")
+
+	require.NoError(t, ts.Close())
+}
+
+// TestTieredStorage_PutSurvivesObjectStoreFailure pins that the object store is
+// best-effort: an upload error is logged and dropped, the client's write still
+// succeeds, and the file is present locally.
+func TestTieredStorage_PutSurvivesObjectStoreFailure(t *testing.T) {
+	const key = "packages/flask/flask-3.0.0.tar.gz"
+	payload := []byte("more wheel bytes")
+
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	l2 := newFakeTier(nil)
+	l2.putErr = errors.New("s3 is having a day")
+
+	ts := newTieredStorage(l1, l2, 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	ctx := context.Background()
+
+	_, err = ts.Put(ctx, key, bytes.NewReader(payload), int64(len(payload)), "application/gzip")
+	require.NoError(t, err, "an object store failure must not fail the client's write")
+
+	reader, _, err := l1.Get(ctx, key)
+	require.NoError(t, err, "the file must be present locally")
+	defer func() { _ = reader.Close() }()
+
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Equal(t, payload, body)
+
+	// The upload was attempted and its failure went nowhere near the caller.
+	require.Eventually(t, func() bool { return l2.puts.Load() > 0 }, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestTieredStorage_CloseDrainsPendingUploads pins that a shutdown does not
+// silently abandon files that were cached moments earlier.
+func TestTieredStorage_CloseDrainsPendingUploads(t *testing.T) {
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	l2 := newFakeTier(nil)
+
+	// One worker and a queue deep enough for every key, so the uploads are
+	// genuinely still pending when Close is called.
+	ts := newTieredStorage(l1, l2, 8, 1)
+
+	ctx := context.Background()
+	keys := []string{"packages/a/a-1.0.tar.gz", "packages/b/b-1.0.tar.gz", "packages/c/c-1.0.tar.gz"}
+	for _, key := range keys {
+		_, err := ts.Put(ctx, key, bytes.NewReader([]byte(key)), int64(len(key)), "application/gzip")
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, ts.Close())
+
+	for _, key := range keys {
+		exists, err := l2.Exists(ctx, key)
+		require.NoError(t, err)
+		assert.True(t, exists, "%s was abandoned instead of drained on shutdown", key)
+	}
+}
+
 // TestTieredStorage_PutRejectsTruncatedSource pins that a source that fails
-// part-way through commits to neither tier: the pipes feeding them must be
-// closed with the error, not cleanly, or both tiers store a short object.
+// part-way through commits to neither tier: the local write must fail the call
+// rather than leaving a short object behind and queueing it for upload.
 func TestTieredStorage_PutRejectsTruncatedSource(t *testing.T) {
 	const key = "packages/numpy/numpy-1.26.0.tar.gz"
 
@@ -274,27 +377,6 @@ func TestTieredStorage_Capabilities(t *testing.T) {
 	path, err := zc.GetFilePath(context.Background(), key)
 	require.NoError(t, err)
 	assert.Equal(t, "/fake/"+key, path, "zero-copy must resolve against L1")
-}
-
-// TestTieredStorage_BasicOperations tests basic tiered storage operations
-func TestTieredStorage_BasicOperations(t *testing.T) {
-	// Create temporary directories
-	localDir := t.TempDir()
-
-	// Create tiered storage (without real S3, just test structure)
-	// Note: This is a basic structure test. Full integration tests would use MinIO
-	t.Run("creation", func(t *testing.T) {
-		// Just verify local cache creation works
-		lruCache, err := NewLRULocalStorage(localDir, 1024*1024*10, 0)
-		if err != nil {
-			t.Fatalf("Failed to create LRU local storage: %v", err)
-		}
-		defer func() { _ = lruCache.Close() }()
-
-		if lruCache == nil {
-			t.Fatal("Expected non-nil LRU cache")
-		}
-	})
 }
 
 // TestLRUCache tests LRU eviction logic

@@ -12,9 +12,19 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// syncJobTimeout bounds a single L1 back-fill. A back-fill that has not
-// finished by then is abandoned; the next read will queue a fresh one.
-const syncJobTimeout = 5 * time.Minute
+const (
+	// syncJobTimeout bounds a single L1 back-fill. A back-fill that has not
+	// finished by then is abandoned; the next read will queue a fresh one.
+	syncJobTimeout = 5 * time.Minute
+
+	// uploadJobTimeout bounds a single best-effort upload of a finished local
+	// file to the object store.
+	uploadJobTimeout = 5 * time.Minute
+
+	// uploadDrainTimeout bounds how long Close waits for queued uploads before
+	// giving up on them.
+	uploadDrainTimeout = 30 * time.Second
+)
 
 // l1Storage is the L1 tier contract: core storage plus the local-path
 // capability that is the whole point of having an L1.
@@ -23,14 +33,28 @@ type l1Storage interface {
 	ZeroCopyCapable
 }
 
-// TieredStorage implements a multi-tier caching system with local (L1) and S3 (L2) storage.
+// uploadJob names a finished local file to copy up to the object store.
+type uploadJob struct {
+	key         string
+	contentType string
+}
+
+// TieredStorage caches objects on local disk (L1) in front of an object store
+// (L2).
+//
+// L1 is authoritative for writes: a request is served as soon as the local file
+// is complete, and the copy to L2 happens afterwards on a bounded worker pool.
+// L2 is a best-effort cache, so an upload failure, a full queue or a race with
+// local eviction is logged and dropped — a file missing from both tiers is
+// simply refetched from upstream.
 //
 // Zero-copy is re-exposed from L1, the only tier that genuinely has it (real
 // files on disk).
 type TieredStorage struct {
-	localCache    l1Storage           // L1 cache - fast local storage
-	remoteStorage Storage             // L2 cache - persistent S3 storage
-	syncQueue     *WorkerPool[string] // Keys queued for L1 cache population
+	localCache    l1Storage              // L1 cache - fast local storage
+	remoteStorage Storage                // L2 cache - persistent object storage
+	syncQueue     *WorkerPool[string]    // Keys queued for L1 back-fill from L2
+	uploadQueue   *WorkerPool[uploadJob] // Finished local files queued for L2
 	sf            singleflight.Group
 }
 
@@ -38,37 +62,6 @@ var (
 	_ Storage         = (*TieredStorage)(nil)
 	_ ZeroCopyCapable = (*TieredStorage)(nil)
 )
-
-// newTieredSyncQueue builds the bounded worker pool that back-fills L1 from L2.
-//
-// The job's context is derived from the pool's own lifetime context, never from
-// the request that queued it. Submitting used to hand over a context the
-// submitting goroutine cancelled on its way out, so every worker found a dead
-// context and the back-fill silently never happened.
-func newTieredSyncQueue(storage *TieredStorage, queueSize, workerCount int) *WorkerPool[string] {
-	return NewWorkerPool("tiered-sync", queueSize, workerCount,
-		func(poolCtx context.Context, key string) {
-			jobCtx, cancel := context.WithTimeout(poolCtx, syncJobTimeout)
-			defer cancel()
-
-			start := time.Now()
-			err := storage.populateLocalCache(jobCtx, key)
-			duration := time.Since(start)
-
-			if err != nil {
-				log.Error().
-					Err(err).
-					Str("key", key).
-					Dur("duration", duration).
-					Msg("Failed to populate L1 cache from L2")
-			} else {
-				log.Debug().
-					Str("key", key).
-					Dur("duration", duration).
-					Msg("Successfully populated L1 cache from L2")
-			}
-		})
-}
 
 // TieredConfig holds configuration for tiered storage
 type TieredConfig struct {
@@ -80,9 +73,9 @@ type TieredConfig struct {
 	// S3 (L2) configuration
 	S3Config *S3Config
 
-	// Sync queue configuration
-	SyncWorkers   int // Number of workers for L1 population (default: 5)
-	SyncQueueSize int // Size of sync queue (default: 100)
+	// Background transfer configuration, shared by L1 back-fill and L2 upload
+	SyncWorkers   int // Number of workers per pool (default: 5)
+	SyncQueueSize int // Queue depth per pool (default: 100)
 }
 
 // NewTieredStorage creates a new tiered storage backend
@@ -115,25 +108,48 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 	log.Info().
 		Str("local_cache_dir", cfg.LocalCacheDir).
 		Int64("local_cache_size_bytes", cfg.LocalCacheSize).
-		Int64("local_cache_size_mb", cfg.LocalCacheSize/(1024*1024)).
 		Dur("local_cache_ttl", cfg.LocalCacheTTL).
 		Str("s3_endpoint", cfg.S3Config.Endpoint).
 		Str("s3_bucket", cfg.S3Config.Bucket).
-		Int("sync_workers", cfg.SyncWorkers).
-		Int("sync_queue_size", cfg.SyncQueueSize).
+		Int("workers", cfg.SyncWorkers).
+		Int("queue_size", cfg.SyncQueueSize).
 		Msg("Tiered storage initialized successfully")
 
 	return ts, nil
 }
 
-// newTieredStorage wires the two tiers and starts the back-fill pool. It exists
-// so tests can supply tier doubles without a live S3.
+// newTieredStorage wires the two tiers and starts the background pools. It
+// exists so tests can supply tier doubles without a live object store.
 func newTieredStorage(l1 l1Storage, l2 Storage, queueSize, workers int) *TieredStorage {
 	ts := &TieredStorage{
 		localCache:    l1,
 		remoteStorage: l2,
 	}
-	ts.syncQueue = newTieredSyncQueue(ts, queueSize, workers)
+
+	// The job context is derived from the pool's lifetime rather than from the
+	// request that queued it: a back-fill must outlive the read that triggered
+	// it.
+	ts.syncQueue = NewWorkerPool("tiered-sync", queueSize, workers,
+		func(poolCtx context.Context, key string) {
+			jobCtx, cancel := context.WithTimeout(poolCtx, syncJobTimeout)
+			defer cancel()
+
+			if err := ts.populateLocalCache(jobCtx, key); err != nil {
+				log.Error().Err(err).Str("key", key).Msg("Failed to populate L1 cache from L2")
+			}
+		})
+
+	// Uploads deliberately ignore the pool context so that Close can drain a
+	// job that is already running instead of cancelling it mid-flight.
+	ts.uploadQueue = NewWorkerPool("tiered-upload", queueSize, workers,
+		func(_ context.Context, job uploadJob) {
+			jobCtx, cancel := context.WithTimeout(context.Background(), uploadJobTimeout)
+			defer cancel()
+
+			if err := ts.uploadToRemote(jobCtx, job); err != nil {
+				log.Warn().Err(err).Str("key", job.key).Msg("Best-effort upload to L2 failed")
+			}
+		})
 
 	return ts
 }
@@ -147,30 +163,22 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 	reader, info, err := ts.localCache.Get(ctx, key)
 	switch {
 	case err == nil:
-		log.Debug().Str("key", key).Msg("✅ Tiered storage: L1 hit (local)")
 		return reader, info, nil
 	case !errors.Is(err, ErrNotFound):
 		log.Error().Err(err).Str("key", key).Msg("L1 read failed for a reason other than a miss")
 		return nil, nil, fmt.Errorf("L1 read of %q failed: %w", key, err)
 	}
 
-	// L1 miss, try L2 (S3) cache
-	log.Debug().Str("key", key).Msg("🔍 Tiered storage: L1 miss, checking L2 (S3)")
-
 	reader, info, err = ts.remoteStorage.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			log.Debug().Str("key", key).Msg("❌ Tiered storage: L1 and L2 miss")
 			return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
 		return nil, nil, fmt.Errorf("L2 read of %q failed: %w", key, err)
 	}
 
-	log.Info().Str("key", key).Msg("✅ Tiered storage: L2 hit (S3), populating L1 async")
-
-	// Back-fill L1 for future requests without blocking this one. The job owns
-	// its own lifetime, so it survives this request finishing. Back-fill is
-	// best-effort: a full queue drops the key rather than blocking the caller.
+	// Back-fill L1 for future requests without blocking this one. Best-effort:
+	// a full queue drops the key rather than blocking the caller.
 	if !ts.syncQueue.Submit(key) {
 		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
 	}
@@ -178,13 +186,22 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 	return reader, info, nil
 }
 
-// Put stores an object in both L1 and L2 concurrently
+// Put writes the object to local disk and returns as soon as that write is
+// complete; the copy to the object store is queued in the background.
 func (ts *TieredStorage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	// Use singleflight to prevent duplicate concurrent puts
+	// Singleflight prevents duplicate concurrent puts of the same key.
 	result, err, _ := ts.sf.Do("put:"+key, func() (any, error) {
-		return ts.putInternal(ctx, key, reader, size, contentType)
-	})
+		info, err := ts.localCache.Put(ctx, key, reader, size, contentType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to write to L1 storage: %w", err)
+		}
 
+		if !ts.uploadQueue.Submit(uploadJob{key: key, contentType: contentType}) {
+			log.Warn().Str("key", key).Msg("Tiered upload queue is full, skipping L2 upload")
+		}
+
+		return info, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -192,96 +209,50 @@ func (ts *TieredStorage) Put(ctx context.Context, key string, reader io.Reader, 
 	return result.(*ObjectInfo), nil
 }
 
-// putInternal performs the actual concurrent put to both L1 and L2
-func (ts *TieredStorage) putInternal(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	// Create pipes for concurrent writes to both L1 and L2
-	pr1, pw1 := io.Pipe()
-	pr2, pw2 := io.Pipe()
-
-	var l2Info *ObjectInfo
-	var l1Err, l2Err error
-
-	var wg sync.WaitGroup
-	wg.Add(3) // Reader + 2 writers
-
-	// Goroutine to read from source and tee to both pipes
-	go func() {
-		defer wg.Done()
-
-		// Use MultiWriter to write to both pipes simultaneously
-		multiWriter := io.MultiWriter(pw1, pw2)
-		_, err := io.Copy(multiWriter, reader)
-		if err != nil {
-			log.Error().Err(err).Str("key", key).Msg("Failed to read source data")
+// uploadToRemote copies a finished local file up to the object store. The file
+// is a real seekable file, so a small object costs a single put rather than a
+// multipart upload. A file that has since been evicted is not an error: the
+// object is simply refetched from upstream when it is next wanted.
+func (ts *TieredStorage) uploadToRemote(ctx context.Context, job uploadJob) error {
+	reader, info, err := ts.localCache.Get(ctx, job.key)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			log.Debug().Str("key", job.key).Msg("Local file evicted before upload, dropping")
+			return nil
 		}
-		// A clean close is what tells each tier the object is complete, so a
-		// failed read must close with the error instead: neither tier may commit
-		// a truncated object.
-		_ = pw1.CloseWithError(err)
-		_ = pw2.CloseWithError(err)
-	}()
+		return fmt.Errorf("failed to read local file for upload: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
 
-	// Write to L2 (S3) - primary storage
-	go func() {
-		defer wg.Done()
-		l2Info, l2Err = ts.remoteStorage.Put(ctx, key, pr2, size, contentType)
-	}()
-
-	// Write to L1 (local) - fast cache
-	go func() {
-		defer wg.Done()
-		_, l1Err = ts.localCache.Put(ctx, key, pr1, size, contentType)
-	}()
-
-	// Wait for all operations to complete
-	wg.Wait()
-
-	// L2 (S3) is primary - if it fails, the operation fails
-	if l2Err != nil {
-		log.Error().Err(l2Err).Str("key", key).Msg("Failed to write to L2 (S3)")
-		return nil, fmt.Errorf("failed to write to L2 storage: %w", l2Err)
+	if _, err := ts.remoteStorage.Put(ctx, job.key, reader, info.Size, job.contentType); err != nil {
+		return fmt.Errorf("failed to upload to L2: %w", err)
 	}
 
-	// L1 failure is non-fatal (just log warning)
-	if l1Err != nil {
-		log.Warn().Err(l1Err).Str("key", key).Msg("Failed to write to L1 (local), but L2 (S3) succeeded")
-	} else {
-		log.Debug().Str("key", key).Msg("✅ Successfully wrote to both L1 and L2")
-	}
-
-	// Return L2 info as the authoritative source
-	return l2Info, nil
+	log.Debug().Str("key", job.key).Int64("size", info.Size).Msg("Uploaded local file to L2")
+	return nil
 }
 
-// Delete removes an object from both L1 and L2
+// Delete removes an object from both tiers. Only the L1 failure is propagated:
+// L2 is best-effort, so a stale object left behind there costs a wasted
+// back-fill rather than correctness.
 func (ts *TieredStorage) Delete(ctx context.Context, key string) error {
-	var l1Err, l2Err error
+	var l2Err error
 
-	// Delete from both caches concurrently
 	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		l1Err = ts.localCache.Delete(ctx, key)
-	}()
-
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		l2Err = ts.remoteStorage.Delete(ctx, key)
 	}()
 
+	l1Err := ts.localCache.Delete(ctx, key)
 	wg.Wait()
 
-	// L2 is primary - if it fails, the operation fails
 	if l2Err != nil {
-		log.Error().Err(l2Err).Str("key", key).Msg("Failed to delete from L2 (S3)")
-		return fmt.Errorf("failed to delete from L2 storage: %w", l2Err)
+		log.Warn().Err(l2Err).Str("key", key).Msg("Failed to delete from L2 (best-effort)")
 	}
-
-	// L1 failure is non-fatal
 	if l1Err != nil {
-		log.Warn().Err(l1Err).Str("key", key).Msg("Failed to delete from L1, but L2 succeeded")
+		return fmt.Errorf("failed to delete from L1 storage: %w", l1Err)
 	}
 
 	return nil
@@ -309,51 +280,41 @@ func (ts *TieredStorage) GetFilePath(ctx context.Context, key string) (string, e
 	return ts.localCache.GetFilePath(ctx, key)
 }
 
-// Close releases resources from both storage backends. Both tiers are closed
-// even if the first fails, and every failure is reported.
+// Close drains pending uploads under a timeout, stops the pools, then closes
+// both tiers. Both tiers are closed even if the first fails.
 func (ts *TieredStorage) Close() error {
-	// Stop the back-fill pool before the tiers it writes through
+	ts.uploadQueue.Drain(uploadDrainTimeout)
 	ts.syncQueue.Close()
 
 	if err := errors.Join(ts.localCache.Close(), ts.remoteStorage.Close()); err != nil {
 		return fmt.Errorf("failed to close tiered storage: %w", err)
 	}
 
-	log.Info().Msg("Tiered storage closed successfully")
 	return nil
 }
 
 // populateLocalCache copies an object from L2 to L1
 func (ts *TieredStorage) populateLocalCache(ctx context.Context, key string) error {
-	// Check if already in L1. The check is only a shortcut, so a failed check is
-	// treated as "unknown" and population goes ahead: Put writes to a temp file
-	// and renames, so re-populating an object that turned out to be present is
-	// harmless, whereas assuming presence would leave L1 cold.
+	// The check is only a shortcut, so a failed check is treated as "unknown"
+	// and population goes ahead: Put writes to a temp file and renames, so
+	// re-populating an object that turned out to be present is harmless,
+	// whereas assuming presence would leave L1 cold.
 	exists, err := ts.localCache.Exists(ctx, key)
 	if err != nil {
 		log.Warn().Err(err).Str("key", key).Msg("L1 existence check failed, populating anyway")
 	} else if exists {
-		log.Debug().Str("key", key).Msg("Object already in L1 cache, skipping population")
 		return nil
 	}
 
-	// Get from L2
 	reader, info, err := ts.remoteStorage.Get(ctx, key)
 	if err != nil {
 		return fmt.Errorf("failed to get from L2 for L1 population: %w", err)
 	}
 	defer func() { _ = reader.Close() }()
 
-	// Write to L1
-	_, err = ts.localCache.Put(ctx, key, reader, info.Size, info.ContentType)
-	if err != nil {
+	if _, err := ts.localCache.Put(ctx, key, reader, info.Size, info.ContentType); err != nil {
 		return fmt.Errorf("failed to populate L1 cache: %w", err)
 	}
-
-	log.Info().
-		Str("key", key).
-		Int64("size", info.Size).
-		Msg("✅ Successfully populated L1 cache from L2")
 
 	return nil
 }

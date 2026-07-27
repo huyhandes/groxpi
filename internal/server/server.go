@@ -530,7 +530,6 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		UseSSL:          cfg.S3UseSSL,
 		ForcePathStyle:  cfg.S3ForcePathStyle,
 		EnableHTTP2:     cfg.S3EnableHTTP2,
-		TransferAccel:   cfg.S3TransferAccel,
 		ConnectTimeout:  cfg.ConnectTimeout,
 		RequestTimeout:  cfg.DownloadTimeout,
 	}

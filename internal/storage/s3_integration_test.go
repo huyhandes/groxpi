@@ -5,11 +5,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +59,22 @@ func TestS3WithMinIO(t *testing.T) {
 		require.NoError(t, err, "Failed to read object data")
 		assert.Equal(t, content, data)
 
+		// Streaming put of an unseekable body whose length is unknown, which is
+		// how pure object-storage mode writes a live download. This is the
+		// transfer-manager path rather than a single-object put.
+		streamKey := key + ".stream"
+		stream := io.NopCloser(bytes.NewReader(content)) // hides ReadSeeker
+		_, err = storage.Put(ctx, streamKey, stream, -1, contentType)
+		require.NoError(t, err, "Failed to stream object of unknown size")
+
+		streamed, _, err := storage.Get(ctx, streamKey)
+		require.NoError(t, err)
+		streamedData, err := io.ReadAll(streamed)
+		require.NoError(t, err)
+		_ = streamed.Close()
+		assert.Equal(t, content, streamedData)
+		require.NoError(t, storage.Delete(ctx, streamKey))
+
 		// Test Delete
 		err = storage.Delete(ctx, key)
 		assert.NoError(t, err, "Failed to delete test object")
@@ -63,6 +84,76 @@ func TestS3WithMinIO(t *testing.T) {
 		require.NoError(t, err, "Failed to check existence after delete")
 		assert.False(t, exists, "Object should not exist after deletion")
 	})
+}
+
+// TestS3WithMinIO_RejectsChecksumTrailers puts an object through a proxy that
+// answers 400 to any request carrying an aws-chunked checksum trailer, the way
+// older MinIO releases do. It is the only assertion that catches the SDK's
+// newer default checksum behaviour, and it needs a real server behind it.
+func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping S3 integration test in short mode")
+	}
+
+	target, err := url.Parse("http://" + minioEndpoint(t))
+	require.NoError(t, err)
+
+	var rejected atomic.Int64
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	strict := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sendsChecksum(r.Header) {
+			rejected.Add(1)
+			http.Error(w, "checksums are not supported", http.StatusBadRequest)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer strict.Close()
+
+	storage := newIntegrationS3Storage(t, strict.URL)
+	defer func() { _ = storage.Close() }()
+
+	ctx := context.Background()
+	key := fmt.Sprintf("test/no-trailers-%d.txt", time.Now().UnixNano())
+	content := []byte("no checksum trailers here")
+
+	_, err = storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
+	require.NoError(t, err, "put must succeed against a server that rejects checksum trailers")
+
+	// The streaming path is where the SDK's newer default emits a trailer, so
+	// it is the case that actually breaks against an older MinIO.
+	streamKey := key + ".stream"
+	_, err = storage.Put(ctx, streamKey, io.NopCloser(bytes.NewReader(content)), -1, "text/plain")
+	require.NoError(t, err, "streaming put must succeed against a server that rejects checksum trailers")
+
+	assert.Zero(t, rejected.Load(), "the client sent a checksum trailer")
+	require.NoError(t, storage.Delete(ctx, streamKey))
+
+	reader, _, err := storage.Get(ctx, key)
+	require.NoError(t, err)
+	defer func() { _ = reader.Close() }()
+
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Equal(t, content, data)
+
+	require.NoError(t, storage.Delete(ctx, key))
+}
+
+// sendsChecksum reports whether a request carries the checksum trailer or
+// header the SDK now emits by default and older MinIO releases reject.
+func sendsChecksum(h http.Header) bool {
+	if h.Get("X-Amz-Trailer") != "" ||
+		strings.Contains(strings.ToLower(h.Get("Content-Encoding")), "aws-chunked") {
+		return true
+	}
+	for name := range h {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-checksum-") ||
+			strings.EqualFold(name, "X-Amz-Sdk-Checksum-Algorithm") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestS3WithRealClients tests that real package managers work with S3 backend
@@ -99,33 +190,45 @@ func TestS3WithRealClients(t *testing.T) {
 
 }
 
-// createTestS3Storage creates an S3 storage instance for testing with MinIO defaults
+// createTestS3Storage creates an S3 storage instance pointed at MinIO.
 func createTestS3Storage(t *testing.T) *S3Storage {
-	endpoint := getEnvOrDefault("TEST_S3_ENDPOINT", "localhost:9000")
-	accessKey := getEnvOrDefault("TEST_S3_ACCESS_KEY", "minioadmin")
-	secretKey := getEnvOrDefault("TEST_S3_SECRET_KEY", "minioadmin")
-	bucket := getEnvOrDefault("TEST_S3_BUCKET", "groxpi-test")
+	return newIntegrationS3Storage(t, minioEndpoint(t))
+}
 
-	cfg := &S3Config{
+// minioEndpoint returns the MinIO endpoint under test, skipping the test when
+// nothing is listening there rather than failing it.
+func minioEndpoint(t *testing.T) string {
+	t.Helper()
+
+	endpoint := strings.TrimPrefix(getEnvOrDefault("TEST_S3_ENDPOINT", "localhost:9000"), "http://")
+	conn, err := net.DialTimeout("tcp", endpoint, 2*time.Second)
+	if err != nil {
+		t.Skipf("MinIO not available at %s, skipping S3 integration test: %v", endpoint, err)
+	}
+	_ = conn.Close()
+
+	return endpoint
+}
+
+// newIntegrationS3Storage builds a backend against endpoint. Path-style
+// addressing is on: MinIO cannot resolve virtual-hosted bucket names, so a round
+// trip here is itself the proof that path-style addressing is in use.
+func newIntegrationS3Storage(t *testing.T, endpoint string) *S3Storage {
+	t.Helper()
+
+	storage, err := NewS3Storage(&S3Config{
 		Endpoint:        endpoint,
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
+		AccessKeyID:     getEnvOrDefault("TEST_S3_ACCESS_KEY", "minioadmin"),
+		SecretAccessKey: getEnvOrDefault("TEST_S3_SECRET_KEY", "minioadmin"),
 		Region:          "us-east-1",
-		Bucket:          bucket,
+		Bucket:          getEnvOrDefault("TEST_S3_BUCKET", "groxpi-test"),
 		Prefix:          "client-test",
 		UseSSL:          false,
 		ForcePathStyle:  true,
 		ConnectTimeout:  30 * time.Second,
 		RequestTimeout:  5 * time.Minute,
-	}
-
-	storage, err := NewS3Storage(cfg)
-	if err != nil {
-		if strings.Contains(err.Error(), "connection refused") {
-			t.Skipf("MinIO not available, skipping S3 integration test: %v", err)
-		}
-		require.NoError(t, err, "Failed to create S3 storage")
-	}
+	})
+	require.NoError(t, err, "Failed to create S3 storage")
 
 	return storage
 }

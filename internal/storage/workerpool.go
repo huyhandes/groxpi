@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/phuslu/log"
 )
@@ -90,6 +91,30 @@ func (p *WorkerPool[T]) Submit(job T) bool {
 	default:
 		return false
 	}
+}
+
+// Drain waits for the queue to empty, up to timeout, and then closes the pool.
+// Jobs still queued when the timeout expires are dropped; a job already running
+// is always waited for by Close.
+func (p *WorkerPool[T]) Drain(timeout time.Duration) {
+	deadline := time.After(timeout)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+
+	for len(p.queue) > 0 {
+		select {
+		case <-deadline:
+			log.Warn().
+				Str("pool", p.name).
+				Int("dropped", len(p.queue)).
+				Msg("Drain timed out, dropping queued jobs")
+			p.Close()
+			return
+		case <-tick.C:
+		}
+	}
+
+	p.Close()
 }
 
 // Close stops the workers and waits for jobs already in flight to finish. Jobs

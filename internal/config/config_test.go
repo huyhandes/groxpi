@@ -162,6 +162,44 @@ func TestLoad(t *testing.T) {
 	})
 }
 
+// TestLoadS3WithoutStaticCredentials pins that S3 and hybrid storage load with
+// no static access keys configured. The loader used to abort here, which made
+// instance, task and web-identity roles unreachable.
+func TestLoadS3WithoutStaticCredentials(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("GROXPI_S3_BUCKET", "groxpi-cache")
+
+	for _, storageType := range []string{"s3", "hybrid"} {
+		t.Run(storageType, func(t *testing.T) {
+			t.Setenv("GROXPI_STORAGE_TYPE", storageType)
+
+			cfg := Load()
+
+			if cfg.S3AccessKeyID != "" || cfg.S3SecretAccessKey != "" {
+				t.Fatalf("expected no static credentials, got %q/%q", cfg.S3AccessKeyID, cfg.S3SecretAccessKey)
+			}
+			if cfg.S3Bucket != "groxpi-cache" {
+				t.Errorf("expected bucket to survive, got %q", cfg.S3Bucket)
+			}
+		})
+	}
+}
+
+// TestLoadS3RequiresBucket pins that the bucket requirement remains.
+func TestLoadS3RequiresBucket(t *testing.T) {
+	t.Setenv("GROXPI_STORAGE_TYPE", "s3")
+	t.Setenv("GROXPI_S3_BUCKET", "")
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected Load to abort without a bucket name")
+		}
+	}()
+
+	Load()
+}
+
 // GetEnv is not exported, skip these tests
 
 // GetIntEnv is not exported, skip these tests
