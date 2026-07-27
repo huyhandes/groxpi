@@ -20,7 +20,6 @@ func newTestS3Storage(t *testing.T) *S3Storage {
 	s, err := NewS3Storage(&S3Config{
 		Endpoint: "test.endpoint",
 		Bucket:   "test-bucket",
-		PartSize: 10 * 1024 * 1024,
 	})
 	if err != nil {
 		t.Skipf("Cannot create S3 storage for testing: %v", err)
@@ -89,111 +88,4 @@ func TestS3Storage_ContextIsHonoured(t *testing.T) {
 	_, err := s.Stat(ctx, "whatever")
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrNotFound)
-}
-
-// TestS3Storage_CalculateOptimalPartSize tests the part size calculation logic,
-// including the degenerate sizes a caller can pass in.
-func TestS3Storage_CalculateOptimalPartSize(t *testing.T) {
-	tests := []struct {
-		name        string
-		fileSize    int64
-		expectedMin int64
-		expectedMax int64
-		description string
-	}{
-		{
-			name:        "small_file_10MB",
-			fileSize:    10 * 1024 * 1024, // 10MB
-			expectedMin: 5 * 1024 * 1024,  // 5MB minimum
-			expectedMax: 32 * 1024 * 1024, // Should use default or small part size
-			description: "Small files should use minimum viable part size",
-		},
-		{
-			name:        "medium_file_50MB",
-			fileSize:    50 * 1024 * 1024, // 50MB
-			expectedMin: 5 * 1024 * 1024,  // 5MB minimum
-			expectedMax: 32 * 1024 * 1024, // Should use default part size
-			description: "Medium files should use default part size",
-		},
-		{
-			name:        "large_file_500MB",
-			fileSize:    500 * 1024 * 1024, // 500MB
-			expectedMin: 10 * 1024 * 1024,  // Should be at least 10MB
-			expectedMax: 64 * 1024 * 1024,  // Should scale up for better throughput
-			description: "Large files should use larger part sizes for throughput",
-		},
-		{
-			name:        "extra_large_file_5GB",
-			fileSize:    5 * 1024 * 1024 * 1024, // 5GB
-			expectedMin: 32 * 1024 * 1024,       // Should use larger parts
-			expectedMax: 128 * 1024 * 1024,      // But not too large
-			description: "Extra large files should balance part count vs throughput",
-		},
-		{
-			name:        "huge_file_50GB",
-			fileSize:    50 * 1024 * 1024 * 1024, // 50GB
-			expectedMin: 64 * 1024 * 1024,        // Must be large enough to stay under 10k parts
-			expectedMax: 256 * 1024 * 1024,       // But reasonable for memory usage
-			description: "Huge files must respect 10,000 part limit",
-		},
-		{
-			name:        "pyspark_size_317MB",
-			fileSize:    317 * 1024 * 1024, // 317MB (real-world pyspark example)
-			expectedMin: 10 * 1024 * 1024,  // At least 10MB
-			expectedMax: 64 * 1024 * 1024,  // Should use optimized size
-			description: "Real-world pyspark file should have optimized part size",
-		},
-		{
-			name:        "zero_size",
-			fileSize:    0,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Zero size should not crash, should return the smallest band",
-		},
-		{
-			name:        "negative_size",
-			fileSize:    -1,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Negative size should not crash, should return the smallest band",
-		},
-		{
-			name:        "very_small_size_1KB",
-			fileSize:    1024,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Very small files should use the smallest band",
-		},
-		{
-			name:        "exact_aws_minimum_5MB",
-			fileSize:    5 * 1024 * 1024,
-			expectedMin: 5 * 1024 * 1024,
-			expectedMax: 10 * 1024 * 1024,
-			description: "Exact AWS minimum should work correctly",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			partSize := calculateOptimalPartSize(tt.fileSize)
-
-			// Verify part size is within expected range
-			assert.GreaterOrEqual(t, partSize, tt.expectedMin,
-				"Part size should be at least %d bytes for %s", tt.expectedMin, tt.description)
-			assert.LessOrEqual(t, partSize, tt.expectedMax,
-				"Part size should be at most %d bytes for %s", tt.expectedMax, tt.description)
-
-			// Verify AWS S3 constraints
-			assert.GreaterOrEqual(t, partSize, int64(5*1024*1024),
-				"Part size must meet AWS S3 minimum of 5MB")
-
-			// Verify part count doesn't exceed AWS limit
-			partCount := (tt.fileSize + partSize - 1) / partSize // Ceiling division
-			assert.LessOrEqual(t, partCount, int64(10000),
-				"Part count (%d) must not exceed AWS S3 limit of 10,000 parts", partCount)
-
-			t.Logf("File size: %dMB, Part size: %dMB, Part count: %d",
-				tt.fileSize/(1024*1024), partSize/(1024*1024), partCount)
-		})
-	}
 }

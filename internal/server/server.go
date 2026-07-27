@@ -107,6 +107,11 @@ func (s *Server) Router() *gin.Engine {
 	return s.router
 }
 
+// Close releases the storage backend. Called from the shutdown path.
+func (s *Server) Close() error {
+	return s.storage.Close()
+}
+
 func (s *Server) setupRoutes() {
 	// Home page
 	s.router.GET("/", s.handleHome)
@@ -524,17 +529,10 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		Prefix:          cfg.S3Prefix,
 		UseSSL:          cfg.S3UseSSL,
 		ForcePathStyle:  cfg.S3ForcePathStyle,
-		PartSize:        cfg.S3PartSize,
-		MaxConnections:  cfg.S3MaxConnections,
-
-		// Performance configuration
-		ReadPoolSize:   cfg.S3ReadPoolSize,
-		WritePoolSize:  cfg.S3WritePoolSize,
-		MetaPoolSize:   cfg.S3MetaPoolSize,
-		EnableHTTP2:    cfg.S3EnableHTTP2,
-		TransferAccel:  cfg.S3TransferAccel,
-		ConnectTimeout: cfg.ConnectTimeout,
-		RequestTimeout: cfg.DownloadTimeout,
+		EnableHTTP2:     cfg.S3EnableHTTP2,
+		TransferAccel:   cfg.S3TransferAccel,
+		ConnectTimeout:  cfg.ConnectTimeout,
+		RequestTimeout:  cfg.DownloadTimeout,
 	}
 
 	switch cfg.StorageType {

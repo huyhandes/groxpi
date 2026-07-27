@@ -514,7 +514,7 @@ func (lru *LRULocalStorage) recordAccess(ctx context.Context, key string) {
 		return
 	}
 
-	info, err := lru.inner.Stat(ctx, key)
+	info, err := lru.inner.stat(ctx, key)
 	if err != nil {
 		log.Debug().
 			Err(err).
@@ -567,7 +567,7 @@ func (lru *LRULocalStorage) GetFilePath(ctx context.Context, key string) (string
 // Stat returns object metadata and records the access. Callers stat a file
 // immediately before serving it, so this counts as use.
 func (lru *LRULocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
-	info, err := lru.inner.Stat(ctx, key)
+	info, err := lru.inner.stat(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -592,12 +592,6 @@ func (lru *LRULocalStorage) Delete(ctx context.Context, key string) error {
 // not use of the content, and it yields no size to account for.
 func (lru *LRULocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 	return lru.inner.Exists(ctx, key)
-}
-
-// List forwards without recording: bulk enumeration would reorder the whole
-// cache and make recency meaningless.
-func (lru *LRULocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
-	return lru.inner.List(ctx, opts)
 }
 
 // Close closes both the storage and LRU cache

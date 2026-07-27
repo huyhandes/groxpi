@@ -97,9 +97,6 @@ func TestS3WithRealClients(t *testing.T) {
 		testUVAdd(t, testDir)
 	})
 
-	t.Run("verify_s3_storage", func(t *testing.T) {
-		verifyS3Storage(t)
-	})
 }
 
 // createTestS3Storage creates an S3 storage instance for testing with MinIO defaults
@@ -118,8 +115,6 @@ func createTestS3Storage(t *testing.T) *S3Storage {
 		Prefix:          "client-test",
 		UseSSL:          false,
 		ForcePathStyle:  true,
-		PartSize:        5 * 1024 * 1024,
-		MaxConnections:  10,
 		ConnectTimeout:  30 * time.Second,
 		RequestTimeout:  5 * time.Minute,
 	}
@@ -256,29 +251,6 @@ func testUVAdd(t *testing.T, testDir string) {
 	assert.Contains(t, string(content), "click", "click package not found in pyproject.toml")
 
 	t.Log("Successfully added click package with uv")
-}
-
-// verifyS3Storage verifies that packages are actually stored in S3
-func verifyS3Storage(t *testing.T) {
-	storage := createTestS3Storage(t)
-	defer func() { _ = storage.Close() }()
-
-	ctx := context.Background()
-
-	// List objects to verify files were stored
-	objects, err := storage.List(ctx, ListOptions{
-		Prefix:  "",
-		MaxKeys: 100,
-	})
-	require.NoError(t, err, "Failed to list S3 objects")
-
-	// Should have at least some cached files
-	assert.NotEmpty(t, objects, "Expected some files to be cached in S3")
-
-	t.Logf("Found %d objects in S3 storage", len(objects))
-	for _, obj := range objects {
-		t.Logf("  - %s (size: %d)", obj.Key, obj.Size)
-	}
 }
 
 // getEnvOrDefault returns environment variable value or default

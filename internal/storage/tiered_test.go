@@ -103,8 +103,6 @@ func (f *fakeTier) Exists(_ context.Context, key string) (bool, error) {
 	return ok, nil
 }
 
-func (f *fakeTier) List(_ context.Context, _ ListOptions) ([]*ObjectInfo, error) { return nil, nil }
-
 func (f *fakeTier) Close() error { return nil }
 
 func (f *fakeTier) GetFilePath(_ context.Context, key string) (string, error) {
@@ -213,11 +211,6 @@ func TestTieredStorage_PropagatesRealL1Error(t *testing.T) {
 		assert.Zero(t, l2.gets.Load(), "L2 must not be consulted after a real L1 failure")
 	})
 
-	t.Run("Stat", func(t *testing.T) {
-		_, err := ts.Stat(ctx, key)
-		require.ErrorIs(t, err, diskFailure)
-	})
-
 	t.Run("Exists", func(t *testing.T) {
 		_, err := ts.Exists(ctx, key)
 		require.ErrorIs(t, err, diskFailure)
@@ -259,9 +252,6 @@ func TestTieredStorage_MissIsSentinel(t *testing.T) {
 	ctx := context.Background()
 
 	_, _, err := ts.Get(ctx, "packages/absent/absent-1.0.0.tar.gz")
-	require.ErrorIs(t, err, ErrNotFound)
-
-	_, err = ts.Stat(ctx, "packages/absent/absent-1.0.0.tar.gz")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 

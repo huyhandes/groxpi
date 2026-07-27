@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -96,11 +97,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	shutdown(ctx, httpServer, srv)
+
+	log.Info().Msg("✅ Server stopped gracefully")
+}
+
+// shutdown drains in-flight requests, then releases the storage backend.
+func shutdown(ctx context.Context, httpServer *http.Server, backend io.Closer) {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("Server forced to shutdown")
 	}
 
-	log.Info().Msg("✅ Server stopped gracefully")
+	if err := backend.Close(); err != nil {
+		log.Error().Err(err).Msg("Failed to close storage backend")
+	}
 }
 
 // formatBytes converts bytes to human readable format

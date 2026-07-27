@@ -26,8 +26,6 @@ func BenchmarkS3Storage(b *testing.B) {
 		UseSSL:          false,
 		ForcePathStyle:  true,
 		Prefix:          "bench",
-		PartSize:        10 * 1024 * 1024, // 10MB parts
-		MaxConnections:  100,
 	}
 
 	storage, err := NewS3Storage(cfg)
@@ -91,34 +89,6 @@ func BenchmarkS3Storage(b *testing.B) {
 			}
 		})
 	}
-
-	b.Run("List", func(b *testing.B) {
-		// Setup: upload 100 small files
-		for i := range 100 {
-			key := fmt.Sprintf("bench/list/item_%03d", i)
-			data := []byte(key)
-			_, _ = storage.Put(ctx, key, bytes.NewReader(data), int64(len(data)), "text/plain")
-		}
-		defer func() {
-			// Cleanup
-			for i := range 100 {
-				key := fmt.Sprintf("bench/list/item_%03d", i)
-				_ = storage.Delete(ctx, key)
-			}
-		}()
-
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			_, err := storage.List(ctx, ListOptions{
-				Prefix:  "bench/list/",
-				MaxKeys: 50,
-			})
-			if err != nil {
-				b.Fatalf("Failed to list: %v", err)
-			}
-		}
-	})
 
 }
 

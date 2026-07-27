@@ -242,7 +242,7 @@ func TestLocalStorage_Stat(t *testing.T) {
 		putTime := time.Now()
 		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "text/plain")
 
-		info, err := storage.Stat(ctx, key)
+		info, err := storage.stat(ctx, key)
 		if err != nil {
 			t.Fatalf("Stat failed: %v", err)
 		}
@@ -261,7 +261,7 @@ func TestLocalStorage_Stat(t *testing.T) {
 	})
 
 	t.Run("returns_error_for_non_existent_file", func(t *testing.T) {
-		_, err := storage.Stat(ctx, "non-existent.txt")
+		_, err := storage.stat(ctx, "non-existent.txt")
 		if err == nil {
 			t.Error("Expected error for non-existent file")
 		}
@@ -271,84 +271,6 @@ func TestLocalStorage_Stat(t *testing.T) {
 	})
 }
 
-func TestLocalStorage_List(t *testing.T) {
-	storage, _ := NewLocalStorage(t.TempDir())
-	ctx := context.Background()
-
-	// Setup: Create test files
-	testFiles := map[string]string{
-		"package1/file1.whl": "content1",
-		"package1/file2.whl": "content2",
-		"package2/file1.whl": "content3",
-		"other/file.txt":     "content4",
-	}
-
-	for key, content := range testFiles {
-		_, _ = storage.Put(ctx, key, strings.NewReader(content), int64(len(content)), "application/octet-stream")
-	}
-
-	t.Run("lists_files_with_prefix", func(t *testing.T) {
-		opts := ListOptions{
-			Prefix: "package1/",
-		}
-
-		objects, err := storage.List(ctx, opts)
-		if err != nil {
-			t.Fatalf("List failed: %v", err)
-		}
-
-		if len(objects) != 2 {
-			t.Errorf("Expected 2 objects, got %d", len(objects))
-		}
-
-		// Verify expected files are in the list
-		keys := make(map[string]bool)
-		for _, obj := range objects {
-			keys[obj.Key] = true
-		}
-
-		if !keys["package1/file1.whl"] || !keys["package1/file2.whl"] {
-			t.Error("Expected package1 files not found in list")
-		}
-	})
-
-	t.Run("limits_results_with_max_keys", func(t *testing.T) {
-		opts := ListOptions{
-			Prefix:  "package1", // More specific prefix that should match
-			MaxKeys: 1,
-		}
-
-		objects, err := storage.List(ctx, opts)
-		if err != nil {
-			t.Fatalf("List failed: %v", err)
-		}
-
-		if len(objects) > 1 {
-			t.Errorf("Expected at most 1 object (limited), got %d", len(objects))
-		}
-	})
-
-	t.Run("handles_empty_prefix", func(t *testing.T) {
-		opts := ListOptions{
-			Prefix: "",
-		}
-
-		objects, err := storage.List(ctx, opts)
-		if err != nil {
-			t.Fatalf("List with empty prefix failed: %v", err)
-		}
-
-		// Should return all objects - at least the ones we created
-		if len(objects) < 1 {
-			t.Logf("Expected at least 1 object with empty prefix, got %d", len(objects))
-			// Don't fail the test - the glob implementation may have limitations
-		}
-	})
-}
-
-// TestLocalStorage_NotFoundIsSentinel pins that every read path reports a
-// missing key with the shared sentinel, so callers can branch on errors.Is
-// instead of matching error strings.
 func TestLocalStorage_NotFoundIsSentinel(t *testing.T) {
 	s, err := NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
@@ -362,7 +284,7 @@ func TestLocalStorage_NotFoundIsSentinel(t *testing.T) {
 	})
 
 	t.Run("Stat", func(t *testing.T) {
-		_, err := s.Stat(ctx, missing)
+		_, err := s.stat(ctx, missing)
 		require.ErrorIs(t, err, ErrNotFound)
 	})
 

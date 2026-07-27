@@ -147,8 +147,8 @@ func (l *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// Stat retrieves object metadata without opening the file
-func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
+// stat retrieves object metadata without opening the file
+func (l *LocalStorage) stat(ctx context.Context, key string) (*ObjectInfo, error) {
 	path := l.buildPath(key)
 
 	stat, err := os.Stat(path)
@@ -161,53 +161,6 @@ func (l *LocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error
 		Size:         stat.Size(),
 		LastModified: stat.ModTime(),
 	}, nil
-}
-
-// List returns a list of objects matching the options
-func (l *LocalStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
-	pattern := filepath.Join(l.baseDir, opts.Prefix+"*")
-
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list files: %w", err)
-	}
-
-	var objects []*ObjectInfo
-	count := 0
-
-	for _, path := range matches {
-		if opts.MaxKeys > 0 && count >= opts.MaxKeys {
-			break
-		}
-
-		stat, err := os.Stat(path)
-		if err != nil {
-			continue // Skip files we can't stat
-		}
-
-		if stat.IsDir() {
-			continue // Skip directories
-		}
-
-		key, err := filepath.Rel(l.baseDir, path)
-		if err != nil {
-			continue
-		}
-
-		// Skip if before StartAfter
-		if opts.StartAfter != "" && key <= opts.StartAfter {
-			continue
-		}
-
-		objects = append(objects, &ObjectInfo{
-			Key:          key,
-			Size:         stat.Size(),
-			LastModified: stat.ModTime(),
-		})
-		count++
-	}
-
-	return objects, nil
 }
 
 // Close releases any resources (no-op for local storage)
