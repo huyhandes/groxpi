@@ -166,6 +166,56 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 	})
 }
 
+// TestServer_PackageNameNormalization_Integration asserts that every legal
+// spelling of a package name reaches the same upstream path and the same cache
+// entry (PEP 503).
+func TestServer_PackageNameNormalization_Integration(t *testing.T) {
+	const normalized = "zope-interface"
+
+	var mu sync.Mutex
+	var indexPaths []string
+
+	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		indexPaths = append(indexPaths, r.URL.Path)
+		mu.Unlock()
+
+		if r.URL.Path != "/"+normalized+"/" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body>
+<a href="/files/zope.interface-5.0.tar.gz">zope.interface-5.0.tar.gz</a>
+</body></html>`)
+	}))
+	defer mockPyPI.Close()
+
+	cfg := &config.Config{
+		IndexURL:        mockPyPI.URL,
+		CacheDir:        t.TempDir(),
+		IndexTTL:        time.Hour,
+		DownloadTimeout: 10 * time.Second,
+		LogLevel:        "ERROR",
+	}
+	router := New(cfg).Router()
+
+	for _, spelling := range []string{"zope.interface", "zope-interface", "Zope__Interface", "zope---interface"} {
+		req := httptest.NewRequest("GET", "/simple/"+spelling+"/", nil)
+		resp := testRequestIntegration(router, req)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "spelling %q should resolve", spelling)
+		assert.Contains(t, string(body), "zope.interface-5.0.tar.gz", "spelling %q should list the file", spelling)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"/" + normalized + "/"}, indexPaths,
+		"all spellings must produce exactly one upstream fetch of the normalized name")
+}
+
 // TestServer_DownloadCoordination_RealWorld tests real-world scenarios
 func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 	if testing.Short() {

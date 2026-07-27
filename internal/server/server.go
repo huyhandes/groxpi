@@ -212,10 +212,7 @@ func (s *Server) handleListPackages(c *gin.Context) {
 }
 
 func (s *Server) handleListFiles(c *gin.Context) {
-	packageName := c.Param("package")
-
-	// Normalize package name
-	packageName = normalizePackageName(packageName)
+	packageName := pypi.NormalizeName(c.Param("package"))
 
 	// Check response cache first for JSON requests
 	if wantsJSON(c) {
@@ -339,7 +336,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 }
 
 func (s *Server) handleDownloadFile(c *gin.Context) {
-	packageName := normalizePackageName(c.Param("package"))
+	packageName := pypi.NormalizeName(c.Param("package"))
 	fileName := c.Param("file")
 
 	log.Debug().
@@ -464,7 +461,7 @@ func (s *Server) handleCacheList(c *gin.Context) {
 }
 
 func (s *Server) handleCachePackage(c *gin.Context) {
-	packageName := c.Param("package")
+	packageName := pypi.NormalizeName(c.Param("package"))
 
 	if packageName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -513,14 +510,6 @@ func wantsJSON(c *gin.Context) bool {
 	// Check for JSON preference in Accept header
 	return strings.Contains(accept, "application/vnd.pypi.simple") &&
 		strings.Contains(accept, "json")
-}
-
-func normalizePackageName(name string) string {
-	// PyPI package names are case-insensitive and
-	// treat hyphens and underscores as equivalent
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, "_", "-")
-	return name
 }
 
 // initStorage creates the appropriate storage backend based on configuration
