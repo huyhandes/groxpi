@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -233,10 +236,73 @@ func TestResolutionOrder_PrimaryOnly(t *testing.T) {
 	}
 }
 
-// GetEnv is not exported, skip these tests
+// captureLogs collects everything logged through the default logger while fn
+// runs, so a test can assert a misconfiguration was announced rather than
+// swallowed.
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
 
-// GetIntEnv is not exported, skip these tests
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(previous)
 
-// GetBoolEnv is not exported, skip these tests
+	fn()
 
-// SplitAndTrim is not exported, skip these tests
+	return buf.String()
+}
+
+// TestDurationEnvAcceptsUnits pins that a duration written the Go way is
+// honoured. "300s" used to fail the bare-integer parse and silently fall back to
+// the default, which is how a 300 second download budget became 900ms.
+func TestDurationEnvAcceptsUnits(t *testing.T) {
+	cases := map[string]time.Duration{
+		"300s":  300 * time.Second,
+		"5m":    5 * time.Minute,
+		"1h30m": 90 * time.Minute,
+		"300":   300 * time.Second, // proxpi's bare-seconds spelling still works
+		"2.5":   2500 * time.Millisecond,
+	}
+
+	for value, want := range cases {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("GROXPI_DOWNLOAD_TIMEOUT", value)
+			if got := Load().DownloadTimeout; got != want {
+				t.Fatalf("GROXPI_DOWNLOAD_TIMEOUT=%s gave %v, want %v", value, got, want)
+			}
+		})
+	}
+}
+
+// TestMalformedEnvIsLoud pins that a value we cannot use is announced. Load
+// cannot fail - a mistyped tuning knob must not stop the proxy - so the warning
+// is the only thing standing between an operator and a setting that was never
+// applied.
+func TestMalformedEnvIsLoud(t *testing.T) {
+	cases := []struct {
+		key, value string
+		read       func(*Config) any
+		want       any
+	}{
+		{"GROXPI_INDEX_CACHE_SIZE", "512MB", func(c *Config) any { return c.IndexCacheSize }, int64(256 * 1024 * 1024)},
+		{"GROXPI_CACHE_SIZE", "-1", func(c *Config) any { return c.CacheSize }, int64(5 * 1024 * 1024 * 1024)},
+		{"GROXPI_DOWNLOAD_TIMEOUT", "later", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		{"GROXPI_INDEX_TTL", "-5m", func(c *Config) any { return c.IndexTTL }, 30 * time.Minute},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+
+			var cfg *Config
+			logs := captureLogs(t, func() { cfg = Load() })
+
+			if got := tc.read(cfg); got != tc.want {
+				t.Errorf("expected the default %v, got %v", tc.want, got)
+			}
+			if !strings.Contains(logs, tc.key) {
+				t.Errorf("malformed %s was ignored silently; logs were:\n%s", tc.key, logs)
+			}
+		})
+	}
+}
