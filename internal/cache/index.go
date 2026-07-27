@@ -18,8 +18,7 @@ import (
 // HTML is not stored: it is the uncommon content type and is cheap to render
 // from Files on demand.
 type Entry struct {
-	Files []pypi.FileInfo // parsed package file list; nil for the package-list entry
-	Names []string        // parsed package list; nil for package-file entries
+	Files []pypi.FileInfo // parsed package file list
 	JSON  []byte          // marshalled PEP 691 body
 	GZIP  []byte          // gzip of JSON, produced once at fill time
 
@@ -34,14 +33,6 @@ type Entry struct {
 // marshalled form of files.
 func NewPackageEntry(files []pypi.FileInfo, body []byte) *Entry {
 	e := &Entry{Files: files, JSON: body}
-	e.finish()
-	return e
-}
-
-// NewListEntry builds the entry for the full package list. body must be the
-// marshalled form of names.
-func NewListEntry(names []string, body []byte) *Entry {
-	e := &Entry{Names: names, JSON: body}
 	e.finish()
 	return e
 }
@@ -178,12 +169,6 @@ func (c *IndexCache) evictLocked() {
 	}
 }
 
-func (c *IndexCache) InvalidateList() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.removeLocked(ListKey)
-}
-
 func (c *IndexCache) InvalidatePackage(packageName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -211,8 +196,5 @@ func (c *IndexCache) Bytes() int64 {
 	defer c.mu.RUnlock()
 	return c.bytes
 }
-
-// ListKey names the full package list.
-const ListKey = "package-list"
 
 func packageKey(packageName string) string { return "package:" + packageName }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -53,13 +54,8 @@ type ServePlan struct {
 // packageIndex is the upstream index seam. It exists so the decision tree can be
 // exercised without a live PyPI client.
 type packageIndex interface {
-	GetPackageList() ([]string, error)
 	GetPackageFiles(packageName string) ([]pypi.FileInfo, error)
 }
-
-// packageListKey names the package list in both the index cache and the
-// singleflight group.
-const packageListKey = cache.ListKey
 
 // jsonContentType is the PEP 691 media type of every index body served as JSON.
 const jsonContentType = "application/vnd.pypi.simple.v1+json"
@@ -88,15 +84,6 @@ type wireFiles struct {
 	Name  string     `json:"name"`
 }
 
-type wireProject struct {
-	Name string `json:"name"`
-}
-
-type wireProjects struct {
-	Meta     wireMeta      `json:"meta"`
-	Projects []wireProject `json:"projects"`
-}
-
 // encodePackageFiles marshals a package's file list, rewriting every URL to
 // point at this proxy.
 func encodePackageFiles(packageName string, files []pypi.FileInfo) ([]byte, error) {
@@ -121,17 +108,6 @@ func encodePackageFiles(packageName string, files []pypi.FileInfo) ([]byte, erro
 	return json.Marshal(body)
 }
 
-func encodePackageList(packages []string) ([]byte, error) {
-	body := wireProjects{
-		Meta:     wireMeta{APIVersion: "1.0"},
-		Projects: make([]wireProject, 0, len(packages)),
-	}
-	for _, name := range packages {
-		body.Projects = append(body.Projects, wireProject{Name: name})
-	}
-	return json.Marshal(body)
-}
-
 func proxyFileURL(packageName, fileName string) string {
 	return "/simple/" + packageName + "/" + fileName
 }
@@ -148,6 +124,11 @@ type PackageFileService struct {
 	sf              singleflight.Group
 	indexTTL        time.Duration
 	downloadTimeout time.Duration
+
+	// The root index is proxied rather than parsed, so it needs an HTTP client of
+	// its own instead of the typed index client.
+	rootURL    string
+	rootClient *http.Client
 }
 
 func newPackageFileService(
@@ -164,6 +145,11 @@ func newPackageFileService(
 		downloader:      downloader,
 		indexTTL:        cfg.IndexTTL,
 		downloadTimeout: cfg.DownloadTimeout,
+		rootURL:         strings.TrimSuffix(cfg.IndexURL, "/") + "/",
+		// ponytail: one fixed timeout for the whole proxied response. The root list
+		// is large but a single upstream GET; a byte-rate budget can come later if a
+		// slow index actually shows up.
+		rootClient: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -338,39 +324,64 @@ func (s *PackageFileService) resolveIndex(packageName string) (*cache.Entry, err
 	return entry, nil
 }
 
-// resolvePackageList returns the cache entry for the full package list, using
-// the index cache and deduplicating concurrent upstream fetches. It is the only
-// path to the upstream package list.
-func (s *PackageFileService) resolvePackageList() (*cache.Entry, error) {
-	if entry, found := s.indexCache.Get(packageListKey); found {
-		return entry, nil
-	}
+// rootResponse is one upstream root-index response, held only as long as it
+// takes to answer the burst of clients that shared its fetch.
+type rootResponse struct {
+	status          int
+	contentType     string
+	contentEncoding string
+	body            []byte
+}
 
-	result, err, _ := s.sf.Do(packageListKey, func() (any, error) {
-		packages, err := s.index.GetPackageList()
+// ProxyRoot fetches the upstream root index verbatim: the client's accepted
+// content type and encoding are forwarded and the body is copied back
+// undecoded. Nothing is cached — the full project list is tens of megabytes and
+// is served through, not stored — but concurrent callers asking for the same
+// representation still share one upstream fetch.
+func (s *PackageFileService) ProxyRoot(ctx context.Context, accept, acceptEncoding string) (*rootResponse, error) {
+	result, err, _ := s.sf.Do("root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
+		// The fetch serves every waiter, so it must not die with whichever client
+		// happened to trigger it; the HTTP client's own timeout bounds it.
+		req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, s.rootURL, nil)
 		if err != nil {
 			return nil, err
 		}
-		body, err := encodePackageList(packages)
+		req.Header.Set("User-Agent", "groxpi/1.0.0")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		// Setting this explicitly also stops net/http decompressing the body, which
+		// is what makes the pass-through byte-level.
+		if acceptEncoding != "" {
+			req.Header.Set("Accept-Encoding", acceptEncoding)
+		}
+
+		resp, err := s.rootClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode package list: %w", err)
+			return nil, err
 		}
-		entry := cache.NewListEntry(packages, body)
-		// Never cache an empty list, for the same reason as resolveIndex.
-		if len(packages) > 0 {
-			s.indexCache.Set(packageListKey, entry, s.indexTTL)
+		defer func() { _ = resp.Body.Close() }()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
 		}
-		return entry, nil
+		return &rootResponse{
+			status:          resp.StatusCode,
+			contentType:     resp.Header.Get("Content-Type"),
+			contentEncoding: resp.Header.Get("Content-Encoding"),
+			body:            body,
+		}, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve package list: %w", err)
+		return nil, fmt.Errorf("failed to proxy root index: %w", err)
 	}
 
-	entry, ok := result.(*cache.Entry)
+	root, ok := result.(*rootResponse)
 	if !ok {
-		return nil, fmt.Errorf("unexpected package list result type %T", result)
+		return nil, fmt.Errorf("unexpected root index result type %T", result)
 	}
-	return entry, nil
+	return root, nil
 }
 
 func storageKeyFor(packageName, fileName string) string {

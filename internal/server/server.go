@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/phuslu/log"
 
@@ -59,8 +58,8 @@ func New(cfg *config.Config) *Server {
 		)
 	}))
 
-	// Add compression middleware
-	router.Use(gzip.Gzip(gzip.BestSpeed))
+	// No compression middleware: package files are already-compressed archives and
+	// index bodies carry their compressed form in the cache entry.
 
 	// Note: Templates are not currently used - handlers generate HTML inline
 	// This avoids issues with template syntax differences between frameworks
@@ -162,37 +161,28 @@ func (s *Server) handleHome(c *gin.Context) {
 	c.String(http.StatusOK, html)
 }
 
-// emptyPackageListJSON is what a failed upstream list serves: the same shape
-// encodePackageList produces for no packages.
-const emptyPackageListJSON = `{"meta":{"api-version":"1.0"},"projects":[]}`
-
+// handleListPackages proxies the upstream root index byte for byte. It is not
+// cached and not decoded: the full project list is tens of megabytes, and every
+// representation the client can ask for is one the upstream already produces.
 func (s *Server) handleListPackages(c *gin.Context) {
-	// One entry per resource: the body was marshalled when the cache was filled,
-	// so a hit writes bytes and marshals nothing.
-	entry, err := s.packageFiles.resolvePackageList()
+	// ?format= overrides Accept here exactly as it does on a package page.
+	accept := c.GetHeader("Accept")
+	if format := c.Query("format"); format != "" {
+		accept = format
+	}
+
+	root, err := s.packageFiles.ProxyRoot(c.Request.Context(), accept, c.GetHeader("Accept-Encoding"))
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to fetch package list")
-		if wantsJSON(c) {
-			c.Data(http.StatusOK, jsonContentType, []byte(emptyPackageListJSON))
-			return
-		}
-	} else if wantsJSON(c) {
-		c.Data(http.StatusOK, jsonContentType, entry.JSON)
+		log.Error().Err(err).Msg("Failed to proxy root index")
+		c.String(http.StatusBadGateway, "Failed to fetch package list")
 		return
 	}
 
-	// Return simple HTML for packages
-	html := `<!DOCTYPE html>
-<html>
-<head><title>Package Index</title></head>
-<body>
-	<h1>Simple index</h1>
-	<p>No packages cached yet. Install a package to populate the cache.</p>
-	<p><a href="/">← Back to home</a></p>
-</body>
-</html>`
-	c.Header("Content-Type", "text/html")
-	c.String(http.StatusOK, html)
+	c.Header("Vary", "Accept, Accept-Encoding")
+	if root.contentEncoding != "" {
+		c.Header("Content-Encoding", root.contentEncoding)
+	}
+	c.Data(root.status, root.contentType, root.body)
 }
 
 func (s *Server) handleListFiles(c *gin.Context) {
@@ -214,10 +204,25 @@ func (s *Server) handleListFiles(c *gin.Context) {
 	}
 
 	if wantsJSON(c) {
-		c.Data(http.StatusOK, jsonContentType, entry.JSON)
+		writeIndexJSON(c, entry)
 		return
 	}
 	renderPackageFilesHTML(c, packageName, entry.Files)
+}
+
+// writeIndexJSON serves the body built when the entry was filled, preferring its
+// pre-compressed form when the client accepts it. Nothing is compressed on the
+// request path.
+func writeIndexJSON(c *gin.Context, entry *cache.Entry) {
+	c.Header("Vary", "Accept-Encoding")
+	// ponytail: substring match, not a q-value parse. "gzip;q=0" is rare enough
+	// that the parser can wait for a client that actually sends it.
+	if len(entry.GZIP) > 0 && strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		c.Header("Content-Encoding", "gzip")
+		c.Data(http.StatusOK, jsonContentType, entry.GZIP)
+		return
+	}
+	c.Data(http.StatusOK, jsonContentType, entry.JSON)
 }
 
 // renderPackageFilesHTML renders the index page from the parsed file list. HTML
@@ -384,9 +389,10 @@ func (hw *headerWriter) Write(p []byte) (int, error) {
 	return hw.w.Write(p)
 }
 
+// handleCacheList is a no-op kept for API compatibility with the Python
+// implementation: the root index is proxied, so there is no cached list to
+// invalidate.
 func (s *Server) handleCacheList(c *gin.Context) {
-	s.indexCache.InvalidateList()
-
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   nil,
@@ -485,10 +491,10 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 // buys range and If-Modified-Since handling for free. Backends that cannot name a
 // file are opened and streamed here.
 //
-// Serving by path is not a kernel-level zero copy: gin's writer, wrapped further
-// by the gzip middleware, exposes neither the file nor the ReaderFrom hooks
-// net/http needs to skip user space. The win is delegated correctness, not a
-// saved copy.
+// Serving by path is not a kernel-level zero copy: gin's writer exposes neither
+// the file nor the ReaderFrom hooks net/http needs to skip user space, so the
+// bytes still pass through it. The win is delegated correctness, not a saved
+// copy.
 func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := c.Request.Context()
