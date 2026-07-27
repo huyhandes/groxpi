@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net"
@@ -145,11 +146,12 @@ func NewClient(cfg *config.Config) *Client {
 		Timeout:   60 * time.Second, // Increased for large responses
 	}
 
-	if cfg.ConnectTimeout > 0 || cfg.ReadTimeout > 0 {
-		timeout := cfg.ConnectTimeout + cfg.ReadTimeout
-		if timeout > 0 {
-			httpClient.Timeout = timeout
-		}
+	// http.Client.Timeout is one budget for the whole request - connect, headers
+	// and body - so the two configured phases are summed rather than applied
+	// separately: an index that takes ConnectTimeout to connect is still allowed
+	// its ReadTimeout to answer. Both default to 0, which leaves the 60s above.
+	if budget := cfg.ConnectTimeout + cfg.ReadTimeout; budget > 0 {
+		httpClient.Timeout = budget
 	}
 
 	return &Client{
@@ -233,26 +235,14 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
-		return nil, redactRequestError(err)
+		return nil, config.RedactURLError(err)
 	}
 
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
 	resp, err := c.httpClient.Do(req)
-	return resp, redactRequestError(err)
-}
-
-// redactRequestError strips credentials out of the URL net/http embeds in its
-// transport errors: *url.Error prints the URL it failed on, user-info and all, so
-// wrapping one unredacted would leak a private index's password into any log that
-// records the error.
-func redactRequestError(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) {
-		uerr.URL = config.RedactURL(uerr.URL)
-	}
-	return err
+	return resp, config.RedactURLError(err)
 }
 
 func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {
@@ -358,11 +348,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			return err
 		}
 
-		html := buf.String()
+		page := buf.String()
 		files = make([]FileInfo, 0, 50)
 
 		// Simple HTML parsing for package files
-		lines := strings.SplitSeq(html, "\n")
+		lines := strings.SplitSeq(page, "\n")
 		for line := range lines {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "<a ") {
@@ -379,7 +369,11 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if hrefEnd == -1 {
 				continue
 			}
-			href := line[hrefStart : hrefStart+hrefEnd]
+			// Attribute values and anchor text arrive HTML-escaped: a PEP 503
+			// index must write "&gt;=3.8", and re-emitting that escape into the
+			// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
+			// "&amp;" in a query string.
+			href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
 
 			// Resolve the href against the index page URL. ResolveReference
 			// correctly handles absolute, protocol-relative, root-relative and
@@ -403,14 +397,14 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
 				continue
 			}
-			filename := line[textStart+1 : textEnd]
+			filename := html.UnescapeString(line[textStart+1 : textEnd])
 
 			// Extract data-requires-python if present
 			var requiresPython string
 			if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
 				rpStart += 22
 				if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
-					requiresPython = line[rpStart : rpStart+rpEnd]
+					requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
 				}
 			}
 
@@ -419,7 +413,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
 				yankStart += 13
 				if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
-					yankedStr := line[yankStart : yankStart+yankEnd]
+					yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
 					if yankedStr == "" {
 						yanked = true
 					} else {

@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/telemetry"
@@ -77,7 +78,10 @@ type S3Storage struct {
 	existsSF singleflight.Group
 }
 
-var _ Storage = (*S3Storage)(nil)
+var (
+	_ Storage       = (*S3Storage)(nil)
+	_ PrefixDeleter = (*S3Storage)(nil)
+)
 
 // endpointURL turns a bare host, or a host that already carries a scheme, into
 // the absolute URL the SDK wants as a base endpoint.
@@ -188,12 +192,22 @@ func isNotFoundResponse(err error) bool {
 		return true
 	}
 
-	// HeadObject on a missing key answers with a bare 404 carrying no error
-	// body, so the status code is all there is to go on. The interface is the
-	// target rather than a concrete type because both the SDK's and smithy's
-	// response errors implement it.
-	var httpErr interface{ HTTPStatusCode() int }
-	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound
+	// HeadObject on a missing key answers with a bodyless 404, which the SDK
+	// deserializes into an unmodelled API error whose code it derives from the
+	// status line. Only the codes that mean "this object" may be folded into a
+	// miss: a 404 also covers NoSuchBucket, and reading a deleted bucket as an
+	// absent object turns a broken configuration into a silent permanent 100%
+	// miss - every read re-downloads and every write is thrown away.
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "NoSuchKey", "NotFound":
+		return true
+	default:
+		return false
+	}
 }
 
 // s3Error wraps a backend failure for key, folding a genuine absence into the
@@ -304,10 +318,77 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// deleteBatchSize is the most keys S3 accepts in one DeleteObjects request.
+const deleteBatchSize = 1000
+
+// DeletePrefix removes every object under prefix and reports how many went. It is
+// what makes evicting a package mean anything in pure-S3 mode: the transport
+// evicts only through PrefixDeleter, so without this the admin endpoint answered
+// 200 having deleted nothing.
+//
+// Listing and deleting are interleaved page by page rather than collected first,
+// so evicting a package with thousands of files costs one page of keys in memory
+// instead of all of them.
+func (s *S3Storage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(s.buildKey(prefix)),
+		MaxKeys: aws.Int32(deleteBatchSize),
+	})
+
+	deleted := 0
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to list objects under %s: %w", prefix, err)
+		}
+		if len(page.Contents) == 0 {
+			continue
+		}
+
+		ids := make([]types.ObjectIdentifier, 0, len(page.Contents))
+		for _, object := range page.Contents {
+			ids = append(ids, types.ObjectIdentifier{Key: object.Key})
+		}
+
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			// Quiet mode answers with the failures only, which is also what makes
+			// the response size independent of the batch size.
+			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return deleted, fmt.Errorf("failed to delete objects under %s: %w", prefix, err)
+		}
+
+		deleted += len(ids) - len(out.Errors)
+		if len(out.Errors) > 0 {
+			return deleted, fmt.Errorf("failed to delete %d of %d objects under %s: %s",
+				len(out.Errors), len(ids), prefix, aws.ToString(out.Errors[0].Message))
+		}
+	}
+
+	slog.Debug("Deleted object prefix from S3", "prefix", prefix, "deleted", deleted)
+
+	return deleted, nil
+}
+
 // Exists checks if an object exists in S3, deduplicating concurrent lookups.
 func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
+	// A caller who arrived with a dead context is answered from its own context,
+	// never by starting or joining a flight.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	result, err, _ := s.existsSF.Do(key, func() (any, error) {
-		_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		// The flight is shared, so it must not be cancellable by whichever caller
+		// happened to start it: one client disconnecting used to fail every other
+		// caller waiting on the same key with context.Canceled, which the read path
+		// reads as a miss and re-downloads a file that is sitting in the bucket.
+		// Values (the trace context) are kept; the deadline comes from the
+		// transport's response-header timeout instead.
+		_, err := s.client.HeadObject(context.WithoutCancel(ctx), &s3.HeadObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(s.buildKey(key)),
 		})
@@ -315,19 +396,26 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 			// Absence is the answer, not a failure. Anything else is a failure
 			// and must not be reported as "does not exist".
 			if isNotFoundResponse(err) {
-				telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 				return false, nil
 			}
 			return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
 		}
-		telemetry.CacheHit(ctx, telemetry.LayerRemote)
 		return true, nil
 	})
 	if err != nil {
 		return false, err
 	}
 
-	return result.(bool), nil
+	// Counted per caller rather than per flight: every caller that got an answer
+	// out of this either hit or missed, whether or not it did the lookup.
+	exists := result.(bool)
+	if exists {
+		telemetry.CacheHit(ctx, telemetry.LayerRemote)
+	} else {
+		telemetry.CacheMiss(ctx, telemetry.LayerRemote)
+	}
+
+	return exists, nil
 }
 
 // Close releases any resources held by the storage backend

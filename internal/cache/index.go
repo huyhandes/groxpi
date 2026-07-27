@@ -133,7 +133,19 @@ func (c *IndexCache) Get(key string) (*Entry, bool) {
 	entry, exists := c.entries[key]
 	c.mu.RUnlock()
 
-	if !exists || time.Now().After(entry.expiresAt) {
+	if !exists {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		// A miss is the moment the entry's bytes are known to be worthless, so
+		// they are refunded here rather than left charged against maxBytes until
+		// the next sweep - which is half an hour away by default, long enough to
+		// evict live entries to make room for dead ones.
+		c.mu.Lock()
+		if current, still := c.entries[key]; still && current == entry {
+			c.removeLocked(key)
+		}
+		c.mu.Unlock()
 		return nil, false
 	}
 	entry.lastAccess.Store(time.Now().UnixNano())
@@ -168,16 +180,30 @@ func (c *IndexCache) removeLocked(key string) {
 	}
 }
 
+// evictSample bounds how many entries are examined to pick one victim. Go
+// randomises the iteration order of a map, so the sample is a random one and the
+// oldest of a handful is very likely to be genuinely cold.
+//
+// ponytail: approximate LRU. An exact one needs a recency list, which means
+// taking the write lock on every read - the read path deliberately updates
+// recency under the read lock with an atomic. Swap in the list only if a measured
+// hit rate says the approximation costs something.
+const evictSample = 8
+
 // evictLocked drops least-recently-used entries until the cache fits its budget.
-// Picking the victim scans the map, but only while over budget: the common write
-// costs one map assignment regardless of how many packages are cached.
+// Each victim costs a bounded sample rather than a full scan, so filling a cache
+// of n packages stays linear in n instead of quadratic.
 func (c *IndexCache) evictLocked() {
 	for c.maxBytes > 0 && c.bytes > c.maxBytes && len(c.entries) > 0 {
 		var victim string
 		var oldest int64
+		seen := 0
 		for key, entry := range c.entries {
 			if access := entry.lastAccess.Load(); victim == "" || access < oldest {
 				victim, oldest = key, access
+			}
+			if seen++; seen == evictSample {
+				break
 			}
 		}
 		c.removeLocked(victim)

@@ -67,6 +67,24 @@ func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
 	}
 }
 
+// TestIndexCache_MissDropsTheStaleEntry pins that a read which finds an expired
+// entry also reclaims it. Leaving it charged against maxBytes until the sweep
+// (half an hour away) means live entries get evicted to make room for bytes
+// already known to be worthless.
+func TestIndexCache_MissDropsTheStaleEntry(t *testing.T) {
+	c := NewIndexCache(0, 0)
+	defer c.Close()
+
+	c.Set("k", testEntry(`{"a":1}`), -time.Second)
+
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("an expired entry must not be readable")
+	}
+	if c.Len() != 0 || c.Bytes() != 0 {
+		t.Fatalf("stale entry still charged: %d entries, %d bytes", c.Len(), c.Bytes())
+	}
+}
+
 func TestIndexCache_PackageHelpers(t *testing.T) {
 	c := NewIndexCache(0, 0)
 	defer c.Close()
@@ -145,6 +163,28 @@ func TestIndexCache_SweepDropsExpiredWithoutARead(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("background sweep did not remove the expired entry")
+}
+
+// BenchmarkIndexCache_SetOverBudget is the check on the bounded eviction sample:
+// the per-write cost must not grow with how many packages are cached. A full scan
+// per victim made this quadratic in the number of entries.
+func BenchmarkIndexCache_SetOverBudget(b *testing.B) {
+	one := testEntry(`{"a":1}`)
+
+	for _, resident := range []int{100, 10000} {
+		b.Run(fmt.Sprintf("resident=%d", resident), func(b *testing.B) {
+			c := NewIndexCache(int64(resident)*one.Size(), 0)
+			defer c.Close()
+
+			for i := range resident {
+				c.Set(fmt.Sprintf("k-%d", i), testEntry(`{"a":1}`), time.Hour)
+			}
+
+			for i := 0; b.Loop(); i++ {
+				c.Set(fmt.Sprintf("new-%d", i), testEntry(`{"a":1}`), time.Hour)
+			}
+		})
+	}
 }
 
 func TestIndexCache_ConcurrentAccess(t *testing.T) {

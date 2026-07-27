@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
@@ -43,6 +45,18 @@ func RedactURL(raw string) string {
 	}
 	u.User = url.User("redacted")
 	return u.String()
+}
+
+// RedactURLError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// returning one unredacted leaks a private index's password into any log or
+// response that records the error.
+func RedactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		uerr.URL = RedactURL(uerr.URL)
+	}
+	return err
 }
 
 // ResolutionOrder returns the indexes to consult for a package: the extra
@@ -144,7 +158,7 @@ func Load() *Config {
 		CacheSize:              getIntEnv("GROXPI_CACHE_SIZE", 5*1024*1024*1024),    // 5GB
 		IndexCacheSize:         getIntEnv("GROXPI_INDEX_CACHE_SIZE", 256*1024*1024), // 256MB, provisional
 		CacheDir:               getEnv("GROXPI_CACHE_DIR", ""),
-		DownloadTimeout:        getFloatDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
+		DownloadTimeout:        getDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
 		Port:                   getEnv("PORT", "5000"),
 		LogLevel:               getEnv("GROXPI_LOGGING_LEVEL", "INFO"),
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
@@ -155,8 +169,8 @@ func Load() *Config {
 		AdminEnabled:           getBoolEnv("GROXPI_ADMIN_ENABLED", false),
 		AdminUsername:          getEnv("GROXPI_ADMIN_USERNAME", ""),
 		AdminPassword:          getEnv("GROXPI_ADMIN_PASSWORD", ""),
-		ConnectTimeout:         getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
-		ReadTimeout:            getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0),
+		ConnectTimeout:         getDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
+		ReadTimeout:            getDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
 		// Storage configuration
 		StorageType:       getEnv("GROXPI_STORAGE_TYPE", "local"),
@@ -190,11 +204,13 @@ func Load() *Config {
 		ttlStrs := splitAndTrim(extraTTLs, ",")
 		cfg.ExtraIndexTTLs = make([]time.Duration, len(ttlStrs))
 		for i, ttlStr := range ttlStrs {
-			if ttl, err := strconv.Atoi(ttlStr); err == nil {
-				cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
-			} else {
+			ttl, err := strconv.Atoi(ttlStr)
+			if err != nil || ttl < 0 {
+				invalidEnv("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
 				cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
+				continue
 			}
+			cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
 		}
 	} else {
 		// Default TTL for extra indices
@@ -239,31 +255,55 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+// invalidEnv reports a setting that could not be used and names the value taken
+// instead. Load has no error return - a mistyped cache size must not stop the
+// proxy from starting - so the substitution has to be visible in the log, or an
+// operator who wrote "512MB" never learns their tuning was ignored.
+func invalidEnv(key, value string, fallback any) {
+	slog.Warn("Ignoring malformed environment variable, using default instead",
+		"variable", key,
+		"value", value,
+		"default", fallback)
+}
+
 func getIntEnv(key string, defaultValue int64) int64 {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
-			return intVal
-		}
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
-	return defaultValue
+
+	intVal, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || intVal < 0 {
+		invalidEnv(key, value, defaultValue)
+		return defaultValue
+	}
+	return intVal
 }
 
+// getDurationEnv reads a duration written either with a unit ("300s", "5m") or
+// as a bare number of seconds ("300", "2.5"). Both spellings have to work: the
+// bare-seconds form is proxpi's, and the unit form is what anyone reading Go
+// durations elsewhere in the configuration will reach for.
 func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if intVal, err := strconv.Atoi(value); err == nil {
-			return time.Duration(intVal) * time.Second
-		}
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
-	return defaultValue
-}
 
-func getFloatDurationEnv(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
-			return time.Duration(floatVal * float64(time.Second))
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		seconds, floatErr := strconv.ParseFloat(value, 64)
+		if floatErr != nil {
+			invalidEnv(key, value, defaultValue)
+			return defaultValue
 		}
+		d = time.Duration(seconds * float64(time.Second))
 	}
-	return defaultValue
+	if d < 0 {
+		invalidEnv(key, value, defaultValue)
+		return defaultValue
+	}
+	return d
 }
 
 func getBoolEnv(key string, defaultValue bool) bool {

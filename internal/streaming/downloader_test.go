@@ -3,11 +3,14 @@ package streaming
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -127,19 +130,13 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
 
-		// This test expects the downloader to handle storage errors gracefully
-		// The client stream should still work even if storage fails
+		// Caching is best-effort: a backend that fails costs this download its
+		// cache entry and nothing else. The client must still get its bytes.
 		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer, Expectation{})
-
-		// The streaming may fail due to pipe closure, which is expected behavior
-		// when storage fails immediately
 		if err != nil {
-			// This is acceptable - when storage fails immediately, the pipe closes
-			// and the stream fails, which is the correct behavior
-			return
+			t.Fatalf("a cache-write failure must not fail the client transfer: %v", err)
 		}
 
-		// If streaming succeeded, client should receive data
 		if clientBuffer.String() != testData {
 			t.Errorf("Client buffer mismatch: expected %q, got %q", testData, clientBuffer.String())
 		}
@@ -261,6 +258,156 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 			t.Errorf("Concurrent download error: %v", err)
 		}
 	})
+}
+
+// TestTeeStreamingDownloader_RedactsCredentials pins that a file URL carrying
+// index credentials never reaches an error string. Package file URLs are resolved
+// against the index URL, so a private index configured with user:password hands
+// its password to every download; an unredacted error puts it in the log and in
+// the 500 body.
+func TestTeeStreamingDownloader_RedactsCredentials(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+
+	credentialed := func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		u.User = url.UserPassword("deploy", secret)
+		return u.String()
+	}
+
+	t.Run("transport failure", func(t *testing.T) {
+		// A server that is closed before use gives a connection refused, which is
+		// how *url.Error - the shape that prints the URL it failed on - is reached.
+		dead := createTestServer("", http.StatusOK, 0)
+		dead.Close()
+
+		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+
+		_, err := downloader.DownloadAndStream(context.Background(),
+			credentialed(dead.URL), "k", io.Discard, Expectation{})
+		if err == nil {
+			t.Fatal("expected a transport failure")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("index credentials leaked into the error: %v", err)
+		}
+	})
+
+	t.Run("upstream status", func(t *testing.T) {
+		server := createTestServer("nope", http.StatusNotFound, 0)
+		defer server.Close()
+
+		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+
+		_, err := downloader.DownloadAndStream(context.Background(),
+			credentialed(server.URL), "k", io.Discard, Expectation{})
+		if err == nil {
+			t.Fatal("expected an error for HTTP 404")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("index credentials leaked into the error: %v", err)
+		}
+	})
+}
+
+// truncatingStorage accepts a fixed number of bytes and then fails, standing in
+// for a disk that fills up in the middle of a download.
+type truncatingStorage struct {
+	accept int64
+}
+
+func (s *truncatingStorage) Put(_ context.Context, _ string, reader io.Reader, _ int64, _ string) (*storage.ObjectInfo, error) {
+	if _, err := io.CopyN(io.Discard, reader, s.accept); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("no space left on device")
+}
+
+// TestTeeStreamingDownloader_StorageFailureIsNotFatal pins that a cache-write
+// failure part-way through a download degrades to a pass-through instead of
+// breaking the transfer. The backend returning early closed the storage pipe,
+// which made the next tee write fail with io.ErrClosedPipe and handed the client
+// a truncated 200 - so one full disk broke every concurrent download rather than
+// merely skipping the cache.
+func TestTeeStreamingDownloader_StorageFailureIsNotFatal(t *testing.T) {
+	// Large enough that the backend gives up long before the copy is done.
+	testData := strings.Repeat("ABCDEFGHIJ", 100*1024)
+	server := createTestServer(testData, http.StatusOK, 0)
+	defer server.Close()
+
+	downloader := NewTeeStreamingDownloader(&truncatingStorage{accept: 4096},
+		&http.Client{Timeout: 10 * time.Second})
+
+	var clientBuffer bytes.Buffer
+	result, err := downloader.DownloadAndStream(context.Background(),
+		server.URL, "test-key", &clientBuffer, Expectation{})
+	if err != nil {
+		t.Fatalf("a mid-stream cache failure must not fail the client transfer: %v", err)
+	}
+
+	if clientBuffer.String() != testData {
+		t.Errorf("client got %d of %d bytes", clientBuffer.Len(), len(testData))
+	}
+	if result.Size != int64(len(testData)) {
+		t.Errorf("Size = %d, want %d", result.Size, len(testData))
+	}
+	if result.Error == nil {
+		t.Error("the cache-write failure must be reported in StreamResult.Error")
+	}
+}
+
+// TestTeeStreamingDownloader_Verification pins what the integrity check does:
+// bytes that do not match what the index declared are refused, and the cache is
+// left empty. Nothing here asserts the client was protected - it cannot be, the
+// bytes are already gone by the time the digest exists.
+func TestTeeStreamingDownloader_Verification(t *testing.T) {
+	const testData = "wheel bytes"
+	// sha256 of testData, so the matching case is a real digest comparison.
+	sum := sha256.Sum256([]byte(testData))
+	digest := hex.EncodeToString(sum[:])
+
+	cases := []struct {
+		name    string
+		expect  Expectation
+		wantErr bool
+	}{
+		{"matching sha256", Expectation{SHA256: digest}, false},
+		{"mismatched sha256", Expectation{SHA256: strings.Repeat("ab", 32)}, true},
+		{"matching size", Expectation{Size: int64(len(testData))}, false},
+		{"mismatched size", Expectation{Size: 99}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := createTestServer(testData, http.StatusOK, 0)
+			defer server.Close()
+
+			store := newMockStorageWriter()
+			downloader := NewTeeStreamingDownloader(store, &http.Client{Timeout: 5 * time.Second})
+
+			_, err := downloader.DownloadAndStream(context.Background(),
+				server.URL, "test-key", io.Discard, tc.expect)
+
+			if tc.wantErr {
+				if !errors.Is(err, ErrVerification) {
+					t.Fatalf("expected ErrVerification, got %v", err)
+				}
+				if _, cached := store.Get("test-key"); cached {
+					t.Error("bytes that failed verification must never be committed")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("verification rejected bytes that match the index: %v", err)
+			}
+			if _, cached := store.Get("test-key"); !cached {
+				t.Error("verified bytes should have been cached")
+			}
+		})
+	}
 }
 
 func TestNewTeeStreamingDownloader(t *testing.T) {

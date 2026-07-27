@@ -19,16 +19,15 @@ import (
 // LRUEntry represents an entry in the LRU cache.
 //
 // Eviction order comes from the list ordering alone; CreatedAt exists only to
-// drive TTL expiry. Hits and LastServed are display columns for the cache
-// listing, written on the access path under the same write lock. They must never
-// become the eviction signal: a timestamp comparison would have to scan every
-// entry to find a victim that the list already has at its back.
+// drive TTL expiry. Hits is a display column for the cache listing, written on
+// the access path under the same write lock. It must never become the eviction
+// signal: a hit-count comparison would have to scan every entry to find a victim
+// that the list already has at its back.
 type LRUEntry struct {
-	Key        string
-	Size       int64
-	CreatedAt  time.Time
-	Hits       int64
-	LastServed time.Time
+	Key       string
+	Size      int64
+	CreatedAt time.Time
+	Hits      int64
 }
 
 // PrefixDeleter deletes every cached object whose key starts with a prefix. It is
@@ -145,15 +144,24 @@ func (lru *LRUCache) evictionWorker() {
 // cache is. Caller must not hold lru.mu.
 func (lru *LRUCache) expireEntries() {
 	lru.mu.Lock()
-	defer lru.mu.Unlock()
+	keys := lru.expireLocked()
+	lru.mu.Unlock()
 
+	if err := lru.unlink(context.Background(), keys); err != nil {
+		slog.Error("Failed to delete expired files", "error", err)
+	}
+}
+
+// expireLocked detaches every entry past its TTL and returns their keys for
+// unlinking. Caller must hold lru.mu.
+func (lru *LRUCache) expireLocked() []string {
 	if lru.ttl <= 0 {
-		return
+		return nil
 	}
 
 	now := time.Now()
-	expiredCount := 0
-	expiredSize := int64(0)
+	var keys []string
+	var size int64
 
 	// CreatedAt is not ordered by list position (a rewrite restarts an entry's
 	// TTL clock without moving it), so every entry is checked.
@@ -162,73 +170,43 @@ func (lru *LRUCache) expireEntries() {
 
 		entry := elem.Value.(*LRUEntry)
 		if now.Sub(entry.CreatedAt) > lru.ttl {
-			size := entry.Size
-			if err := lru.evictEntry(context.Background(), elem, entry, true); err == nil {
-				expiredCount++
-				expiredSize += size
-			}
+			size += entry.Size
+			keys = append(keys, lru.detachLocked(elem, entry))
 		}
 
 		elem = prev
 	}
 
-	if expiredCount > 0 {
+	if len(keys) > 0 {
 		slog.Info("Expired entries from L1 cache",
-			"expired_count", expiredCount,
-			"expired_size_mb", expiredSize/(1024*1024),
+			"expired_count", len(keys),
+			"expired_size_mb", size/(1024*1024),
 			"current_size_mb", lru.currentSize/(1024*1024),
 			"ttl", lru.ttl)
 	}
+
+	return keys
 }
 
-// performEviction evicts entries until size is under limit
-// Two-phase eviction when TTL is enabled:
-// Phase 1: Evict only expired entries (in LRU order)
-// Phase 2: If still over limit, fall back to pure LRU eviction
+// performEviction evicts entries until size is under limit: everything already
+// expired first, then pure LRU order for as long as the cache is still over
+// quota. Caller must not hold lru.mu.
 func (lru *LRUCache) performEviction() {
 	lru.mu.Lock()
-	defer lru.mu.Unlock()
 
 	// If maxSize is 0, treat as unlimited (no eviction)
 	if lru.maxSize == 0 || lru.currentSize <= lru.maxSize {
+		lru.mu.Unlock()
 		return
 	}
-
-	evictedCount := 0
-	evictedSize := int64(0)
-	now := time.Now()
 
 	slog.Info("Starting LRU eviction",
 		"current_size_mb", lru.currentSize/(1024*1024),
 		"max_size_mb", lru.maxSize/(1024*1024),
 		"ttl", lru.ttl)
 
-	// Phase 1: Evict only expired entries (if TTL is enabled)
-	if lru.ttl > 0 {
-		// Collect expired entries from back to front (LRU order)
-		var expiredElements []*list.Element
-		for elem := lru.lruList.Back(); elem != nil; elem = elem.Prev() {
-			entry := elem.Value.(*LRUEntry)
-			if now.Sub(entry.CreatedAt) > lru.ttl {
-				expiredElements = append(expiredElements, elem)
-			}
-		}
+	keys := lru.expireLocked()
 
-		// Evict expired entries until under size limit
-		for _, elem := range expiredElements {
-			if lru.currentSize <= lru.maxSize {
-				break
-			}
-
-			entry := elem.Value.(*LRUEntry)
-			if err := lru.evictEntry(context.Background(), elem, entry, true); err == nil {
-				evictedCount++
-				evictedSize += entry.Size
-			}
-		}
-	}
-
-	// Phase 2: If still over limit, fall back to pure LRU eviction
 	if lru.currentSize > lru.maxSize {
 		if lru.ttl > 0 {
 			slog.Warn("Evicting unexpired entries to meet size limit (all expired entries already evicted)",
@@ -236,52 +214,64 @@ func (lru *LRUCache) performEviction() {
 				"max_size_mb", lru.maxSize/(1024*1024))
 		}
 
-		for lru.currentSize > lru.maxSize && lru.lruList.Len() > 0 {
+		for lru.currentSize > lru.maxSize {
 			elem := lru.lruList.Back()
 			if elem == nil {
 				break
 			}
 
-			entry := elem.Value.(*LRUEntry)
-			if err := lru.evictEntry(context.Background(), elem, entry, false); err == nil {
-				evictedCount++
-				evictedSize += entry.Size
-			}
+			keys = append(keys, lru.detachLocked(elem, elem.Value.(*LRUEntry)))
 		}
 	}
 
+	newSize := lru.currentSize
+	lru.mu.Unlock()
+
 	slog.Info("LRU eviction completed",
-		"evicted_count", evictedCount,
-		"evicted_size_mb", evictedSize/(1024*1024),
-		"new_size_mb", lru.currentSize/(1024*1024))
+		"evicted_count", len(keys),
+		"new_size_mb", newSize/(1024*1024))
+
+	if err := lru.unlink(context.Background(), keys); err != nil {
+		slog.Error("Failed to delete evicted files", "error", err)
+	}
 }
 
-// evictEntry removes a single entry from the cache. Deletion goes through the
-// storage backend so that the on-disk state and the size accounting have
-// exactly one owner.
-func (lru *LRUCache) evictEntry(ctx context.Context, elem *list.Element, entry *LRUEntry, expired bool) error {
-	// Delete the file (a missing file is not an error for the backend)
-	if err := lru.deleter.Delete(ctx, entry.Key); err != nil {
-		slog.Error("Failed to delete file during eviction",
-			"error", err,
-			"key", entry.Key,
-			"path", filepath.Join(lru.baseDir, entry.Key))
-		return fmt.Errorf("failed to delete %q during eviction: %w", entry.Key, err)
-	}
-
-	// Remove from tracking
+// detachLocked drops an entry from tracking and returns its key so the caller can
+// unlink the file with the lock released. It is the one place the size accounting
+// shrinks, which makes it the one place occupancy can be reported from. Caller
+// must hold lru.mu.
+func (lru *LRUCache) detachLocked(elem *list.Element, entry *LRUEntry) string {
 	lru.currentSize -= entry.Size
 	delete(lru.entries, entry.Key)
 	lru.lruList.Remove(elem)
 
-	// Every removal from the on-disk cache goes through here, which makes it the
-	// one place eviction pressure and occupancy can be counted from.
-	telemetry.CacheEviction(ctx, telemetry.LayerLocal, 1)
-	telemetry.CacheOccupancy(ctx, telemetry.LayerLocal, lru.currentSize)
+	telemetry.CacheOccupancy(context.Background(), telemetry.LayerLocal, lru.currentSize)
 
-	slog.Debug("Evicted entry from L1 cache", "key", entry.Key, "size", entry.Size, "expired", expired)
+	slog.Debug("Detached entry from L1 cache", "key", entry.Key, "size", entry.Size)
 
-	return nil
+	return entry.Key
+}
+
+// unlink removes detached objects through the storage backend, which owns the
+// on-disk lifecycle. Caller must NOT hold lru.mu: one unlink per file, and
+// evicting a package means thousands of them, so holding the lock across this
+// would stall every read path for the duration.
+func (lru *LRUCache) unlink(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	var errs []error
+	for _, key := range keys {
+		// A missing file is not an error for the backend.
+		if err := lru.deleter.Delete(ctx, key); err != nil {
+			errs = append(errs, fmt.Errorf("failed to delete %q during eviction: %w", key, err))
+		}
+	}
+
+	telemetry.CacheEviction(ctx, telemetry.LayerLocal, int64(len(keys)))
+
+	return errors.Join(errs...)
 }
 
 // touch marks an already-tracked key as most recently used. It reports whether
@@ -291,13 +281,6 @@ func (lru *LRUCache) touch(key string) bool {
 	defer lru.mu.Unlock()
 
 	return lru.touchLocked(key)
-}
-
-// recordServeLocked counts a serve of an entry for the display columns. Caller
-// must hold lru.mu. It does not touch the list: recency is the caller's business.
-func recordServeLocked(entry *LRUEntry) {
-	entry.Hits++
-	entry.LastServed = time.Now()
 }
 
 // Snapshot copies every tracked entry, most recently used first. The copies mean
@@ -321,26 +304,22 @@ func (lru *LRUCache) Snapshot() []LRUEntry {
 // prefix that matches nothing is not an error.
 func (lru *LRUCache) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	lru.mu.Lock()
-	defer lru.mu.Unlock()
 
-	deleted := 0
-	var errs []error
+	var keys []string
 	for elem := lru.lruList.Back(); elem != nil; {
 		prev := elem.Prev()
 
 		entry := elem.Value.(*LRUEntry)
 		if strings.HasPrefix(entry.Key, prefix) {
-			if err := lru.evictEntry(ctx, elem, entry, false); err != nil {
-				errs = append(errs, err)
-			} else {
-				deleted++
-			}
+			keys = append(keys, lru.detachLocked(elem, entry))
 		}
 
 		elem = prev
 	}
 
-	return deleted, errors.Join(errs...)
+	lru.mu.Unlock()
+
+	return len(keys), lru.unlink(ctx, keys)
 }
 
 // touchLocked bumps recency for an existing entry. Caller must hold lru.mu.
@@ -351,7 +330,7 @@ func (lru *LRUCache) touchLocked(key string) bool {
 	}
 
 	lru.lruList.MoveToFront(elem)
-	recordServeLocked(elem.Value.(*LRUEntry))
+	elem.Value.(*LRUEntry).Hits++
 
 	slog.Debug("Updated access time for existing entry", "key", key)
 
@@ -405,7 +384,7 @@ func (lru *LRUCache) RecordAccess(key string, size int64) {
 		return
 	}
 
-	recordServeLocked(lru.addEntryLocked(key, size))
+	lru.addEntryLocked(key, size).Hits++
 }
 
 // RecordWrite records a write operation and adds/updates the entry. Unlike
@@ -436,7 +415,10 @@ func (lru *LRUCache) RecordWrite(key string, size int64) {
 	lru.triggerEvictionLocked()
 }
 
-// RecordDelete removes an entry from tracking
+// RecordDelete removes an entry from tracking. The file is already gone - the
+// caller deleted it - so this only reconciles the accounting, which is why it
+// goes through detachLocked rather than unlink: skipping detachLocked is what
+// used to leave the occupancy gauge permanently high after an explicit delete.
 func (lru *LRUCache) RecordDelete(key string) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
@@ -446,13 +428,7 @@ func (lru *LRUCache) RecordDelete(key string) {
 		return
 	}
 
-	entry := elem.Value.(*LRUEntry)
-	lru.currentSize -= entry.Size
-
-	delete(lru.entries, key)
-	lru.lruList.Remove(elem)
-
-	slog.Debug("Removed entry from L1 cache tracking", "key", key, "size", entry.Size)
+	lru.detachLocked(elem, elem.Value.(*LRUEntry))
 }
 
 // Close stops the LRU cache and cleans up resources
@@ -490,16 +466,9 @@ func (lru *LRUCache) ScanAndRebuild() error {
 			return err
 		}
 
-		// Add to LRU cache (use ModTime as CreatedAt for existing files)
-		entry := &LRUEntry{
-			Key:       relPath,
-			Size:      info.Size(),
-			CreatedAt: info.ModTime(),
-		}
-
-		elem := lru.lruList.PushFront(entry)
-		lru.entries[relPath] = elem
-		lru.currentSize += info.Size()
+		// A file that survived a restart keeps its age: ModTime is its CreatedAt,
+		// so a configured TTL still expires it.
+		lru.addEntryLocked(relPath, info.Size()).CreatedAt = info.ModTime()
 
 		scannedCount++
 		scannedSize += info.Size()
@@ -621,19 +590,6 @@ func (lru *LRULocalStorage) GetFilePath(ctx context.Context, key string) (string
 	lru.recordAccess(ctx, key)
 
 	return path, nil
-}
-
-// Stat returns object metadata and records the access. Callers stat a file
-// immediately before serving it, so this counts as use.
-func (lru *LRULocalStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
-	info, err := lru.inner.stat(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	lru.lruCache.RecordAccess(key, info.Size)
-
-	return info, nil
 }
 
 // Delete removes an object and drops it from LRU tracking.

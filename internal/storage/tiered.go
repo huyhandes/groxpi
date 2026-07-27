@@ -78,24 +78,14 @@ type TieredConfig struct {
 	// S3 (L2) configuration
 	S3Config *S3Config
 
-	// Background transfer configuration, shared by L1 back-fill and L2 upload
-	SyncWorkers   int // Number of workers per pool (default: 5)
-	SyncQueueSize int // Queue depth per pool (default: 100)
+	// Background transfer configuration, shared by L1 back-fill and L2 upload.
+	// Defaulted by config.Load; NewWorkerPool clamps anything unusable.
+	SyncWorkers   int // Number of workers per pool
+	SyncQueueSize int // Queue depth per pool
 }
 
 // NewTieredStorage creates a new tiered storage backend
 func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
-	// Set defaults
-	if cfg.SyncWorkers == 0 {
-		cfg.SyncWorkers = 5
-	}
-	if cfg.SyncQueueSize == 0 {
-		cfg.SyncQueueSize = 100
-	}
-	if cfg.LocalCacheSize == 0 {
-		cfg.LocalCacheSize = 10 * 1024 * 1024 * 1024 // 10GB default
-	}
-
 	// Create local storage with LRU eviction (L1 cache)
 	localStorage, err := NewLRULocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
 	if err != nil {
@@ -277,19 +267,28 @@ func (ts *TieredStorage) Exists(ctx context.Context, key string) (bool, error) {
 	return ts.remoteStorage.Exists(ctx, key)
 }
 
-// DeletePrefix forwards package eviction to L1, which is the only tier that
-// knows its own contents. Without this, evicting a package in hybrid mode
-// cleared the index entry and left every file on disk while reporting success.
+// DeletePrefix evicts a package from both tiers and reports how many L1 files
+// went, L1 being the tier that can count what it held. Without this, evicting a
+// package in hybrid mode cleared the index entry and left every file on disk
+// while reporting success.
 //
-// L2 objects are deliberately left in place. Deleting them would mean listing
-// the object store to discover what matches the prefix, and that listing
-// operation was removed from the storage interface on purpose. The cost of
-// leaving them is bounded and self-correcting: L2 is a best-effort cache, so a
-// stale object there costs one wasted back-fill, and the next upstream fetch
-// overwrites it. Freeing object-store space is the object store's lifecycle
-// policy's job, not the proxy's.
+// L2 has to go too, and its failure is not best-effort: it is the tier the next
+// request back-fills L1 from, so an object left behind resurrects the package the
+// operator just evicted. A remote that cannot enumerate a prefix is skipped
+// rather than failed - nothing in the core Storage contract promises listing.
 func (ts *TieredStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
-	return ts.localCache.DeletePrefix(ctx, prefix)
+	deleted, err := ts.localCache.DeletePrefix(ctx, prefix)
+
+	if remote, ok := ts.remoteStorage.(PrefixDeleter); ok {
+		if _, l2Err := remote.DeletePrefix(ctx, prefix); l2Err != nil {
+			err = errors.Join(err, fmt.Errorf("failed to evict %q from L2: %w", prefix, l2Err))
+		}
+	} else {
+		slog.Warn("L2 cannot evict a prefix; evicted objects may be back-filled again",
+			"prefix", prefix)
+	}
+
+	return deleted, err
 }
 
 // Snapshot forwards the cache listing to L1, the only tier that knows its own

@@ -141,11 +141,11 @@ func (f *fakeTier) Snapshot() []LRUEntry {
 
 var _ l1Storage = (*fakeTier)(nil)
 
-// TestTieredStorage_DeletePrefixForwardsToL1 pins the hybrid-mode gap where
-// evicting a package cleared the index entry and left every file on disk. L2 is
-// deliberately untouched: discovering what matches there would need the storage
-// listing operation this design does without.
-func TestTieredStorage_DeletePrefixForwardsToL1(t *testing.T) {
+// TestTieredStorage_DeletePrefixClearsBothTiers pins the hybrid-mode gap where
+// evicting a package cleared the index entry and left every file on disk. L2 has
+// to go with it: it is what L1 back-fills from, so an object left there
+// resurrects the package that was just evicted.
+func TestTieredStorage_DeletePrefixClearsBothTiers(t *testing.T) {
 	l1 := newFakeTier(map[string][]byte{
 		"packages/evictme/evictme-1.0.0.tar.gz": []byte("a"),
 		"packages/evictme/evictme-1.0.0.whl":    []byte("b"),
@@ -170,7 +170,7 @@ func TestTieredStorage_DeletePrefixForwardsToL1(t *testing.T) {
 
 	exists, err = l2.Exists(context.Background(), "packages/evictme/evictme-1.0.0.tar.gz")
 	require.NoError(t, err)
-	assert.True(t, exists, "L2 is best-effort and deliberately left alone")
+	assert.False(t, exists, "L2 still holds the package, so the next read back-fills it into L1")
 }
 
 // TestTieredStorage_SnapshotForwardsToL1 pins the hybrid-mode gap where the
