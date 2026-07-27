@@ -165,6 +165,28 @@ func TestIndexCache_SweepDropsExpiredWithoutARead(t *testing.T) {
 	t.Fatal("background sweep did not remove the expired entry")
 }
 
+// BenchmarkIndexCache_SetOverBudget is the check on the bounded eviction sample:
+// the per-write cost must not grow with how many packages are cached. A full scan
+// per victim made this quadratic in the number of entries.
+func BenchmarkIndexCache_SetOverBudget(b *testing.B) {
+	one := testEntry(`{"a":1}`)
+
+	for _, resident := range []int{100, 10000} {
+		b.Run(fmt.Sprintf("resident=%d", resident), func(b *testing.B) {
+			c := NewIndexCache(int64(resident)*one.Size(), 0)
+			defer c.Close()
+
+			for i := range resident {
+				c.Set(fmt.Sprintf("k-%d", i), testEntry(`{"a":1}`), time.Hour)
+			}
+
+			for i := 0; b.Loop(); i++ {
+				c.Set(fmt.Sprintf("new-%d", i), testEntry(`{"a":1}`), time.Hour)
+			}
+		})
+	}
+}
+
 func TestIndexCache_ConcurrentAccess(t *testing.T) {
 	c := NewIndexCache(1024*1024, 0)
 	defer c.Close()
