@@ -13,6 +13,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/huyhandes/groxpi/internal/cache"
 	"github.com/huyhandes/groxpi/internal/config"
@@ -20,6 +24,7 @@ import (
 	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/streaming"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 type Server struct {
@@ -49,6 +54,7 @@ func New(cfg *config.Config) *Server {
 
 	// Add middleware
 	router.Use(gin.Recovery())
+	router.Use(traceRequests())
 	router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		return fmt.Sprintf("[%s] %d - %v %s %s\n",
 			param.TimeStamp.Format(time.RFC3339),
@@ -104,6 +110,32 @@ func New(cfg *config.Config) *Server {
 
 func (s *Server) Router() *gin.Engine {
 	return s.router
+}
+
+// traceRequests opens the root span of every request and puts it on the request
+// context, so every span the handlers open hangs off it. An upstream trace is
+// continued when the client sent W3C headers. It is instrumentation only: it
+// reads the response status and changes nothing about it.
+func traceRequests() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := otel.GetTextMapPropagator().Extract(c.Request.Context(),
+			propagation.HeaderCarrier(c.Request.Header))
+
+		// The route pattern, not the path: a span name per package name would be a
+		// cardinality explosion in any backend.
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+		ctx, span := telemetry.Tracer().Start(ctx, c.Request.Method+" "+route,
+			trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+
+		span.SetAttributes(attribute.Int("http.response.status_code", c.Writer.Status()))
+	}
 }
 
 // Close stops the index-cache sweeper and releases the storage backend. Called
@@ -341,6 +373,7 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 			c.Abort()
 			return
 		}
+		telemetry.Redirect(c.Request.Context(), telemetry.RedirectFetchFailed)
 		c.Redirect(http.StatusFound, plan.URL)
 	case !led:
 		// The leader's download populated the cache; the service decides whether

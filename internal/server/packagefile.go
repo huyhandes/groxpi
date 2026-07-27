@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/cache"
@@ -19,6 +21,7 @@ import (
 	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/streaming"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // ServeAction is the outcome of the package-file miss pipeline: what the
@@ -170,7 +173,9 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 		Size:        -1,
 	}
 
-	exists, err := s.storage.Exists(ctx, plan.StorageKey)
+	existsCtx, existsSpan := telemetry.Tracer().Start(ctx, "storage.exists")
+	exists, err := s.storage.Exists(existsCtx, plan.StorageKey)
+	existsSpan.End()
 	if err != nil {
 		// A backend hiccup must not fail the request: fall through to upstream.
 		slog.Error("Failed to check storage", "error", err, "key", plan.StorageKey)
@@ -202,6 +207,7 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 		slog.Debug("Download timeout is 0, redirecting directly to PyPI",
 			"package", packageName,
 			"file", fileName)
+		telemetry.Redirect(ctx, telemetry.RedirectCachingDisabled)
 		plan.Action = ActionRedirect
 		return plan, nil
 	}
@@ -230,16 +236,28 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 
 	value, err, _ := s.sf.Do(plan.StorageKey, func() (any, error) {
 		led = true
-		slog.Info("🚀 Starting streaming download with simultaneous cache",
+		dlCtx, span := telemetry.Tracer().Start(fetchCtx, "upstream.fetch")
+		defer span.End()
+
+		slog.InfoContext(dlCtx, "🚀 Starting streaming download with simultaneous cache",
 			"package", plan.PackageName,
 			"file", plan.FileName,
 			"file_url", config.RedactURL(plan.URL),
 			"file_size", plan.Size,
 			"timeout", plan.Timeout)
-		return s.downloader.DownloadAndStream(fetchCtx, plan.URL, plan.StorageKey, dst, streaming.Expectation{
+
+		started := time.Now()
+		result, err := s.downloader.DownloadAndStream(dlCtx, plan.URL, plan.StorageKey, dst, streaming.Expectation{
 			SHA256: plan.SHA256,
 			Size:   plan.Size,
 		})
+		outcome := telemetry.OutcomeOK
+		if err != nil {
+			outcome = telemetry.OutcomeError
+			span.RecordError(err)
+		}
+		telemetry.UpstreamFetch(dlCtx, time.Since(started), outcome)
+		return result, err
 	})
 
 	if !led {
@@ -278,6 +296,7 @@ func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan)
 	slog.Debug("⏭️ Redirecting to PyPI after download coordination",
 		"package", plan.PackageName,
 		"file", plan.FileName)
+	telemetry.Redirect(ctx, telemetry.RedirectNotCached)
 	plan.Action = ActionRedirect
 	return plan
 }
@@ -287,9 +306,14 @@ func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan)
 // deduplicating concurrent upstream fetches. It is the only path to the upstream
 // package index.
 func (s *PackageFileService) resolveIndex(ctx context.Context, packageName string) (*cache.Entry, error) {
+	ctx, span := telemetry.Tracer().Start(ctx, "index.resolve")
+	defer span.End()
+
 	if entry, found := s.indexCache.GetPackage(packageName); found {
+		telemetry.CacheHit(ctx, telemetry.LayerIndex)
 		return entry, nil
 	}
+	telemetry.CacheMiss(ctx, telemetry.LayerIndex)
 
 	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
 		// The fetch fills the cache for every waiter, so it must not die with
@@ -320,6 +344,22 @@ func (s *PackageFileService) resolveIndex(ctx context.Context, packageName strin
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
 	return entry, nil
+}
+
+// resolutionResult classifies one index's answer for the resolution metric. A
+// cancellation is not an error: it means a higher-priority index answered first
+// and this query was abandoned on purpose.
+func resolutionResult(err error) string {
+	switch {
+	case err == nil:
+		return telemetry.ResultHit
+	case errors.Is(err, pypi.ErrNotFound):
+		return telemetry.ResultMiss
+	case errors.Is(err, context.Canceled):
+		return telemetry.ResultCancelled
+	default:
+		return telemetry.ResultError
+	}
 }
 
 // indexAnswer is one index's reply to one package query.
@@ -372,7 +412,21 @@ func (s *PackageFileService) queryConcurrently(ctx context.Context, indexes []co
 		done[i], cancels[i] = make(chan struct{}), cancel
 		go func(i int, index config.Index) {
 			defer close(done[i])
+
+			// One span and one counted outcome per index consulted, so a slow or
+			// unreachable private index is visible without reading the code. The
+			// identity is the redacted URL: a raw index URL must never reach a span
+			// attribute or a metric label.
+			redacted := index.Redacted()
+			queryCtx, span := telemetry.Tracer().Start(queryCtx, "index.query",
+				trace.WithAttributes(attribute.String(telemetry.AttrIndex, redacted)))
+			defer span.End()
+
 			files, err := s.index.GetPackageFiles(queryCtx, index, packageName)
+			result := resolutionResult(err)
+			span.SetAttributes(attribute.String(telemetry.AttrIndexResult, result))
+			telemetry.IndexResolution(queryCtx, redacted, result)
+
 			// Written before the channel closes and read after: no other
 			// synchronisation is needed.
 			answers[i] = indexAnswer{files: files, err: err}

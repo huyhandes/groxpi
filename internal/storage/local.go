@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // LocalStorage stores objects as plain files under a base directory.
@@ -132,18 +134,23 @@ func (l *LocalStorage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Exists checks if an object exists in local filesystem
+// Exists checks if an object exists in local filesystem. This is the one place
+// every local-tier presence check passes through, so it is where the local layer
+// of the cache hit rate is counted — including when this store is the L1 of the
+// tiered backend.
 func (l *LocalStorage) Exists(ctx context.Context, key string) (bool, error) {
 	path := l.buildPath(key)
 
 	_, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			telemetry.CacheMiss(ctx, telemetry.LayerLocal)
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to stat file: %w", err)
 	}
 
+	telemetry.CacheHit(ctx, telemetry.LayerLocal)
 	return true, nil
 }
 

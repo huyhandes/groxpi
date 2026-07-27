@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/storage"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // ErrVerification marks a download whose bytes did not match what the index
@@ -111,7 +112,14 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	storageErrCh := make(chan error, 1)
 	go func() {
 		defer func() { _ = storageReader.Close() }()
-		_, err := tsd.storage.Put(ctx, storageKey, storageReader, resp.ContentLength, contentType)
+
+		putCtx, span := telemetry.Tracer().Start(ctx, "storage.put")
+		defer span.End()
+
+		_, err := tsd.storage.Put(putCtx, storageKey, storageReader, resp.ContentLength, contentType)
+		if err != nil {
+			span.RecordError(err)
+		}
 		storageErrCh <- err
 	}()
 
@@ -128,6 +136,9 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 		failure = verify(storageKey, expect, digest, totalSize, resp.ContentLength)
 	}
 	if failure != nil {
+		if errors.Is(failure, ErrVerification) {
+			telemetry.VerificationFailure(ctx)
+		}
 		_ = storageWriter.CloseWithError(failure)
 	} else {
 		_ = storageWriter.Close()

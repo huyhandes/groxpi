@@ -5,11 +5,13 @@ package cache
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/pypi"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // Entry is one cached index resource. The parsed list and the serialised bodies
@@ -113,10 +115,16 @@ func (c *IndexCache) Expire() {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	expired := int64(0)
 	for key, entry := range c.entries {
 		if now.After(entry.expiresAt) {
 			c.removeLocked(key)
+			expired++
 		}
+	}
+	if expired > 0 {
+		telemetry.CacheEviction(context.Background(), telemetry.LayerIndex, expired)
 	}
 }
 
@@ -146,14 +154,17 @@ func (c *IndexCache) Set(key string, entry *Entry, ttl time.Duration) {
 	c.entries[key] = entry
 	c.bytes += entry.size
 	c.evictLocked()
+	telemetry.CacheOccupancy(context.Background(), telemetry.LayerIndex, c.bytes)
 }
 
 // removeLocked deletes a key and refunds its bytes. Accounting is incremental:
-// nothing re-sums the map.
+// nothing re-sums the map. Occupancy is reported here, the one place the total
+// changes downwards, and there is no request context to attribute it to.
 func (c *IndexCache) removeLocked(key string) {
 	if entry, exists := c.entries[key]; exists {
 		c.bytes -= entry.size
 		delete(c.entries, key)
+		telemetry.CacheOccupancy(context.Background(), telemetry.LayerIndex, c.bytes)
 	}
 }
 
@@ -170,6 +181,7 @@ func (c *IndexCache) evictLocked() {
 			}
 		}
 		c.removeLocked(victim)
+		telemetry.CacheEviction(context.Background(), telemetry.LayerIndex, 1)
 	}
 }
 

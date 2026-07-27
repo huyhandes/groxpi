@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // LRUEntry represents an entry in the LRU cache.
@@ -272,6 +274,11 @@ func (lru *LRUCache) evictEntry(ctx context.Context, elem *list.Element, entry *
 	delete(lru.entries, entry.Key)
 	lru.lruList.Remove(elem)
 
+	// Every removal from the on-disk cache goes through here, which makes it the
+	// one place eviction pressure and occupancy can be counted from.
+	telemetry.CacheEviction(ctx, telemetry.LayerLocal, 1)
+	telemetry.CacheOccupancy(ctx, telemetry.LayerLocal, lru.currentSize)
+
 	slog.Debug("Evicted entry from L1 cache", "key", entry.Key, "size", entry.Size, "expired", expired)
 
 	return nil
@@ -362,6 +369,7 @@ func (lru *LRUCache) addEntryLocked(key string, size int64) *LRUEntry {
 
 	lru.entries[key] = lru.lruList.PushFront(entry)
 	lru.currentSize += size
+	telemetry.CacheOccupancy(context.Background(), telemetry.LayerLocal, lru.currentSize)
 
 	slog.Debug("Added new entry to L1 cache",
 		"key", key,
