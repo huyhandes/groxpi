@@ -1,225 +1,158 @@
-# API Endpoints
+# API
 
-Groxpi provides a fully compliant PyPI Simple API (PEP 503/691) with additional cache management endpoints.
+Every route groxpi registers, and nothing else.
 
-## Package Index Endpoints
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/` | — | Landing page: configured index, cache size, index TTL, links. |
+| `GET` | `/simple/` | — | Root project list, proxied from upstream (PEP 503/691). |
+| `GET` | `/simple/<package>/` | — | File list for one package. |
+| `GET` | `/simple/<package>/<file>` | — | Download one distribution file. |
+| `GET` | `/index/` | — | Alias of `/simple/`. |
+| `GET` | `/index/<package>` | — | Alias of `/simple/<package>/` (note: no trailing slash). |
+| `GET` | `/index/<package>/<file>` | — | Alias of `/simple/<package>/<file>`. |
+| `GET` | `/health` | — | Liveness and configuration echo. |
+| `GET` | `/admin` | basic | Cache administration page. |
+| `GET` | `/admin/rows` | basic | HTML fragment the page polls. |
+| `GET` | `/admin/htmx.min.js` | basic | Embedded interaction library. |
+| `POST` | `/admin/prefetch` | basic | Warm the cache for one package. |
+| `DELETE` | `/cache/list` | basic | No-op, kept for Python-proxpi compatibility. |
+| `DELETE` | `/cache/<package>` | basic | Evict one package's index entry and cached files. |
 
-### List All Packages
-- **Endpoints**: 
-  - `GET /simple/` (PEP 503 standard)
-  - `GET /index/` (compatibility)
-- **Description**: Returns a list of all available packages
-- **Content Negotiation**: 
-  - HTML: Browser-friendly package listing
-  - JSON: API response for pip/poetry/pipenv clients
-- **Headers**: 
-  - `Accept: application/json` → JSON response
-  - `Accept: text/html` → HTML response
-- **Compression**: Automatic gzip/deflate based on client support
+Point pip at `/simple/` (or `/index/`, which exists only for compatibility with the Python
+implementation).
 
-**Example JSON Response:**
+## Package names
+
+Names are normalised per PEP 503 — lowercased, runs of `-`, `_` and `.` collapsed to a single `-` —
+before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
+
+## Content negotiation
+
+`GET /simple/<package>/` answers JSON when the request asks for it, HTML otherwise.
+
+- `?format=` wins outright over `Accept`. Any value containing `json` selects JSON.
+- Otherwise the `Accept` header selects JSON only when it contains **both** `application/vnd.pypi.simple`
+  and `json`.
+- JSON responses carry `Content-Type: application/vnd.pypi.simple.v1+json` and `Vary: Accept-Encoding`.
+- A client sending `Accept-Encoding: gzip` gets the gzipped body stored alongside the entry in the index
+  cache, with `Content-Encoding: gzip`. Nothing is compressed on the request path; there is no
+  compression middleware.
+- HTML is rendered on demand from the parsed file list, with `data-requires-python` and `data-yanked`
+  attributes preserved and every href rewritten to point back at groxpi.
+
+## The root index
+
+`GET /simple/` is a byte-level pass-through. The client's `Accept` and `Accept-Encoding` are forwarded
+upstream and the body is returned undecoded, with the upstream status, `Content-Type` and
+`Content-Encoding`. `?format=` overrides `Accept` here too, and the response carries
+`Vary: Accept, Accept-Encoding`.
+
+Nothing is cached: the full project list is tens of megabytes, and every representation a client can
+ask for is one the upstream already produces. Concurrent requests for the same representation are
+coalesced into a single upstream fetch. An upstream failure answers `502`.
+
+Because it is a pass-through, the HTML form lists the real upstream projects, not just the ones groxpi
+has cached.
+
+## Downloading a file
+
+`GET /simple/<package>/<file>` resolves to one of four outcomes:
+
+1. **Cached** — served from the object store. When the backend can name a local file, the path is handed
+   to `net/http`, which brings range requests and conditional requests with it.
+2. **Stream and cache** — the file is fetched from upstream and streamed to the client while the same
+   bytes are written into the cache. Concurrent requests for the same file are deduplicated: one request
+   streams, and the others are served the freshly cached object once it lands.
+3. **Redirect (`302`)** — the client is sent to the upstream URL. This happens when caching is disabled
+   (`GROXPI_DOWNLOAD_TIMEOUT=0`), when the upstream fetch failed or exceeded its time-to-first-byte
+   budget, or when a coordinated download left nothing cached.
+4. **`404`** — the package's index could not be resolved, or the index does not list that filename.
+
+Every cached file is verified before it is committed: against the SHA-256 the index declared, or failing
+that against the declared content length. A file that matches neither is cached **unverified** and a
+warning is logged. A file that contradicts either is not cached at all and the partial write is
+discarded.
+
+Response headers on a download are `Content-Type` (derived from the filename extension), `Content-Length`
+and `ETag` (the SHA-256, quoted) when the index supplied them. Files served from storage additionally
+carry `Content-Disposition: attachment` and `Cache-Control: public, max-age=3600`.
+
+Package files are never compressed by groxpi — they are already-compressed archives.
+
+## `GET /health`
+
 ```json
 {
-  "packages": [
-    {
-      "name": "numpy",
-      "normalized_name": "numpy"
-    },
-    {
-      "name": "requests", 
-      "normalized_name": "requests"
-    }
-  ]
+  "status": "success",
+  "timestamp": 1753574400,
+  "data": {
+    "cache_dir": "/tmp",
+    "index_url": "https://pypi.org/simple/",
+    "extra_index_urls": [],
+    "cache_size": 5368709120,
+    "index_ttl_seconds": 1800,
+    "storage_type": "local"
+  }
 }
 ```
 
-### List Package Files
-- **Endpoints**:
-  - `GET /simple/{package}/` (PEP 503 standard)
-  - `GET /index/{package}` (compatibility)
-- **Description**: Returns available files for a specific package
-- **Parameters**: 
-  - `package`: Package name (case-insensitive, normalized)
-- **Content Negotiation**: HTML/JSON based on Accept header
+`timestamp` is Unix seconds. Index URLs are redacted, because this endpoint is unauthenticated and must
+not leak an index's credentials.
 
-**Example JSON Response:**
-```json
-{
-  "files": [
-    {
-      "filename": "numpy-1.24.3-cp39-cp39-win32.whl",
-      "url": "https://files.pythonhosted.org/packages/.../numpy-1.24.3-cp39-cp39-win32.whl",
-      "hashes": {
-        "sha256": "abc123..."
-      },
-      "requires-python": ">=3.8",
-      "size": 12345678
-    }
-  ]
-}
-```
+## Administration
 
-### Download/Redirect to File
-- **Endpoints**:
-  - `GET /simple/{package}/{file}` (PEP 503 standard)
-  - `GET /index/{package}/{file}` (compatibility)
-- **Description**: Downloads file or redirects to upstream URL
-- **Parameters**:
-  - `package`: Package name
-  - `file`: Filename
-- **Behavior**:
-  - If cached: served from the storage backend — by filesystem path when the backend can name one (so `net/http` handles range and conditional requests), otherwise opened and streamed
-  - If not cached: Downloads, caches, then serves (or redirects based on timeout)
-  - Uses SingleFlight pattern to deduplicate concurrent downloads; the requests that waited are served the freshly cached object, or redirected upstream if the cache write did not land
-  - `ETag` is emitted with exactly one layer of quotes whether it came from the index hash or from the storage backend
-- **Methods**: `GET` only — `HEAD` currently returns `405` (see [Method Handling](#method-handling))
+The admin routes exist only when both `GROXPI_ADMIN_USERNAME` and `GROXPI_ADMIN_PASSWORD` are set; see
+[configuration.md](configuration.md). Without them, nothing below is registered and every path answers
+`404`.
 
-## Administrative Endpoints
+Basic authentication transmits the credentials in cleartext. Terminate TLS in front of groxpi — see
+[deployment.md](deployment.md).
 
-### Home Page
-- **Endpoint**: `GET /`
-- **Description**: Server status and statistics
-- **Response**: HTML page with:
-  - Server information
-  - Cache statistics
-  - Performance metrics
-  - System health indicators
+### `GET /admin`
 
-### Health Check
-- **Endpoint**: `GET /health`
-- **Description**: Detailed health status for monitoring
-- **Response**: JSON with system information
+An HTML page listing what the local cache holds: packages, their files, sizes, hit counts and ages, plus
+the 20 most recent prefetch failures. The table polls `GET /admin/rows` for updates. Only backends that
+hold real local files can be listed, so in pure `s3` mode the table is empty.
 
-**Example Response:**
-```json
-{
-  "status": "healthy",
-  "timestamp": "2024-01-01T12:00:00Z",
-  "version": "1.0.0",
-  "uptime": "2h30m45s",
-  "cache": {
-    "index_entries": 1250,
-    "file_cache_size": "2.1GB",
-    "hit_ratio": 0.89
-  },
-  "storage": {
-    "type": "local",
-    "available_space": "45.2GB"
-  },
-  "indices": [
-    {
-      "url": "https://pypi.org/simple/",
-      "status": "healthy",
-      "last_check": "2024-01-01T11:58:30Z"
-    }
-  ]
-}
-```
+### `POST /admin/prefetch`
 
-## Cache Management Endpoints
+Form-encoded, field `package`. Answers `202 Accepted` immediately and downloads on a context detached
+from the request, so a large package cannot be cut off by a reverse-proxy timeout. There is no job ID:
+progress is the files appearing in the table.
 
-### Invalidate Package List Cache
-- **Endpoint**: `DELETE /cache/list`
-- **Description**: Clears the cached package list
-- **Response**: `200 OK` with confirmation message
-- **Use Case**: Force refresh of package list from upstream indices
+Prefetch downloads the **newest final release only** — yanked files and pre-releases are excluded,
+versions are compared under PEP 440 ordering, and all files of the winning release (wheels plus sdist)
+are fetched. A filename whose version will not parse is skipped. An empty `package` field answers `400`.
 
-### Invalidate Package Cache
-- **Endpoint**: `DELETE /cache/{package}`
-- **Description**: Clears cached data for a specific package
-- **Parameters**:
-  - `package`: Package name to invalidate
-- **Response**: `200 OK` with confirmation message
-- **Use Case**: Force refresh of package files/metadata
+### `DELETE /cache/list`
 
-## Method Handling
+Answers `{"status":"success","data":null}` and does nothing. The root index is proxied rather than
+cached, so there is no cached list to invalidate. The route exists so Python-proxpi clients keep working.
 
-The router runs with gin's `HandleMethodNotAllowed` enabled, so this is **router-wide**, not a per-endpoint handler: any *known* path reached with a method that is not registered on it gets `405 Method Not Allowed` plus an `Allow` header listing the methods that are. Only an *unknown* path falls through to the 404 handler.
+### `DELETE /cache/<package>`
 
-| Request | Response |
-|---------|----------|
-| `POST /simple/`, `PUT /simple/{package}/` | `405` + `Allow: GET` |
-| `GET`/`POST`/`PUT`/`PATCH` on `/cache/list` or `/cache/{package}` | `405` + `Allow: DELETE` |
-| `HEAD /simple/{package}/{file}` | `405` + `Allow: GET` |
-| `GET /nonexistent` | `404 Not Found` |
+Drops the package's index cache entry **and deletes its cached files**. Answers
+`{"status":"success","data":null}`, `400` for an empty package name, or `500` if the deletion failed.
 
-> ⚠️ **`HEAD` returning 405 is a gap, not a design choice.** Only `GET` is registered on the index and download routes, so `HEAD` — which clients legitimately use to check size, `ETag` or freshness without pulling the body — is rejected. Registering `HEAD` alongside each `GET` is an open follow-up (see [`tasks/architecture-improvement-plan.md`](../tasks/architecture-improvement-plan.md)).
+In `hybrid` mode only the local L1 copies are deleted; the objects stay in S3 by design. In pure `s3`
+mode no files are deleted — see the note in [architecture.md](architecture.md).
 
-## Error Responses
+> **Breaking change.** Both `DELETE /cache/*` routes required no authentication in the Python
+> implementation and in earlier groxpi releases. They now sit behind basic auth and answer `404` when no
+> admin credentials are configured. Update any script or CI job that calls them.
 
-### 404 Not Found
-- **Condition**: an unknown route, or a package/file the upstream index does not list
-- **Response**: `404 Not Found` with plain text message
-- **Note**: a known route reached with the wrong method is `405`, not `404`
+## Errors
 
-### 500 Internal Server Error
-- **Condition**: Server errors, upstream failures
-- **Response**: `500 Internal Server Error` with error details
-- **Logging**: Full error context logged for debugging
+| Status | When |
+|---|---|
+| `302` | Redirect to upstream for a file groxpi will not serve itself. |
+| `400` | Missing required parameter on an admin route. |
+| `401` | Missing or wrong basic-auth credentials on an admin route. |
+| `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
+| `405` | Known path reached with the wrong method — the response carries `Allow`. |
+| `500` | Index resolution failed for a reason other than absence, or a storage operation failed. |
+| `502` | The upstream root index could not be fetched. |
 
-### 502 Bad Gateway
-- **Condition**: Upstream index unavailable
-- **Response**: `502 Bad Gateway` when all configured indices fail
-
-## Content Negotiation Details
-
-### Accept Headers
-- `application/json`: Returns JSON response (PEP 691 compliant)
-- `text/html`: Returns HTML response with templates
-- `*/*` or missing: Defaults to JSON for API clients
-
-### Compression Support
-- **Supported**: gzip, deflate
-- **Automatic**: Based on `Accept-Encoding` header
-- **Performance**: Significant bandwidth savings for JSON responses
-
-## Caching Behavior
-
-### Index Caching
-- **TTL**: Configurable per index (default: 30 minutes)
-- **Strategy**: In-memory cache with automatic expiration
-- **Invalidation**: Manual via `/cache/list` endpoint
-- **Empty results are not cached**: a transient upstream fault returns an empty index for that request only, rather than being cached for the whole TTL
-
-### File Caching
-- **Strategy**: LRU eviction with size limits, plus an independent TTL sweep when one is configured
-- **Storage**: Configurable (local filesystem, S3, or hybrid local L1 + S3 L2)
-- **Streaming**: files are streamed, never buffered whole. Locally cached files are handed to `net/http` by path — this is *not* a kernel zero copy, see [performance.md](performance.md)
-
-### Response Caching
-- **Duration**: Short-term response caching (5 minutes default)
-- **Key**: URL + Accept header combination
-- **Benefit**: Reduces redundant processing for repeated requests
-
-## Rate Limiting & Performance
-
-### Concurrent Handling
-- **Downloads**: SingleFlight pattern prevents duplicate downloads
-- **Connections**: Handles 1000+ concurrent connections
-- **Streaming**: Efficient file serving with minimal memory usage
-
-### Timeouts
-- **Download**: Configurable timeout before redirect (default: 0.9s)
-- **Connect**: Socket connection timeout (default: 30s)
-- **Read**: Data read timeout (default: 30s)
-
-## Compatibility
-
-### PEP 503 Compliance
-- ✅ Simple repository API
-- ✅ Package name normalization
-- ✅ File hash verification support
-- ✅ Metadata support
-
-### PEP 691 Compliance
-- ✅ JSON API variant
-- ✅ Content negotiation
-- ✅ Structured metadata format
-
-### Client Compatibility
-- ✅ pip (all versions)
-- ✅ poetry
-- ✅ pipenv
-- ✅ conda/mamba (via pip fallback)
-- ✅ PDM
-- ✅ uv
+A known path with the wrong method answers `405`, not `404`: `DELETE /simple/` tells you the method is
+wrong rather than that the path does not exist.

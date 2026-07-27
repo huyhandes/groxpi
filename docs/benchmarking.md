@@ -1,162 +1,82 @@
-# groxpi Benchmarking Suite
+# Benchmarking
 
-A comprehensive benchmarking framework for comparing groxpi (Go implementation) vs proxpi (Python implementation) across multiple performance dimensions.
+How to measure groxpi. **This guide publishes no figures.** Every number this repository once quoted
+predates the current architecture and has been deleted rather than guessed at; there is nothing to
+compare against until the suite is re-run.
 
-## Overview
+## What the suite measures
 
-The groxpi benchmarking suite provides automated performance testing to validate the significant performance improvements of the Go-based PyPI proxy implementation over the original Python version. The suite measures:
+`benchmarks/` compares groxpi against the Python proxpi implementation on two things:
 
-- **API Performance**: HTTP request throughput and latency using WRK load testing
-- **Package Installation**: Python package installation times using UV package manager
-- **Resource Usage**: CPU, memory, and I/O consumption during operations
-- **Cache Efficiency**: Performance differences between cold and warm cache scenarios
+- **Index API throughput and latency** (`scripts/wrk_api_test.sh`) — `wrk` against the index endpoints,
+  cold and warm.
+- **End-to-end install time** (`scripts/uv_install_test.sh`) — `uv pip install` of real packages through
+  each proxy, in a container.
 
-## Key Features
+Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
+`scripts/analyze_results_duckdb.sh` turns the raw output into comparison tables.
 
-### Comprehensive Testing Scenarios
-- **Cold Cache**: Performance when starting with empty caches
-- **Warm Cache**: Performance with pre-populated caches
-- **Load Testing**: High-concurrency API performance measurement
-- **Real-world Packages**: Testing with popular PyPI packages (numpy, pandas, polars, pyspark, fastapi)
+## Prerequisites
 
-### Automated Orchestration
-- **Master Orchestrator**: Single command execution for complete benchmark suites
-- **Consistent Timestamps**: All output files use synchronized timestamps for correlation
-- **Resource Monitoring**: Continuous Docker container stats logging
-- **Cache Management**: Automated cache clearing between test scenarios
+- `wrk` — `brew install wrk`, or `apt-get install wrk`
+- Docker, for the install tests and for running both proxies
+- `duckdb` — `brew install duckdb`, only for the analysis step
+- Two running servers to point at: groxpi and proxpi
 
-### Advanced Analysis
-- **DuckDB Integration**: SQL-based analysis of CSV results
-- **Statistical Metrics**: Percentile latencies, throughput measurements
-- **Comparative Reports**: Side-by-side performance comparisons
-- **Export Capabilities**: CSV outputs compatible with Excel, Google Sheets, and data analysis tools
+## Running it
 
-## Architecture
+Bring the two proxies up (`benchmarks/docker/docker-compose.benchmark.yml` does this), then:
 
-```
-benchmarks/
-├── benchmark.sh              # Master orchestrator
-├── docker/                   # Container configurations
-│   ├── docker-compose.benchmark.yml  # groxpi + proxpi services
-│   └── uv/                   # UV testing container
-├── scripts/                  # Individual test components
-│   ├── cache_manager.sh      # Cache clearing operations
-│   ├── monitor_resources.sh  # Resource usage monitoring
-│   ├── wrk_api_test.sh      # API performance testing
-│   ├── uv_install_test.sh   # Package installation testing
-│   └── analyze_results_duckdb.sh  # Results analysis
-└── results/                  # Output directory for all test data
-```
-
-## Quick Start
-
-### Prerequisites
 ```bash
-# Required tools
-docker
-docker-compose
-curl
-duckdb  # For analysis (brew install duckdb)
-
-# Optional for API testing
-wrk  # HTTP benchmarking tool
+./benchmarks/benchmark.sh \
+  --groxpi-url http://localhost:5005 \
+  --proxpi-url http://localhost:5006
 ```
 
-### Basic Usage
+Both URLs are required. Options:
 
-1. **Start Services** (if not running externally):
+| Flag | Meaning |
+|---|---|
+| `--api-only` | Run only the `wrk` API benchmarks. |
+| `--uv-only` | Run only the install benchmarks. |
+| `--no-monitoring` | Skip resource sampling. |
+| `--timestamp TS` | Reuse a specific run timestamp instead of generating one. |
+| `--docker-network N` | Docker network the containers share. |
+| `--results-dir DIR` | Where results are written (default `benchmarks/results`). |
+| `-h`, `--help` | Usage. |
+
+`GROXPI_URL`, `PROXPI_URL` and `DOCKER_NETWORK` are read from the environment as defaults for the
+corresponding flags.
+
+Individual stages can be run directly. `scripts/wrk_api_test.sh` and `scripts/uv_install_test.sh` take
+positional arguments — `<groxpi_url> <proxpi_url> <timestamp> [scenario]` — and print their usage when
+called with none. `scripts/analyze_results_duckdb.sh` has a `--help`.
+
+## Cache state
+
+A comparison is meaningless unless both proxies start from the same cache state.
+`scripts/cache_manager.sh` clears them between runs by issuing `DELETE /cache/list` and
+`DELETE /cache/<package>`.
+
+> Those routes now require admin credentials on groxpi and answer `404` when none are configured — see
+> [api-endpoints.md](api-endpoints.md). The script sends no credentials, so against a groxpi with the
+> admin surface enabled it will not clear anything. Either run the benchmark against a groxpi with no
+> admin credentials configured, or clear the cache directory directly between runs.
+
+## Go microbenchmarks
+
+The storage and download paths carry Go benchmarks:
+
 ```bash
-cd benchmarks
-docker-compose -f docker/docker-compose.benchmark.yml up -d
+go test -bench=. -benchmem ./internal/storage/
+go test -bench=. -benchmem ./internal/server/
 ```
 
-2. **Run Complete Benchmark Suite**:
-```bash
-./benchmark.sh --groxpi-url http://localhost:5005 --proxpi-url http://localhost:5006
-```
+These are for spotting a regression between two commits on one machine. They are not comparable across
+machines and are not what the suite above measures.
 
-3. **Analyze Results**:
-```bash
-./scripts/analyze_results_duckdb.sh <timestamp>
-```
+## Reporting a result
 
-### Environment Variables
-For convenience, export server URLs:
-```bash
-export GROXPI_URL=http://server1:5005
-export PROXPI_URL=http://server2:5006
-./benchmark.sh  # Uses environment variables
-```
-
-## Test Scenarios
-
-### API Performance Testing (WRK)
-- **Load Tests**: High-concurrency HTTP requests
-- **Cache Scenarios**: Cold vs warm cache performance
-- **Latency Metrics**: P50, P99 response times
-- **Throughput Metrics**: Requests per second
-
-### Package Installation Testing (UV)
-- **Individual Packages**: Single package installation timing
-- **Batch Installation**: Multiple packages simultaneously
-- **Cache Impact**: Installation time differences with cache
-- **Size Analysis**: Installed package sizes and dependency counts
-
-### Resource Monitoring
-- **CPU Usage**: Container CPU percentage over time
-- **Memory Usage**: RAM consumption patterns
-- **Network I/O**: Data transfer rates
-- **Disk I/O**: Read/write operations
-
-## Output Format
-
-All benchmark results are saved as timestamped CSV files for easy analysis:
-
-```
-results/
-├── wrk-summary-20240101_120000.csv      # API performance metrics
-├── uv-summary-20240101_120000.csv       # Installation performance
-├── resources-20240101_120000.csv        # Resource usage logs
-└── benchmark-report-20240101_120000.md  # Consolidated report
-```
-
-## Performance Results (December 2024)
-
-Latest benchmark results demonstrate groxpi's exceptional performance:
-
-**API Performance (WRK Load Testing - 60s, 8 threads, 100 connections):**
-- **12.8x higher throughput**: 52,880 vs 4,139 requests/sec for package index
-- **27x faster latency**: 0.85ms vs 23.04ms P50 response times
-- **High load stability**: Groxpi maintains stable responses while proxpi fails (returns non-2xx)
-- **Sub-millisecond P50 latency** for cached package index requests
-
-**Resource Efficiency:**
-- **Production validated** with popular packages (numpy, pandas, polars, pyspark, fastapi)
-- **Docker containerized** testing for fair comparison
-- **Serve-by-path** for locally cached files (not a kernel zero copy — see [performance.md](performance.md))
-- **60-second sustained** load testing with stable performance
-
-## Use Cases
-
-### Development
-- Performance regression testing
-- Optimization validation
-- Feature impact measurement
-
-### Production Planning
-- Capacity planning and sizing
-- Performance baseline establishment
-- Migration impact assessment
-
-### Research & Analysis
-- PyPI proxy performance characteristics
-- Cache effectiveness studies
-- Resource utilization patterns
-
-## Integration
-
-The benchmark suite integrates with:
-- **CI/CD Pipelines**: Automated performance validation
-- **Monitoring Systems**: Long-term performance tracking
-- **Analysis Tools**: DuckDB, pandas, Excel, Google Sheets
-- **Reporting**: Markdown reports with performance summaries
+A figure is only worth publishing with the commit it was measured at, the machine, the cache state, and
+the command line that produced it. Anything less becomes the kind of claim this guide exists to avoid
+repeating.
