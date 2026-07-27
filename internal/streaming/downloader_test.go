@@ -83,7 +83,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
 
-		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
+		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer, Expectation{})
 		if err != nil {
 			t.Fatalf("DownloadAndStream failed: %v", err)
 		}
@@ -129,7 +129,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 
 		// This test expects the downloader to handle storage errors gracefully
 		// The client stream should still work even if storage fails
-		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
+		result, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer, Expectation{})
 
 		// The streaming may fail due to pipe closure, which is expected behavior
 		// when storage fails immediately
@@ -166,7 +166,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
 
-		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
+		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer, Expectation{})
 		if err == nil {
 			t.Error("Expected error for HTTP 404")
 		}
@@ -186,7 +186,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
 
-		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer)
+		_, err := downloader.DownloadAndStream(ctx, server.URL, "test-key", &clientBuffer, Expectation{})
 		if err == nil {
 			t.Error("Expected context cancellation error")
 		}
@@ -204,7 +204,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
 
-		result, err := downloader.DownloadAndStream(ctx, server.URL, "large-file", &clientBuffer)
+		result, err := downloader.DownloadAndStream(ctx, server.URL, "large-file", &clientBuffer, Expectation{})
 		if err != nil {
 			t.Fatalf("DownloadAndStream failed for large file: %v", err)
 		}
@@ -241,7 +241,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 				var buffer bytes.Buffer
 				key := fmt.Sprintf("concurrent-key-%d", id)
 
-				_, err := downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
+				_, err := downloader.DownloadAndStream(ctx, server.URL, key, &buffer, Expectation{})
 				if err != nil {
 					errors <- err
 					return
@@ -285,7 +285,7 @@ func TestTeeStreamingDownloader_DownloadAndStream(t *testing.T) {
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
 
-		result, err := downloader.DownloadAndStream(ctx, server.URL, "tee-key", &clientBuffer)
+		result, err := downloader.DownloadAndStream(ctx, server.URL, "tee-key", &clientBuffer, Expectation{})
 		if err != nil {
 			t.Fatalf("TeeStreamingDownloader failed: %v", err)
 		}
@@ -324,6 +324,6 @@ func BenchmarkTeeStreamingDownloader_Comparison(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var buffer bytes.Buffer
 		key := fmt.Sprintf("tee-bench-key-%d", i)
-		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer)
+		_, _ = downloader.DownloadAndStream(ctx, server.URL, key, &buffer, Expectation{})
 	}
 }

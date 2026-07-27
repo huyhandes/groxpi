@@ -207,10 +207,6 @@ func (ts *TieredStorage) putInternal(ctx context.Context, key string, reader io.
 	// Goroutine to read from source and tee to both pipes
 	go func() {
 		defer wg.Done()
-		defer func() {
-			_ = pw1.Close()
-			_ = pw2.Close()
-		}()
 
 		// Use MultiWriter to write to both pipes simultaneously
 		multiWriter := io.MultiWriter(pw1, pw2)
@@ -218,6 +214,11 @@ func (ts *TieredStorage) putInternal(ctx context.Context, key string, reader io.
 		if err != nil {
 			log.Error().Err(err).Str("key", key).Msg("Failed to read source data")
 		}
+		// A clean close is what tells each tier the object is complete, so a
+		// failed read must close with the error instead: neither tier may commit
+		// a truncated object.
+		_ = pw1.CloseWithError(err)
+		_ = pw2.CloseWithError(err)
 	}()
 
 	// Write to L2 (S3) - primary storage

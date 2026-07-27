@@ -44,8 +44,9 @@ type ServePlan struct {
 	URL         string        // ActionStreamAndCache / ActionRedirect
 	ContentType string        // derived from the filename
 	ETag        string        // from the index hashes, empty if unknown
+	SHA256      string        // from the index hashes, empty if unknown
 	Size        int64         // from the PyPI index, -1 if unknown
-	Timeout     time.Duration // ActionStreamAndCache
+	Timeout     time.Duration // ActionStreamAndCache: time-to-first-byte budget
 }
 
 // packageIndex is the upstream index seam. It exists so the decision tree can be
@@ -130,7 +131,8 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	if info.Size > 0 {
 		plan.Size = info.Size
 	}
-	plan.ETag = quoteETag(info.Hashes["sha256"])
+	plan.SHA256 = info.Hashes["sha256"]
+	plan.ETag = quoteETag(plan.SHA256)
 
 	if s.downloadTimeout <= 0 {
 		log.Debug().
@@ -142,7 +144,7 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	}
 
 	plan.Action = ActionStreamAndCache
-	plan.Timeout = s.calculateDynamicTimeout(plan.Size)
+	plan.Timeout = s.downloadTimeout
 	return plan, nil
 }
 
@@ -153,10 +155,10 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 // their dst — they must re-Plan and serve the now-cached object.
 func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.Writer) (*streaming.StreamResult, bool, error) {
 	// The download populates the cache for every waiting request, so it must not
-	// die with the client that happened to trigger it. Only the dynamic timeout
-	// bounds it.
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), plan.Timeout)
-	defer cancel()
+	// die with the client that happened to trigger it. It carries no deadline
+	// either: the configured budget applies only until upstream response headers
+	// arrive, and the downloader enforces that itself.
+	fetchCtx := context.WithoutCancel(ctx)
 
 	// Only the leader runs the closure, so this is written on the leader's own
 	// stack before Do returns and read after it returns — no synchronization
@@ -172,7 +174,10 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 			Int64("file_size", plan.Size).
 			Dur("timeout", plan.Timeout).
 			Msg("🚀 Starting streaming download with simultaneous cache")
-		return s.downloader.DownloadAndStream(fetchCtx, plan.URL, plan.StorageKey, dst)
+		return s.downloader.DownloadAndStream(fetchCtx, plan.URL, plan.StorageKey, dst, streaming.Expectation{
+			SHA256: plan.SHA256,
+			Size:   plan.Size,
+		})
 	})
 
 	if !led {
@@ -275,19 +280,6 @@ func (s *PackageFileService) resolvePackageList() ([]string, error) {
 		s.indexCache.Set(packageListKey, packages, s.indexTTL)
 	}
 	return packages, nil
-}
-
-// calculateDynamicTimeout budgets the download at a 100 KB/s floor, clamped to
-// [2min, 1h]: 2 minutes covers network overhead on small files, 1 hour stops a
-// stalled transfer from pinning the request forever. An unknown size (<= 0) gets
-// the configured timeout unchanged.
-func (s *PackageFileService) calculateDynamicTimeout(expectedSize int64) time.Duration {
-	if expectedSize <= 0 {
-		return s.downloadTimeout
-	}
-	const minSpeedBytesPerSec = 100 * 1024
-	transfer := time.Duration(expectedSize/minSpeedBytesPerSec) * time.Second
-	return min(max(transfer, 2*time.Minute), 60*time.Minute)
 }
 
 func storageKeyFor(packageName, fileName string) string {
