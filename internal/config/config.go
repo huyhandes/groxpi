@@ -28,8 +28,6 @@ type Config struct {
 	S3Prefix          string
 	S3ForcePathStyle  bool
 	S3UseSSL          bool
-	S3PartSize        int64 // Multipart upload part size
-	S3MaxConnections  int   // Max concurrent S3 connections (legacy)
 
 	// Hybrid/Tiered storage configuration
 	LocalCacheSize      int64         // Size limit for local L1 cache (hybrid mode only)
@@ -39,9 +37,6 @@ type Config struct {
 	TieredSyncQueueSize int           // Size of tiered sync queue (default: 100)
 
 	// S3 Performance Configuration
-	S3ReadPoolSize  int  // Max connections for GET operations
-	S3WritePoolSize int  // Max connections for PUT operations
-	S3MetaPoolSize  int  // Max connections for HEAD/STAT operations
 	S3EnableHTTP2   bool // Enable HTTP/2 for better multiplexing
 	S3TransferAccel bool // Enable S3 Transfer Acceleration
 
@@ -58,9 +53,6 @@ type Config struct {
 
 	// SSL configuration
 	DisableSSLVerification bool
-
-	// Response configuration
-	BinaryFileMimeType bool
 }
 
 func Load() *Config {
@@ -75,7 +67,8 @@ func Load() *Config {
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
 		LogColor:               getBoolEnv("GROXPI_LOG_COLOR", true),
 		DisableSSLVerification: getBoolEnv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", false),
-		BinaryFileMimeType:     getBoolEnv("GROXPI_BINARY_FILE_MIME_TYPE", false),
+		ConnectTimeout:         getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
+		ReadTimeout:            getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
 		// Storage configuration
 		StorageType:       getEnv("GROXPI_STORAGE_TYPE", "local"),
@@ -87,13 +80,8 @@ func Load() *Config {
 		S3Prefix:          getEnv("GROXPI_S3_PREFIX", "groxpi"),
 		S3ForcePathStyle:  getBoolEnv("GROXPI_S3_FORCE_PATH_STYLE", false),
 		S3UseSSL:          getBoolEnv("GROXPI_S3_USE_SSL", true),
-		S3PartSize:        getIntEnv("GROXPI_S3_PART_SIZE", 10*1024*1024), // 10MB
-		S3MaxConnections:  int(getIntEnv("GROXPI_S3_MAX_CONNECTIONS", 100)),
 
 		// S3 Performance Configuration
-		S3ReadPoolSize:  int(getIntEnv("GROXPI_S3_READ_POOL_SIZE", 50)),
-		S3WritePoolSize: int(getIntEnv("GROXPI_S3_WRITE_POOL_SIZE", 30)),
-		S3MetaPoolSize:  int(getIntEnv("GROXPI_S3_META_POOL_SIZE", 20)),
 		S3EnableHTTP2:   getBoolEnv("GROXPI_S3_ENABLE_HTTP2", true),
 		S3TransferAccel: getBoolEnv("GROXPI_S3_TRANSFER_ACCEL", false),
 
@@ -127,19 +115,6 @@ func Load() *Config {
 		for i := range cfg.ExtraIndexTTLs {
 			cfg.ExtraIndexTTLs[i] = 3 * time.Minute
 		}
-	}
-
-	// Parse timeout configurations
-	if connectTimeout := getEnv("GROXPI_CONNECT_TIMEOUT", ""); connectTimeout != "" {
-		cfg.ConnectTimeout = getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0)
-	} else if cfg.ReadTimeout > 0 {
-		cfg.ConnectTimeout = 3100 * time.Millisecond
-	}
-
-	if readTimeout := getEnv("GROXPI_READ_TIMEOUT", ""); readTimeout != "" {
-		cfg.ReadTimeout = getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0)
-	} else if cfg.ConnectTimeout > 0 {
-		cfg.ReadTimeout = 20 * time.Second
 	}
 
 	// Set default cache dir if not specified

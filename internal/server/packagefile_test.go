@@ -96,10 +96,6 @@ func (f *fakeStorage) Stat(_ context.Context, key string) (*storage.ObjectInfo, 
 	return &storage.ObjectInfo{Key: key, Size: int64(len(data))}, nil
 }
 
-func (f *fakeStorage) List(_ context.Context, _ storage.ListOptions) ([]*storage.ObjectInfo, error) {
-	return nil, nil
-}
-
 func (f *fakeStorage) Close() error { return nil }
 
 var _ storage.Storage = (*fakeStorage)(nil)

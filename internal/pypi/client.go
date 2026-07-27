@@ -245,27 +245,6 @@ func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error)
 	return c.parseHTMLPackageFiles(resp.Body, baseURL)
 }
 
-func (c *Client) DownloadFile(url string, dest string) error {
-	resp, err := c.httpClient.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to download %s: %w", url, err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			// Log error but don't fail the operation
-			_ = err
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-
-	// TODO: Implement actual file download to dest
-	// For now, this is a placeholder
-	return nil
-}
-
 func (c *Client) makeRequest(url, accept string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

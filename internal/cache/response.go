@@ -2,7 +2,6 @@ package cache
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,7 +17,6 @@ type ResponseEntry struct {
 	Data      []byte // Pre-marshaled JSON
 	ExpiresAt time.Time
 	Size      int
-	RefCount  int64 // Reference counting for zero-copy safety
 }
 
 func NewResponseCache(maxSize int) *ResponseCache {
@@ -46,46 +44,9 @@ func (c *ResponseCache) Get(key string) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Increment reference count for zero-copy safety
-	atomic.AddInt64(&entry.RefCount, 1)
-
-	// Update LRU
 	c.updateLRU(key)
 
 	return entry.Data, true
-}
-
-// GetZeroCopy returns a zero-copy reference to cached data
-// The caller must call Release() when done with the data
-func (c *ResponseCache) GetZeroCopy(key string) ([]byte, func(), bool) {
-	c.mu.RLock()
-	entry, exists := c.entries[key]
-	c.mu.RUnlock()
-
-	if !exists {
-		return nil, nil, false
-	}
-
-	if time.Now().After(entry.ExpiresAt) {
-		// Expired, remove it
-		c.mu.Lock()
-		delete(c.entries, key)
-		c.mu.Unlock()
-		return nil, nil, false
-	}
-
-	// Increment reference count for zero-copy safety
-	atomic.AddInt64(&entry.RefCount, 1)
-
-	// Update LRU
-	c.updateLRU(key)
-
-	// Return data and release function
-	release := func() {
-		atomic.AddInt64(&entry.RefCount, -1)
-	}
-
-	return entry.Data, release, true
 }
 
 func (c *ResponseCache) Set(key string, data []byte, ttl time.Duration) {
@@ -115,7 +76,6 @@ func (c *ResponseCache) Set(key string, data []byte, ttl time.Duration) {
 		Data:      data,
 		ExpiresAt: time.Now().Add(ttl),
 		Size:      newSize,
-		RefCount:  0, // Initialize reference count
 	}
 
 	// Add to LRU

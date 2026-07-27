@@ -301,26 +301,6 @@ func (ts *TieredStorage) Exists(ctx context.Context, key string) (bool, error) {
 	return ts.remoteStorage.Exists(ctx, key)
 }
 
-// Stat retrieves object metadata from L1, falling through to L2 only on a
-// genuine miss.
-func (ts *TieredStorage) Stat(ctx context.Context, key string) (*ObjectInfo, error) {
-	info, err := ts.localCache.Stat(ctx, key)
-	switch {
-	case err == nil:
-		return info, nil
-	case !errors.Is(err, ErrNotFound):
-		return nil, fmt.Errorf("L1 stat of %q failed: %w", key, err)
-	}
-
-	return ts.remoteStorage.Stat(ctx, key)
-}
-
-// List returns a list of objects from L2 (authoritative source)
-func (ts *TieredStorage) List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error) {
-	// Always list from L2 (S3) as it's the authoritative source
-	return ts.remoteStorage.List(ctx, opts)
-}
-
 // GetFilePath returns the local file path for zero-copy serving. Only L1 holds
 // real files, so an object that is only in L2 reports a miss here and the
 // caller falls back to streaming it.

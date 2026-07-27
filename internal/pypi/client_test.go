@@ -322,45 +322,6 @@ func TestClient_ParseJSONInvalidData(t *testing.T) {
 	})
 }
 
-func TestClient_DownloadFile(t *testing.T) {
-	// Create test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("fake file content"))
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{}
-	client := NewClient(cfg)
-
-	err := client.DownloadFile(server.URL, "/tmp/test-file")
-	if err != nil {
-		t.Errorf("DownloadFile failed: %v", err)
-	}
-}
-
-func TestClient_DownloadFile_HTTPError(t *testing.T) {
-	// Create test server that returns 404
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{}
-	client := NewClient(cfg)
-
-	err := client.DownloadFile(server.URL, "/tmp/test-file")
-	if err == nil {
-		t.Error("Expected error for HTTP 404")
-	}
-
-	if !strings.Contains(err.Error(), "404") {
-		t.Errorf("Expected '404' in error message, got: %v", err)
-	}
-}
-
-// Singleflight tests following TDD principles
 func TestClient_SingleflightPackageList(t *testing.T) {
 	requestCount := int64(0)
 

@@ -3,7 +3,6 @@ package cache
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -92,74 +91,6 @@ func TestResponseCache_SetAndGet(t *testing.T) {
 
 		if string(result) != string(data2) {
 			t.Errorf("Expected '%s', got '%s'", string(data2), string(result))
-		}
-	})
-}
-
-func TestResponseCache_GetZeroCopy(t *testing.T) {
-	responseCache := NewResponseCache(1024 * 1024) // 1MB
-
-	t.Run("get zero-copy valid entry", func(t *testing.T) {
-		key := "zero-copy-key"
-		data := []byte(`{"zero": "copy"}`)
-		ttl := 5 * time.Second
-
-		responseCache.Set(key, data, ttl)
-
-		result, release, exists := responseCache.GetZeroCopy(key)
-		if !exists {
-			t.Error("Expected entry to exist")
-		}
-
-		if release == nil {
-			t.Error("Expected release function to be provided")
-		}
-
-		if string(result) != string(data) {
-			t.Errorf("Expected '%s', got '%s'", string(data), string(result))
-		}
-
-		// Skip reference count verification - test interface instead
-		// Call release function
-		release()
-	})
-
-	t.Run("get zero-copy non-existent entry", func(t *testing.T) {
-		result, release, exists := responseCache.GetZeroCopy("non-existent-key")
-		if exists {
-			t.Error("Expected entry to not exist")
-		}
-
-		if result != nil {
-			t.Error("Expected result to be nil")
-		}
-
-		if release != nil {
-			t.Error("Expected release function to be nil")
-		}
-	})
-
-	t.Run("get zero-copy expired entry", func(t *testing.T) {
-		key := "zero-copy-expired-key"
-		data := []byte(`{"zero": "copy", "expired": true}`)
-		ttl := 10 * time.Millisecond
-
-		responseCache.Set(key, data, ttl)
-
-		// Wait for expiration
-		time.Sleep(20 * time.Millisecond)
-
-		result, release, exists := responseCache.GetZeroCopy(key)
-		if exists {
-			t.Error("Expected expired entry to not exist")
-		}
-
-		if result != nil {
-			t.Error("Expected result to be nil for expired entry")
-		}
-
-		if release != nil {
-			t.Error("Expected release function to be nil for expired entry")
 		}
 	})
 }
@@ -312,53 +243,6 @@ func TestResponseCache_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestResponseCache_ConcurrentZeroCopyAccess(t *testing.T) {
-	responseCache := NewResponseCache(10 * 1024 * 1024) // 10MB
-
-	key := "zero-copy-concurrent"
-	data := []byte(`{"concurrent": "zero-copy"}`)
-	ttl := 5 * time.Second
-
-	responseCache.Set(key, data, ttl)
-
-	const numGoroutines = 50
-	var wg sync.WaitGroup
-	var successCount int64
-
-	// Test concurrent zero-copy access
-	for range numGoroutines {
-		wg.Go(func() {
-
-			result, release, exists := responseCache.GetZeroCopy(key)
-			if !exists {
-				t.Error("Expected entry to exist")
-				return
-			}
-
-			if string(result) != string(data) {
-				t.Errorf("Expected '%s', got '%s'", string(data), string(result))
-				return
-			}
-
-			// Hold reference for a short time
-			time.Sleep(1 * time.Millisecond)
-
-			// Release reference
-			release()
-
-			atomic.AddInt64(&successCount, 1)
-		})
-	}
-
-	wg.Wait()
-
-	if atomic.LoadInt64(&successCount) != numGoroutines {
-		t.Errorf("Expected %d successful operations, got %d", numGoroutines, atomic.LoadInt64(&successCount))
-	}
-
-	// Skip final reference count verification
-}
-
 func TestResponseCache_EdgeCases(t *testing.T) {
 	responseCache := NewResponseCache(100) // Very small cache
 
@@ -488,29 +372,6 @@ func BenchmarkResponseCache_Get(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("bench-get-%d", i%1000)
 		responseCache.Get(key)
-	}
-}
-
-func BenchmarkResponseCache_GetZeroCopy(b *testing.B) {
-	responseCache := NewResponseCache(100 * 1024 * 1024) // 100MB
-	data := []byte(`{"benchmark": "zero-copy"}`)
-	ttl := 1 * time.Hour
-
-	// Pre-populate cache
-	for i := range 1000 {
-		key := fmt.Sprintf("bench-zero-copy-%d", i)
-		responseCache.Set(key, data, ttl)
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("bench-zero-copy-%d", i%1000)
-		_, release, exists := responseCache.GetZeroCopy(key)
-		if exists && release != nil {
-			release()
-		}
 	}
 }
 

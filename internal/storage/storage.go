@@ -21,13 +21,6 @@ type ObjectInfo struct {
 	ContentType  string
 }
 
-// ListOptions configures object listing
-type ListOptions struct {
-	Prefix     string
-	MaxKeys    int
-	StartAfter string
-}
-
 // Storage is the core contract every backend satisfies. It is deliberately
 // small: anything a backend can only fake belongs in a capability interface
 // below, so callers never have to ask which backend they are talking to.
@@ -41,19 +34,12 @@ type Storage interface {
 	// Put stores an object.
 	Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error)
 
-	// Stat retrieves object metadata without downloading content. Returns an
-	// error matching ErrNotFound if the key does not exist.
-	Stat(ctx context.Context, key string) (*ObjectInfo, error)
-
 	// Delete removes an object. Deleting a missing object is not an error.
 	Delete(ctx context.Context, key string) error
 
 	// Exists reports whether an object is present. A missing object is
 	// (false, nil); a non-nil error always means the check itself failed.
 	Exists(ctx context.Context, key string) (bool, error)
-
-	// List returns the objects matching opts.
-	List(ctx context.Context, opts ListOptions) ([]*ObjectInfo, error)
 
 	// Close releases any resources held by the backend.
 	Close() error

@@ -18,7 +18,6 @@ func TestLoad(t *testing.T) {
 		"PORT",
 		"GROXPI_LOGGING_LEVEL",
 		"GROXPI_DISABLE_INDEX_SSL_VERIFICATION",
-		"GROXPI_BINARY_FILE_MIME_TYPE",
 		"GROXPI_EXTRA_INDEX_URLS",
 		"GROXPI_EXTRA_INDEX_TTLS",
 		"GROXPI_CONNECT_TIMEOUT",
@@ -71,10 +70,6 @@ func TestLoad(t *testing.T) {
 		if cfg.DisableSSLVerification != false {
 			t.Errorf("Expected default DisableSSLVerification to be false, got %v", cfg.DisableSSLVerification)
 		}
-
-		if cfg.BinaryFileMimeType != false {
-			t.Errorf("Expected default BinaryFileMimeType to be false, got %v", cfg.BinaryFileMimeType)
-		}
 	})
 
 	t.Run("custom environment variables", func(t *testing.T) {
@@ -86,7 +81,6 @@ func TestLoad(t *testing.T) {
 		_ = os.Setenv("PORT", "8080")
 		_ = os.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
 		_ = os.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
-		_ = os.Setenv("GROXPI_BINARY_FILE_MIME_TYPE", "1")
 
 		cfg := Load()
 
@@ -120,10 +114,6 @@ func TestLoad(t *testing.T) {
 
 		if cfg.DisableSSLVerification != true {
 			t.Errorf("Expected DisableSSLVerification to be true, got %v", cfg.DisableSSLVerification)
-		}
-
-		if cfg.BinaryFileMimeType != true {
-			t.Errorf("Expected BinaryFileMimeType to be true, got %v", cfg.BinaryFileMimeType)
 		}
 	})
 
