@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -178,9 +179,9 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	existsSpan.End()
 	if err != nil {
 		// A backend hiccup must not fail the request: fall through to upstream.
-		slog.Error("Failed to check storage", "error", err, "key", plan.StorageKey)
+		slog.ErrorContext(ctx, "Failed to check storage", "error", err, "key", plan.StorageKey)
 	} else if exists {
-		slog.Debug("✅ Serving from storage cache", "package", packageName, "file", fileName)
+		slog.DebugContext(ctx, "✅ Serving from storage cache", "package", packageName, "file", fileName)
 		plan.Action = ActionFromStorage
 		return plan, nil
 	}
@@ -204,7 +205,7 @@ func (s *PackageFileService) Plan(ctx context.Context, packageName, fileName str
 	plan.ETag = quoteETag(plan.SHA256)
 
 	if s.downloadTimeout <= 0 {
-		slog.Debug("Download timeout is 0, redirecting directly to PyPI",
+		slog.DebugContext(ctx, "Download timeout is 0, redirecting directly to PyPI",
 			"package", packageName,
 			"file", fileName)
 		telemetry.Redirect(ctx, telemetry.RedirectCachingDisabled)
@@ -261,7 +262,7 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 	})
 
 	if !led {
-		slog.Debug("🔄 Waited for in-flight download", "package", plan.PackageName, "file", plan.FileName)
+		slog.DebugContext(ctx, "🔄 Waited for in-flight download", "package", plan.PackageName, "file", plan.FileName)
 		if err != nil {
 			return nil, false, fmt.Errorf("shared download of %q failed: %w", plan.StorageKey, err)
 		}
@@ -287,13 +288,13 @@ func (s *PackageFileService) Fetch(ctx context.Context, plan ServePlan, dst io.W
 func (s *PackageFileService) PlanAfterFetch(ctx context.Context, plan ServePlan) ServePlan {
 	next, err := s.Plan(ctx, plan.PackageName, plan.FileName)
 	if err == nil && next.Action == ActionFromStorage {
-		slog.Debug("✅ Serving from storage after coordinated download",
+		slog.DebugContext(ctx, "✅ Serving from storage after coordinated download",
 			"package", plan.PackageName,
 			"file", plan.FileName)
 		return next
 	}
 
-	slog.Debug("⏭️ Redirecting to PyPI after download coordination",
+	slog.DebugContext(ctx, "⏭️ Redirecting to PyPI after download coordination",
 		"package", plan.PackageName,
 		"file", plan.FileName)
 	telemetry.Redirect(ctx, telemetry.RedirectNotCached)
@@ -447,13 +448,13 @@ func (s *PackageFileService) queryConcurrently(ctx context.Context, indexes []co
 
 		switch answer := answers[i]; {
 		case answer.err == nil:
-			slog.Debug("Package resolved from index",
+			slog.DebugContext(ctx, "Package resolved from index",
 				"package", packageName,
 				"index", index.Redacted(),
 				"files", len(answer.files))
 			return index, answer.files, nil
 		case errors.Is(answer.err, pypi.ErrNotFound):
-			slog.Debug("Package not on index, trying the next",
+			slog.DebugContext(ctx, "Package not on index, trying the next",
 				"package", packageName,
 				"index", index.Redacted())
 		default:
@@ -464,6 +465,9 @@ func (s *PackageFileService) queryConcurrently(ctx context.Context, indexes []co
 
 	return config.Index{}, nil, fmt.Errorf("%w: %s", pypi.ErrNotFound, packageName)
 }
+
+// maxRootIndexBytes caps the proxied root index. See the read in ProxyRoot.
+var maxRootIndexBytes int64 = 256 << 20
 
 // rootResponse is one upstream root-index response, held only as long as it
 // takes to answer the burst of clients that shared its fetch.
@@ -503,9 +507,18 @@ func (s *PackageFileService) ProxyRoot(ctx context.Context, accept, acceptEncodi
 		}
 		defer func() { _ = resp.Body.Close() }()
 
-		body, err := io.ReadAll(resp.Body)
+		// ponytail: a var, not a const, only so a test can lower it. The whole
+		// response is held in memory to be handed to every waiter, so an upstream
+		// that answers this route with an endless body would otherwise be an
+		// unauthenticated way to exhaust the process's memory. The ceiling is far
+		// above PyPI's own project list; exceeding it fails loudly rather than
+		// serving a truncated index.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRootIndexBytes+1))
 		if err != nil {
 			return nil, err
+		}
+		if int64(len(body)) > maxRootIndexBytes {
+			return nil, fmt.Errorf("root index exceeds the %d byte limit", maxRootIndexBytes)
 		}
 		return &rootResponse{
 			status:          resp.StatusCode,
@@ -535,6 +548,26 @@ func findFile(files []pypi.FileInfo, fileName string) (pypi.FileInfo, bool) {
 		return pypi.FileInfo{}, false
 	}
 	return files[i], true
+}
+
+// credentialedURLPattern matches the user-info component of an absolute URL: a scheme,
+// then everything up to the "@" that is still inside the authority. The
+// character class cannot cross a "/", so a path containing "@" is not matched.
+var credentialedURLPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#\s"'@]+@`)
+
+// redactErrorText renders an error for a log line, an HTTP body or the admin
+// page with any URL credentials stripped out of the whole message.
+//
+// Redacting the URL attribute beside the error is not enough: a package file's
+// URL is resolved against its index's base URL, which carries that index's
+// user-info, and both net/http's *url.Error and the downloader's own "HTTP 404
+// from <url>" print that URL into the error string itself. So the message is
+// rewritten rather than the field next to it.
+func redactErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return credentialedURLPattern.ReplaceAllString(err.Error(), "${1}redacted@")
 }
 
 // quoteETag normalises an entity-tag to exactly one layer of quotes. Sources

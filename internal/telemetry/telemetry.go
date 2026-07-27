@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -95,8 +96,14 @@ func Setup(ctx context.Context, endpoint, serviceName string) (shutdown func(con
 	))
 	// Export failures are reported, never propagated: a collector that is down
 	// must not turn into a failed request.
+	//
+	// Reported to stderr directly, never through the slog default: the default
+	// fans records into the OTLP log bridge, so a failing export would log a
+	// record that is itself exported, and an idle server pointed at a down
+	// collector would never quiesce.
+	exportErrors := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		slog.Warn("telemetry export error", "error", err)
+		exportErrors.Warn("telemetry export error", "error", err)
 	}))
 
 	return func(ctx context.Context) error {

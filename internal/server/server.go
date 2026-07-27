@@ -41,6 +41,9 @@ type Server struct {
 	// Administrative surface. Nil templates mean it was never mounted.
 	adminTemplates *template.Template
 	adminErrors    adminErrors
+	// prefetches counts the detached prefetch goroutines so shutdown can wait for
+	// them: one of them may be inside storage.Put when the signal arrives.
+	prefetches sync.WaitGroup
 }
 
 // New builds a server or terminates the process. It is the entry point's
@@ -165,9 +168,11 @@ func traceRequests() gin.HandlerFunc {
 	}
 }
 
-// Close stops the index-cache sweeper and releases the storage backend. Called
-// from the shutdown path.
+// Close waits for detached prefetches, stops the index-cache sweeper and
+// releases the storage backend. Called from the shutdown path: closing the
+// backend under a prefetch that is still writing to it would fail that write.
 func (s *Server) Close() error {
+	s.prefetches.Wait()
 	s.indexCache.Close()
 	return s.storage.Close()
 }
@@ -265,15 +270,24 @@ func (s *Server) handleHome(c *gin.Context) {
 // cached and not decoded: the full project list is tens of megabytes, and every
 // representation the client can ask for is one the upstream already produces.
 func (s *Server) handleListPackages(c *gin.Context) {
-	// ?format= overrides Accept here exactly as it does on a package page.
-	accept := c.GetHeader("Accept")
-	if format := c.Query("format"); format != "" {
-		accept = format
+	// ?format= overrides Accept here exactly as it does on a package page, but
+	// neither value is forwarded verbatim: both are attacker-controlled and both
+	// are part of the singleflight key, so N distinct spellings would be N
+	// concurrent multi-megabyte fetches all resident in memory. They collapse to
+	// the two representations and one encoding this route actually asks upstream
+	// for, which is the whole set it can serve.
+	accept := "text/html"
+	if wantsJSON(c) {
+		accept = jsonContentType
+	}
+	acceptEncoding := ""
+	if strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		acceptEncoding = "gzip"
 	}
 
-	root, err := s.packageFiles.ProxyRoot(c.Request.Context(), accept, c.GetHeader("Accept-Encoding"))
+	root, err := s.packageFiles.ProxyRoot(c.Request.Context(), accept, acceptEncoding)
 	if err != nil {
-		slog.Error("Failed to proxy root index", "error", err)
+		slog.ErrorContext(c.Request.Context(), "Failed to proxy root index", "error", redactErrorText(err))
 		c.String(http.StatusBadGateway, "Failed to fetch package list")
 		return
 	}
@@ -297,8 +311,9 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			c.String(http.StatusNotFound, "Package not found")
 			return
 		}
-		slog.Error("Failed to fetch package files", "error", err, "package", packageName)
-		c.String(http.StatusInternalServerError, "Error fetching package: "+err.Error())
+		slog.ErrorContext(c.Request.Context(), "Failed to fetch package files",
+			"error", redactErrorText(err), "package", packageName)
+		c.String(http.StatusInternalServerError, "Error fetching package: "+redactErrorText(err))
 		return
 	}
 
@@ -378,7 +393,7 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 	packageName := pypi.NormalizeName(c.Param("package"))
 	fileName := c.Param("file")
 
-	slog.Debug("📦 File download request received",
+	slog.DebugContext(c.Request.Context(), "📦 File download request received",
 		"package", packageName,
 		"file", fileName,
 		"user_agent", c.GetHeader("User-Agent"),
@@ -386,7 +401,8 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 
 	plan, err := s.packageFiles.Plan(c.Request.Context(), packageName, fileName)
 	if err != nil {
-		slog.Debug("Package index unavailable", "error", err, "package", packageName, "file", fileName)
+		slog.DebugContext(c.Request.Context(), "Package index unavailable",
+			"error", redactErrorText(err), "package", packageName, "file", fileName)
 		c.String(http.StatusNotFound, "Package not found")
 		return
 	}
@@ -400,7 +416,8 @@ func (s *Server) servePlan(c *gin.Context, plan ServePlan) {
 	switch plan.Action {
 	case ActionFromStorage:
 		if err := s.serveFromStorage(c, plan.StorageKey); err != nil {
-			slog.Error("Failed to serve from storage", "error", err, "storage_key", plan.StorageKey)
+			slog.ErrorContext(c.Request.Context(), "Failed to serve from storage",
+				"error", err, "storage_key", plan.StorageKey)
 			// Only a failure that happened before the first body byte can still
 			// be reported; anything later would append garbage to the payload.
 			if !c.Writer.Written() {
@@ -428,11 +445,14 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 
 	switch {
 	case err != nil:
-		slog.Error("Failed to stream download, redirecting to PyPI",
-			"error", err,
+		// Both the message and the URL are redacted: a file URL resolved against a
+		// credentialed index carries that index's password, and the downloader's
+		// error string embeds the URL it failed on.
+		slog.ErrorContext(c.Request.Context(), "Failed to stream download, redirecting to PyPI",
+			"error", redactErrorText(err),
 			"package", plan.PackageName,
 			"file", plan.FileName,
-			"file_url", plan.URL,
+			"file_url", config.RedactURL(plan.URL),
 			"file_size", plan.Size,
 			"timeout", plan.Timeout)
 		if body.wrote {
@@ -447,7 +467,7 @@ func (s *Server) streamAndCache(c *gin.Context, plan ServePlan) {
 		// this request can now be served from it or has to go upstream.
 		s.servePlan(c, s.packageFiles.PlanAfterFetch(c.Request.Context(), plan))
 	default:
-		slog.Info("✅ Successfully streamed file to client",
+		slog.InfoContext(c.Request.Context(), "✅ Successfully streamed file to client",
 			"package", plan.PackageName,
 			"file", plan.FileName,
 			"size", result.Size,
@@ -515,7 +535,7 @@ func (s *Server) handleCachePackage(c *gin.Context) {
 	if deleter, ok := s.storage.(storage.PrefixDeleter); ok {
 		deleted, err := deleter.DeletePrefix(c.Request.Context(), storageKeyFor(packageName, ""))
 		if err != nil {
-			slog.Error("Failed to delete cached files",
+			slog.ErrorContext(c.Request.Context(), "Failed to delete cached files",
 				"error", err,
 				"package", packageName)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -524,7 +544,7 @@ func (s *Server) handleCachePackage(c *gin.Context) {
 			})
 			return
 		}
-		slog.Info("Evicted package from cache",
+		slog.InfoContext(c.Request.Context(), "Evicted package from cache",
 			"package", packageName,
 			"files_deleted", deleted)
 	}
@@ -632,7 +652,7 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	// assume, and do not branch on a boolean the backend has to lie about.
 	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
 		if filePath, err := zeroCopy.GetFilePath(ctx, storageKey); err == nil {
-			slog.Debug("Serving local file by path via net/http",
+			slog.DebugContext(ctx, "Serving local file by path via net/http",
 				"storage_key", storageKey,
 				"file_path", filePath)
 			c.File(filePath)
@@ -640,7 +660,7 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		}
 	}
 
-	slog.Debug("Starting file serve from storage",
+	slog.DebugContext(ctx, "Starting file serve from storage",
 		"storage_key", storageKey,
 		"method", c.Request.Method)
 
@@ -649,11 +669,11 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 	reader, info, err := s.storage.Get(ctx, storageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			slog.Debug("Object missing from storage", "key", storageKey)
+			slog.DebugContext(ctx, "Object missing from storage", "key", storageKey)
 			c.String(http.StatusNotFound, "File not found")
 			return nil
 		}
-		slog.Error("Failed to get from storage", "error", err, "key", storageKey)
+		slog.ErrorContext(ctx, "Failed to get from storage", "error", err, "key", storageKey)
 		c.String(http.StatusInternalServerError, "Storage error")
 		return nil
 	}
@@ -680,20 +700,20 @@ func (s *Server) serveFromStorage(c *gin.Context, storageKey string) error {
 		c.Header("ETag", etag)
 	}
 
-	slog.Debug("Starting file stream from storage", "storage_key", storageKey, "size", info.Size)
+	slog.DebugContext(ctx, "Starting file stream from storage", "storage_key", storageKey, "size", info.Size)
 
 	// Use io.Copy to manually stream the file to the response writer
 	// c.Writer is safe for concurrent use (unlike Fiber's context)
 	written, err := io.Copy(c.Writer, reader)
 	if err != nil {
-		slog.Error("Failed to stream file from storage",
+		slog.ErrorContext(ctx, "Failed to stream file from storage",
 			"error", err,
 			"storage_key", storageKey,
 			"bytes_written", written)
 		return err
 	}
 
-	slog.Debug("File stream completed successfully",
+	slog.DebugContext(ctx, "File stream completed successfully",
 		"storage_key", storageKey,
 		"bytes_written", written)
 
