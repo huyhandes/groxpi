@@ -13,7 +13,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -311,6 +313,72 @@ func TestS3Storage_DeletePrefix(t *testing.T) {
 	deleted, err = deleter.DeletePrefix(context.Background(), "packages/absent/")
 	require.NoError(t, err)
 	assert.Zero(t, deleted)
+}
+
+// TestS3Storage_ExistsSurvivesAnotherCallersCancellation pins that the
+// deduplicated lookup belongs to no single caller. The flight used to run on the
+// context of whichever caller started it, so one client disconnecting failed
+// every other caller waiting on the same key with context.Canceled - which the
+// read path reads as a miss and re-downloads a file that is in the bucket.
+func TestS3Storage_ExistsSurvivesAnotherCallersCancellation(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var heads atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The bucket check at construction time is also a HEAD; only object heads
+		// are the ones under test.
+		if r.Method != http.MethodHead || !strings.Contains(r.URL.Path, "/packages/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if heads.Add(1) == 1 {
+			close(arrived)
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	s, err := NewS3Storage(&S3Config{
+		Endpoint:        server.URL,
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		Bucket:          "test-bucket",
+		ForcePathStyle:  true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+
+	// Caller A starts the flight and then goes away, as a client that hung up
+	// mid-request does.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	go func() { _, _ = s.Exists(ctxA, key) }()
+	<-arrived
+
+	// Caller B joins A's in-flight lookup: A cannot have finished, it is parked in
+	// the handler.
+	type answer struct {
+		exists bool
+		err    error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		exists, err := s.Exists(context.Background(), key)
+		answers <- answer{exists, err}
+	}()
+
+	// Give B time to join the flight, then take A away and let the lookup finish.
+	time.Sleep(50 * time.Millisecond)
+	cancelA()
+	close(release)
+
+	got := <-answers
+	require.NoError(t, got.err, "a second caller was failed by the first one disconnecting")
+	assert.True(t, got.exists, "the object is in the bucket and must not be reported absent")
+	assert.Equal(t, int64(1), heads.Load(), "the lookup must still be deduplicated")
 }
 
 // TestS3Storage_ContextIsHonoured is a cheap guard that read paths propagate a

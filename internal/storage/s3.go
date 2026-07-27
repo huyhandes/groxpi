@@ -364,8 +364,20 @@ func (s *S3Storage) DeletePrefix(ctx context.Context, prefix string) (int, error
 
 // Exists checks if an object exists in S3, deduplicating concurrent lookups.
 func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
+	// A caller who arrived with a dead context is answered from its own context,
+	// never by starting or joining a flight.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
 	result, err, _ := s.existsSF.Do(key, func() (any, error) {
-		_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		// The flight is shared, so it must not be cancellable by whichever caller
+		// happened to start it: one client disconnecting used to fail every other
+		// caller waiting on the same key with context.Canceled, which the read path
+		// reads as a miss and re-downloads a file that is sitting in the bucket.
+		// Values (the trace context) are kept; the deadline comes from the
+		// transport's response-header timeout instead.
+		_, err := s.client.HeadObject(context.WithoutCancel(ctx), &s3.HeadObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(s.buildKey(key)),
 		})
@@ -373,19 +385,26 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 			// Absence is the answer, not a failure. Anything else is a failure
 			// and must not be reported as "does not exist".
 			if isNotFoundResponse(err) {
-				telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 				return false, nil
 			}
 			return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
 		}
-		telemetry.CacheHit(ctx, telemetry.LayerRemote)
 		return true, nil
 	})
 	if err != nil {
 		return false, err
 	}
 
-	return result.(bool), nil
+	// Counted per caller rather than per flight: every caller that got an answer
+	// out of this either hit or missed, whether or not it did the lookup.
+	exists := result.(bool)
+	if exists {
+		telemetry.CacheHit(ctx, telemetry.LayerRemote)
+	} else {
+		telemetry.CacheMiss(ctx, telemetry.LayerRemote)
+	}
+
+	return exists, nil
 }
 
 // Close releases any resources held by the storage backend
