@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 	"github.com/phuslu/log"
@@ -186,7 +186,7 @@ func (s *Server) handleListPackages(c *gin.Context) {
 			"projects": projects,
 		}
 
-		responseData, err := sonic.ConfigFastest.Marshal(response)
+		responseData, err := json.Marshal(response)
 		if err != nil {
 			c.String(http.StatusInternalServerError, "JSON encoding error")
 			return
@@ -281,7 +281,7 @@ func (s *Server) renderPackageFiles(c *gin.Context, packageName string, files []
 			"files": fileList,
 		}
 
-		responseData, err := sonic.ConfigFastest.Marshal(response)
+		responseData, err := json.Marshal(response)
 		if err != nil {
 			c.String(http.StatusInternalServerError, "JSON encoding error")
 			return

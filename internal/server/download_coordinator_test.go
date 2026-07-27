@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
@@ -48,7 +48,7 @@ func TestServer_DownloadCoordinator_ConcurrentRequests(t *testing.T) {
 						},
 					},
 				}
-				jsonData, _ := sonic.Marshal(response)
+				jsonData, _ := json.Marshal(response)
 				_, _ = w.Write(jsonData)
 			} else {
 				// Return HTML response

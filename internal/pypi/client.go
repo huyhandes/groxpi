@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,16 +14,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/phuslu/log"
-	"golang.org/x/sync/singleflight"
 )
 
+// Client fetches index pages from an upstream PyPI-compatible index. Concurrent
+// requests for the same package are coalesced by the package-file service, not
+// here.
 type Client struct {
 	config     *config.Config
 	httpClient *http.Client
-	sf         singleflight.Group // For deduplicating concurrent requests
 }
 
 type FileInfo struct {
@@ -151,19 +152,6 @@ func NewClient(cfg *config.Config) *Client {
 }
 
 func (c *Client) GetPackageList() ([]string, error) {
-	// Use singleflight to deduplicate concurrent requests
-	result, err, _ := c.sf.Do("package-list", func() (any, error) {
-		return c.getPackageListInternal()
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.([]string), nil
-}
-
-func (c *Client) getPackageListInternal() ([]string, error) {
 	url := strings.TrimSuffix(c.config.IndexURL, "/")
 
 	// Try JSON first
@@ -193,20 +181,6 @@ func (c *Client) getPackageListInternal() ([]string, error) {
 }
 
 func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
-	// Use singleflight to deduplicate concurrent requests for the same package
-	key := "package-files:" + packageName
-	result, err, _ := c.sf.Do(key, func() (any, error) {
-		return c.getPackageFilesInternal(packageName)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return result.([]FileInfo), nil
-}
-
-func (c *Client) getPackageFilesInternal(packageName string) ([]FileInfo, error) {
 	indexURL := strings.TrimSuffix(c.config.IndexURL, "/") + "/" + packageName + "/"
 
 	// Try JSON first
@@ -287,7 +261,7 @@ func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {
 		}
 
 		var response PyPISimpleResponse
-		if err := sonic.ConfigFastest.Unmarshal(buf.Bytes(), &response); err != nil {
+		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
 			return fmt.Errorf("failed to parse JSON response: %w", err)
 		}
 
@@ -313,9 +287,8 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 			return err
 		}
 
-		// Use sonic's ConfigFastest for maximum performance
 		var response PyPISimpleResponse
-		if err := sonic.ConfigFastest.Unmarshal(buf.Bytes(), &response); err != nil {
+		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
 			return fmt.Errorf("failed to parse JSON response: %w", err)
 		}
 
@@ -449,9 +422,20 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 				}
 			}
 
+			// PEP 503 carries the digest in the href fragment as
+			// #sha256=<hex>; lift it into the same hash map shape the JSON
+			// index produces so downstream code needs no format branch.
+			var hashes map[string]string
+			if _, fragment, found := strings.Cut(href, "#"); found {
+				if sum, ok := strings.CutPrefix(fragment, "sha256="); ok && sum != "" {
+					hashes = map[string]string{"sha256": sum}
+				}
+			}
+
 			files = append(files, FileInfo{
 				Name:           filename,
 				URL:            fileURL,
+				Hashes:         hashes,
 				RequiresPython: requiresPython,
 				Yanked:         yanked,
 			})
