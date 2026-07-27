@@ -217,6 +217,7 @@ deleting the templates would reclaim close to nothing. Do not "optimize" them aw
 
 ## Known gaps
 
-- In pure `s3` mode, `DELETE /cache/<package>` drops the index entry but deletes no objects: the S3
-  backend implements no prefix delete. The response still reports success.
+- In pure `s3` mode the S3 backend implements neither `PrefixDeleter` nor `Snapshot`, so
+  `DELETE /cache/<package>` drops the index entry, leaves every object in the bucket and still reports
+  success, and `GET /admin` renders no rows however much the bucket holds.
 - The landing page at `/` reports a hardcoded version string.

@@ -138,9 +138,13 @@ Drops the package's index cache entry **and deletes its cached files**. Answers
 In `hybrid` mode only the local L1 copies are deleted; the objects stay in S3 by design. In pure `s3`
 mode no files are deleted — see the note in [architecture.md](architecture.md).
 
-> **Breaking change.** Both `DELETE /cache/*` routes required no authentication in the Python
-> implementation and in earlier groxpi releases. They now sit behind basic auth and answer `404` when no
-> admin credentials are configured. Update any script or CI job that calls them.
+> **Breaking change, and deliberate.** Both `DELETE /cache/*` routes required no authentication in the
+> Python implementation and in earlier groxpi releases. They now sit inside the admin group, so **in the
+> default configuration — no `GROXPI_ADMIN_USERNAME`, no `GROXPI_ADMIN_PASSWORD` — both answer `404`, not
+> `200`.** `DELETE /cache/list` is kept for Python-proxpi compatibility, but that compatibility only
+> exists once admin credentials are configured. Setting both variables is the whole fix; callers then
+> send basic auth. This is not a defect to "restore": authenticating the whole group was chosen after the
+> compatibility route was kept, in full knowledge that it breaks unauthenticated callers.
 
 ## Errors
 

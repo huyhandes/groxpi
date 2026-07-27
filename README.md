@@ -91,8 +91,9 @@ setting still exists; `PROXPI_`-prefixed spellings are not read. Two things chan
 
 - **Extra indexes now participate in resolution**, queried before the primary, first hit winning whole.
   A package that used to resolve to PyPI may now resolve to an extra index.
-- **`DELETE /cache/list` and `DELETE /cache/<package>` require credentials** and answer `404` when the
-  admin surface is not configured. They were open before.
+- **`DELETE /cache/list` and `DELETE /cache/<package>` require credentials** and answer `404` in the
+  default configuration, where none are set. They were open in proxpi. Set `GROXPI_ADMIN_USERNAME` and
+  `GROXPI_ADMIN_PASSWORD` to get them back, and send basic auth from whatever calls them.
 
 Both are covered in [docs/configuration.md](docs/configuration.md) and
 [docs/api-endpoints.md](docs/api-endpoints.md).

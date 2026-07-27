@@ -69,7 +69,7 @@ Files live under `GROXPI_CACHE_DIR`, bounded by `GROXPI_CACHE_SIZE` with LRU evi
 |---|---|---|
 | `GROXPI_S3_BUCKET` | *(none — required)* | Bucket. Startup fails if unset in `s3` or `hybrid` mode. |
 | `GROXPI_S3_PREFIX` | `groxpi` | Key prefix inside the bucket. |
-| `AWS_ENDPOINT_URL` | `s3.amazonaws.com` | Endpoint. An explicit scheme here overrides `GROXPI_S3_USE_SSL`. |
+| `AWS_ENDPOINT_URL` | *(unset — the SDK's own endpoint for the region)* | Endpoint override, for MinIO and other S3-compatible services. An explicit scheme here overrides `GROXPI_S3_USE_SSL`. |
 | `AWS_REGION` | `us-east-1` | Region. |
 | `AWS_ACCESS_KEY_ID` | *(unset)* | Optional static access key. |
 | `AWS_SECRET_ACCESS_KEY` | *(unset)* | Optional static secret key. |
@@ -82,7 +82,8 @@ configured the SDK's default credential chain applies — environment, shared co
 credentials, web identity, instance metadata — which is how instance and task roles work. Static keys,
 when both are set, take precedence over the chain.
 
-groxpi probes the bucket with `HeadBucket` at startup and refuses to start if it is unreachable.
+groxpi probes the bucket with `HeadBucket` at startup and refuses to start if it is unreachable. See
+[deployment.md](deployment.md) for the IAM-role path and the permissions the bucket policy needs.
 
 For MinIO set `GROXPI_S3_FORCE_PATH_STYLE=true`: MinIO cannot resolve virtual-hosted bucket names.
 Checksum calculation and validation are configured as *when required* rather than always, because
@@ -110,8 +111,8 @@ pending uploads. A `SIGKILL` can.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Time-to-first-byte budget for an upstream package file. |
-| `GROXPI_CONNECT_TIMEOUT` | `0` (unset) | Index client connect budget. |
-| `GROXPI_READ_TIMEOUT` | `0` (unset) | Index client read budget. |
+| `GROXPI_CONNECT_TIMEOUT` | `0` (unset) | Summed with the next into one whole-request timeout for the index client. Also the S3 backend's setup deadline. |
+| `GROXPI_READ_TIMEOUT` | `0` (unset) | Summed with the previous. Neither is a per-phase budget — read the note below before setting either. |
 
 `GROXPI_DOWNLOAD_TIMEOUT` bounds only the wait for the upstream **response headers**. Once headers
 arrive, the body streams to completion under the request's own lifetime — a transfer already flowing to
@@ -122,7 +123,17 @@ Set it to `0` to disable caching of package files altogether: every download bec
 upstream. That is what `redirect.reason=caching_disabled` counts.
 
 `GROXPI_CONNECT_TIMEOUT` and `GROXPI_READ_TIMEOUT` apply to the index HTTP client, not to package
-downloads. They are summed into one client timeout; with both `0` that client has no timeout.
+downloads. They are **summed into one `http.Client.Timeout`**, which covers the whole request —
+connection setup, headers *and* body. Neither name means what it says:
+
+- Setting only `GROXPI_CONNECT_TIMEOUT=3` caps the entire index request at 3 seconds, body included. A
+  slow-to-transfer index answer fails as if it had failed to connect.
+- With both unset the client keeps its built-in 60-second total timeout. `0` does not mean "no limit".
+- To allow a long transfer, set both, and set the sum to what the whole request may take.
+
+`GROXPI_CONNECT_TIMEOUT` is reused as the S3 backend's dial, TLS-handshake and credential-load budget
+(default 10 seconds there), and `GROXPI_DOWNLOAD_TIMEOUT` as its response-header budget — so the `0.9`
+default also bounds how long S3 may take to start answering.
 
 ## Server
 
