@@ -102,18 +102,9 @@ var _ storage.Storage = (*fakeStorage)(nil)
 
 // fakeIndex is a packageIndex double recording how often upstream was consulted.
 type fakeIndex struct {
-	files    map[string][]pypi.FileInfo
-	packages []string
-	err      error
-	calls    atomic.Int64
-}
-
-func (f *fakeIndex) GetPackageList() ([]string, error) {
-	f.calls.Add(1)
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.packages, nil
+	files map[string][]pypi.FileInfo
+	err   error
+	calls atomic.Int64
 }
 
 func (f *fakeIndex) GetPackageFiles(packageName string) ([]pypi.FileInfo, error) {

@@ -67,7 +67,7 @@ func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
 	}
 }
 
-func TestIndexCache_PackageAndListHelpers(t *testing.T) {
+func TestIndexCache_PackageHelpers(t *testing.T) {
 	c := NewIndexCache(0, 0)
 	defer c.Close()
 
@@ -78,12 +78,6 @@ func TestIndexCache_PackageAndListHelpers(t *testing.T) {
 	c.InvalidatePackage("numpy")
 	if _, ok := c.GetPackage("numpy"); ok {
 		t.Fatal("package entry should be invalidated")
-	}
-
-	c.Set(ListKey, NewListEntry([]string{"numpy"}, []byte(`{"a":1}`)), time.Minute)
-	c.InvalidateList()
-	if _, ok := c.Get(ListKey); ok {
-		t.Fatal("package list should be invalidated")
 	}
 	if c.Bytes() != 0 {
 		t.Fatalf("invalidation must refund bytes, still holding %d", c.Bytes())
