@@ -1,4 +1,6 @@
-package main_test
+// This is an internal test package so that TestFormatBytes can exercise the
+// real FormatBytes: package main cannot be imported from an external test.
+package main
 
 import (
 	"context"
@@ -61,20 +63,6 @@ func TestStartupWithoutOTLPEndpoint(t *testing.T) {
 	}
 }
 
-// Helper function to test formatBytes logic
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
 func TestFormatBytes(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -82,6 +70,7 @@ func TestFormatBytes(t *testing.T) {
 		expected string
 	}{
 		{"zero bytes", 0, "0 B"},
+		{"single byte", 1, "1 B"},
 		{"bytes", 512, "512 B"},
 		{"kilobytes", 1024, "1.0 KB"},
 		{"kilobytes with decimal", 1536, "1.5 KB"},
@@ -90,14 +79,15 @@ func TestFormatBytes(t *testing.T) {
 		{"gigabytes", 1024 * 1024 * 1024, "1.0 GB"},
 		{"large gigabytes", 5 * 1024 * 1024 * 1024, "5.0 GB"},
 		{"terabytes", 1024 * 1024 * 1024 * 1024, "1.0 TB"},
-		{"negative bytes", -1024, "-1024 B"}, // formatBytes doesn't handle negatives properly
+		{"terabytes from gigabytes", 2048 * 1024 * 1024 * 1024, "2.0 TB"},
+		{"negative bytes", -1024, "-1024 B"}, // FormatBytes doesn't handle negatives
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := formatBytes(tc.bytes)
+			result := FormatBytes(tc.bytes)
 			if result != tc.expected {
-				t.Errorf("formatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
+				t.Errorf("FormatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
 			}
 		})
 	}

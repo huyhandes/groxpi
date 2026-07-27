@@ -103,7 +103,11 @@ func main() {
 
 	shutdown(ctx, httpServer, srv)
 
-	if err := shutdownTelemetry(ctx); err != nil {
+	// The telemetry flush gets its own budget: a slow drain consumes ctx, and a
+	// flush on an expired context would drop the shutdown-path spans and logs.
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFlush()
+	if err := shutdownTelemetry(flushCtx); err != nil {
 		slog.Error("Failed to flush telemetry", "error", err)
 	}
 

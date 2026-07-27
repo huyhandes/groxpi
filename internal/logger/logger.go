@@ -32,10 +32,9 @@ var Logger = slog.Default()
 
 // LogConfig holds logging configuration
 type LogConfig struct {
-	Level      string // DEBUG, INFO, WARN, ERROR
-	Format     string // console, json
-	TimeFormat string // time format for console output
-	Color      bool   // enable color output for console
+	Level  string // DEBUG, INFO, WARN, ERROR
+	Format string // console, json
+	Color  bool   // enable color output for console
 }
 
 // Init initializes the global logger
@@ -52,7 +51,7 @@ func Init(cfg LogConfig) {
 		})
 	default:
 		// Console format with optional color
-		sink = newConsoleHandler(os.Stdout, cfg.Color, cfg.TimeFormat)
+		sink = newConsoleHandler(os.Stdout, cfg.Color)
 	}
 
 	Logger = slog.New(&fanout{
@@ -80,34 +79,12 @@ func ParseLevel(level string) slog.Level {
 	}
 }
 
-// IsTerminal checks if stdout is a terminal
-func IsTerminal() bool {
-	fileInfo, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return (fileInfo.Mode() & os.ModeCharDevice) != 0
-}
-
-// Convenience functions for direct access
-
-func Debug(msg string, args ...any) { Logger.Debug(msg, args...) }
-
-func Info(msg string, args ...any) { Logger.Info(msg, args...) }
-
-func Warn(msg string, args ...any) { Logger.Warn(msg, args...) }
-
-func Error(msg string, args ...any) { Logger.Error(msg, args...) }
-
-// Fatal logs at LevelFatal and terminates the process.
+// Fatal logs at LevelFatal and terminates the process. slog has no equivalent,
+// which is why this one wrapper exists where the rest of the codebase calls
+// slog directly.
 func Fatal(msg string, args ...any) {
 	Logger.Log(context.Background(), LevelFatal, msg, args...)
 	os.Exit(1)
-}
-
-// GetLogger returns the global logger instance
-func GetLogger() *slog.Logger {
-	return Logger
 }
 
 // levelName renders a level with the names log collectors are already
@@ -175,26 +152,26 @@ func (f *fanout) derive(fn func(slog.Handler) slog.Handler) slog.Handler {
 // consoleHandler renders human-readable single lines: time, level tag, message,
 // then key=value pairs. Level filtering is the fanout's job.
 type consoleHandler struct {
-	mu         *sync.Mutex
-	w          io.Writer
-	color      bool
-	timeFormat string
-	prefix     string // accumulated group prefix
-	attrs      []slog.Attr
+	mu     *sync.Mutex
+	w      io.Writer
+	color  bool
+	prefix string // accumulated group prefix
+	attrs  []slog.Attr
 }
 
-func newConsoleHandler(w io.Writer, color bool, timeFormat string) *consoleHandler {
-	if timeFormat == "" {
-		timeFormat = "15:04:05.000"
-	}
-	return &consoleHandler{mu: &sync.Mutex{}, w: w, color: color, timeFormat: timeFormat}
+// consoleTimeFormat is the wall-clock stamp on a console line. Console output is
+// for a human watching a terminal; the date is not useful there.
+const consoleTimeFormat = "15:04:05.000"
+
+func newConsoleHandler(w io.Writer, color bool) *consoleHandler {
+	return &consoleHandler{mu: &sync.Mutex{}, w: w, color: color}
 }
 
 func (h *consoleHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
-	b.WriteString(r.Time.Format(h.timeFormat))
+	b.WriteString(r.Time.Format(consoleTimeFormat))
 	b.WriteByte(' ')
 	if h.color {
 		b.WriteString(levelColor(r.Level))
