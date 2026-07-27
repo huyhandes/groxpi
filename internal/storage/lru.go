@@ -3,22 +3,38 @@ package storage
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/phuslu/log"
 )
 
-// LRUEntry represents an entry in the LRU cache. Recency lives in the list
-// ordering, not in a timestamp; CreatedAt exists only to drive TTL expiry.
+// LRUEntry represents an entry in the LRU cache.
+//
+// Eviction order comes from the list ordering alone; CreatedAt exists only to
+// drive TTL expiry. Hits and LastServed are display columns for the cache
+// listing, written on the access path under the same write lock. They must never
+// become the eviction signal: a timestamp comparison would have to scan every
+// entry to find a victim that the list already has at its back.
 type LRUEntry struct {
-	Key       string
-	Size      int64
-	CreatedAt time.Time
+	Key        string
+	Size       int64
+	CreatedAt  time.Time
+	Hits       int64
+	LastServed time.Time
+}
+
+// PrefixDeleter deletes every cached object whose key starts with a prefix. It is
+// a capability of the local cache, which knows its own contents, not of every
+// backend: nothing here lists the object store.
+type PrefixDeleter interface {
+	DeletePrefix(ctx context.Context, prefix string) (int, error)
 }
 
 // objectDeleter removes a stored object by key. It is the single owner of the
@@ -147,7 +163,7 @@ func (lru *LRUCache) expireEntries() {
 		entry := elem.Value.(*LRUEntry)
 		if now.Sub(entry.CreatedAt) > lru.ttl {
 			size := entry.Size
-			if err := lru.evictEntry(elem, entry, true); err == nil {
+			if err := lru.evictEntry(context.Background(), elem, entry, true); err == nil {
 				expiredCount++
 				expiredSize += size
 			}
@@ -207,7 +223,7 @@ func (lru *LRUCache) performEviction() {
 			}
 
 			entry := elem.Value.(*LRUEntry)
-			if err := lru.evictEntry(elem, entry, true); err == nil {
+			if err := lru.evictEntry(context.Background(), elem, entry, true); err == nil {
 				evictedCount++
 				evictedSize += entry.Size
 			}
@@ -230,7 +246,7 @@ func (lru *LRUCache) performEviction() {
 			}
 
 			entry := elem.Value.(*LRUEntry)
-			if err := lru.evictEntry(elem, entry, false); err == nil {
+			if err := lru.evictEntry(context.Background(), elem, entry, false); err == nil {
 				evictedCount++
 				evictedSize += entry.Size
 			}
@@ -247,9 +263,9 @@ func (lru *LRUCache) performEviction() {
 // evictEntry removes a single entry from the cache. Deletion goes through the
 // storage backend so that the on-disk state and the size accounting have
 // exactly one owner.
-func (lru *LRUCache) evictEntry(elem *list.Element, entry *LRUEntry, expired bool) error {
+func (lru *LRUCache) evictEntry(ctx context.Context, elem *list.Element, entry *LRUEntry, expired bool) error {
 	// Delete the file (a missing file is not an error for the backend)
-	if err := lru.deleter.Delete(context.Background(), entry.Key); err != nil {
+	if err := lru.deleter.Delete(ctx, entry.Key); err != nil {
 		log.Error().
 			Err(err).
 			Str("key", entry.Key).
@@ -281,6 +297,56 @@ func (lru *LRUCache) touch(key string) bool {
 	return lru.touchLocked(key)
 }
 
+// recordServeLocked counts a serve of an entry for the display columns. Caller
+// must hold lru.mu. It does not touch the list: recency is the caller's business.
+func recordServeLocked(entry *LRUEntry) {
+	entry.Hits++
+	entry.LastServed = time.Now()
+}
+
+// Snapshot copies every tracked entry, most recently used first. The copies mean
+// a caller can render the listing without holding the lock or racing the
+// evictor.
+func (lru *LRUCache) Snapshot() []LRUEntry {
+	lru.mu.RLock()
+	defer lru.mu.RUnlock()
+
+	rows := make([]LRUEntry, 0, lru.lruList.Len())
+	for elem := lru.lruList.Front(); elem != nil; elem = elem.Next() {
+		rows = append(rows, *elem.Value.(*LRUEntry))
+	}
+
+	return rows
+}
+
+// DeletePrefix removes every tracked object whose key starts with prefix and
+// reports how many were removed. Deletion goes through the same eviction path as
+// any other removal, so size accounting and the recency list stay consistent. A
+// prefix that matches nothing is not an error.
+func (lru *LRUCache) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	deleted := 0
+	var errs []error
+	for elem := lru.lruList.Back(); elem != nil; {
+		prev := elem.Prev()
+
+		entry := elem.Value.(*LRUEntry)
+		if strings.HasPrefix(entry.Key, prefix) {
+			if err := lru.evictEntry(ctx, elem, entry, false); err != nil {
+				errs = append(errs, err)
+			} else {
+				deleted++
+			}
+		}
+
+		elem = prev
+	}
+
+	return deleted, errors.Join(errs...)
+}
+
 // touchLocked bumps recency for an existing entry. Caller must hold lru.mu.
 func (lru *LRUCache) touchLocked(key string) bool {
 	elem, exists := lru.entries[key]
@@ -289,14 +355,16 @@ func (lru *LRUCache) touchLocked(key string) bool {
 	}
 
 	lru.lruList.MoveToFront(elem)
+	recordServeLocked(elem.Value.(*LRUEntry))
 
 	log.Debug().Str("key", key).Msg("Updated access time for existing entry")
 
 	return true
 }
 
-// addEntryLocked tracks a previously unknown key. Caller must hold lru.mu.
-func (lru *LRUCache) addEntryLocked(key string, size int64) {
+// addEntryLocked tracks a previously unknown key and returns its entry. Caller
+// must hold lru.mu.
+func (lru *LRUCache) addEntryLocked(key string, size int64) *LRUEntry {
 	entry := &LRUEntry{
 		Key:       key,
 		Size:      size,
@@ -313,6 +381,8 @@ func (lru *LRUCache) addEntryLocked(key string, size int64) {
 		Msg("Added new entry to L1 cache")
 
 	lru.triggerEvictionLocked()
+
+	return entry
 }
 
 // triggerEvictionLocked queues an eviction pass if the cache is over its limit.
@@ -339,7 +409,7 @@ func (lru *LRUCache) RecordAccess(key string, size int64) {
 		return
 	}
 
-	lru.addEntryLocked(key, size)
+	recordServeLocked(lru.addEntryLocked(key, size))
 }
 
 // RecordWrite records a write operation and adds/updates the entry. Unlike
@@ -479,6 +549,7 @@ var (
 	_ l1Storage       = (*LRULocalStorage)(nil)
 	_ Storage         = (*LRULocalStorage)(nil)
 	_ ZeroCopyCapable = (*LRULocalStorage)(nil)
+	_ PrefixDeleter   = (*LRULocalStorage)(nil)
 )
 
 // NewLRULocalStorage creates a LocalStorage with LRU eviction
@@ -586,6 +657,17 @@ func (lru *LRULocalStorage) Delete(ctx context.Context, key string) error {
 	lru.lruCache.RecordDelete(key)
 
 	return nil
+}
+
+// Snapshot reports what the cache holds, for the cache listing.
+func (lru *LRULocalStorage) Snapshot() []LRUEntry {
+	return lru.lruCache.Snapshot()
+}
+
+// DeletePrefix removes every cached object under prefix, for evicting one
+// package's files.
+func (lru *LRULocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	return lru.lruCache.DeletePrefix(ctx, prefix)
 }
 
 // Exists forwards without recording: a presence check is a routing decision,

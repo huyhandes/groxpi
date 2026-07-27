@@ -412,6 +412,22 @@ func (s *Server) handleCachePackage(c *gin.Context) {
 
 	s.indexCache.InvalidatePackage(packageName)
 
+	// Dropping the index entry alone would report success while leaving every
+	// cached file on disk. Deleting goes through the cache's own path, keyed off
+	// the package prefix every storage key already carries.
+	if deleter, ok := s.storage.(storage.PrefixDeleter); ok {
+		deleted, err := deleter.DeletePrefix(c.Request.Context(), storageKeyFor(packageName, ""))
+		if err != nil {
+			log.Error().Err(err).Str("package", packageName).Msg("Failed to delete cached files")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"status":  "error",
+				"message": "Failed to delete cached files",
+			})
+			return
+		}
+		log.Info().Str("package", packageName).Int("files_deleted", deleted).Msg("Evicted package from cache")
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data":   nil,

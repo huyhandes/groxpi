@@ -360,6 +360,87 @@ func TestLRULocalStorage_OverwriteKeepsSizeAccurate(t *testing.T) {
 	assert.Equal(t, onDiskSize(t, dir), trackedSize(s))
 }
 
+// TestLRULocalStorage_SnapshotReportsServingStats pins the columns the
+// administrative listing needs: size, age, hit count and last-served time, with
+// the hit count rising each time the same object is served.
+func TestLRULocalStorage_SnapshotReportsServingStats(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	s, err := NewLRULocalStorage(dir, 0, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	before := time.Now()
+	putBlob(t, s, "packages/numpy/numpy-2.0.0.tar.gz", 128)
+
+	rows := s.Snapshot()
+	require.Len(t, rows, 1)
+	row := rows[0]
+	assert.Equal(t, "packages/numpy/numpy-2.0.0.tar.gz", row.Key)
+	assert.Equal(t, int64(128), row.Size)
+	assert.False(t, row.CreatedAt.Before(before), "creation time must be usable as an age")
+	assert.Zero(t, row.Hits, "a write is not a serve")
+
+	for i := range 3 {
+		rc, _, err := s.Get(ctx, "packages/numpy/numpy-2.0.0.tar.gz")
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+
+		rows = s.Snapshot()
+		require.Len(t, rows, 1)
+		assert.Equal(t, int64(i+1), rows[0].Hits, "hit count must rise on every serve")
+		assert.False(t, rows[0].LastServed.Before(before), "last-served time was not recorded")
+	}
+
+	// The snapshot is a copy: mutating it cannot corrupt the cache.
+	rows[0].Size = -1
+	assert.Equal(t, int64(128), s.Snapshot()[0].Size)
+}
+
+// TestLRULocalStorage_DeletePrefixKeepsAccountingConsistent pins that a
+// prefix delete removes exactly the matching objects, through the cache's own
+// deletion path, leaving size accounting and recency ordering intact.
+func TestLRULocalStorage_DeletePrefixKeepsAccountingConsistent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	s, err := NewLRULocalStorage(dir, 0, 0)
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	putBlob(t, s, "packages/numpy/numpy-2.0.0.tar.gz", 100)
+	putBlob(t, s, "packages/numpy/numpy-2.0.0-py3-none-any.whl", 200)
+	// A package whose name merely starts with the evicted one must survive.
+	putBlob(t, s, "packages/numpy-stubs/numpy-stubs-1.0.0.tar.gz", 300)
+
+	deleted, err := s.DeletePrefix(ctx, "packages/numpy/")
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted)
+
+	for _, key := range []string{"packages/numpy/numpy-2.0.0.tar.gz", "packages/numpy/numpy-2.0.0-py3-none-any.whl"} {
+		exists, err := s.Exists(ctx, key)
+		require.NoError(t, err)
+		assert.False(t, exists, "%s survived the prefix delete", key)
+	}
+
+	exists, err := s.Exists(ctx, "packages/numpy-stubs/numpy-stubs-1.0.0.tar.gz")
+	require.NoError(t, err)
+	assert.True(t, exists, "prefix delete matched a different package")
+
+	assert.Equal(t, int64(300), trackedSize(s))
+	assert.Equal(t, onDiskSize(t, dir), trackedSize(s))
+	assert.Equal(t, 1, trackedCount(s))
+	require.Len(t, s.Snapshot(), 1)
+
+	// Deleting a prefix nothing matches is not an error.
+	deleted, err = s.DeletePrefix(ctx, "packages/absent/")
+	require.NoError(t, err)
+	assert.Equal(t, 0, deleted)
+}
+
 // TestLRULocalStorage_ConcurrentReadsUnderEvictionPressure exercises every read
 // path concurrently while eviction runs, for the -race detector.
 func TestLRULocalStorage_ConcurrentReadsUnderEvictionPressure(t *testing.T) {
