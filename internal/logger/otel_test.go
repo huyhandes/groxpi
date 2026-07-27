@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -33,21 +34,36 @@ func (e *recordingExporter) collected() []sdklog.Record {
 	return append([]sdklog.Record(nil), e.records...)
 }
 
+// restoreGlobals reverts the process-wide state that installing a logger
+// provider and calling Init overwrite, so these tests do not leak into whatever
+// runs after them.
+func restoreGlobals(t *testing.T) {
+	t.Helper()
+	provider, global, def := otellog.GetLoggerProvider(), Logger, slog.Default()
+	t.Cleanup(func() {
+		otellog.SetLoggerProvider(provider)
+		Logger = global
+		slog.SetDefault(def)
+	})
+}
+
 // TestLogRecordsCarryTraceContext is the correlation guarantee that motivated
 // the logging-library swap: with a span active, the exported log record carries
 // that span's trace and span identifiers, with no hand-rolled plumbing.
 func TestLogRecordsCarryTraceContext(t *testing.T) {
+	restoreGlobals(t)
 	exporter := &recordingExporter{}
 	otellog.SetLoggerProvider(sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewSimpleProcessor(exporter)),
 	))
 
-	// Init after the provider is installed: the bridge resolves it here.
-	Init(LogConfig{Level: "INFO", Format: "json"})
-
 	tp := sdktrace.NewTracerProvider()
 	ctx, span := tp.Tracer("test").Start(context.Background(), "request")
-	Logger.InfoContext(ctx, "handled", "package", "numpy")
+	_ = captureStdout(t, func() {
+		// Init after the provider is installed: the bridge resolves it here.
+		Init(LogConfig{Level: "INFO", Format: "json"})
+		Logger.InfoContext(ctx, "handled", "package", "numpy")
+	})
 	span.End()
 
 	records := exporter.collected()
@@ -73,15 +89,17 @@ func TestLogRecordsCarryTraceContext(t *testing.T) {
 // TestLogRecordsRespectLevelWhenBridged proves the configured level gates the
 // OpenTelemetry bridge too, not just stdout.
 func TestLogRecordsRespectLevelWhenBridged(t *testing.T) {
+	restoreGlobals(t)
 	exporter := &recordingExporter{}
 	otellog.SetLoggerProvider(sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewSimpleProcessor(exporter)),
 	))
 
-	Init(LogConfig{Level: "WARN", Format: "json"})
-
-	Logger.Info("filtered out")
-	Logger.Warn("kept")
+	_ = captureStdout(t, func() {
+		Init(LogConfig{Level: "WARN", Format: "json"})
+		Logger.Info("filtered out")
+		Logger.Warn("kept")
+	})
 
 	records := exporter.collected()
 	if len(records) != 1 {
