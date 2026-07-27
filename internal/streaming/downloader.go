@@ -2,15 +2,24 @@ package streaming
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/phuslu/log"
+
 	"github.com/huyhandes/groxpi/internal/storage"
 )
+
+// ErrVerification marks a download whose bytes did not match what the index
+// declared. Such a download is never committed to storage.
+var ErrVerification = errors.New("integrity check failed")
 
 // StorageWriter is the write half of storage.Storage, narrowed to what the
 // downloader needs. The signature matches storage.Storage.Put exactly so any
@@ -23,20 +32,34 @@ type StorageWriter interface {
 type teeStreamingDownloader struct {
 	storage     StorageWriter
 	httpClient  *http.Client
+	ttfb        time.Duration
 	copyBufPool *sync.Pool
 }
 
-// NewTeeStreamingDownloader creates a StreamingDownloader with TeeReader broadcasting
+// NewTeeStreamingDownloader creates a StreamingDownloader with TeeReader broadcasting.
+//
+// The client's Timeout is taken as the time-to-first-byte budget and then
+// cleared: it bounds only the wait for upstream response headers. Once headers
+// are in, the body runs to completion under the caller's context, because a
+// transfer that has already started streaming to the client must not be cut off
+// by a budget meant for connection setup.
 func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) StreamingDownloader {
+	ttfb := 5 * time.Minute
 	if client == nil {
-		client = &http.Client{
-			Timeout: 5 * time.Minute, // Use 5 minute timeout for large files
+		client = &http.Client{}
+	} else {
+		if client.Timeout > 0 {
+			ttfb = client.Timeout
 		}
+		clone := *client
+		client = &clone
 	}
+	client.Timeout = 0
 
 	return &teeStreamingDownloader{
 		storage:    storage,
 		httpClient: client,
+		ttfb:       ttfb,
 		copyBufPool: &sync.Pool{
 			New: func() any {
 				buf := make([]byte, 64*1024) // 64KB buffer
@@ -46,22 +69,28 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 	}
 }
 
-// DownloadAndStream downloads using TeeReader for better streaming performance
-func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, storageKey string, writer io.Writer) (*StreamResult, error) {
-	// Debug logging disabled for tests
+// DownloadAndStream downloads using TeeReader for better streaming performance.
+// The bytes are hashed on the way through and checked against expect before the
+// storage pipe is closed cleanly, so a file that fails verification is never
+// committed: the pipe is closed with an error instead and the backend discards
+// its partial write.
+func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, storageKey string, writer io.Writer, expect Expectation) (*StreamResult, error) {
+	// A deadline on the request context would outlive the headers and kill the
+	// body read, so the budget is a timer that cancels and is then stopped: it
+	// can only fire while we are still waiting for the response headers.
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	budget := time.AfterFunc(tsd.ttfb, cancel)
 
-	start := time.Now()
-
-	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if err != nil {
+		budget.Stop()
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
-	// Perform request
 	resp, err := tsd.httpClient.Do(req)
+	budget.Stop()
 	if err != nil {
 		return nil, fmt.Errorf("failed to download from %s: %w", url, err)
 	}
@@ -76,62 +105,78 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 		contentType = "application/octet-stream"
 	}
 
-	// Create hash calculator
-	hasher := md5.New()
-
-	// Create storage writer
+	hasher := sha256.New()
 	storageReader, storageWriter := io.Pipe()
-
-	// Create TeeReader that sends data to both client and storage
 	teeReader := io.TeeReader(resp.Body, io.MultiWriter(storageWriter, hasher))
 
-	// Start storage goroutine
 	storageErrCh := make(chan error, 1)
 	go func() {
-		defer func() {
-			if err := storageReader.Close(); err != nil {
-				// Log error but continue
-				_ = err
-			}
-		}()
+		defer func() { _ = storageReader.Close() }()
 		_, err := tsd.storage.Put(ctx, storageKey, storageReader, resp.ContentLength, contentType)
 		storageErrCh <- err
 	}()
 
-	// Copy to client using pooled buffer
 	copyBufPtr := tsd.copyBufPool.Get().(*[]byte)
 	defer tsd.copyBufPool.Put(copyBufPtr)
-	copyBuf := *copyBufPtr
 
-	totalSize, streamErr := io.CopyBuffer(writer, teeReader, copyBuf)
+	totalSize, streamErr := io.CopyBuffer(writer, teeReader, *copyBufPtr)
+	digest := hex.EncodeToString(hasher.Sum(nil))
 
-	// Close storage writer
-	if err := storageWriter.Close(); err != nil {
-		// Log error but continue
-		_ = err
+	// Closing the pipe cleanly is what tells the backend to commit, so it may
+	// only happen once the bytes are known to be complete and correct.
+	failure := streamErr
+	if failure == nil {
+		failure = verify(storageKey, expect, digest, totalSize, resp.ContentLength)
+	}
+	if failure != nil {
+		_ = storageWriter.CloseWithError(failure)
+	} else {
+		_ = storageWriter.Close()
 	}
 
-	// Wait for storage completion
 	storageErr := <-storageErrCh
 
-	// duration calculation for logging (disabled in tests)
-	_ = time.Since(start)
-
 	if streamErr != nil {
-		// TeeReader error logging disabled for tests
 		return nil, fmt.Errorf("tee streaming failed: %w", streamErr)
 	}
-
-	etag := fmt.Sprintf("\"%x\"", hasher.Sum(nil))
-
-	result := &StreamResult{
-		Size:        totalSize,
-		ContentType: contentType,
-		ETag:        etag,
-		Error:       storageErr,
+	if failure != nil {
+		return nil, failure
 	}
 
-	// TeeReader info logging disabled for tests
+	return &StreamResult{
+		Size:        totalSize,
+		ContentType: contentType,
+		ETag:        `"` + digest + `"`,
+		Error:       storageErr,
+	}, nil
+}
 
-	return result, nil
+// verify checks the received bytes against what the index declared: SHA-256 when
+// it supplied one, otherwise the declared length. With neither, the file is
+// accepted unverified — a deliberate hole so that sparse private indexes keep
+// working — and the weakening is logged.
+func verify(storageKey string, expect Expectation, digest string, received, upstreamLength int64) error {
+	if expect.SHA256 != "" {
+		if !strings.EqualFold(expect.SHA256, digest) {
+			return fmt.Errorf("%w: %s: sha256 %s, expected %s", ErrVerification, storageKey, digest, expect.SHA256)
+		}
+		return nil
+	}
+
+	expectedSize := expect.Size
+	if expectedSize <= 0 {
+		expectedSize = upstreamLength
+	}
+	if expectedSize >= 0 {
+		if received != expectedSize {
+			return fmt.Errorf("%w: %s: %d bytes, expected %d", ErrVerification, storageKey, received, expectedSize)
+		}
+		return nil
+	}
+
+	log.Warn().
+		Str("key", storageKey).
+		Int64("size", received).
+		Msg("⚠️ Caching unverified file: index supplied neither a hash nor a length")
+	return nil
 }

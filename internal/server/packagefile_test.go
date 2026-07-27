@@ -142,7 +142,7 @@ type fakeDownloader struct {
 	storage   *fakeStorage
 }
 
-func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey string, w io.Writer) (*streaming.StreamResult, error) {
+func (f *fakeDownloader) DownloadAndStream(ctx context.Context, _, storageKey string, w io.Writer, _ streaming.Expectation) (*streaming.StreamResult, error) {
 	f.calls.Add(1)
 	if f.delay > 0 {
 		select {

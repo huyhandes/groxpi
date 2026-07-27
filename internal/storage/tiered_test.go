@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -221,6 +222,32 @@ func TestTieredStorage_PropagatesRealL1Error(t *testing.T) {
 		_, err := ts.Exists(ctx, key)
 		require.ErrorIs(t, err, diskFailure)
 	})
+}
+
+// TestTieredStorage_PutRejectsTruncatedSource pins that a source that fails
+// part-way through commits to neither tier: the pipes feeding them must be
+// closed with the error, not cleanly, or both tiers store a short object.
+func TestTieredStorage_PutRejectsTruncatedSource(t *testing.T) {
+	const key = "packages/numpy/numpy-1.26.0.tar.gz"
+
+	l1 := newFakeTier(nil)
+	l2 := newFakeTier(nil)
+	ts := newTieredStorage(l1, l2, 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	truncated := io.MultiReader(
+		bytes.NewReader([]byte("first half")),
+		iotest.ErrReader(errors.New("connection reset")),
+	)
+
+	_, err := ts.Put(context.Background(), key, truncated, 100, "application/gzip")
+	require.Error(t, err)
+
+	for name, tier := range map[string]*fakeTier{"L1": l1, "L2": l2} {
+		exists, err := tier.Exists(context.Background(), key)
+		require.NoError(t, err)
+		assert.False(t, exists, "%s must not commit a truncated object", name)
+	}
 }
 
 // TestTieredStorage_MissIsSentinel pins that a genuine miss in both tiers is
