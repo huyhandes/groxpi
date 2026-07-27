@@ -27,10 +27,13 @@ const (
 )
 
 // l1Storage is the L1 tier contract: core storage plus the local-path
-// capability that is the whole point of having an L1.
+// capability that is the whole point of having an L1, plus the prefix delete
+// that package eviction needs. All three are things only a tier holding real
+// local files can do.
 type l1Storage interface {
 	Storage
 	ZeroCopyCapable
+	PrefixDeleter
 }
 
 // uploadJob names a finished local file to copy up to the object store.
@@ -61,6 +64,7 @@ type TieredStorage struct {
 var (
 	_ Storage         = (*TieredStorage)(nil)
 	_ ZeroCopyCapable = (*TieredStorage)(nil)
+	_ PrefixDeleter   = (*TieredStorage)(nil)
 )
 
 // TieredConfig holds configuration for tiered storage
@@ -270,6 +274,21 @@ func (ts *TieredStorage) Exists(ctx context.Context, key string) (bool, error) {
 	}
 
 	return ts.remoteStorage.Exists(ctx, key)
+}
+
+// DeletePrefix forwards package eviction to L1, which is the only tier that
+// knows its own contents. Without this, evicting a package in hybrid mode
+// cleared the index entry and left every file on disk while reporting success.
+//
+// L2 objects are deliberately left in place. Deleting them would mean listing
+// the object store to discover what matches the prefix, and that listing
+// operation was removed from the storage interface on purpose. The cost of
+// leaving them is bounded and self-correcting: L2 is a best-effort cache, so a
+// stale object there costs one wasted back-fill, and the next upstream fetch
+// overwrites it. Freeing object-store space is the object store's lifecycle
+// policy's job, not the proxy's.
+func (ts *TieredStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	return ts.localCache.DeletePrefix(ctx, prefix)
 }
 
 // GetFilePath returns the local file path for zero-copy serving. Only L1 holds

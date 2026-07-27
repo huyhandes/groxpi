@@ -250,15 +250,18 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 
 func TestServer_HandleCacheList(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
 	router := srv.Router()
 
-	// Test DELETE method
+	// The cache routes are part of the authenticated administrative group.
 	req := httptest.NewRequest("DELETE", "/cache/list", nil)
+	req.SetBasicAuth(adminUser, adminPass)
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
@@ -287,8 +290,10 @@ func TestServer_HandleCacheList(t *testing.T) {
 
 func TestServer_HandleCachePackage(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
@@ -296,6 +301,7 @@ func TestServer_HandleCachePackage(t *testing.T) {
 
 	// Test DELETE method with package name
 	req := httptest.NewRequest("DELETE", "/cache/numpy", nil)
+	req.SetBasicAuth(adminUser, adminPass)
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
@@ -552,8 +558,10 @@ func TestServer_NormalizePackageName(t *testing.T) {
 
 func TestServer_HandleCacheEdgeCases(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL:      "https://pypi.org/simple/",
+		CacheDir:      "/tmp/test-cache",
+		AdminUsername: adminUser,
+		AdminPassword: adminPass,
 	}
 
 	srv := New(cfg)
@@ -576,6 +584,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 		packages := []string{"test-package", "test_package", "Test.Package"}
 		for _, pkg := range packages {
 			req := httptest.NewRequest("DELETE", "/cache/"+pkg, nil)
+			req.SetBasicAuth(adminUser, adminPass)
 			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 

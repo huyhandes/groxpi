@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -113,7 +114,53 @@ func (f *fakeTier) GetFilePath(_ context.Context, key string) (string, error) {
 	return "/fake/" + key, nil
 }
 
+func (f *fakeTier) DeletePrefix(_ context.Context, prefix string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	deleted := 0
+	for key := range f.objects {
+		if strings.HasPrefix(key, prefix) {
+			delete(f.objects, key)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
 var _ l1Storage = (*fakeTier)(nil)
+
+// TestTieredStorage_DeletePrefixForwardsToL1 pins the hybrid-mode gap where
+// evicting a package cleared the index entry and left every file on disk. L2 is
+// deliberately untouched: discovering what matches there would need the storage
+// listing operation this design does without.
+func TestTieredStorage_DeletePrefixForwardsToL1(t *testing.T) {
+	l1 := newFakeTier(map[string][]byte{
+		"packages/evictme/evictme-1.0.0.tar.gz": []byte("a"),
+		"packages/evictme/evictme-1.0.0.whl":    []byte("b"),
+		"packages/keepme/keepme-1.0.0.tar.gz":   []byte("c"),
+	})
+	l2 := newFakeTier(map[string][]byte{"packages/evictme/evictme-1.0.0.tar.gz": []byte("a")})
+
+	ts := newTieredStorage(l1, l2, 1, 1)
+	t.Cleanup(func() { _ = ts.Close() })
+
+	deleted, err := ts.DeletePrefix(context.Background(), "packages/evictme/")
+	require.NoError(t, err)
+	assert.Equal(t, 2, deleted)
+
+	exists, err := l1.Exists(context.Background(), "packages/evictme/evictme-1.0.0.tar.gz")
+	require.NoError(t, err)
+	assert.False(t, exists, "L1 must no longer hold the evicted package")
+
+	exists, err = l1.Exists(context.Background(), "packages/keepme/keepme-1.0.0.tar.gz")
+	require.NoError(t, err)
+	assert.True(t, exists, "an unrelated package must survive")
+
+	exists, err = l2.Exists(context.Background(), "packages/evictme/evictme-1.0.0.tar.gz")
+	require.NoError(t, err)
+	assert.True(t, exists, "L2 is best-effort and deliberately left alone")
+}
 
 // TestTieredStorage_L1BackfillLands covers the bug where the back-fill job was
 // submitted with a context the submitting goroutine cancelled on its way out:

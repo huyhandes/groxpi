@@ -62,11 +62,13 @@ func newCountingUpstream(t *testing.T, pkg, file string, payload []byte) *counti
 }
 
 // newEvictionServer builds a router with a long index TTL, so a refetch can only
-// mean the index entry was dropped.
+// mean the index entry was dropped. The cache routes are part of the
+// authenticated administrative group, so credentials are configured here and
+// every request below carries them.
 func newEvictionServer(t *testing.T, upstreamURL string) (*gin.Engine, string) {
 	t.Helper()
 	cacheDir := t.TempDir()
-	srv := New(&config.Config{
+	srv, err := NewServer(&config.Config{
 		IndexURL:        upstreamURL,
 		IndexTTL:        time.Minute,
 		IndexCacheSize:  1 << 20,
@@ -74,13 +76,17 @@ func newEvictionServer(t *testing.T, upstreamURL string) (*gin.Engine, string) {
 		CacheSize:       1 << 30,
 		DownloadTimeout: 5 * time.Second,
 		LogLevel:        "ERROR",
+		AdminUsername:   adminUser,
+		AdminPassword:   adminPass,
 	})
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = srv.Close() })
 	return srv.Router(), cacheDir
 }
 
 func deletePackage(router *gin.Engine, pkg string) *http.Response {
 	req := httptest.NewRequest("DELETE", "/cache/"+pkg, nil)
+	req.SetBasicAuth(adminUser, adminPass)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()
