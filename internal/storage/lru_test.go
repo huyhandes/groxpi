@@ -3,7 +3,9 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,6 +23,10 @@ func onDiskSize(t *testing.T, dir string) int64 {
 	var total int64
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// Eviction unlinks files concurrently; a vanished entry is not a failure.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if info.IsDir() {
@@ -41,6 +47,10 @@ func onDiskCount(t *testing.T, dir string) int {
 	count := 0
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// Eviction unlinks files concurrently; a vanished entry is not a failure.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if !info.IsDir() {
