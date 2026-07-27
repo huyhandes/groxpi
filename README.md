@@ -160,8 +160,8 @@ All configuration is done through environment variables:
 | `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Timeout before redirect (seconds) |
 | `GROXPI_CONNECT_TIMEOUT` | `3.1` | Socket connect timeout (seconds) |
 | `GROXPI_READ_TIMEOUT` | `20` | Data read timeout (seconds) |
-| `GROXPI_EXTRA_INDEX_URLS` | - | Additional PyPI indices (comma-separated) |
-| `GROXPI_EXTRA_INDEX_TTLS` | - | TTLs for extra indices (comma-separated) |
+| `GROXPI_EXTRA_INDEX_URLS` | - | Additional indices (comma-separated), consulted before the main index, results never merged |
+| `GROXPI_EXTRA_INDEX_TTLS` | - | Per-index TTLs in seconds (comma-separated, default `180`) |
 | `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip SSL verification |
 
 ## 🗂️ Storage Backends

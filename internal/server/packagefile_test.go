@@ -107,14 +107,14 @@ type fakeIndex struct {
 	calls atomic.Int64
 }
 
-func (f *fakeIndex) GetPackageFiles(packageName string) ([]pypi.FileInfo, error) {
+func (f *fakeIndex) GetPackageFiles(_ context.Context, _ config.Index, packageName string) ([]pypi.FileInfo, error) {
 	f.calls.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
 	files, ok := f.files[packageName]
 	if !ok {
-		return nil, fmt.Errorf("package not found: %s", packageName)
+		return nil, fmt.Errorf("%w: %s", pypi.ErrNotFound, packageName)
 	}
 	return files, nil
 }
@@ -295,7 +295,7 @@ func TestPackageFileService_Plan_DecisionTree(t *testing.T) {
 			if tt.seedIndexCache != nil {
 				body, err := encodePackageFiles(pkg, tt.seedIndexCache)
 				require.NoError(t, err)
-				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body), time.Minute)
+				svc.indexCache.SetPackage(pkg, cache.NewPackageEntry(tt.seedIndexCache, body, "seed"), time.Minute)
 			}
 
 			plan, err := svc.Plan(context.Background(), pkg, file)

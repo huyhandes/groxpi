@@ -97,15 +97,18 @@ groxpi does **not** have a kernel zero-copy path. `storage.ZeroCopyCapable` mean
 
 Speculative streaming machinery — `ZeroCopyServer`, `BroadcastWriter`, `HashingWriter` and a second non-tee downloader — had no production callers and was deleted in `6243e0a`.
 
-## Multi-Index Support 🔄 (configuration only)
+## Multi-Index Support ✅
 
-`GROXPI_EXTRA_INDEX_URLS` and `GROXPI_EXTRA_INDEX_TTLS` are parsed and validated into `config.ExtraIndexURLs` / `ExtraIndexTTLs`, but **no code reads them** — `pypi.Client` queries `IndexURL` only. Verified at `ba2e0d6`: the only references to these fields outside `internal/config` are its own tests.
+`GROXPI_EXTRA_INDEX_URLS` / `GROXPI_EXTRA_INDEX_TTLS` build `config.ResolutionOrder()` — extras first in configured order, primary last — which `PackageFileService.queryIndexes` consults. See [ADR 0001](adr/0001-extras-first-index-resolution.md).
 
 ### Index Configuration
-- **Main Index**: Primary PyPI index configuration ✅
-- **Extra Indices**: parsed from env, not yet queried 🔄
-- **Individual TTLs**: parsed from env, not yet applied 🔄
-- **Fallback Logic**: not implemented 🔄
+- **Main Index**: primary index, consulted last ✅
+- **Extra Indices**: queried before the primary, in configured order ✅
+- **Individual TTLs**: the answering index's TTL is the cache entry's TTL ✅
+- **Never Merged**: the first index with the package supplies its whole file list; no union, no dedup, so dependency confusion is impossible by construction ✅
+- **Fallthrough**: not-found only after every index has missed; a failing index fails the request rather than falling through ✅
+- **Concurrency**: extras are queried in parallel with strictly ordered selection; the primary is never queried speculatively (it would leak internal package names) ✅
+- **Credential Redaction**: user-info in an index URL never reaches a log field, an error or the `/health` payload ✅
 - **Health Monitoring**: not implemented 🔄
 
 ### Timeouts

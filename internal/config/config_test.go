@@ -200,6 +200,39 @@ func TestLoadS3RequiresBucket(t *testing.T) {
 	Load()
 }
 
+func TestResolutionOrder(t *testing.T) {
+	cfg := &Config{
+		IndexURL:       "https://pypi.org/simple/",
+		IndexTTL:       30 * time.Minute,
+		ExtraIndexURLs: []string{"https://private.example.com/simple/", "https://other.example.com/simple/"},
+		ExtraIndexTTLs: []time.Duration{time.Minute}, // second one omitted on purpose
+	}
+
+	got := cfg.ResolutionOrder()
+
+	want := []Index{
+		{URL: "https://private.example.com/simple/", TTL: time.Minute},
+		{URL: "https://other.example.com/simple/", TTL: defaultExtraIndexTTL},
+		{URL: "https://pypi.org/simple/", TTL: 30 * time.Minute},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Expected %d indexes, got %d", len(want), len(got))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Index[%d]: expected %+v, got %+v", i, want[i], got[i])
+		}
+	}
+}
+
+func TestResolutionOrder_PrimaryOnly(t *testing.T) {
+	cfg := &Config{IndexURL: "https://pypi.org/simple/", IndexTTL: time.Hour}
+	got := cfg.ResolutionOrder()
+	if len(got) != 1 || got[0].URL != cfg.IndexURL {
+		t.Fatalf("Expected the primary index alone, got %+v", got)
+	}
+}
+
 // GetEnv is not exported, skip these tests
 
 // GetIntEnv is not exported, skip these tests

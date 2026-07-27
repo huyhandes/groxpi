@@ -8,8 +8,8 @@ Groxpi supports comprehensive configuration through environment variables, maint
 |----------|---------|-------------|
 | `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Main PyPI index URL |
 | `GROXPI_INDEX_TTL` | `1800` | Index cache TTL in seconds (30 minutes) |
-| `GROXPI_EXTRA_INDEX_URLS` | - | Comma-separated extra indices |
-| `GROXPI_EXTRA_INDEX_TTLS` | - | Corresponding TTLs for extra indices |
+| `GROXPI_EXTRA_INDEX_URLS` | - | Comma-separated extra indices, consulted **before** the main index in the order given |
+| `GROXPI_EXTRA_INDEX_TTLS` | - | Per-index cache TTLs in seconds, positionally matched to the URLs (default `180`) |
 | `GROXPI_CACHE_SIZE` | `5368709120` | File cache size in bytes (5GB) |
 | `GROXPI_CACHE_DIR` | `./cache` | Cache directory path |
 | `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Timeout before redirect (seconds) |
@@ -169,9 +169,26 @@ export GROXPI_LOGGING_LEVEL=INFO
 ### Multiple Indices
 ```bash
 export GROXPI_INDEX_URL="https://pypi.org/simple/"
-export GROXPI_EXTRA_INDEX_URLS="https://test.pypi.org/simple/,https://private.pypi.example.com/simple/"
+export GROXPI_EXTRA_INDEX_URLS="https://private.pypi.example.com/simple/,https://test.pypi.org/simple/"
 export GROXPI_EXTRA_INDEX_TTLS="900,3600"  # 15 minutes, 1 hour
 ```
+
+Resolution order is **extras first, in the order listed, then the main index
+last**. The first index that has the package supplies its whole file list; lists
+from different indexes are never merged, so a package registered on PyPI under an
+internal name cannot shadow the internal one. A 404 is returned only after every
+index has missed, and each index's entries expire on that index's own TTL. An
+extra index that *fails* (connection refused, 5xx) fails the request rather than
+falling through to the main index. See
+[ADR 0001](adr/0001-extras-first-index-resolution.md) for the reasoning.
+
+Credentials may be embedded in any index URL
+(`https://user:token@private.example.com/simple/`); they are redacted from logs,
+error messages and the `/health` payload.
+
+> **Upgrade note:** before this release `GROXPI_EXTRA_INDEX_URLS` was parsed and
+> never queried. If you already had it set, resolution changes: packages that
+> resolved from PyPI may now resolve from an extra index.
 
 ## Docker Environment
 

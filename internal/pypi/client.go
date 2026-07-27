@@ -3,8 +3,10 @@ package pypi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +19,11 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/phuslu/log"
 )
+
+// ErrNotFound reports that an index does not list a package. Index resolution has
+// to tell a miss from a failure: a miss falls through to the next index, a
+// failure does not.
+var ErrNotFound = errors.New("package not found")
 
 // Client fetches index pages from an upstream PyPI-compatible index. Concurrent
 // requests for the same package are coalesced by the package-file service, not
@@ -152,10 +159,11 @@ func NewClient(cfg *config.Config) *Client {
 }
 
 func (c *Client) GetPackageList() ([]string, error) {
-	url := strings.TrimSuffix(c.config.IndexURL, "/")
+	index := config.Index{URL: c.config.IndexURL}
+	url := strings.TrimSuffix(index.URL, "/")
 
 	// Try JSON first
-	resp, err := c.makeRequest(url, "application/vnd.pypi.simple.v1+json")
+	resp, err := c.makeRequest(context.Background(), url, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package list: %w", err)
 	}
@@ -167,7 +175,7 @@ func (c *Client) GetPackageList() ([]string, error) {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, index.Redacted())
 	}
 
 	// Check if response is JSON
@@ -180,13 +188,16 @@ func (c *Client) GetPackageList() ([]string, error) {
 	return c.parseHTMLPackageList(resp.Body)
 }
 
-func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
-	indexURL := strings.TrimSuffix(c.config.IndexURL, "/") + "/" + packageName + "/"
+// GetPackageFiles fetches one package's file list from one index. The index is a
+// parameter rather than client state because resolution asks several of them for
+// the same package; the client itself is stateless about which.
+func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
+	indexURL := strings.TrimSuffix(index.URL, "/") + "/" + packageName + "/"
 
 	// Try JSON first
-	resp, err := c.makeRequest(indexURL, "application/vnd.pypi.simple.v1+json")
+	resp, err := c.makeRequest(ctx, indexURL, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch package files for %s: %w", packageName, err)
+		return nil, fmt.Errorf("failed to fetch package files for %s from %s: %w", packageName, index.Redacted(), err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -196,11 +207,11 @@ func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("package %s not found", packageName)
+		return nil, fmt.Errorf("%w: %s on %s", ErrNotFound, packageName, index.Redacted())
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, indexURL)
+		return nil, fmt.Errorf("HTTP %d from %s for package %s", resp.StatusCode, index.Redacted(), packageName)
 	}
 
 	// Check if response is JSON
@@ -219,16 +230,29 @@ func (c *Client) GetPackageFiles(packageName string) ([]FileInfo, error) {
 	return c.parseHTMLPackageFiles(resp.Body, baseURL)
 }
 
-func (c *Client) makeRequest(url, accept string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
-		return nil, err
+		return nil, redactRequestError(err)
 	}
 
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	return resp, redactRequestError(err)
+}
+
+// redactRequestError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// wrapping one unredacted would leak a private index's password into any log that
+// records the error.
+func redactRequestError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		uerr.URL = config.RedactURL(uerr.URL)
+	}
+	return err
 }
 
 func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {
@@ -323,7 +347,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 	// emitting hrefs verbatim rather than dropping the whole index.
 	base, baseErr := url.Parse(baseURL)
 	if baseErr != nil {
-		log.Warn().Err(baseErr).Str("base_url", baseURL).
+		log.Warn().Err(baseErr).Str("base_url", config.RedactURL(baseURL)).
 			Msg("Cannot parse index URL, leaving package file hrefs unresolved")
 		base = nil
 	}
@@ -363,7 +387,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if base != nil {
 				ref, err := url.Parse(href)
 				if err != nil {
-					log.Warn().Err(err).Str("href", href).Str("base_url", baseURL).
+					log.Warn().Err(err).Str("href", href).Str("base_url", config.RedactURL(baseURL)).
 						Msg("Skipping package file with unparseable href")
 					continue
 				}
