@@ -18,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // S3Config holds S3 storage configuration
@@ -313,10 +315,12 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 			// Absence is the answer, not a failure. Anything else is a failure
 			// and must not be reported as "does not exist".
 			if isNotFoundResponse(err) {
+				telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 				return false, nil
 			}
 			return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
 		}
+		telemetry.CacheHit(ctx, telemetry.LayerRemote)
 		return true, nil
 	})
 	if err != nil {
