@@ -84,6 +84,30 @@ with a common S3 bucket: each pod keeps a local L1 and the bucket is the shared 
 
 See [configuration.md](configuration.md) for the settings each mode reads.
 
+## S3 credentials
+
+groxpi uses the AWS SDK for Go v2 and configures static keys **only** when both `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` are set. With neither set, the SDK's default credential chain applies, so the
+preferred deployment sets no keys at all and relies on the role attached to the workload:
+
+- **EKS** — an IAM role for the service account (or Pod Identity). The projected token and role ARN the
+  cluster injects are picked up by the chain; set `GROXPI_S3_BUCKET` and `AWS_REGION` and nothing else.
+- **EC2 / ECS** — the instance profile or task role, read from the metadata or container credentials
+  endpoint by the same chain.
+- **Static keys** — for MinIO and local development, where there is no role to assume.
+
+Whichever path is used, groxpi calls `HeadBucket` at startup and refuses to start if the bucket is
+unreachable — a missing or unauthorised credential is a startup failure, not a runtime surprise. Loading
+the SDK config and that probe share one deadline: `GROXPI_CONNECT_TIMEOUT` if set, otherwise 10 seconds.
+So a slow metadata endpoint on a cold node shows up as a failure to start, and on such a node the
+setting has to be raised. The
+startup log line records `static_credentials=true|false`, which is the quickest way to confirm a pod is
+really using its role.
+
+The role needs `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the bucket — `ListBucket` covers the
+`HeadBucket` probe. No request path deletes an S3 object, so `s3:DeleteObject` is not required; see the
+eviction note in [api-endpoints.md](api-endpoints.md).
+
 ## Reverse proxy and TLS
 
 The admin surface authenticates with HTTP basic auth, which transmits the username and password in
