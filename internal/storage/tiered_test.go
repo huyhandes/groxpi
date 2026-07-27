@@ -128,6 +128,17 @@ func (f *fakeTier) DeletePrefix(_ context.Context, prefix string) (int, error) {
 	return deleted, nil
 }
 
+func (f *fakeTier) Snapshot() []LRUEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	rows := make([]LRUEntry, 0, len(f.objects))
+	for key, data := range f.objects {
+		rows = append(rows, LRUEntry{Key: key, Size: int64(len(data))})
+	}
+	return rows
+}
+
 var _ l1Storage = (*fakeTier)(nil)
 
 // TestTieredStorage_DeletePrefixForwardsToL1 pins the hybrid-mode gap where
@@ -160,6 +171,29 @@ func TestTieredStorage_DeletePrefixForwardsToL1(t *testing.T) {
 	exists, err = l2.Exists(context.Background(), "packages/evictme/evictme-1.0.0.tar.gz")
 	require.NoError(t, err)
 	assert.True(t, exists, "L2 is best-effort and deliberately left alone")
+}
+
+// TestTieredStorage_SnapshotForwardsToL1 pins the hybrid-mode gap where the
+// cached-package listing rendered zero rows: the admin page reads its rows from
+// a Snapshot the top-level backend has to provide, and in hybrid mode that
+// backend is the tiered one, not the local cache underneath it.
+func TestTieredStorage_SnapshotForwardsToL1(t *testing.T) {
+	const key = "packages/requests/requests-2.31.0.tar.gz"
+	payload := []byte("wheel bytes")
+
+	l1, err := NewLRULocalStorage(t.TempDir(), 10*1024*1024, 0)
+	require.NoError(t, err)
+
+	ts := newTieredStorage(l1, newFakeTier(nil), 4, 1)
+	defer func() { _ = ts.Close() }()
+
+	_, err = ts.Put(context.Background(), key, bytes.NewReader(payload), int64(len(payload)), "application/octet-stream")
+	require.NoError(t, err)
+
+	rows := ts.Snapshot()
+	require.Len(t, rows, 1, "a file written through the tiered backend must show up in its snapshot")
+	assert.Equal(t, key, rows[0].Key)
+	assert.Equal(t, int64(len(payload)), rows[0].Size)
 }
 
 // TestTieredStorage_L1BackfillLands covers the bug where the back-fill job was
