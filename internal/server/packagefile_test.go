@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -637,7 +637,7 @@ func TestServer_DownloadStream_HeadersPrecedeBody(t *testing.T) {
 					},
 				},
 			}
-			jsonData, _ := sonic.Marshal(response)
+			jsonData, _ := json.Marshal(response)
 			_, _ = w.Write(jsonData)
 			return
 		}
@@ -697,7 +697,7 @@ func TestServer_HandleDownloadFile_ServesFollowersFromStorage(t *testing.T) {
 					},
 				},
 			}
-			jsonData, _ := sonic.Marshal(response)
+			jsonData, _ := json.Marshal(response)
 			_, _ = w.Write(jsonData)
 			return
 		}

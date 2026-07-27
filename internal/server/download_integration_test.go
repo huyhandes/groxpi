@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -59,7 +59,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 						},
 					},
 				}
-				jsonData, _ := sonic.Marshal(response)
+				jsonData, _ := json.Marshal(response)
 				_, _ = w.Write(jsonData)
 			} else {
 				// Return package index HTML
@@ -248,7 +248,7 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 						},
 					},
 				}
-				jsonData, _ := sonic.Marshal(response)
+				jsonData, _ := json.Marshal(response)
 				_, _ = w.Write(jsonData)
 			} else {
 				// Return HTML response
