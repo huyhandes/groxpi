@@ -1,13 +1,65 @@
 package main_test
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/logger"
+	"github.com/huyhandes/groxpi/internal/server"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
+
+// TestStartupWithoutOTLPEndpoint is the regression guard for observability
+// becoming a startup dependency: with no collector configured, telemetry setup
+// installs nothing, the logger initialises, and the server serves a request.
+func TestStartupWithoutOTLPEndpoint(t *testing.T) {
+	for _, key := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SERVICE_NAME"} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	t.Setenv("GROXPI_CACHE_DIR", t.TempDir())
+	t.Setenv("GROXPI_LOGGING_LEVEL", "ERROR")
+
+	cfg := config.Load()
+	if cfg.OTLPEndpoint != "" {
+		t.Fatalf("expected no OTLP endpoint, got %q", cfg.OTLPEndpoint)
+	}
+
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	if err != nil {
+		t.Fatalf("telemetry setup must not fail without a collector: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdownTelemetry(context.Background()) })
+
+	logger.Init(logger.LogConfig{Level: cfg.LogLevel, Format: cfg.LogFormat, Color: cfg.LogColor})
+
+	srv := server.New(cfg)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: srv.Router()}
+	go func() { _ = httpServer.Serve(listener) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("server did not serve a request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health = %d, want 200", resp.StatusCode)
+	}
+}
 
 // Helper function to test formatBytes logic
 func formatBytes(bytes int64) string {

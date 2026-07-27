@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/phuslu/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"log/slog"
 
 	"github.com/huyhandes/groxpi/internal/config"
 )
@@ -441,12 +441,12 @@ func getBody(t *testing.T, srv *Server, path string) (string, int) {
 // duration of a test, and returns the restore function.
 func captureLogs(t *testing.T, w io.Writer) func() {
 	t.Helper()
-	previousLogger := log.DefaultLogger
+	previousLogger := slog.Default()
 	previousOut, previousErr := gin.DefaultWriter, gin.DefaultErrorWriter
-	log.DefaultLogger = log.Logger{Level: log.TraceLevel, Writer: &log.IOWriter{Writer: w}}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	gin.DefaultWriter, gin.DefaultErrorWriter = w, w
 	return func() {
-		log.DefaultLogger = previousLogger
+		slog.SetDefault(previousLogger)
 		gin.DefaultWriter, gin.DefaultErrorWriter = previousOut, previousErr
 	}
 }

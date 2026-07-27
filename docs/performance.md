@@ -120,9 +120,10 @@ There is **no response buffer pool** and **no pooling on the S3 write path**. Th
 - **SIMD instructions** for JSON processing
 - **Memory efficient** with reduced allocations
 
-### phuslu/log (vs standard log)
-- **Zero allocation** structured logging
-- **High throughput** logging with minimal latency
+### log/slog (vs standard log)
+- **Structured** logging with attribute pairs rather than formatted strings
+- **Level-gated** at the handler, so disabled records cost one comparison
+- **Bridged to OpenTelemetry**, so correlation costs no extra logging call
 - **JSON structured** output for observability
 
 ## Caching Performance

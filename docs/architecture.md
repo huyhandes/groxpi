@@ -36,7 +36,8 @@ flowchart TB
 | Module | Files | Role | Depth |
 |---|---|---|---|
 | `config` | `config.go` | env-var config load, proxpi-compatible | shallow (data) |
-| `logger` | `logger.go` | phuslu/log setup | shallow (data) |
+| `logger` | `logger.go` | slog setup: stdout handler fanned out to the OpenTelemetry log bridge | shallow (data) |
+| `telemetry` | `telemetry.go` | OTel trace/metric/log provider setup over OTLP; no-op with no endpoint | shallow (data) |
 | `cache` | `index.go`, `response.go` | 2 in-memory caches: TTL map for parsed indexes, LRU for pre-marshaled JSON | shallow–moderate |
 | `pypi` | `client.go` | upstream Simple API client; Sonic JSON parse, PEP 503 HTML fallback | moderate |
 | `storage` | `storage.go`, `local.go`, `lru.go`, `s3.go`, `tiered.go`, `workerpool.go` | pluggable object storage; L1/L2 tiering; generic bounded worker pool | deep |

@@ -5,7 +5,10 @@ Groxpi provides comprehensive monitoring and observability features for producti
 ## Current Features
 
 ### Structured Logging
-Groxpi uses [phuslu/log](https://github.com/phuslu/log) for high-performance structured logging.
+Groxpi logs through the standard library's `log/slog`, bridged to OpenTelemetry by
+[otelslog](https://pkg.go.dev/go.opentelemetry.io/contrib/bridges/otelslog). Records go to stdout in
+the configured format and, when a collector is configured, over OTLP as well — carrying the trace and
+span identifiers of the request that produced them.
 
 #### Log Levels
 - **DEBUG**: Detailed debugging information
@@ -77,26 +80,20 @@ Comprehensive health monitoring endpoint for container orchestration.
 }
 ```
 
-### Performance Metrics
-Real-time performance tracking integrated into the server.
+### OpenTelemetry Export
+All three signals — logs, metrics and traces — leave groxpi over OTLP (HTTP/protobuf) to one
+collector endpoint. groxpi exposes **no** Prometheus scrape endpoint of its own; see
+[adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md) for why.
 
-#### Request Metrics
-- **Total requests**: Counter with method/status breakdown
-- **Response times**: Histogram with P50/P95/P99
-- **Error rates**: 4xx/5xx response tracking
-- **Concurrent connections**: Active connection count
+```bash
+# One destination for all three signals. Unset means telemetry is inert.
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+export OTEL_SERVICE_NAME=groxpi   # optional, defaults to "groxpi"
+```
 
-#### Cache Metrics
-- **Hit ratios**: Index cache, file cache, response cache
-- **Cache sizes**: Memory usage and entry counts
-- **Eviction rates**: LRU cache eviction frequency
-- **Miss penalties**: Time spent on cache misses
-
-#### System Metrics
-- **Memory usage**: Heap size, GC frequency, allocations
-- **CPU usage**: Process CPU utilization
-- **Disk I/O**: File cache read/write operations
-- **Network I/O**: Upstream request latency
+With `OTEL_EXPORTER_OTLP_ENDPOINT` unset the providers are no-op: nothing is exported, no connection
+is attempted at startup, and instrumentation costs nothing. A collector that is unreachable is
+absorbed by the exporters' retry-and-drop behaviour — it cannot fail a request or block startup.
 
 ### Error Recovery
 Automatic error recovery with comprehensive logging.
@@ -105,7 +102,6 @@ Automatic error recovery with comprehensive logging.
 - **Middleware**: Automatic panic recovery
 - **Logging**: Full stack trace logging
 - **Response**: 500 Internal Server Error
-- **Metrics**: Panic counter for alerting
 
 #### Graceful Shutdown
 - **Signal handling**: SIGTERM/SIGINT support
@@ -123,51 +119,21 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:5000/health || exit 1
 ```
 
-### Prometheus Integration (Planned)
-Configuration for Prometheus metrics scraping.
+### Prometheus Integration
+groxpi does not serve Prometheus exposition format. Point it at a collector, and let the collector
+re-export to Prometheus:
 
-#### Prometheus Configuration
 ```yaml
-# monitoring/prometheus.yml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-
+# monitoring/prometheus.yml — scrape the collector, never groxpi
 scrape_configs:
-  - job_name: 'groxpi'
+  - job_name: 'otel-collector'
     static_configs:
-      - targets: ['groxpi:5000']
-    metrics_path: '/metrics'
-    scrape_interval: 5s
-    scrape_timeout: 5s
+      - targets: ['otel-collector:8889']
 ```
 
-#### Metrics Endpoint (Planned)
-- **URL**: `GET /metrics`
-- **Format**: Prometheus exposition format
-- **Metrics**: Application and system metrics
-
-### Grafana Dashboards (Planned)
-Pre-configured Grafana dashboards for visualization.
-
-#### Dashboard Features
-- **Request Rate**: RPS over time with breakdown
-- **Response Times**: Latency histograms and percentiles
-- **Cache Performance**: Hit ratios and cache efficiency
-- **Error Monitoring**: Error rate trends and alerting
-- **System Health**: Memory, CPU, and disk usage
-
-#### Dashboard Configuration
-```yaml
-# monitoring/grafana/datasources/prometheus.yml
-apiVersion: 1
-datasources:
-  - name: Prometheus
-    type: prometheus
-    access: proxy
-    url: http://prometheus:9090
-    isDefault: true
-```
+The collector's own configuration owns the receiver (`otlp` on `:4318`) and the
+`prometheus` exporter that `:8889` belongs to. Metric names are whatever your collector pipeline
+produces from the OTLP metrics groxpi sends.
 
 ## Production Monitoring
 
@@ -272,10 +238,8 @@ version: '3.8'
 services:
   groxpi:
     # ... other config
-    labels:
-      - "prometheus.io/scrape=true"
-      - "prometheus.io/port=5000"
-      - "prometheus.io/path=/metrics"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
@@ -290,10 +254,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: groxpi
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "5000"
-    prometheus.io/path: "/metrics"
 spec:
   ports:
     - port: 5000

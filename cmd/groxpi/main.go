@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,12 +14,22 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/logger"
 	"github.com/huyhandes/groxpi/internal/server"
-	"github.com/phuslu/log"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 func main() {
 	// Load configuration
 	cfg := config.Load()
+
+	// Install the OpenTelemetry providers before the logger, so that the log
+	// bridge picks up a real provider when one is configured. With no endpoint
+	// configured this installs nothing and cannot fail.
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	if err != nil {
+		// A misconfigured exporter must not stop the proxy from serving.
+		slog.Warn("Telemetry disabled: failed to set up OpenTelemetry", "error", err)
+		shutdownTelemetry = func(context.Context) error { return nil }
+	}
 
 	// Initialize logger
 	logger.Init(logger.LogConfig{
@@ -28,42 +39,37 @@ func main() {
 	})
 
 	// Test debug logging immediately after logger init
-	log.Debug().
-		Str("log_level", cfg.LogLevel).
-		Str("log_format", cfg.LogFormat).
-		Bool("log_color", cfg.LogColor).
-		Msg("🔧 Logger initialized and debug logging is working")
+	slog.Debug("🔧 Logger initialized and debug logging is working",
+		"log_level", cfg.LogLevel,
+		"log_format", cfg.LogFormat,
+		"log_color", cfg.LogColor)
 
 	// Log startup info
-	log.Info().
-		Str("version", "1.0.0").
-		Str("storage_type", cfg.StorageType).
-		Str("log_level", cfg.LogLevel).
-		Str("log_format", cfg.LogFormat).
-		Msg("🚀 Starting groxpi server")
+	slog.Info("🚀 Starting groxpi server",
+		"version", "1.0.0",
+		"storage_type", cfg.StorageType,
+		"log_level", cfg.LogLevel,
+		"log_format", cfg.LogFormat,
+		"otlp_endpoint", cfg.OTLPEndpoint)
 
 	// Log configuration
-	log.Info().
-		Str("index_url", cfg.IndexURL).
-		Int64("cache_size_bytes", cfg.CacheSize).
-		Str("cache_size_human", FormatBytes(cfg.CacheSize)).
-		Dur("index_ttl", cfg.IndexTTL).
-		Str("port", cfg.Port).
-		Msg("📋 Configuration loaded")
+	slog.Info("📋 Configuration loaded",
+		"index_url", config.RedactURL(cfg.IndexURL),
+		"cache_size_bytes", cfg.CacheSize,
+		"cache_size_human", FormatBytes(cfg.CacheSize),
+		"index_ttl", cfg.IndexTTL,
+		"port", cfg.Port)
 
 	// Log storage configuration
 	if cfg.StorageType == "s3" {
-		log.Info().
-			Str("endpoint", cfg.S3Endpoint).
-			Str("bucket", cfg.S3Bucket).
-			Str("prefix", cfg.S3Prefix).
-			Str("region", cfg.S3Region).
-			Bool("ssl", cfg.S3UseSSL).
-			Msg("☁️  S3 storage configured")
+		slog.Info("☁️  S3 storage configured",
+			"endpoint", cfg.S3Endpoint,
+			"bucket", cfg.S3Bucket,
+			"prefix", cfg.S3Prefix,
+			"region", cfg.S3Region,
+			"ssl", cfg.S3UseSSL)
 	} else {
-		log.Info().
-			Str("cache_dir", cfg.CacheDir).
-			Msg("💾 Local storage configured")
+		slog.Info("💾 Local storage configured", "cache_dir", cfg.CacheDir)
 	}
 
 	// Create server
@@ -78,12 +84,10 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		log.Info().
-			Str("address", ":"+cfg.Port).
-			Msg("🌐 HTTP server starting")
+		slog.Info("🌐 HTTP server starting", "address", ":"+cfg.Port)
 
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal().Err(err).Msg("Failed to start server")
+			logger.Fatal("Failed to start server", "error", err)
 		}
 	}()
 
@@ -93,23 +97,27 @@ func main() {
 	<-stop
 
 	// Graceful shutdown
-	log.Warn().Msg("⚠️  Shutdown signal received")
+	slog.Warn("⚠️  Shutdown signal received")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	shutdown(ctx, httpServer, srv)
 
-	log.Info().Msg("✅ Server stopped gracefully")
+	if err := shutdownTelemetry(ctx); err != nil {
+		slog.Error("Failed to flush telemetry", "error", err)
+	}
+
+	slog.Info("✅ Server stopped gracefully")
 }
 
 // shutdown drains in-flight requests, then releases the storage backend.
 func shutdown(ctx context.Context, httpServer *http.Server, backend io.Closer) {
 	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Error().Err(err).Msg("Server forced to shutdown")
+		slog.Error("Server forced to shutdown", "error", err)
 	}
 
 	if err := backend.Close(); err != nil {
-		log.Error().Err(err).Msg("Failed to close storage backend")
+		slog.Error("Failed to close storage backend", "error", err)
 	}
 }
 

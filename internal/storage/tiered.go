@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/phuslu/log"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -105,15 +105,14 @@ func NewTieredStorage(cfg *TieredConfig) (*TieredStorage, error) {
 
 	ts := newTieredStorage(localStorage, s3Storage, cfg.SyncQueueSize, cfg.SyncWorkers)
 
-	log.Info().
-		Str("local_cache_dir", cfg.LocalCacheDir).
-		Int64("local_cache_size_bytes", cfg.LocalCacheSize).
-		Dur("local_cache_ttl", cfg.LocalCacheTTL).
-		Str("s3_endpoint", cfg.S3Config.Endpoint).
-		Str("s3_bucket", cfg.S3Config.Bucket).
-		Int("workers", cfg.SyncWorkers).
-		Int("queue_size", cfg.SyncQueueSize).
-		Msg("Tiered storage initialized successfully")
+	slog.Info("Tiered storage initialized successfully",
+		"local_cache_dir", cfg.LocalCacheDir,
+		"local_cache_size_bytes", cfg.LocalCacheSize,
+		"local_cache_ttl", cfg.LocalCacheTTL,
+		"s3_endpoint", cfg.S3Config.Endpoint,
+		"s3_bucket", cfg.S3Config.Bucket,
+		"workers", cfg.SyncWorkers,
+		"queue_size", cfg.SyncQueueSize)
 
 	return ts, nil
 }
@@ -135,7 +134,7 @@ func newTieredStorage(l1 l1Storage, l2 Storage, queueSize, workers int) *TieredS
 			defer cancel()
 
 			if err := ts.populateLocalCache(jobCtx, key); err != nil {
-				log.Error().Err(err).Str("key", key).Msg("Failed to populate L1 cache from L2")
+				slog.Error("Failed to populate L1 cache from L2", "error", err, "key", key)
 			}
 		})
 
@@ -147,7 +146,7 @@ func newTieredStorage(l1 l1Storage, l2 Storage, queueSize, workers int) *TieredS
 			defer cancel()
 
 			if err := ts.uploadToRemote(jobCtx, job); err != nil {
-				log.Warn().Err(err).Str("key", job.key).Msg("Best-effort upload to L2 failed")
+				slog.Warn("Best-effort upload to L2 failed", "error", err, "key", job.key)
 			}
 		})
 
@@ -165,7 +164,7 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 	case err == nil:
 		return reader, info, nil
 	case !errors.Is(err, ErrNotFound):
-		log.Error().Err(err).Str("key", key).Msg("L1 read failed for a reason other than a miss")
+		slog.Error("L1 read failed for a reason other than a miss", "error", err, "key", key)
 		return nil, nil, fmt.Errorf("L1 read of %q failed: %w", key, err)
 	}
 
@@ -180,7 +179,7 @@ func (ts *TieredStorage) Get(ctx context.Context, key string) (io.ReadCloser, *O
 	// Back-fill L1 for future requests without blocking this one. Best-effort:
 	// a full queue drops the key rather than blocking the caller.
 	if !ts.syncQueue.Submit(key) {
-		log.Warn().Str("key", key).Msg("Tiered sync queue is full, skipping L1 population")
+		slog.Warn("Tiered sync queue is full, skipping L1 population", "key", key)
 	}
 
 	return reader, info, nil
@@ -197,7 +196,7 @@ func (ts *TieredStorage) Put(ctx context.Context, key string, reader io.Reader, 
 		}
 
 		if !ts.uploadQueue.Submit(uploadJob{key: key, contentType: contentType}) {
-			log.Warn().Str("key", key).Msg("Tiered upload queue is full, skipping L2 upload")
+			slog.Warn("Tiered upload queue is full, skipping L2 upload", "key", key)
 		}
 
 		return info, nil
@@ -217,7 +216,7 @@ func (ts *TieredStorage) uploadToRemote(ctx context.Context, job uploadJob) erro
 	reader, info, err := ts.localCache.Get(ctx, job.key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			log.Debug().Str("key", job.key).Msg("Local file evicted before upload, dropping")
+			slog.Debug("Local file evicted before upload, dropping", "key", job.key)
 			return nil
 		}
 		return fmt.Errorf("failed to read local file for upload: %w", err)
@@ -228,7 +227,7 @@ func (ts *TieredStorage) uploadToRemote(ctx context.Context, job uploadJob) erro
 		return fmt.Errorf("failed to upload to L2: %w", err)
 	}
 
-	log.Debug().Str("key", job.key).Int64("size", info.Size).Msg("Uploaded local file to L2")
+	slog.Debug("Uploaded local file to L2", "key", job.key, "size", info.Size)
 	return nil
 }
 
@@ -249,7 +248,7 @@ func (ts *TieredStorage) Delete(ctx context.Context, key string) error {
 	wg.Wait()
 
 	if l2Err != nil {
-		log.Warn().Err(l2Err).Str("key", key).Msg("Failed to delete from L2 (best-effort)")
+		slog.Warn("Failed to delete from L2 (best-effort)", "error", l2Err, "key", key)
 	}
 	if l1Err != nil {
 		return fmt.Errorf("failed to delete from L1 storage: %w", l1Err)
@@ -301,7 +300,7 @@ func (ts *TieredStorage) populateLocalCache(ctx context.Context, key string) err
 	// whereas assuming presence would leave L1 cold.
 	exists, err := ts.localCache.Exists(ctx, key)
 	if err != nil {
-		log.Warn().Err(err).Str("key", key).Msg("L1 existence check failed, populating anyway")
+		slog.Warn("L1 existence check failed, populating anyway", "error", err, "key", key)
 	} else if exists {
 		return nil
 	}

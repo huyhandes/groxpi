@@ -2,10 +2,9 @@ package storage
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/phuslu/log"
 )
 
 // WorkerPool runs jobs of type T on a fixed set of goroutines fed by a bounded
@@ -50,11 +49,7 @@ func NewWorkerPool[T any](name string, queueSize, workers int, run func(context.
 		go pool.worker(i)
 	}
 
-	log.Info().
-		Str("pool", name).
-		Int("workers", workers).
-		Int("queue_size", queueSize).
-		Msg("Worker pool initialized")
+	slog.Info("Worker pool initialized", "pool", name, "workers", workers, "queue_size", queueSize)
 
 	return pool
 }
@@ -63,12 +58,12 @@ func NewWorkerPool[T any](name string, queueSize, workers int, run func(context.
 func (p *WorkerPool[T]) worker(id int) {
 	defer p.wg.Done()
 
-	log.Debug().Str("pool", p.name).Int("worker_id", id).Msg("Worker started")
+	slog.Debug("Worker started", "pool", p.name, "worker_id", id)
 
 	for {
 		select {
 		case <-p.ctx.Done():
-			log.Debug().Str("pool", p.name).Int("worker_id", id).Msg("Worker shutting down")
+			slog.Debug("Worker shutting down", "pool", p.name, "worker_id", id)
 			return
 		case job := <-p.queue:
 			p.run(p.ctx, job)
@@ -104,10 +99,7 @@ func (p *WorkerPool[T]) Drain(timeout time.Duration) {
 	for len(p.queue) > 0 {
 		select {
 		case <-deadline:
-			log.Warn().
-				Str("pool", p.name).
-				Int("dropped", len(p.queue)).
-				Msg("Drain timed out, dropping queued jobs")
+			slog.Warn("Drain timed out, dropping queued jobs", "pool", p.name, "dropped", len(p.queue))
 			p.Close()
 			return
 		case <-tick.C:
@@ -124,6 +116,6 @@ func (p *WorkerPool[T]) Close() {
 	p.closeOnce.Do(func() {
 		p.cancel()
 		p.wg.Wait()
-		log.Info().Str("pool", p.name).Msg("Worker pool shut down")
+		slog.Info("Worker pool shut down", "pool", p.name)
 	})
 }

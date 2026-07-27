@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,7 +18,6 @@ import (
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/phuslu/log"
 )
 
 // ErrNotFound reports that an index does not list a package. Index resolution has
@@ -347,8 +347,9 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 	// emitting hrefs verbatim rather than dropping the whole index.
 	base, baseErr := url.Parse(baseURL)
 	if baseErr != nil {
-		log.Warn().Err(baseErr).Str("base_url", config.RedactURL(baseURL)).
-			Msg("Cannot parse index URL, leaving package file hrefs unresolved")
+		slog.Warn("Cannot parse index URL, leaving package file hrefs unresolved",
+			"error", baseErr,
+			"base_url", config.RedactURL(baseURL))
 		base = nil
 	}
 
@@ -387,8 +388,10 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 			if base != nil {
 				ref, err := url.Parse(href)
 				if err != nil {
-					log.Warn().Err(err).Str("href", href).Str("base_url", config.RedactURL(baseURL)).
-						Msg("Skipping package file with unparseable href")
+					slog.Warn("Skipping package file with unparseable href",
+						"error", err,
+						"href", href,
+						"base_url", config.RedactURL(baseURL))
 					continue
 				}
 				fileURL = base.ResolveReference(ref).String()
