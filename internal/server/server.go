@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"path"
@@ -30,9 +31,32 @@ type Server struct {
 	// packageFiles owns index resolution, the package-file miss pipeline and the
 	// single singleflight.Group that deduplicates both.
 	packageFiles *PackageFileService
+
+	// Administrative surface. Nil templates mean it was never mounted.
+	adminTemplates *template.Template
+	adminErrors    adminErrors
 }
 
+// New builds a server or terminates the process. It is the entry point's
+// constructor; anything that needs to observe a construction failure calls
+// NewServer.
 func New(cfg *config.Config) *Server {
+	s, err := NewServer(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to construct server")
+	}
+	return s
+}
+
+// NewServer builds a server, returning an error rather than producing one that
+// cannot be trusted. A misconfigured administrative surface fails here: serving
+// an open management panel because a password was missing is worse than not
+// starting.
+func NewServer(cfg *config.Config) (*Server, error) {
+	if cfg.AdminEnabled && !cfg.AdminConfigured() {
+		return nil, errors.New("admin interface is enabled but GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD are not both set")
+	}
+
 	// Set Gin mode based on log level
 	if cfg.LogLevel == "DEBUG" {
 		gin.SetMode(gin.DebugMode)
@@ -61,13 +85,10 @@ func New(cfg *config.Config) *Server {
 	// No compression middleware: package files are already-compressed archives and
 	// index bodies carry their compressed form in the cache entry.
 
-	// Note: Templates are not currently used - handlers generate HTML inline
-	// This avoids issues with template syntax differences between frameworks
-
 	// Initialize storage backend
 	storageBackend, err := initStorage(cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize storage")
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
 
 	// Create HTTP client for streaming downloader with configured timeout
@@ -97,8 +118,14 @@ func New(cfg *config.Config) *Server {
 		streaming.NewTeeStreamingDownloader(storageBackend, streamClient),
 	)
 
+	if cfg.AdminConfigured() {
+		if s.adminTemplates, err = parseAdminTemplates(); err != nil {
+			return nil, fmt.Errorf("failed to parse admin templates: %w", err)
+		}
+	}
+
 	s.setupRoutes()
-	return s
+	return s, nil
 }
 
 func (s *Server) Router() *gin.Engine {
@@ -125,13 +152,10 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/index/:package", s.handleListFiles)
 	s.router.GET("/index/:package/:file", s.handleDownloadFile)
 
-	// Cache management. Any other method on these paths is answered by gin's
-	// HandleMethodNotAllowed.
-	s.router.DELETE("/cache/list", s.handleCacheList)
-	s.router.DELETE("/cache/:package", s.handleCachePackage)
-
 	// Health check
 	s.router.GET("/health", s.handleHealth)
+
+	s.setupAdminRoutes()
 
 	// 404 handler
 	s.router.NoRoute(func(c *gin.Context) {
@@ -139,7 +163,50 @@ func (s *Server) setupRoutes() {
 	})
 }
 
+// setupAdminRoutes mounts the administrative surface behind basic
+// authentication, or not at all.
+//
+// With no credentials configured nothing is registered, so every path below
+// falls through to NoRoute and answers 404 — the surface does not exist rather
+// than existing unauthenticated. That deliberately includes the pre-existing
+// /cache routes, which were open and are now in the same group: an authenticated
+// front door on a building with an open side entrance is not authentication.
+// Requiring credentials there is a breaking change against the Python
+// implementation's API.
+//
+// The group covers only these paths. The package index routes pip uses are
+// registered above and are never inside it, in any configuration.
+func (s *Server) setupAdminRoutes() {
+	if !s.config.AdminConfigured() {
+		return
+	}
+
+	// Basic auth rather than a bearer token: the browser prompts for the
+	// credential and resends it on every subsequent request, including the ones
+	// the page's interaction library issues, so there is no login form and no
+	// token in client-side storage. It travels in cleartext, so a deployment needs
+	// a TLS-terminating proxy.
+	admin := s.router.Group("", gin.BasicAuth(gin.Accounts{
+		s.config.AdminUsername: s.config.AdminPassword,
+	}))
+
+	admin.GET("/admin", s.handleAdminPage)
+	admin.GET("/admin/rows", s.handleAdminRows)
+	admin.GET("/admin/htmx.min.js", s.handleAdminAsset)
+	admin.POST("/admin/prefetch", s.handleAdminPrefetch)
+
+	// Eviction is the pre-existing cache route: the page's Evict button issues the
+	// same DELETE an operator can curl.
+	admin.DELETE("/cache/list", s.handleCacheList)
+	admin.DELETE("/cache/:package", s.handleCachePackage)
+}
+
 func (s *Server) handleHome(c *gin.Context) {
+	adminLink := ""
+	if s.config.AdminConfigured() {
+		adminLink = ` | <a href="/admin">Cache admin</a>`
+	}
+
 	// For now, return simple HTML without layout
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -153,9 +220,9 @@ func (s *Server) handleHome(c *gin.Context) {
 		<li>Index TTL: %s</li>
 		<li>Version: 1.0.0</li>
 	</ul>
-	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a></p>
+	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a>%s</p>
 </body>
-</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String())
+</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
 
 	c.Header("Content-Type", "text/html")
 	c.String(http.StatusOK, html)

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>groxpi cache</title>
+<script src="/admin/htmx.min.js"></script>
+<style>
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #ddd; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.file td:first-child { padding-left: 2rem; font-family: ui-monospace, monospace; font-size: .9em; }
+  .muted { color: #777; }
+  .errors { border: 1px solid #c33; padding: .5rem 1rem; margin: 1rem 0; }
+  .errors li { color: #c33; }
+  form, .controls { display: flex; gap: .5rem; margin: .75rem 0; }
+  input { padding: .3rem .5rem; }
+</style>
+</head>
+<body>
+<h1>groxpi cache</h1>
+
+<form hx-post="/admin/prefetch" hx-swap="none">
+  <input name="package" placeholder="package name" required autocomplete="off">
+  <button type="submit">Prefetch newest release</button>
+</form>
+
+<div class="controls">
+  <input id="filter" type="search" placeholder="Filter packages…" autocomplete="off">
+</div>
+
+<!-- The table polls: prefetch has no progress bar, so files appearing here are
+     the progress display. The first render is server-side, so the poll only
+     needs to pick up changes. -->
+<div id="cache" hx-get="/admin/rows" hx-trigger="every 3s" hx-swap="innerHTML">
+{{template "rows" .}}
+</div>
+
+<script>
+  // Client-side filter: the row count is in the hundreds, so narrowing them is a
+  // hidden attribute rather than a server round trip. Re-applied after every
+  // poll, because the swap replaces the rows the filter was hiding.
+  function applyFilter() {
+    var box = document.getElementById('filter');
+    var q = box ? box.value.trim().toLowerCase() : '';
+    var rows = document.querySelectorAll('#cache tr[data-package]');
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].hidden = q !== '' && rows[i].dataset.package.indexOf(q) === -1;
+    }
+  }
+  document.getElementById('filter').addEventListener('input', applyFilter);
+  document.body.addEventListener('htmx:afterSwap', applyFilter);
+</script>
+</body>
+</html>

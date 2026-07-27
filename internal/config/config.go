@@ -110,6 +110,24 @@ type Config struct {
 
 	// SSL configuration
 	DisableSSLVerification bool
+
+	// Administrative interface. The surface is off unless credentials are
+	// configured: with none set the routes do not exist. AdminEnabled is the
+	// operator asserting they want it, which makes missing credentials a startup
+	// failure rather than an open panel.
+	//
+	// Basic authentication sends the credentials in cleartext, so a deployment
+	// needs a TLS-terminating proxy in front.
+	AdminEnabled  bool
+	AdminUsername string
+	AdminPassword string
+}
+
+// AdminConfigured reports whether the administrative surface should be mounted.
+// Credentials alone are the switch; AdminEnabled only escalates their absence
+// into a startup failure.
+func (c *Config) AdminConfigured() bool {
+	return c.AdminUsername != "" && c.AdminPassword != ""
 }
 
 func Load() *Config {
@@ -125,6 +143,9 @@ func Load() *Config {
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
 		LogColor:               getBoolEnv("GROXPI_LOG_COLOR", true),
 		DisableSSLVerification: getBoolEnv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", false),
+		AdminEnabled:           getBoolEnv("GROXPI_ADMIN_ENABLED", false),
+		AdminUsername:          getEnv("GROXPI_ADMIN_USERNAME", ""),
+		AdminPassword:          getEnv("GROXPI_ADMIN_PASSWORD", ""),
 		ConnectTimeout:         getFloatDurationEnv("GROXPI_CONNECT_TIMEOUT", 0),
 		ReadTimeout:            getFloatDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
