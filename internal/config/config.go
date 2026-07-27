@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"net/url"
 	"os"
@@ -44,6 +45,18 @@ func RedactURL(raw string) string {
 	}
 	u.User = url.User("redacted")
 	return u.String()
+}
+
+// RedactURLError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// returning one unredacted leaks a private index's password into any log or
+// response that records the error.
+func RedactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		uerr.URL = RedactURL(uerr.URL)
+	}
+	return err
 }
 
 // ResolutionOrder returns the indexes to consult for a package: the extra

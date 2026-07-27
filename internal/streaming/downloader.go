@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
@@ -92,12 +93,16 @@ func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, s
 	resp, err := tsd.httpClient.Do(req)
 	budget.Stop()
 	if err != nil {
-		return nil, fmt.Errorf("failed to download from %s: %w", url, err)
+		// Both the URL we format and the one net/http embeds in its *url.Error
+		// carry whatever credentials the index handed us, so neither may reach a
+		// log or a response body as-is.
+		return nil, fmt.Errorf("failed to download from %s: %w",
+			config.RedactURL(url), config.RedactURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, config.RedactURL(url))
 	}
 
 	contentType := resp.Header.Get("Content-Type")

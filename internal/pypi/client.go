@@ -233,26 +233,14 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
-		return nil, redactRequestError(err)
+		return nil, config.RedactURLError(err)
 	}
 
 	req.Header.Set("Accept", accept)
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
 	resp, err := c.httpClient.Do(req)
-	return resp, redactRequestError(err)
-}
-
-// redactRequestError strips credentials out of the URL net/http embeds in its
-// transport errors: *url.Error prints the URL it failed on, user-info and all, so
-// wrapping one unredacted would leak a private index's password into any log that
-// records the error.
-func redactRequestError(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) {
-		uerr.URL = config.RedactURL(uerr.URL)
-	}
-	return err
+	return resp, config.RedactURLError(err)
 }
 
 func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {

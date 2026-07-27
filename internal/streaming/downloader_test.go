@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -259,6 +260,58 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		// Check for any errors
 		for err := range errors {
 			t.Errorf("Concurrent download error: %v", err)
+		}
+	})
+}
+
+// TestTeeStreamingDownloader_RedactsCredentials pins that a file URL carrying
+// index credentials never reaches an error string. Package file URLs are resolved
+// against the index URL, so a private index configured with user:password hands
+// its password to every download; an unredacted error puts it in the log and in
+// the 500 body.
+func TestTeeStreamingDownloader_RedactsCredentials(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+
+	credentialed := func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		u.User = url.UserPassword("deploy", secret)
+		return u.String()
+	}
+
+	t.Run("transport failure", func(t *testing.T) {
+		// A server that is closed before use gives a connection refused, which is
+		// how *url.Error - the shape that prints the URL it failed on - is reached.
+		dead := createTestServer("", http.StatusOK, 0)
+		dead.Close()
+
+		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+
+		_, err := downloader.DownloadAndStream(context.Background(),
+			credentialed(dead.URL), "k", io.Discard, Expectation{})
+		if err == nil {
+			t.Fatal("expected a transport failure")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("index credentials leaked into the error: %v", err)
+		}
+	})
+
+	t.Run("upstream status", func(t *testing.T) {
+		server := createTestServer("nope", http.StatusNotFound, 0)
+		defer server.Close()
+
+		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+
+		_, err := downloader.DownloadAndStream(context.Background(),
+			credentialed(server.URL), "k", io.Discard, Expectation{})
+		if err == nil {
+			t.Fatal("expected an error for HTTP 404")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("index credentials leaked into the error: %v", err)
 		}
 	})
 }
