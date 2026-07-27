@@ -77,7 +77,10 @@ type S3Storage struct {
 	existsSF singleflight.Group
 }
 
-var _ Storage = (*S3Storage)(nil)
+var (
+	_ Storage       = (*S3Storage)(nil)
+	_ PrefixDeleter = (*S3Storage)(nil)
+)
 
 // endpointURL turns a bare host, or a host that already carries a scheme, into
 // the absolute URL the SDK wants as a base endpoint.
@@ -302,6 +305,61 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to delete object %s: %w", key, err)
 	}
 	return nil
+}
+
+// deleteBatchSize is the most keys S3 accepts in one DeleteObjects request.
+const deleteBatchSize = 1000
+
+// DeletePrefix removes every object under prefix and reports how many went. It is
+// what makes evicting a package mean anything in pure-S3 mode: the transport
+// evicts only through PrefixDeleter, so without this the admin endpoint answered
+// 200 having deleted nothing.
+//
+// Listing and deleting are interleaved page by page rather than collected first,
+// so evicting a package with thousands of files costs one page of keys in memory
+// instead of all of them.
+func (s *S3Storage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(s.bucket),
+		Prefix:  aws.String(s.buildKey(prefix)),
+		MaxKeys: aws.Int32(deleteBatchSize),
+	})
+
+	deleted := 0
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to list objects under %s: %w", prefix, err)
+		}
+		if len(page.Contents) == 0 {
+			continue
+		}
+
+		ids := make([]types.ObjectIdentifier, 0, len(page.Contents))
+		for _, object := range page.Contents {
+			ids = append(ids, types.ObjectIdentifier{Key: object.Key})
+		}
+
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			// Quiet mode answers with the failures only, which is also what makes
+			// the response size independent of the batch size.
+			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return deleted, fmt.Errorf("failed to delete objects under %s: %w", prefix, err)
+		}
+
+		deleted += len(ids) - len(out.Errors)
+		if len(out.Errors) > 0 {
+			return deleted, fmt.Errorf("failed to delete %d of %d objects under %s: %s",
+				len(out.Errors), len(ids), prefix, aws.ToString(out.Errors[0].Message))
+		}
+	}
+
+	slog.Debug("Deleted object prefix from S3", "prefix", prefix, "deleted", deleted)
+
+	return deleted, nil
 }
 
 // Exists checks if an object exists in S3, deduplicating concurrent lookups.
