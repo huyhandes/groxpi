@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/telemetry"
@@ -191,12 +192,22 @@ func isNotFoundResponse(err error) bool {
 		return true
 	}
 
-	// HeadObject on a missing key answers with a bare 404 carrying no error
-	// body, so the status code is all there is to go on. The interface is the
-	// target rather than a concrete type because both the SDK's and smithy's
-	// response errors implement it.
-	var httpErr interface{ HTTPStatusCode() int }
-	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound
+	// HeadObject on a missing key answers with a bodyless 404, which the SDK
+	// deserializes into an unmodelled API error whose code it derives from the
+	// status line. Only the codes that mean "this object" may be folded into a
+	// miss: a 404 also covers NoSuchBucket, and reading a deleted bucket as an
+	// absent object turns a broken configuration into a silent permanent 100%
+	// miss - every read re-downloads and every write is thrown away.
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "NoSuchKey", "NotFound":
+		return true
+	default:
+		return false
+	}
 }
 
 // s3Error wraps a backend failure for key, folding a genuine absence into the

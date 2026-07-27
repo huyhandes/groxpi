@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,6 +90,15 @@ func responseError(status int) error {
 	}
 }
 
+// apiError builds what the SDK hands callers for a modelled S3 error: an API
+// error code wrapped in the HTTP response it arrived on.
+func apiError(code string, status int) error {
+	return &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: code},
+	}
+}
+
 // TestS3Storage_NotFoundIsSentinel pins the translation from the SDK's error
 // shapes to the shared sentinel. Without it TieredStorage cannot tell an absent
 // object from a broken bucket.
@@ -105,8 +115,19 @@ func TestS3Storage_NotFoundIsSentinel(t *testing.T) {
 		require.ErrorIs(t, s3Error(&types.NotFound{}, key), ErrNotFound)
 	})
 
-	t.Run("bare 404 response", func(t *testing.T) {
-		require.ErrorIs(t, s3Error(responseError(http.StatusNotFound), key), ErrNotFound)
+	// A bodyless 404 is what HeadObject answers with; the SDK derives the error
+	// code from the status line alone.
+	t.Run("bodyless 404 carrying a NotFound code", func(t *testing.T) {
+		require.ErrorIs(t, s3Error(apiError("NotFound", http.StatusNotFound), key), ErrNotFound)
+	})
+
+	// A deleted or misnamed bucket also answers 404. Reading that as "the object
+	// is absent" turns a broken configuration into a silent permanent 100% miss:
+	// every request re-downloads from upstream and every write is discarded.
+	t.Run("NoSuchBucket is not a miss", func(t *testing.T) {
+		err := s3Error(apiError("NoSuchBucket", http.StatusNotFound), key)
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrNotFound)
 	})
 
 	t.Run("other failures are not misses", func(t *testing.T) {
