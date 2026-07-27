@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/gin-gonic/gin"
@@ -18,21 +19,64 @@ import (
 // the version. Longest first, so ".tar.gz" is not truncated to ".gz".
 var sdistExtensions = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.Z", ".tgz", ".tbz2", ".zip", ".tar"}
 
+// prefetchDeadline bounds one detached prefetch. It is deliberately far above
+// any real package: it exists so a wedged upstream cannot pin a goroutine and
+// block shutdown forever, not to time a download out.
+const prefetchDeadline = 30 * time.Minute
+
 // handleAdminPrefetch accepts a prefetch and returns immediately. The download
 // runs on a context detached from the request so a large package does not time
 // out behind a reverse proxy; there is no job registry and no identifier,
 // because the polling table already shows the files arriving.
 func (s *Server) handleAdminPrefetch(c *gin.Context) {
+	// Basic-auth credentials are cached by the browser and resent on a plain
+	// cross-site form post, so the credential alone does not prove intent. A
+	// browser labels every request it makes; anything but a same-origin label is
+	// refused. Non-browser clients (curl, a deploy script) send no label at all and
+	// are unaffected.
+	if site := c.GetHeader("Sec-Fetch-Site"); site != "" && site != "same-origin" {
+		c.String(http.StatusForbidden, "Cross-site prefetch refused")
+		return
+	}
+
 	packageName := pypi.NormalizeName(strings.TrimSpace(c.PostForm("package")))
 	if packageName == "" {
 		c.String(http.StatusBadRequest, "Package name required")
 		return
 	}
 
-	ctx := context.WithoutCancel(c.Request.Context())
-	go s.prefetchPackage(ctx, packageName)
+	s.startPrefetch(context.WithoutCancel(c.Request.Context()), packageName)
 
 	c.String(http.StatusAccepted, "Prefetching %s", packageName)
+}
+
+// startPrefetch runs one prefetch in the background. Everything that makes a
+// detached goroutine dangerous is handled here rather than in the work itself:
+// it is registered so shutdown waits for it, deduplicated so an impatient
+// operator submitting the same name ten times gets one download, deadlined so it
+// cannot outlive the process it is holding open, and its panics are contained —
+// gin.Recovery() only wraps the request goroutine.
+func (s *Server) startPrefetch(ctx context.Context, packageName string) {
+	s.prefetches.Add(1)
+	go func() {
+		defer s.prefetches.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Prefetch panicked", "package", packageName, "panic", r)
+				s.adminErrors.record(packageName, "prefetch failed unexpectedly")
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(ctx, prefetchDeadline)
+		defer cancel()
+
+		// Same group the index and download paths use; the key namespace keeps it
+		// from colliding with either.
+		_, _, _ = s.packageFiles.sf.Do("prefetch:"+packageName, func() (any, error) {
+			s.prefetchPackage(ctx, packageName)
+			return nil, nil
+		})
+	}()
 }
 
 // prefetchPackage resolves the package's index, picks its newest release and
@@ -45,9 +89,9 @@ func (s *Server) prefetchPackage(ctx context.Context, packageName string) {
 		if errors.Is(err, pypi.ErrNotFound) {
 			s.adminErrors.record(packageName, "not found on any configured index")
 		} else {
-			s.adminErrors.record(packageName, "index lookup failed: "+err.Error())
+			s.adminErrors.record(packageName, "index lookup failed: "+redactErrorText(err))
 		}
-		slog.Error("Prefetch could not resolve index", "error", err, "package", packageName)
+		slog.ErrorContext(ctx, "Prefetch could not resolve index", "error", redactErrorText(err), "package", packageName)
 		return
 	}
 
@@ -57,12 +101,12 @@ func (s *Server) prefetchPackage(ctx context.Context, packageName string) {
 		return
 	}
 
-	slog.Info("Prefetching newest release", "package", packageName, "files", len(files))
+	slog.InfoContext(ctx, "Prefetching newest release", "package", packageName, "files", len(files))
 
 	for _, file := range files {
 		plan, err := s.packageFiles.Plan(ctx, packageName, file.Name)
 		if err != nil {
-			s.adminErrors.record(packageName, file.Name+": "+err.Error())
+			s.adminErrors.record(packageName, file.Name+": "+redactErrorText(err))
 			continue
 		}
 
@@ -74,8 +118,12 @@ func (s *Server) prefetchPackage(ctx context.Context, packageName string) {
 			// way through, not the bytes. A failure aborts the cache write too, so a
 			// verification error leaves nothing partial behind.
 			if _, _, err := s.packageFiles.Fetch(ctx, plan, io.Discard); err != nil {
-				s.adminErrors.record(packageName, file.Name+": "+err.Error())
-				slog.Error("Prefetch download failed", "error", err, "package", packageName, "file", file.Name)
+				// Redacted, not raw: the file URL is resolved against the index base, so
+				// a credentialed private index puts its password inside this error — and
+				// this message is both logged and rendered onto the admin page.
+				s.adminErrors.record(packageName, file.Name+": "+redactErrorText(err))
+				slog.ErrorContext(ctx, "Prefetch download failed",
+					"error", redactErrorText(err), "package", packageName, "file", file.Name)
 			}
 		default:
 			// GROXPI_DOWNLOAD_TIMEOUT of 0 turns every download into a redirect, so

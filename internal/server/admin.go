@@ -204,7 +204,7 @@ func (s *Server) handleAdminRows(c *gin.Context) {
 func (s *Server) renderAdmin(c *gin.Context, name string) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	if err := s.adminTemplates.ExecuteTemplate(c.Writer, name, s.snapshotView()); err != nil {
-		slog.Error("Failed to render admin page", "error", err, "template", name)
+		slog.ErrorContext(c.Request.Context(), "Failed to render admin page", "error", err, "template", name)
 		if !c.Writer.Written() {
 			c.String(http.StatusInternalServerError, "Failed to render page")
 		}
