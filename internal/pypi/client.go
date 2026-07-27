@@ -75,9 +75,6 @@ type PyPISimpleResponse struct {
 	Meta struct {
 		APIVersion string `json:"api-version"`
 	} `json:"meta"`
-	Projects []struct {
-		Name string `json:"name"`
-	} `json:"projects,omitempty"`
 	Name  string     `json:"name,omitempty"`
 	Files []FileInfo `json:"files,omitempty"`
 }
@@ -160,36 +157,6 @@ func NewClient(cfg *config.Config) *Client {
 	}
 }
 
-func (c *Client) GetPackageList() ([]string, error) {
-	index := config.Index{URL: c.config.IndexURL}
-	url := strings.TrimSuffix(index.URL, "/")
-
-	// Try JSON first
-	resp, err := c.makeRequest(context.Background(), url, "application/vnd.pypi.simple.v1+json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch package list: %w", err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			// Log error but don't fail the operation
-			_ = err
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, index.Redacted())
-	}
-
-	// Check if response is JSON
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "json") {
-		return c.parseJSONPackageList(resp.Body)
-	}
-
-	// Fall back to HTML parsing
-	return c.parseHTMLPackageList(resp.Body)
-}
-
 // GetPackageFiles fetches one package's file list from one index. The index is a
 // parameter rather than client state because resolution asks several of them for
 // the same package; the client itself is stateless about which.
@@ -245,30 +212,6 @@ func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.
 	return resp, config.RedactURLError(err)
 }
 
-func (c *Client) parseJSONPackageList(body io.Reader) ([]string, error) {
-	var packages []string
-
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		if err := copyToBuffer(buf, body); err != nil {
-			return err
-		}
-
-		var response PyPISimpleResponse
-		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
-			return fmt.Errorf("failed to parse JSON response: %w", err)
-		}
-
-		packages = make([]string, len(response.Projects))
-		for i, project := range response.Projects {
-			packages[i] = project.Name
-		}
-
-		return nil
-	})
-
-	return packages, err
-}
-
 func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 	var files []FileInfo
 
@@ -290,41 +233,6 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 	})
 
 	return files, err
-}
-
-func (c *Client) parseHTMLPackageList(body io.Reader) ([]string, error) {
-	var packages []string
-
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		if err := copyToBuffer(buf, body); err != nil {
-			return err
-		}
-
-		html := buf.String()
-		packages = make([]string, 0, 1000)
-
-		// Simple HTML parsing for package list
-		lines := strings.SplitSeq(html, "\n")
-		for line := range lines {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "<a ") {
-				continue
-			}
-
-			// Extract package name from anchor text
-			textStart := strings.Index(line, ">")
-			textEnd := strings.Index(line, "</a>")
-			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
-				continue
-			}
-			packageName := line[textStart+1 : textEnd]
-			packages = append(packages, packageName)
-		}
-
-		return nil
-	})
-
-	return packages, err
 }
 
 // parseHTMLPackageFiles parses a PEP 503 HTML index page. baseURL is the URL the

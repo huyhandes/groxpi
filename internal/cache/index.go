@@ -23,10 +23,6 @@ type Entry struct {
 	Files []pypi.FileInfo // parsed package file list
 	JSON  []byte          // marshalled PEP 691 body
 	GZIP  []byte          // gzip of JSON, produced once at fill time
-	// Index is the redacted URL of the index that answered. The entry is stored
-	// with that index's TTL, so recording it is what makes a stale entry
-	// attributable to the schedule it expired on.
-	Index string
 
 	size      int64
 	expiresAt time.Time
@@ -36,9 +32,9 @@ type Entry struct {
 }
 
 // NewPackageEntry builds the entry for one package's file list. body must be the
-// marshalled form of files, and index the redacted URL of the index that answered.
-func NewPackageEntry(files []pypi.FileInfo, body []byte, index string) *Entry {
-	e := &Entry{Files: files, JSON: body, Index: index}
+// marshalled form of files.
+func NewPackageEntry(files []pypi.FileInfo, body []byte) *Entry {
+	e := &Entry{Files: files, JSON: body}
 	e.finish()
 	return e
 }

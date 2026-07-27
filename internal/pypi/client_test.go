@@ -84,39 +84,6 @@ func TestClient_MakeRequest(t *testing.T) {
 	}
 }
 
-func TestClient_ParseJSONPackageList(t *testing.T) {
-	cfg := &config.Config{}
-	client := NewClient(cfg)
-
-	jsonResponse := `{
-		"meta": {
-			"api-version": "1.0"
-		},
-		"projects": [
-			{"name": "numpy"},
-			{"name": "scipy"},
-			{"name": "pandas"}
-		]
-	}`
-
-	reader := strings.NewReader(jsonResponse)
-	packages, err := client.parseJSONPackageList(reader)
-	if err != nil {
-		t.Fatalf("parseJSONPackageList failed: %v", err)
-	}
-
-	expected := []string{"numpy", "scipy", "pandas"}
-	if len(packages) != len(expected) {
-		t.Errorf("Expected %d packages, got %d", len(expected), len(packages))
-	}
-
-	for i, pkg := range expected {
-		if i >= len(packages) || packages[i] != pkg {
-			t.Errorf("Expected package[%d] to be '%s', got '%s'", i, pkg, packages[i])
-		}
-	}
-}
-
 func TestClient_ParseJSONPackageFiles(t *testing.T) {
 	cfg := &config.Config{}
 	client := NewClient(cfg)
@@ -168,42 +135,6 @@ func TestClient_ParseJSONPackageFiles(t *testing.T) {
 	// Check second file
 	if files[1].Name != "numpy-1.21.0.tar.gz" {
 		t.Errorf("Expected second file name to be 'numpy-1.21.0.tar.gz', got '%s'", files[1].Name)
-	}
-}
-
-func TestClient_GetPackageList(t *testing.T) {
-	// Create test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"projects": [
-				{"name": "requests"},
-				{"name": "urllib3"}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{IndexURL: server.URL}
-	client := NewClient(cfg)
-
-	packages, err := client.GetPackageList()
-	if err != nil {
-		t.Fatalf("GetPackageList failed: %v", err)
-	}
-
-	expected := []string{"requests", "urllib3"}
-	if len(packages) != len(expected) {
-		t.Errorf("Expected %d packages, got %d", len(expected), len(packages))
-	}
-
-	for i, pkg := range expected {
-		if i >= len(packages) || packages[i] != pkg {
-			t.Errorf("Expected package[%d] to be '%s', got '%s'", i, pkg, packages[i])
-		}
 	}
 }
 
@@ -272,56 +203,6 @@ func TestClient_GetPackageFiles_NotFound(t *testing.T) {
 	}
 }
 
-func TestClient_GetPackageList_HTTPError(t *testing.T) {
-	// Create test server that returns 500
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("Internal Server Error"))
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{IndexURL: server.URL}
-	client := NewClient(cfg)
-
-	_, err := client.GetPackageList()
-	if err == nil {
-		t.Error("Expected error for HTTP 500")
-	}
-
-	if !strings.Contains(err.Error(), "500") {
-		t.Errorf("Expected '500' in error message, got: %v", err)
-	}
-}
-
-func TestClient_ParseJSONInvalidData(t *testing.T) {
-	cfg := &config.Config{}
-	client := NewClient(cfg)
-
-	t.Run("invalid JSON", func(t *testing.T) {
-		reader := strings.NewReader(`{"invalid": json}`)
-		_, err := client.parseJSONPackageList(reader)
-		if err == nil {
-			t.Error("Expected error for invalid JSON")
-		}
-	})
-
-	t.Run("empty response", func(t *testing.T) {
-		reader := strings.NewReader("")
-		_, err := client.parseJSONPackageList(reader)
-		if err == nil {
-			t.Error("Expected error for empty response")
-		}
-	})
-
-	t.Run("malformed structure", func(t *testing.T) {
-		reader := strings.NewReader(`{"projects": "not an array"}`)
-		_, err := client.parseJSONPackageList(reader)
-		if err == nil {
-			t.Error("Expected error for malformed structure")
-		}
-	})
-}
-
 // TestFileInfo_IsYanked tests the IsYanked method with different yanked values
 func TestFileInfo_IsYanked(t *testing.T) {
 	testCases := []struct {
@@ -375,77 +256,6 @@ func TestFileInfo_GetYankedReason(t *testing.T) {
 			result := fileInfo.GetYankedReason()
 			if result != tc.expected {
 				t.Errorf("GetYankedReason() = %q, expected %q", result, tc.expected)
-			}
-		})
-	}
-}
-
-// TestClient_ParseHTMLPackageList tests HTML parsing fallback
-func TestClient_ParseHTMLPackageList(t *testing.T) {
-	client := &Client{}
-
-	testCases := []struct {
-		name     string
-		html     string
-		expected []string
-	}{
-		{
-			name: "simple HTML with packages",
-			html: `<!DOCTYPE html>
-<html>
-<body>
-	<a href="numpy/">numpy</a><br/>
-	<a href="scipy/">scipy</a><br/>
-	<a href="matplotlib/">matplotlib</a><br/>
-</body>
-</html>`,
-			expected: []string{"numpy", "scipy", "matplotlib"},
-		},
-		{
-			name: "HTML with mixed case and extra attributes",
-			html: `<html>
-<body>
-<a href="Django/" class="package">Django</a>
-<a href="flask/">flask</a>
-<a href="requests/" title="HTTP library">requests</a>
-</body>
-</html>`,
-			expected: []string{"Django", "flask", "requests"},
-		},
-		{
-			name:     "empty HTML",
-			html:     `<html><body></body></html>`,
-			expected: []string{},
-		},
-		{
-			name: "HTML with non-package links",
-			html: `<html>
-<body>
-<a href="../">Parent Directory</a>
-<a href="numpy/">numpy</a>
-<a href="scipy/">scipy</a>
-</body>
-</html>`,
-			expected: []string{"Parent Directory", "numpy", "scipy"},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result, err := client.parseHTMLPackageList(strings.NewReader(tc.html))
-			if err != nil {
-				t.Fatalf("parseHTMLPackageList failed: %v", err)
-			}
-
-			if len(result) != len(tc.expected) {
-				t.Errorf("Expected %d packages, got %d", len(tc.expected), len(result))
-				return
-			}
-
-			for i, pkg := range result {
-				if pkg != tc.expected[i] {
-					t.Errorf("Package %d: expected %q, got %q", i, tc.expected[i], pkg)
-				}
 			}
 		})
 	}
