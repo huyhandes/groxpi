@@ -243,10 +243,7 @@ func (s *Server) setupAdminRoutes() {
 // originating from another site, so a form on an attacker's page cannot ride the
 // operator's cached basic-auth credentials.
 //
-// ponytail: the header is the whole defence — no token, no session, no cookie.
-// When Sec-Fetch-Site is absent the request proceeds: that covers curl, scripts
-// and browsers too old to send it. Deliberate, and documented as a limitation —
-// every browser able to mount the attack sends the header.
+// ponytail: absent Sec-Fetch-Site proceeds — see docs/api-endpoints.md.
 func rejectCrossSite(c *gin.Context) {
 	switch c.GetHeader("Sec-Fetch-Site") {
 	case "", "same-origin", "none":

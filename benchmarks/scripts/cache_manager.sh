@@ -49,17 +49,15 @@ show_usage() {
     echo "  $0 http://server1:5005 http://server2:5006 test-connection"
 }
 
-# Emits curl basic-auth arguments for groxpi when admin credentials are
-# configured. Without credentials groxpi's admin routes answer 404, which used
-# to be walked past as "nothing was cached" - so a warm cache got benchmarked as
-# a cold one. proxpi has no admin auth and is never given credentials.
+# curl basic-auth arguments for groxpi's admin routes, constant for the whole
+# run. Without credentials those routes answer 404, which used to be walked past
+# as "nothing was cached" - so a warm cache got benchmarked as a cold one. proxpi
+# has no admin auth and is never given credentials: the call sites pass these
+# arguments only when the target is groxpi.
 CURL_AUTH=()
-set_auth_args() {
-    CURL_AUTH=()
-    if [[ "$1" == "groxpi" && -n "${GROXPI_ADMIN_USERNAME:-}" && -n "${GROXPI_ADMIN_PASSWORD:-}" ]]; then
-        CURL_AUTH=(--user "${GROXPI_ADMIN_USERNAME}:${GROXPI_ADMIN_PASSWORD}")
-    fi
-}
+if [[ -n "${GROXPI_ADMIN_USERNAME:-}" && -n "${GROXPI_ADMIN_PASSWORD:-}" ]]; then
+    CURL_AUTH=(--user "${GROXPI_ADMIN_USERNAME}:${GROXPI_ADMIN_PASSWORD}")
+fi
 
 # A refused or missing groxpi cache-clear is fatal: continuing would publish a
 # warm measurement labelled cold.
@@ -67,13 +65,13 @@ fatal_if_groxpi() {
     local name=$1 http_code=$2 what=$3
     [[ "$name" == "groxpi" ]] || return 0
     case $http_code in
-        401) log_error "groxpi refused $what: unauthorised (HTTP 401). Set GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD." ;;
-        403) log_error "groxpi refused $what: forbidden (HTTP 403). The admin credentials are wrong or lack access." ;;
-        404) log_error "groxpi refused $what: not found (HTTP 404). Admin routes answer 404 when credentials are required but not supplied - set GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD." ;;
-        *) return 0 ;;
+        401|403|404)
+            log_error "groxpi refused $what with HTTP $http_code. Check GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD - admin routes also answer 404 when credentials are required but not supplied."
+            log_error "Aborting: the cache was not cleared, so any 'cold' number from this run would be a lie."
+            exit 1
+            ;;
     esac
-    log_error "Aborting: the cache was not cleared, so any 'cold' number from this run would be a lie."
-    exit 1
+    return 0
 }
 
 # Function to validate URLs
@@ -123,9 +121,12 @@ clear_cache_list() {
     local http_code
 
     # Perform DELETE request to clear cache list
-    set_auth_args "$name"
+    local auth=()
+    if [[ "$name" == "groxpi" ]]; then
+        auth=("${CURL_AUTH[@]+"${CURL_AUTH[@]}"}")
+    fi
     if response=$(curl -s --connect-timeout 10 --max-time $TIMEOUT \
-                      "${CURL_AUTH[@]+"${CURL_AUTH[@]}"}" \
+                      "${auth[@]+"${auth[@]}"}" \
                       -w "HTTP_CODE:%{http_code}" \
                       -X DELETE "$url/cache/list" 2>&1); then
 
@@ -175,9 +176,12 @@ clear_package_cache() {
     local http_code
 
     # Perform DELETE request to clear specific package cache
-    set_auth_args "$name"
+    local auth=()
+    if [[ "$name" == "groxpi" ]]; then
+        auth=("${CURL_AUTH[@]+"${CURL_AUTH[@]}"}")
+    fi
     if response=$(curl -s --connect-timeout 10 --max-time $TIMEOUT \
-                      "${CURL_AUTH[@]+"${CURL_AUTH[@]}"}" \
+                      "${auth[@]+"${auth[@]}"}" \
                       -w "HTTP_CODE:%{http_code}" \
                       -X DELETE "$url/cache/$package" 2>&1); then
 

@@ -17,27 +17,15 @@ import (
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
-// healthCheckTimeout bounds the probe so it finishes inside the Dockerfile's
-// HEALTHCHECK --timeout rather than hanging on an unresponsive server.
-const healthCheckTimeout = 2 * time.Second
-
 // healthCheck GETs baseURL's health endpoint and returns an error unless the
-// server answers 200.
+// server answers 200. The 2s timeout keeps the probe inside the Dockerfile's
+// HEALTHCHECK --timeout=3s rather than hanging on an unresponsive server.
 func healthCheck(baseURL string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/health", nil)
-	if err != nil {
-		return fmt.Errorf("build health request: %w", err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(baseURL + "/health")
 	if err != nil {
 		return fmt.Errorf("health request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("health check returned status %d", resp.StatusCode)
