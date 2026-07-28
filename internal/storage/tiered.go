@@ -295,9 +295,10 @@ func (ts *TieredStorage) DeletePrefix(ctx context.Context, prefix string) (int, 
 // contents. Without this, the listing page rendered zero rows in hybrid mode
 // even with files cached locally, because the top-level backend is this one.
 //
-// L2 objects are not reported, for the same reason DeletePrefix leaves them
-// alone: naming them would need a listing operation the storage interface
-// deliberately does without.
+// L2 objects are not reported: naming them would need a listing operation the
+// core Storage interface deliberately does without. This is a listing-only
+// limitation - DeletePrefix does evict L2 as well, so that an eviction is not
+// undone by the next read back-filling L1 from remote.
 func (ts *TieredStorage) Snapshot() []LRUEntry {
 	return ts.localCache.Snapshot()
 }

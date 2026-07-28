@@ -46,7 +46,7 @@ show_usage() {
     echo "  --api-only         Run only WRK API benchmarks"
     echo "  --uv-only          Run only UV installation benchmarks"
     echo "  --no-monitoring    Disable resource monitoring"
-    echo "  --docker-network N Docker network name (default: groxpi_benchmark-network)"
+    echo "  --docker-network N Docker network name (default: benchmark-network)"
     echo "  --results-dir DIR  Results directory (default: ./results)"
     echo "  -h, --help         Show this help message"
     echo ""
