@@ -43,7 +43,15 @@ type Server struct {
 	adminErrors    adminErrors
 	// prefetches counts the detached prefetch goroutines so shutdown can wait for
 	// them: one of them may be inside storage.Put when the signal arrives.
-	prefetches sync.WaitGroup
+	//
+	// prefetchMu guards shuttingDown together with the Add it gates. An Add that
+	// lands after Wait has begun is documented WaitGroup misuse, and a handler
+	// still parked reading its request body when shutdown starts could otherwise
+	// do exactly that: http.Server.Shutdown reports its timeout but does not kill
+	// the handler.
+	prefetches   sync.WaitGroup
+	prefetchMu   sync.Mutex
+	shuttingDown bool
 }
 
 // New builds a server or terminates the process. It is the entry point's
@@ -168,11 +176,37 @@ func traceRequests() gin.HandlerFunc {
 	}
 }
 
-// Close waits for detached prefetches, stops the index-cache sweeper and
-// releases the storage backend. Called from the shutdown path: closing the
-// backend under a prefetch that is still writing to it would fail that write.
+// prefetchDrainBudget bounds how long Close waits for detached prefetches. It is
+// deliberately short: a prefetch that has not finished in this long will not
+// finish inside any container's stop grace either, and waiting for it only turns
+// a clean stop into a SIGKILL. It is separate from, and consumed after, the HTTP
+// drain budget in main.
+const prefetchDrainBudget = 5 * time.Second
+
+// Close refuses further prefetches, waits a bounded time for the ones already
+// running, stops the index-cache sweeper and releases the storage backend.
+// Closing the backend under a prefetch that is still writing to it would fail
+// that write, which is why the wait comes first — but an unbounded wait is
+// worse: one wedged upstream would hold the process open until it is killed.
 func (s *Server) Close() error {
-	s.prefetches.Wait()
+	// Refusing first is what makes the Wait below safe: no Add can follow it.
+	s.prefetchMu.Lock()
+	s.shuttingDown = true
+	s.prefetchMu.Unlock()
+
+	drained := make(chan struct{})
+	go func() {
+		s.prefetches.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+	case <-time.After(prefetchDrainBudget):
+		slog.Warn("Gave up waiting for prefetches; an in-flight cache write may fail",
+			"budget", prefetchDrainBudget)
+	}
+
 	s.indexCache.Close()
 	return s.storage.Close()
 }

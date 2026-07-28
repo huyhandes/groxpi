@@ -550,3 +550,50 @@ func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
 	assert.Equal(t, []string{"keepme-1.0.0.tar.gz"}, cachedFileNames(srv),
 		"the refused deletion must not have evicted anything")
 }
+
+// ---------------------------------------------------------------------------
+// Shutdown: prefetch registration versus the drain (huyhandes/groxpi#41)
+// ---------------------------------------------------------------------------
+
+// TestPrefetchRefusedAfterShutdown pins the refusal that closes the late-Add
+// window. A handler still parked reading its request body when shutdown begins
+// reaches startPrefetch after Close has entered its wait; registering then is
+// documented WaitGroup misuse, so the request is refused instead.
+func TestPrefetchRefusedAfterShutdown(t *testing.T) {
+	up := newAdminUpstream(t, "latecomer", adminFakeFile{name: "latecomer-1.0.0.tar.gz", body: testPayload(64)})
+	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
+	require.NoError(t, err)
+	router := srv.Router()
+
+	// Accepted while serving.
+	resp := postPrefetch(router, "latecomer", true)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	require.NoError(t, srv.Close())
+
+	// Refused afterwards, and visibly so rather than silently dropped.
+	resp = postPrefetch(router, "latecomer", true)
+	body := readBody(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a prefetch arriving after shutdown must be refused, not registered")
+	assert.Contains(t, string(body), "Shutting down")
+}
+
+// TestCloseDrainsRunningPrefetch pins the ordering the drain exists for: a
+// prefetch already running when Close is called finishes its cache write before
+// the storage backend is released. Without the wait the write would fail.
+func TestCloseDrainsRunningPrefetch(t *testing.T) {
+	up := newAdminUpstream(t, "drainme", adminFakeFile{name: "drainme-1.0.0.tar.gz", body: testPayload(4096)})
+	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
+	require.NoError(t, err)
+
+	resp := postPrefetch(srv.Router(), "drainme", true)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	require.NoError(t, srv.Close())
+
+	assert.Equal(t, []string{"drainme-1.0.0.tar.gz"}, cachedFileNames(srv),
+		"Close must wait for the in-flight prefetch before releasing storage")
+}
