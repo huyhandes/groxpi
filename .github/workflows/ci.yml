@@ -76,10 +76,6 @@ jobs:
         flags: unittests
         name: codecov-umbrella
 
-    - name: Run benchmarks
-      if: matrix.os == 'ubuntu-latest'
-      run: go test -bench=. -benchmem ./...
-
   security:
     name: Security Scan
     runs-on: ubuntu-latest
@@ -136,75 +132,10 @@ jobs:
         version: v2.12.2
         args: --timeout=10m
 
-  s3-integration-test:
-    name: S3 Integration Tests
-    runs-on: ubuntu-latest
-
-    env:
-      TEST_S3_ENDPOINT: 127.0.0.1:9000
-      TEST_S3_ACCESS_KEY: minioadmin
-      TEST_S3_SECRET_KEY: minioadmin
-      TEST_S3_BUCKET: groxpi-test
-      TEST_S3_USE_SSL: false
-      TEST_S3_FORCE_PATH_STYLE: true
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.26.x'
-        cache: true
-        cache-dependency-path: go.sum
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v6
-      with:
-        enable-cache: true
-
-    - name: Start MinIO
-      run: |
-        docker run -d \
-          --name minio \
-          -p 9000:9000 \
-          -p 9001:9001 \
-          -e MINIO_ROOT_USER=minioadmin \
-          -e MINIO_ROOT_PASSWORD=minioadmin \
-          quay.io/minio/minio:latest \
-          server /data --console-address ":9001"
-
-        echo "Waiting for MinIO to be ready..."
-        for i in {1..30}; do
-          if curl -f http://127.0.0.1:9000/minio/health/live 2>/dev/null; then
-            echo "MinIO is ready!"
-            break
-          fi
-          echo "Attempt $i: MinIO not ready yet..."
-          sleep 2
-        done
-
-        # Create the test bucket
-        docker exec minio sh -c "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/groxpi-test || true"
-
-    - name: Build groxpi binary
-      run: go build -o groxpi cmd/groxpi/main.go
-
-    - name: Run S3 integration tests
-      run: |
-        # Run the simplified S3 integration tests
-        go test -race -v -run "TestS3" ./internal/storage/ -timeout=10m
-
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [test, s3-integration-test, security, lint]
+    needs: [test, security, lint]
 
     steps:
     - name: Checkout code

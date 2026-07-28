@@ -28,17 +28,8 @@ const prefetchDeadline = 30 * time.Minute
 // runs on a context detached from the request so a large package does not time
 // out behind a reverse proxy; there is no job registry and no identifier,
 // because the polling table already shows the files arriving.
+// Cross-site protection lives on the admin route group, not here.
 func (s *Server) handleAdminPrefetch(c *gin.Context) {
-	// Basic-auth credentials are cached by the browser and resent on a plain
-	// cross-site form post, so the credential alone does not prove intent. A
-	// browser labels every request it makes; anything but a same-origin label is
-	// refused. Non-browser clients (curl, a deploy script) send no label at all and
-	// are unaffected.
-	if site := c.GetHeader("Sec-Fetch-Site"); site != "" && site != "same-origin" {
-		c.String(http.StatusForbidden, "Cross-site prefetch refused")
-		return
-	}
-
 	packageName := pypi.NormalizeName(strings.TrimSpace(c.PostForm("package")))
 	if packageName == "" {
 		c.String(http.StatusBadRequest, "Package name required")

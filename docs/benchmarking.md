@@ -58,10 +58,11 @@ A comparison is meaningless unless both proxies start from the same cache state.
 `scripts/cache_manager.sh` clears them between runs by issuing `DELETE /cache/list` and
 `DELETE /cache/<package>`.
 
-> Those routes now require admin credentials on groxpi and answer `404` when none are configured — see
-> [api-endpoints.md](api-endpoints.md). The script sends no credentials, so against a groxpi with the
-> admin surface enabled it will not clear anything. Either run the benchmark against a groxpi with no
-> admin credentials configured, or clear the cache directory directly between runs.
+Those routes require admin credentials on groxpi — see [api-endpoints.md](api-endpoints.md). Set
+`GROXPI_ADMIN_USERNAME` and `GROXPI_ADMIN_PASSWORD` in the environment to the credentials of the groxpi
+under test; the script sends them as basic auth. Leave both unset for an unauthenticated local server.
+If the clear is refused (`401`, `403`, or `404`) the run aborts rather than benchmark a warm cache as a
+cold one. proxpi has no admin auth and is never sent credentials.
 
 ## Go microbenchmarks
 

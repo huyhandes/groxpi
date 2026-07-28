@@ -479,3 +479,74 @@ func TestAdminPage_MakesNoExternalAssetRequests(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(script), "htmx", "the interaction library must be served from the binary")
 }
+
+// ---------------------------------------------------------------------------
+// Cross-site rejection
+// ---------------------------------------------------------------------------
+
+// postPrefetchSite issues the authenticated prefetch a cross-site form post would
+// issue, with the browser's own fetch-metadata declaration attached (or, for the
+// empty string, absent as a non-browser client leaves it).
+func postPrefetchSite(router *gin.Engine, pkg, site string) *http.Response {
+	body := url.Values{"package": {pkg}}.Encode()
+	req := httptest.NewRequest(http.MethodPost, "/admin/prefetch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(adminUser, adminPass)
+	if site != "" {
+		req.Header.Set("Sec-Fetch-Site", site)
+	}
+	return do(router, req)
+}
+
+func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
+	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
+	srv := newAdminServer(t, up.URL, withCredentials)
+	router := srv.Router()
+
+	for _, site := range []string{"cross-site", "same-site"} {
+		resp := postPrefetchSite(router, "xsite", site)
+		_ = readBody(t, resp)
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+			"a %s prefetch must be refused", site)
+	}
+
+	// The handler never ran, so it never asked upstream for the package.
+	assert.Zero(t, up.fileHits.Load(), "the refused request must not reach the prefetch handler")
+	assert.Empty(t, cachedFileNames(srv))
+}
+
+func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {
+	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
+	router := newAdminServer(t, up.URL, withCredentials).Router()
+
+	for _, site := range []string{"same-origin", "", "none"} {
+		resp := postPrefetchSite(router, "xsite", site)
+		_ = readBody(t, resp)
+		assert.Equal(t, http.StatusAccepted, resp.StatusCode,
+			"Sec-Fetch-Site %q must be allowed through", site)
+	}
+}
+
+// TestAdminCrossSite_CacheDeletionInherits pins that the check lives on the route
+// group: nothing wires it to the eviction routes, yet they are covered.
+func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
+	up := newAdminUpstream(t, "keepme", adminFakeFile{name: "keepme-1.0.0.tar.gz", body: testPayload(2048)})
+	srv := newAdminServer(t, up.URL, withCredentials)
+	router := srv.Router()
+
+	_ = readBody(t, getFile(router, "keepme", "keepme-1.0.0.tar.gz"))
+	waitCached(t, srv.config.CacheDir, "keepme", "keepme-1.0.0.tar.gz")
+
+	for _, path := range []string{"/cache/keepme", "/cache/list"} {
+		req := httptest.NewRequest(http.MethodDelete, path, nil)
+		req.SetBasicAuth(adminUser, adminPass)
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		resp := do(router, req)
+		_ = readBody(t, resp)
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+			"DELETE %s must inherit the cross-site check", path)
+	}
+
+	assert.Equal(t, []string{"keepme-1.0.0.tar.gz"}, cachedFileNames(srv),
+		"the refused deletion must not have evicted anything")
+}

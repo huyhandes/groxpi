@@ -109,6 +109,17 @@ The admin routes exist only when both `GROXPI_ADMIN_USERNAME` and `GROXPI_ADMIN_
 Basic authentication transmits the credentials in cleartext. Terminate TLS in front of groxpi — see
 [deployment.md](deployment.md).
 
+Every admin route — including both `DELETE /cache/*` routes — also rejects requests a browser reports as
+cross-site. The check reads the `Sec-Fetch-Site` request header: `same-origin` and `none` (address-bar
+navigation) proceed, anything else (`cross-site`, `same-site`) answers `403` before the handler runs.
+Browsers resend cached basic-auth credentials on a cross-site form post, so the credential alone does not
+prove the operator intended the request.
+
+**Stated limitation:** when the header is absent the request proceeds. That keeps curl, scripts and other
+non-browser clients working, and it means browsers too old to send fetch metadata are unprotected. This is
+deliberate: the threat is a browser, and every browser capable of mounting the attack sends the header. No
+token, session or cookie is involved.
+
 ### `GET /admin`
 
 An HTML page listing what the local cache holds: packages, their files, sizes, hit counts and ages, plus
@@ -153,6 +164,7 @@ mode no files are deleted — see the note in [architecture.md](architecture.md)
 | `302` | Redirect to upstream for a file groxpi will not serve itself. |
 | `400` | Missing required parameter on an admin route. |
 | `401` | Missing or wrong basic-auth credentials on an admin route. |
+| `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
 | `500` | Index resolution failed for a reason other than absence, or a storage operation failed. |

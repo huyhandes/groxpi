@@ -77,7 +77,7 @@ services:
       GROXPI_S3_USE_SSL: "false"
       GROXPI_S3_FORCE_PATH_STYLE: "true"
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1"]
+      test: ["CMD", "/groxpi", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -53,7 +53,7 @@ show_usage() {
     echo "Test Packages: ${TEST_PACKAGES[*]}"
     echo ""
     echo "Environment Variables:"
-    echo "  DOCKER_NETWORK - Docker network name (default: groxpi_benchmark-network)"
+    echo "  DOCKER_NETWORK - Docker network name (default: benchmark-network)"
     echo "  UV_IMAGE       - UV container image (default: uv-tester:latest)"
     echo ""
     echo "Examples:"
