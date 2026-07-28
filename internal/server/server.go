@@ -224,7 +224,7 @@ func (s *Server) setupAdminRoutes() {
 	// the page's interaction library issues, so there is no login form and no
 	// token in client-side storage. It travels in cleartext, so a deployment needs
 	// a TLS-terminating proxy.
-	admin := s.router.Group("", gin.BasicAuth(gin.Accounts{
+	admin := s.router.Group("", rejectCrossSite, gin.BasicAuth(gin.Accounts{
 		s.config.AdminUsername: s.config.AdminPassword,
 	}))
 
@@ -237,6 +237,24 @@ func (s *Server) setupAdminRoutes() {
 	// same DELETE an operator can curl.
 	admin.DELETE("/cache/list", s.handleCacheList)
 	admin.DELETE("/cache/:package", s.handleCachePackage)
+}
+
+// rejectCrossSite refuses admin requests that the browser itself reports as
+// originating from another site, so a form on an attacker's page cannot ride the
+// operator's cached basic-auth credentials.
+//
+// ponytail: the header is the whole defence — no token, no session, no cookie.
+// When Sec-Fetch-Site is absent the request proceeds: that covers curl, scripts
+// and browsers too old to send it. Deliberate, and documented as a limitation —
+// every browser able to mount the attack sends the header.
+func rejectCrossSite(c *gin.Context) {
+	switch c.GetHeader("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+		c.Next()
+	default: // cross-site, same-site
+		c.String(http.StatusForbidden, "Forbidden: cross-site request")
+		c.Abort()
+	}
 }
 
 func (s *Server) handleHome(c *gin.Context) {
