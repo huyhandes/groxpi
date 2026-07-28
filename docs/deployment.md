@@ -22,9 +22,15 @@ docker build -t groxpi:latest .
 docker run -p 5000:5000 -v groxpi_cache:/cache groxpi:latest
 ```
 
-Because the image has no shell or HTTP client, a health check **must** be probed from outside the
-container — a Kubernetes `httpGet` probe, a load-balancer check, or a sidecar. A `HEALTHCHECK` that
-execs something inside the image cannot work.
+The image has no shell or HTTP client, so the health check is the binary itself: `groxpi
+--health-check` GETs `/health` on `127.0.0.1` at the configured `PORT` and exits 0 only on a 200. It
+starts no server, opens no storage backend and installs no telemetry. The Dockerfile's `HEALTHCHECK`
+and both compose files use it, so `depends_on: service_healthy` gates correctly and Docker restarts a
+container whose server has stopped answering. A non-default `PORT` is honoured, since the probe reads
+the same configuration the server does.
+
+Probing from outside the container — a Kubernetes `httpGet` probe, a load-balancer check — remains
+valid and is what the Kubernetes manifest below uses.
 
 ```bash
 docker compose up -d      # see docker-compose.yml

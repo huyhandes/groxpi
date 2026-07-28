@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -714,5 +715,35 @@ func TestMainExists(t *testing.T) {
 	cfg := config.Load()
 	if cfg == nil {
 		t.Error("config.Load() should not return nil")
+	}
+}
+
+// TestHealthCheck covers the three states the container probe can observe: a
+// serving server, a degraded one, and nothing listening.
+func TestHealthCheck(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ok.Close()
+
+	if err := healthCheck(ok.URL); err != nil {
+		t.Errorf("healthCheck against a 200 server: %v", err)
+	}
+
+	degraded := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer degraded.Close()
+
+	if err := healthCheck(degraded.URL); err == nil {
+		t.Error("healthCheck against a 503 server: want error, got nil")
+	}
+
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	if err := healthCheck(deadURL); err == nil {
+		t.Error("healthCheck with nothing listening: want error, got nil")
 	}
 }
