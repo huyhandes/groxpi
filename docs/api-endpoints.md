@@ -144,9 +144,10 @@ versions are compared under PEP 440 ordering, and all files of the winning relea
 are fetched. A filename whose version will not parse is skipped. An empty `package` field answers `400`.
 
 Once shutdown has begun the route answers `503` instead of accepting: the download could not have
-finished, and registering it then would race the shutdown drain. Prefetches already running are given
-5 seconds to finish their cache writes before storage is released; one that has not finished by then is
-abandoned with a warning, so a wedged upstream cannot hold the process open until it is killed.
+finished, and registering it then would race the shutdown drain. Prefetches already running finish
+their cache writes before storage is released, but only within the shutdown budget — one still running
+when the budget is spent is abandoned with a warning, so a wedged upstream cannot hold the process open
+until it is killed. See [deployment](deployment.md) for the budget and how to size the stop grace.
 
 ### `DELETE /cache/list`
 

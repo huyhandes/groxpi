@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -176,39 +177,65 @@ func traceRequests() gin.HandlerFunc {
 	}
 }
 
-// prefetchDrainBudget bounds how long Close waits for detached prefetches. It is
-// deliberately short: a prefetch that has not finished in this long will not
-// finish inside any container's stop grace either, and waiting for it only turns
-// a clean stop into a SIGKILL. It is separate from, and consumed after, the HTTP
-// drain budget in main.
-const prefetchDrainBudget = 5 * time.Second
+// closeBudget bounds CloseContext when the caller supplies no deadline of its
+// own. The shutdown path in main always does; this is for tests and for any
+// caller reaching Server through io.Closer.
+const closeBudget = 5 * time.Second
 
-// Close refuses further prefetches, waits a bounded time for the ones already
-// running, stops the index-cache sweeper and releases the storage backend.
-// Closing the backend under a prefetch that is still writing to it would fail
-// that write, which is why the wait comes first — but an unbounded wait is
-// worse: one wedged upstream would hold the process open until it is killed.
+// Close is CloseContext under the default budget, so that Server satisfies
+// io.Closer.
 func (s *Server) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), closeBudget)
+	defer cancel()
+	return s.CloseContext(ctx)
+}
+
+// CloseContext refuses further prefetches, waits for the ones already running,
+// stops the index-cache sweeper and releases the storage backend — all inside
+// the caller's deadline.
+//
+// Ordering matters: releasing the backend under a prefetch still writing to it
+// would fail that write, so the drain comes first. So does the bound. Every step
+// here can block on something remote — a wedged upstream, an unreachable object
+// store — and an unbounded shutdown is not a graceful one: it runs past the
+// container's stop grace and ends in SIGKILL, losing more than giving up would.
+// Overrunning the deadline is reported and stepped over, not waited out.
+func (s *Server) CloseContext(ctx context.Context) error {
 	// Refusing first is what makes the Wait below safe: no Add can follow it.
 	s.prefetchMu.Lock()
 	s.shuttingDown = true
 	s.prefetchMu.Unlock()
 
-	drained := make(chan struct{})
-	go func() {
+	// A prefetch abandoned here loses at most a cache entry the next request
+	// re-fetches.
+	_ = closeWithin(ctx, "prefetches to finish", func() error {
 		s.prefetches.Wait()
-		close(drained)
-	}()
-
-	select {
-	case <-drained:
-	case <-time.After(prefetchDrainBudget):
-		slog.Warn("Gave up waiting for prefetches; an in-flight cache write may fail",
-			"budget", prefetchDrainBudget)
-	}
+		return nil
+	})
 
 	s.indexCache.Close()
-	return s.storage.Close()
+
+	// Bounded for the same reason: the tiered backend drains queued uploads on
+	// close, and an unreachable object store makes that drain the longest step in
+	// the shutdown.
+	return closeWithin(ctx, "the storage backend to close", s.storage.Close)
+}
+
+// closeWithin runs one shutdown step and gives up on it when the budget is
+// spent, reporting no error for a step that never finished. The step keeps
+// running: the process is exiting, and interrupting a half-written upload buys
+// nothing. The buffered channel is what lets it finish without leaking.
+func closeWithin(ctx context.Context, what string, step func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- step() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		slog.Warn("Shutdown budget spent; no longer waiting for "+what, "error", ctx.Err())
+		return nil
+	}
 }
 
 func (s *Server) setupRoutes() {

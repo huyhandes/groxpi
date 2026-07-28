@@ -54,6 +54,9 @@ services:
     image: groxpi:latest
     container_name: groxpi
     restart: unless-stopped
+    # Shutdown drains requests and prefetches, then flushes telemetry; Docker's
+    # 10s default would SIGKILL that mid-flush. See docs/deployment.md.
+    stop_grace_period: 30s
     depends_on:
       minio-init:
         condition: service_completed_successfully
