@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -549,4 +550,85 @@ func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
 
 	assert.Equal(t, []string{"keepme-1.0.0.tar.gz"}, cachedFileNames(srv),
 		"the refused deletion must not have evicted anything")
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown: prefetch registration versus the drain (huyhandes/groxpi#41)
+// ---------------------------------------------------------------------------
+
+// TestPrefetchRefusedAfterShutdown pins the refusal that closes the late-Add
+// window. A handler still parked reading its request body when shutdown begins
+// reaches startPrefetch after Close has entered its wait; registering then is
+// documented WaitGroup misuse, so the request is refused instead.
+func TestPrefetchRefusedAfterShutdown(t *testing.T) {
+	up := newAdminUpstream(t, "latecomer", adminFakeFile{name: "latecomer-1.0.0.tar.gz", body: testPayload(64)})
+	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
+	require.NoError(t, err)
+	router := srv.Router()
+
+	// Accepted while serving.
+	resp := postPrefetch(router, "latecomer", true)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	require.NoError(t, srv.Close())
+
+	// Refused afterwards, and visibly so rather than silently dropped.
+	resp = postPrefetch(router, "latecomer", true)
+	body := readBody(t, resp)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a prefetch arriving after shutdown must be refused, not registered")
+	assert.Contains(t, string(body), "Shutting down")
+}
+
+// TestCloseDrainsRunningPrefetch pins the ordering the drain exists for. The
+// request returns 202 as soon as the prefetch is registered, long before the
+// download runs, so without the wait Close would release storage with nothing
+// cached — not a failed write, an absent one.
+func TestCloseDrainsRunningPrefetch(t *testing.T) {
+	up := newAdminUpstream(t, "drainme", adminFakeFile{name: "drainme-1.0.0.tar.gz", body: testPayload(4096)})
+	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
+	require.NoError(t, err)
+
+	resp := postPrefetch(srv.Router(), "drainme", true)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	require.NoError(t, srv.Close())
+
+	assert.Equal(t, []string{"drainme-1.0.0.tar.gz"}, cachedFileNames(srv),
+		"Close must wait for the in-flight prefetch before releasing storage")
+}
+
+// TestCloseGivesUpWhenBudgetSpent pins the other half of the drain: a prefetch
+// that cannot finish must not hold shutdown open. An unbounded wait here is what
+// turns a graceful stop into a SIGKILL once the container's stop grace expires.
+// The budget is spent before Close is called rather than waited out, so the test
+// asserts the give-up without a real-clock sleep.
+func TestCloseGivesUpWhenBudgetSpent(t *testing.T) {
+	// A wedged upstream: it answers nothing until the test lets it, so the
+	// prefetch it feeds cannot complete on its own.
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer up.Close()
+
+	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
+	require.NoError(t, err)
+
+	resp := postPrefetch(srv.Router(), "wedged", true)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Returns rather than hanging: the test failing here looks like a timeout.
+	assert.NoError(t, srv.CloseContext(ctx),
+		"a prefetch that cannot be drained must be stepped over, not waited for")
+
+	// Let the abandoned prefetch unwind before the temp cache directory goes.
+	close(release)
+	srv.prefetches.Wait()
 }

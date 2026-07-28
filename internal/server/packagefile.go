@@ -467,7 +467,8 @@ func (s *PackageFileService) queryConcurrently(ctx context.Context, indexes []co
 }
 
 // maxRootIndexBytes caps the proxied root index. See the read in ProxyRoot.
-var maxRootIndexBytes int64 = 256 << 20
+// Documented in docs/api-endpoints.md, since a client meets it as a 502.
+const maxRootIndexBytes int64 = 256 << 20
 
 // rootResponse is one upstream root-index response, held only as long as it
 // takes to answer the burst of clients that shared its fetch.
@@ -507,12 +508,16 @@ func (s *PackageFileService) ProxyRoot(ctx context.Context, accept, acceptEncodi
 		}
 		defer func() { _ = resp.Body.Close() }()
 
-		// ponytail: a var, not a const, only so a test can lower it. The whole
-		// response is held in memory to be handed to every waiter, so an upstream
-		// that answers this route with an endless body would otherwise be an
-		// unauthenticated way to exhaust the process's memory. The ceiling is far
+		// The whole response is held in memory to be handed to every waiter, so an
+		// upstream that answers this route with an endless body would otherwise be
+		// an unauthenticated way to exhaust the process's memory. The ceiling is far
 		// above PyPI's own project list; exceeding it fails loudly rather than
-		// serving a truncated index.
+		// serving a truncated index. Reading one byte past the cap is what tells
+		// the two apart: a body of exactly the cap is served, the first byte over
+		// is an error.
+		//
+		// ponytail: the overflow branch is untested — reaching it needs a
+		// 256 MiB response body, which is not a test worth running.
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRootIndexBytes+1))
 		if err != nil {
 			return nil, err

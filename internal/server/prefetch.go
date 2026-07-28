@@ -20,8 +20,9 @@ import (
 var sdistExtensions = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.Z", ".tgz", ".tbz2", ".zip", ".tar"}
 
 // prefetchDeadline bounds one detached prefetch. It is deliberately far above
-// any real package: it exists so a wedged upstream cannot pin a goroutine and
-// block shutdown forever, not to time a download out.
+// any real package: it stops a wedged upstream pinning a goroutine for the life
+// of the process, not a download from taking its time. It is far too long to
+// bound shutdown — that is prefetchDrainBudget's job.
 const prefetchDeadline = 30 * time.Minute
 
 // handleAdminPrefetch accepts a prefetch and returns immediately. The download
@@ -36,7 +37,10 @@ func (s *Server) handleAdminPrefetch(c *gin.Context) {
 		return
 	}
 
-	s.startPrefetch(context.WithoutCancel(c.Request.Context()), packageName)
+	if !s.startPrefetch(context.WithoutCancel(c.Request.Context()), packageName) {
+		c.String(http.StatusServiceUnavailable, "Shutting down; prefetch not accepted")
+		return
+	}
 
 	c.String(http.StatusAccepted, "Prefetching %s", packageName)
 }
@@ -47,8 +51,19 @@ func (s *Server) handleAdminPrefetch(c *gin.Context) {
 // operator submitting the same name ten times gets one download, deadlined so it
 // cannot outlive the process it is holding open, and its panics are contained —
 // gin.Recovery() only wraps the request goroutine.
-func (s *Server) startPrefetch(ctx context.Context, packageName string) {
+//
+// It reports false once shutdown has begun, when the work could not have
+// finished anyway. Taking the lock around the registration is what keeps the Add
+// from racing Close's Wait.
+func (s *Server) startPrefetch(ctx context.Context, packageName string) bool {
+	s.prefetchMu.Lock()
+	if s.shuttingDown {
+		s.prefetchMu.Unlock()
+		return false
+	}
 	s.prefetches.Add(1)
+	s.prefetchMu.Unlock()
+
 	go func() {
 		defer s.prefetches.Done()
 		defer func() {
@@ -68,6 +83,8 @@ func (s *Server) startPrefetch(ctx context.Context, packageName string) {
 			return nil, nil
 		})
 	}()
+
+	return true
 }
 
 // prefetchPackage resolves the package's index, picks its newest release and

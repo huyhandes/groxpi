@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -140,13 +139,16 @@ func main() {
 	slog.Info("✅ Server stopped gracefully")
 }
 
-// shutdown drains in-flight requests, then releases the storage backend.
-func shutdown(ctx context.Context, httpServer *http.Server, backend io.Closer) {
+// shutdown drains in-flight requests, then releases the server's resources.
+// Both steps share one budget: ctx is the whole grace period, not a per-step
+// allowance, so a slow request drain leaves less time for the backend rather
+// than pushing the total past the container's stop grace.
+func shutdown(ctx context.Context, httpServer *http.Server, srv *server.Server) {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		slog.Error("Server forced to shutdown", "error", err)
 	}
 
-	if err := backend.Close(); err != nil {
+	if err := srv.CloseContext(ctx); err != nil {
 		slog.Error("Failed to close storage backend", "error", err)
 	}
 }

@@ -52,6 +52,13 @@ Nothing is cached: the full project list is tens of megabytes, and every represe
 ask for is one the upstream already produces. Concurrent requests for the same representation are
 coalesced into a single upstream fetch. An upstream failure answers `502`.
 
+The proxied root index is capped at **256 MiB**, and an upstream response above that answers `502`
+rather than a truncated list. The whole body is held in memory to serve every client that shared the
+fetch, so the cap is what stops an upstream answering this route with an endless body from exhausting
+the process. It is a fixed limit with no setting, far above PyPI's own project list, and unrelated to
+`GROXPI_INDEX_CACHE_SIZE`, which bounds the per-package index cache and happens to default to a
+similar number.
+
 Because it is a pass-through, the HTML form lists the real upstream projects, not just the ones groxpi
 has cached.
 
@@ -136,6 +143,12 @@ Prefetch downloads the **newest final release only** — yanked files and pre-re
 versions are compared under PEP 440 ordering, and all files of the winning release (wheels plus sdist)
 are fetched. A filename whose version will not parse is skipped. An empty `package` field answers `400`.
 
+Once shutdown has begun the route answers `503` instead of accepting: the download could not have
+finished, and registering it then would race the shutdown drain. Prefetches already running finish
+their cache writes before storage is released, but only within the shutdown budget — one still running
+when the budget is spent is abandoned with a warning, so a wedged upstream cannot hold the process open
+until it is killed. See [deployment](deployment.md) for the budget and how to size the stop grace.
+
 ### `DELETE /cache/list`
 
 Answers `{"status":"success","data":null}` and does nothing. The root index is proxied rather than
@@ -168,7 +181,8 @@ mode no files are deleted — see the note in [architecture.md](architecture.md)
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
 | `500` | Index resolution failed for a reason other than absence, or a storage operation failed. |
-| `502` | The upstream root index could not be fetched. |
+| `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap. |
+| `503` | A prefetch was submitted after shutdown had begun. |
 
 A known path with the wrong method answers `405`, not `404`: `DELETE /simple/` tells you the method is
 wrong rather than that the path does not exist.

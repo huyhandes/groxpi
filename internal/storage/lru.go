@@ -56,6 +56,7 @@ type LRUCache struct {
 	deleter      objectDeleter            // Removes evicted objects from the backend
 	evictionChan chan struct{}            // Channel to trigger eviction checks
 	stopChan     chan struct{}            // Channel to stop background eviction
+	stopOnce     sync.Once                // Guards stopChan against a second Close
 	wg           sync.WaitGroup
 }
 
@@ -431,12 +432,14 @@ func (lru *LRUCache) RecordDelete(key string) {
 	lru.detachLocked(elem, elem.Value.(*LRUEntry))
 }
 
-// Close stops the LRU cache and cleans up resources
+// Close stops the LRU cache and cleans up resources. Idempotent, like the other
+// closers in this package: a second call must not panic on the closed channel.
 func (lru *LRUCache) Close() error {
-	close(lru.stopChan)
-	lru.wg.Wait()
-
-	slog.Info("LRU cache closed")
+	lru.stopOnce.Do(func() {
+		close(lru.stopChan)
+		lru.wg.Wait()
+		slog.Info("LRU cache closed")
+	})
 	return nil
 }
 
