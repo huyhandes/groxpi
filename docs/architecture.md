@@ -42,7 +42,7 @@ benchmarks/                  benchmark harness (see benchmarking.md)
 docs/adr/                    architecture decision records
 ```
 
-Dependencies point one way: `server → admin → download → index → storage`. `download` needs one thing
+Dependencies point one way: `server → admin → download → index`, with `storage` used by `download` and `admin` (never by `index`). `download` needs one thing
 from `index` — a resolved file list — and asks for it through a one-method interface it defines
 itself (`download.Resolver`), which is what lets its tests run against a fake index. Everywhere else a
 module is used as the concrete type it is: an interface with one implementation is a liability, not a
@@ -84,7 +84,7 @@ about:
 |---|---|---|
 | `ZeroCopyCapable` | `GetFilePath` | the filesystem backends |
 | `PrefixDeleter` | `DeletePrefix` | the filesystem backends, and the tiered backend for its L1 |
-| `cacheSnapshotter` | `Snapshot` | the LRU filesystem backend (feeds the admin page) |
+| `cacheSnapshotter` | `Snapshot` | the LRU filesystem backend, and the tiered backend via its L1 (feeds the admin page) |
 
 Storage keys are `packages/<normalised-name>/<filename>`. The package prefix is what makes
 `DELETE /cache/<package>` a prefix delete rather than a second index.
@@ -113,8 +113,9 @@ The L2 upload is queued on a bounded worker pool and is best-effort; the pool is
 Reads that miss L1 and hit L2 queue an L1 back-fill on the same pool, and the back-fill survives
 cancellation of the request that triggered it.
 
-`DeletePrefix` on the tiered backend deletes L1 only. Evicting from the durable tier on an operator's
-cache-clear would defeat the point of having one.
+`DeletePrefix` on the tiered backend deletes L1 and, when the remote implements `PrefixDeleter`, L2 as
+well, so the next request cannot back-fill what the operator just evicted. The S3 backend does not
+implement it today, so in practice hybrid eviction is L1-only and logs a warning.
 
 ## Request flows
 
@@ -145,7 +146,8 @@ request instead of falling through. Losing queries are cancelled once a higher-p
 answered, which is what `index.result=cancelled` counts.
 
 The upstream client prefers the PEP 691 JSON representation and falls back to parsing HTML, resolving
-relative hrefs against the URL actually served and lifting `#sha256=` fragments into the file's hashes.
+relative hrefs against the URL actually served, lifting `#sha256=` fragments into the file's hashes and
+`data-core-metadata` / `data-dist-info-metadata` attributes into the PEP 658 marker.
 
 ### Download — `GET /simple/<package>/<file>`
 
@@ -154,6 +156,7 @@ storage.Exists ──hit──▶ serve from storage
     │miss
     ▼
 resolve index, find the file  ──not listed──▶ 404
+  (a <file>.metadata name is planned from <file>'s entry, PEP 658)
     ▼
 download timeout 0?  ──yes──▶ 302 upstream
     ▼
@@ -170,8 +173,13 @@ removed when the leader's download returns, whatever the outcome.
 
 The tee is one upstream read feeding two sinks: the client's socket and an `io.Pipe` the storage
 backend consumes. The bytes are hashed on the way through; the pipe is closed cleanly only if the
-digest and length check out, so a file that fails verification is never committed — the backend sees a
-pipe error and discards its partial write.
+file verifies — against the SHA-256 the index declared, or failing that against the declared length; a
+file with neither is cached unverified with a warning — so a file that contradicts what was declared
+is never committed: the backend sees a pipe error and discards its partial write.
+
+If the leader fails before the first body byte reaches the client, the client is redirected (`302`) to
+the upstream URL and `groxpi.redirects` counts a `fetch_failed`. A failure after body bytes are on the
+wire simply ends the response; a redirect would corrupt the payload.
 
 The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
 only fire while groxpi is still waiting for upstream response headers. A body already streaming to the
@@ -215,9 +223,9 @@ as long as the collector keeps the series.
 
 ```
 {METHOD} {pattern}           e.g. GET /simple/{package}/{file}
+├─ storage.exists
 ├─ index.resolve
 │  └─ index.query          (one per index consulted)
-├─ storage.exists
 └─ upstream.fetch
    └─ storage.put
 ```
@@ -232,6 +240,18 @@ The cost is binary size. Measured on darwin/arm64 at this commit: about 48 MB fo
 about 33 MB with `-ldflags="-w -s"` (the Dockerfile strips). Most of that is the OpenTelemetry and AWS
 SDKs, not the templates — `html/template` and the embedded assets are a rounding error against them, so
 deleting the templates would reclaim close to nothing. Do not "optimize" them away on a size argument.
+
+## Diagrams
+
+Two explorable diagrams, generated from the code with Archify and checked in as standalone HTML
+(open in a browser; no server needed). Their sources sit beside them as `*.archify.json`; regenerate
+rather than hand-edit the HTML.
+
+- [diagrams/architecture.html](diagrams/architecture.html) — the module map above as a component
+  diagram: clients, the four modules, the storage seam and the externals.
+- [diagrams/download-sequence.html](diagrams/download-sequence.html) — the download flow above as a
+  sequence: a cache miss with a second client coalesced onto the same upstream stream, and the
+  leader-failure alternative.
 
 ## Decisions
 

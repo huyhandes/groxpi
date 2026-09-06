@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "groxpi — Go PyPI caching proxy",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/huyhandes/groxpi",
+      "revision": "8466ebad9829fab857cdfed9d53b9d6fa5321fb5"
+    },
+    "viewBox": [
+      1360,
+      720
+    ]
+  },
+  "components": [
+    {
+      "id": "pip-clients",
+      "type": "external",
+      "label": "pip / uv",
+      "sublabel": "PEP 503/691 · PEP 658",
+      "pos": [
+        40,
+        330
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator browser",
+      "sublabel": "/admin, basic auth",
+      "pos": [
+        40,
+        110
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "server-mod",
+      "type": "backend",
+      "label": "server",
+      "sublabel": "ServeMux · recover · trace",
+      "pos": [
+        320,
+        330
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/server/server.go",
+          "line": 72,
+          "end_line": 91,
+          "label": "mux + middleware"
+        }
+      ]
+    },
+    {
+      "id": "admin-mod",
+      "type": "security",
+      "label": "admin",
+      "sublabel": "auth · cross-site · prefetch",
+      "pos": [
+        600,
+        110
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/admin/admin.go",
+          "line": 91,
+          "end_line": 99,
+          "label": "routes"
+        }
+      ]
+    },
+    {
+      "id": "download-mod",
+      "type": "backend",
+      "label": "download",
+      "sublabel": "Plan / Fetch / Warm · tee",
+      "pos": [
+        600,
+        330
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/download/service.go",
+          "line": 106,
+          "label": "Plan"
+        },
+        {
+          "path": "internal/download/handler.go",
+          "line": 22,
+          "end_line": 23,
+          "label": "routes"
+        }
+      ]
+    },
+    {
+      "id": "index-mod",
+      "type": "backend",
+      "label": "index",
+      "sublabel": "Resolve / Invalidate · cache",
+      "pos": [
+        600,
+        550
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/index/service.go",
+          "line": 39,
+          "label": "singleflight"
+        },
+        {
+          "path": "internal/index/handler.go",
+          "line": 17,
+          "end_line": 20,
+          "label": "routes"
+        }
+      ]
+    },
+    {
+      "id": "storage-seam",
+      "type": "backend",
+      "label": "storage.Storage",
+      "sublabel": "Get Put Delete Exists Close",
+      "pos": [
+        880,
+        210
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "sources": [
+        {
+          "path": "internal/storage/storage.go",
+          "line": 27,
+          "end_line": 65,
+          "label": "interfaces"
+        }
+      ]
+    },
+    {
+      "id": "fs-backends",
+      "type": "database",
+      "label": "Filesystem backends",
+      "sublabel": "Local · LRU · Tiered L1",
+      "pos": [
+        1150,
+        110
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "s3-store",
+      "type": "cloud",
+      "label": "S3 / MinIO",
+      "sublabel": "AWS SDK v2 · Tiered L2",
+      "pos": [
+        1150,
+        300
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "upstream-pypi",
+      "type": "external",
+      "label": "PyPI + extra indexes",
+      "sublabel": "URLs redacted in logs",
+      "pos": [
+        880,
+        550
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "otel-collector",
+      "type": "external",
+      "label": "OTel collector",
+      "sublabel": "OTLP/HTTP · inert if unset",
+      "pos": [
+        320,
+        570
+      ],
+      "size": [
+        170,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "groxpi binary · server → admin → download → index → storage",
+      "wraps": [
+        "server-mod",
+        "admin-mod",
+        "download-mod",
+        "index-mod",
+        "storage-seam"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "pip-to-mux",
+      "from": "pip-clients",
+      "to": "server-mod",
+      "label": "GET /simple/…",
+      "variant": "emphasis"
+    },
+    {
+      "id": "operator-to-mux",
+      "from": "operator",
+      "to": "server-mod",
+      "label": "GET /admin",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "mux-mounts-admin",
+      "from": "server-mod",
+      "to": "admin-mod",
+      "label": "/admin*, DELETE /cache/*",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "mux-mounts-download",
+      "from": "server-mod",
+      "to": "download-mod",
+      "label": "{package}/{file}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "mux-mounts-index",
+      "from": "server-mod",
+      "to": "index-mod",
+      "label": "{package}/ index",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "admin-warms",
+      "from": "admin-mod",
+      "to": "download-mod",
+      "label": "Warm · InFlight",
+      "labelDy": 75
+    },
+    {
+      "id": "download-resolves",
+      "from": "download-mod",
+      "to": "index-mod",
+      "label": "Resolver: file list",
+      "labelDy": 75
+    },
+    {
+      "id": "download-stores",
+      "from": "download-mod",
+      "to": "storage-seam",
+      "label": "Exists · Get · Put"
+    },
+    {
+      "id": "admin-evicts",
+      "from": "admin-mod",
+      "to": "storage-seam",
+      "label": "DeletePrefix",
+      "variant": "dashed"
+    },
+    {
+      "id": "index-fetches",
+      "from": "index-mod",
+      "to": "upstream-pypi",
+      "label": "JSON, HTML fallback"
+    },
+    {
+      "id": "download-fetches",
+      "from": "download-mod",
+      "to": "upstream-pypi",
+      "label": "stream file, verify",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "storage-to-fs",
+      "from": "storage-seam",
+      "to": "fs-backends",
+      "label": "GetFilePath"
+    },
+    {
+      "id": "storage-to-s3",
+      "from": "storage-seam",
+      "to": "s3-store",
+      "label": "PutObject"
+    },
+    {
+      "id": "server-to-otel",
+      "from": "server-mod",
+      "to": "otel-collector",
+      "label": "traces · metrics · logs",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 95
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Request path",
+      "items": [
+        "Every route is a method+pattern on the stdlib mux; r.Pattern names the span; recoverPanics wraps traceRequests",
+        "Index: cache hit, else singleflight → extras first, primary last; first index wins; upstream client prefers PEP 691 JSON, falls back to HTML",
+        "Download: storage hit, else planned fetch; <file>.metadata planned from the file's PEP 658 entry"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Coalescing and caching",
+      "items": [
+        "Leader streams to the client and tees into storage; pipe closes cleanly only if sha256 and length match",
+        "Waiters block on the storage key, then re-plan onto the cached object (or 302)",
+        "In-flight registry feeds admin rows and the groxpi.download.inflight gauge",
+        "Index cache holds files + JSON + gzip per entry under one byte budget; LRU plus TTL sweep"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Storage seam",
+      "items": [
+        "Five-method Storage interface; ZeroCopyCapable, PrefixDeleter and Snapshot are optional capabilities asked for by type assertion",
+        "Filesystem backends expose GetFilePath so http.ServeContent handles range and conditional requests",
+        "Tiered: L1 authoritative for writes, S3 L2 upload and back-fill on a bounded worker pool"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Boundaries",
+      "items": [
+        "download.Resolver is the only cross-module interface: one method, consumer-defined, faked in tests",
+        "Admin: constant-time basic auth, cross-site requests rejected via Sec-Fetch-Site, htmx embedded via go:embed",
+        "Telemetry over OTLP/HTTP only, logs via the otelslog bridge; no Prometheus scrape endpoint"
+      ]
+    }
+  ]
+}

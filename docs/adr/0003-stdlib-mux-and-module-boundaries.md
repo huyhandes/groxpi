@@ -28,10 +28,10 @@ benefit from it.
    client, root proxy), `download` (plan, coalesced fetch, in-flight registry, tee download), `admin`
    (auth, cross-site check, page, prefetch, eviction) and `server` (composition root, middleware,
    shutdown). Each module's surface is `Register(mux)` plus the two or three methods its one consumer
-   needs. Dependencies point one way: `server → admin → download → index → storage`.
+   needs. Dependencies point one way: `server → admin → download → index`, with `storage` used by `download` and `admin` (never by `index`).
 
 3. **Interfaces only where a second implementation exists, defined by the consumer.** `storage.Storage`
-   and its capability interfaces stay (five backends). `download.Resolver` is the single cross-module
+   and its capability interfaces stay (four backends). `download.Resolver` is the single cross-module
    interface: one method, defined in `download`, satisfied by `*index.Service` in production and by a
    fake in tests. The `StreamingDownloader`, `packageIndex` and `fakeDownloader` seams are deleted.
 

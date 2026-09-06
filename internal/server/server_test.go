@@ -203,8 +203,10 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 }
 
 func TestServer_HandleListFiles(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
+		IndexURL: upstream.URL + "/simple/",
 		CacheDir: "/tmp/test-cache",
 		LogLevel: "INFO",
 	}

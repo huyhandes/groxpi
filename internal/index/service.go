@@ -331,6 +331,9 @@ type wireFile struct {
 	URL            string            `json:"url"`
 	Yanked         bool              `json:"yanked,omitempty"`
 	YankedReason   string            `json:"yanked-reason,omitempty"`
+	// PEP 714: emit under both keys so old and new installers find it.
+	CoreMetadata     any `json:"core-metadata,omitempty"`
+	DistInfoMetadata any `json:"dist-info-metadata,omitempty"`
 }
 
 type wireFiles struct {
@@ -357,6 +360,13 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 		if file.IsYanked() {
 			wf.Yanked = true
 			wf.YankedReason = file.GetYankedReason()
+		}
+		if hashes, ok := file.Metadata(); ok {
+			var v any = true
+			if len(hashes) > 0 {
+				v = hashes
+			}
+			wf.CoreMetadata, wf.DistInfoMetadata = v, v
 		}
 		body.Files = append(body.Files, wf)
 	}

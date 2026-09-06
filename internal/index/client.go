@@ -43,6 +43,35 @@ type FileInfo struct {
 	UploadTime     string            `json:"upload-time,omitempty"`
 	Yanked         any               `json:"yanked,omitempty"` // Can be bool or string
 	YankedReason   string            `json:"yanked-reason,omitempty"`
+	// PEP 658/714: true or a hash map when <url>.metadata exists upstream.
+	// Both spellings are accepted; CoreMetadata wins when both are present.
+	CoreMetadata     any `json:"core-metadata,omitempty"`
+	DistInfoMetadata any `json:"dist-info-metadata,omitempty"`
+}
+
+// Metadata reports whether the index advertises a PEP 658 metadata file for
+// this distribution and, when it does, the hashes it declared for it (nil for a
+// bare "true").
+func (f *FileInfo) Metadata() (hashes map[string]string, ok bool) {
+	v := f.CoreMetadata
+	if v == nil {
+		v = f.DistInfoMetadata
+	}
+	switch m := v.(type) {
+	case bool:
+		return nil, m
+	case map[string]any:
+		hashes = make(map[string]string, len(m))
+		for k, h := range m {
+			if s, ok := h.(string); ok {
+				hashes[k] = s
+			}
+		}
+		return hashes, true
+	case map[string]string:
+		return m, true
+	}
+	return nil, false
 }
 
 // IsYanked returns true if the file is yanked
@@ -346,6 +375,7 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 				Hashes:         hashes,
 				RequiresPython: requiresPython,
 				Yanked:         yanked,
+				CoreMetadata:   htmlMetadataAttr(line),
 			})
 		}
 
@@ -353,4 +383,27 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 	})
 
 	return files, err
+}
+
+// htmlMetadataAttr lifts a PEP 658 data-core-metadata (or the older
+// data-dist-info-metadata) attribute into the PEP 691 shape: "true" becomes
+// true, "sha256=<hex>" becomes {"sha256": "<hex>"}, absent stays nil.
+func htmlMetadataAttr(line string) any {
+	for _, attr := range []string{`data-core-metadata="`, `data-dist-info-metadata="`} {
+		start := strings.Index(line, attr)
+		if start == -1 {
+			continue
+		}
+		start += len(attr)
+		end := strings.Index(line[start:], `"`)
+		if end == -1 {
+			continue
+		}
+		value := html.UnescapeString(line[start : start+end])
+		if algo, sum, found := strings.Cut(value, "="); found && sum != "" {
+			return map[string]any{algo: sum}
+		}
+		return true
+	}
+	return nil
 }

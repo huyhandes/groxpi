@@ -133,6 +133,13 @@ func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []F
 			}
 			sb.WriteString(`"`)
 		}
+		if hashes, ok := file.Metadata(); ok {
+			value := "true"
+			if sum := hashes["sha256"]; sum != "" {
+				value = "sha256=" + sum
+			}
+			sb.WriteString(` data-core-metadata="` + value + `" data-dist-info-metadata="` + value + `"`)
+		}
 
 		sb.WriteString(`>`)
 		sb.WriteString(file.Name)

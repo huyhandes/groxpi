@@ -8,6 +8,7 @@ Every route groxpi registers, and nothing else.
 | `GET` | `/simple/` | — | Root project list, proxied from upstream (PEP 503/691). |
 | `GET` | `/simple/<package>/` | — | File list for one package. |
 | `GET` | `/simple/<package>/<file>` | — | Download one distribution file. |
+| `GET` | `/simple/<package>/<file>.metadata` | — | PEP 658 core metadata for one distribution, when the index advertises it. |
 | `GET` | `/index/` | — | Alias of `/simple/`. |
 | `GET` | `/index/<package>` | — | Alias of `/simple/<package>/` (note: no trailing slash). |
 | `GET` | `/index/<package>/<file>` | — | Alias of `/simple/<package>/<file>`. |
@@ -47,6 +48,10 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
   compression middleware.
 - HTML is rendered on demand from the parsed file list, with `data-requires-python` and `data-yanked`
   attributes preserved and every href rewritten to point back at groxpi.
+- PEP 658 metadata availability is passed through as the upstream stated it — `true` or a hash map —
+  under both the `core-metadata` and `dist-info-metadata` keys in JSON (PEP 714) and both
+  `data-core-metadata` and `data-dist-info-metadata` attributes in HTML. Whichever spelling the upstream
+  used, both are emitted. A file the upstream does not mark gets no marker.
 
 ## The root index
 
@@ -93,6 +98,15 @@ and `ETag` (the SHA-256, quoted) when the index supplied them. Files served from
 carry `Content-Disposition: attachment` and `Cache-Control: public, max-age=3600`.
 
 Package files are never compressed by groxpi — they are already-compressed archives.
+
+### `GET /simple/<package>/<file>.metadata`
+
+The PEP 658 metadata file follows the same four outcomes and the same cache as the distribution. It is
+planned from the distribution's index entry: the upstream URL is the file's URL with `.metadata`
+appended, the expected SHA-256 is the one the index declared for the metadata (when it declared one),
+and the storage key is `packages/<package>/<file>.metadata`. A `.metadata` request for a file the
+index lists without a metadata marker, or does not list at all, answers `404`. The response
+`Content-Type` is `text/plain; charset=utf-8`.
 
 ## `GET /health`
 

@@ -1,0 +1,336 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "groxpi download: GET /simple/{package}/{file} cache miss with a coalesced second client",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1080,
+      1160
+    ]
+  },
+  "participants": [
+    {
+      "id": "clientA",
+      "type": "external",
+      "label": "Client A",
+      "sublabel": "first request"
+    },
+    {
+      "id": "clientB",
+      "type": "external",
+      "label": "Client B",
+      "sublabel": "second request"
+    },
+    {
+      "id": "mw",
+      "type": "backend",
+      "label": "server",
+      "sublabel": "trace middleware"
+    },
+    {
+      "id": "dl",
+      "type": "backend",
+      "label": "download",
+      "sublabel": "Plan / Fetch"
+    },
+    {
+      "id": "idx",
+      "type": "backend",
+      "label": "index",
+      "sublabel": "Resolve"
+    },
+    {
+      "id": "st",
+      "type": "database",
+      "label": "storage",
+      "sublabel": "Local / S3 / Tiered"
+    },
+    {
+      "id": "pypi",
+      "type": "external",
+      "label": "upstream PyPI",
+      "sublabel": "or private index"
+    }
+  ],
+  "segments": [
+    {
+      "from": 165,
+      "to": 470,
+      "label": "Plan: cache miss, index resolution"
+    },
+    {
+      "from": 490,
+      "to": 640,
+      "label": "Fetch: leader streams and tees"
+    },
+    {
+      "from": 660,
+      "to": 930,
+      "label": "Client B coalesces onto the same download"
+    },
+    {
+      "from": 950,
+      "to": 1065,
+      "label": "Alternative: leader fails"
+    }
+  ],
+  "messages": [
+    {
+      "id": "a-request",
+      "from": "clientA",
+      "to": "mw",
+      "y": 190,
+      "label": "GET /simple/{package}/{file}",
+      "variant": "emphasis"
+    },
+    {
+      "id": "a-handle",
+      "from": "mw",
+      "to": "dl",
+      "y": 228,
+      "label": "root span, handleDownload",
+      "variant": "default",
+      "note": "span is renamed to r.Pattern once the handler returns"
+    },
+    {
+      "id": "a-exists",
+      "from": "dl",
+      "to": "st",
+      "y": 266,
+      "label": "Exists(packages/pkg/file)",
+      "variant": "default"
+    },
+    {
+      "id": "a-miss",
+      "from": "st",
+      "to": "dl",
+      "y": 300,
+      "label": "miss",
+      "variant": "return"
+    },
+    {
+      "id": "a-resolve",
+      "from": "dl",
+      "to": "idx",
+      "y": 340,
+      "label": "Resolve(package)",
+      "variant": "default",
+      "note": "singleflight keyed on the package name"
+    },
+    {
+      "id": "idx-fetch",
+      "from": "idx",
+      "to": "pypi",
+      "y": 378,
+      "label": "GET /simple/{package}/ (index cache miss only)",
+      "variant": "dashed"
+    },
+    {
+      "id": "idx-files",
+      "from": "pypi",
+      "to": "idx",
+      "y": 412,
+      "label": "file list, JSON or HTML",
+      "variant": "return"
+    },
+    {
+      "id": "a-plan",
+      "from": "idx",
+      "to": "dl",
+      "y": 450,
+      "label": "Entry -> findFile -> ActionStreamAndCache",
+      "variant": "return"
+    },
+    {
+      "id": "a-upstream",
+      "from": "dl",
+      "to": "pypi",
+      "y": 515,
+      "label": "inflight.join (Requests=1), singleflight on key, GET file",
+      "variant": "emphasis",
+      "note": "leader runs on context.WithoutCancel; gauge groxpi.download.inflight recorded"
+    },
+    {
+      "id": "a-body",
+      "from": "pypi",
+      "to": "dl",
+      "y": 553,
+      "label": "200, body stream",
+      "variant": "return"
+    },
+    {
+      "id": "a-stream",
+      "from": "dl",
+      "to": "clientA",
+      "y": 591,
+      "label": "headers before first byte, then body",
+      "variant": "emphasis"
+    },
+    {
+      "id": "a-tee",
+      "from": "dl",
+      "to": "st",
+      "y": 625,
+      "label": "tee via io.Pipe -> Put",
+      "variant": "dashed"
+    },
+    {
+      "id": "b-request",
+      "from": "clientB",
+      "to": "mw",
+      "y": 685,
+      "label": "GET same file",
+      "variant": "emphasis"
+    },
+    {
+      "id": "b-handle",
+      "from": "mw",
+      "to": "dl",
+      "y": 720,
+      "label": "Plan: Exists miss, Resolve hits index cache",
+      "variant": "default",
+      "note": "Fetch: join (Requests=2), blocks on the singleflight"
+    },
+    {
+      "id": "a-commit",
+      "from": "dl",
+      "to": "st",
+      "y": 760,
+      "label": "sha256/length verified -> pipe Close, commit",
+      "variant": "default",
+      "note": "leader returns: inflight.leave removes the entry"
+    },
+    {
+      "id": "a-done",
+      "from": "dl",
+      "to": "clientA",
+      "y": 798,
+      "label": "body complete, 200",
+      "variant": "return"
+    },
+    {
+      "id": "b-replan",
+      "from": "dl",
+      "to": "st",
+      "y": 836,
+      "label": "led=false -> PlanAfterFetch -> Exists",
+      "variant": "default"
+    },
+    {
+      "id": "b-hit",
+      "from": "st",
+      "to": "dl",
+      "y": 870,
+      "label": "hit -> serveFromStorage",
+      "variant": "return"
+    },
+    {
+      "id": "b-serve",
+      "from": "dl",
+      "to": "clientB",
+      "y": 908,
+      "label": "200 via http.ServeContent (ZeroCopyCapable)",
+      "variant": "return"
+    },
+    {
+      "id": "f-error",
+      "from": "pypi",
+      "to": "dl",
+      "y": 975,
+      "label": "error before first body byte",
+      "variant": "dashed"
+    },
+    {
+      "id": "f-discard",
+      "from": "dl",
+      "to": "st",
+      "y": 1010,
+      "label": "CloseWithError -> partial write discarded",
+      "variant": "dashed"
+    },
+    {
+      "id": "f-redirect",
+      "from": "dl",
+      "to": "clientA",
+      "y": 1045,
+      "label": "302 to upstream URL (redirect fetch_failed)",
+      "variant": "dashed",
+      "note": "after body bytes were sent the connection just ends"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "mw",
+      "from": 185,
+      "to": 805,
+      "type": "backend"
+    },
+    {
+      "participant": "dl",
+      "from": 224,
+      "to": 915,
+      "type": "backend"
+    },
+    {
+      "participant": "idx",
+      "from": 336,
+      "to": 456,
+      "type": "backend"
+    },
+    {
+      "participant": "st",
+      "from": 262,
+      "to": 306,
+      "type": "database"
+    },
+    {
+      "participant": "st",
+      "from": 621,
+      "to": 876,
+      "type": "database"
+    },
+    {
+      "participant": "pypi",
+      "from": 374,
+      "to": 418,
+      "type": "external"
+    },
+    {
+      "participant": "pypi",
+      "from": 511,
+      "to": 559,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Main path (Client A)",
+      "items": [
+        "Plan does no client I/O: storage.Exists, then index.Resolve, then findFile",
+        "Fetch runs exactly one upstream download per storage key",
+        "Headers are emitted lazily right before the first body byte"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Coalesced waiter (Client B)",
+      "items": [
+        "join increments Requests on the same in-flight entry",
+        "Waiter gets led=false with nothing written, then PlanAfterFetch",
+        "Storage hit is served with http.ServeContent on ZeroCopyCapable backends"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Failure alternative",
+      "items": [
+        "Error before any body byte: 302 to the upstream URL",
+        "Error after body bytes: the response simply ends",
+        "Verification failure closes the pipe with an error; nothing partial is kept"
+      ]
+    }
+  ]
+}
