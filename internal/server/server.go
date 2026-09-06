@@ -146,9 +146,9 @@ func traceRequests(next http.Handler) http.Handler {
 }
 
 // statusWriter records the status code for the span and the access log. It
-// forwards ReadFrom so http.ServeContent can still hand a cached file to the
-// kernel: wrapping the response writer without it would silently turn every
-// cached-file response back into a user-space copy.
+// forwards ReadFrom so http.ServeContent still reaches the standard writer's own
+// copy path: wrapping the response writer without it would silently hide that
+// path behind the wrapper (there is a test).
 type statusWriter struct {
 	http.ResponseWriter
 	code int

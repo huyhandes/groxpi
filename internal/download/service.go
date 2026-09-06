@@ -191,8 +191,11 @@ func (s *Service) Fetch(ctx context.Context, plan ServePlan, dst io.Writer) (*St
 
 	value, err, _ := s.sf.Do(plan.StorageKey, func() (any, error) {
 		led = true
-		defer s.inflight.leave(plan.StorageKey)
 		telemetry.DownloadsInFlight(fetchCtx, s.inflight.count())
+		defer func() {
+			s.inflight.leave(plan.StorageKey)
+			telemetry.DownloadsInFlight(fetchCtx, s.inflight.count())
+		}()
 
 		dlCtx, span := telemetry.Tracer().Start(fetchCtx, "upstream.fetch")
 		defer span.End()

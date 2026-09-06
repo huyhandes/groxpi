@@ -61,8 +61,8 @@ func (s *Service) servePlan(w http.ResponseWriter, r *http.Request, plan ServePl
 
 // serveFromStorage serves a cached object. When the backend can name a real file
 // on disk it is handed to http.ServeContent, which does range and conditional
-// requests and, on a plain net/http response writer, lets the kernel copy the
-// file to the socket. Backends that cannot name a file are opened and streamed.
+// requests and keeps the standard writer's own copy path available. Backends
+// that cannot name a file are opened and streamed.
 func (s *Service) serveFromStorage(w http.ResponseWriter, r *http.Request, plan ServePlan) {
 	// Read-only serving: it is correct to abandon it when the client goes away.
 	ctx := r.Context()
