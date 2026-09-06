@@ -1,28 +1,22 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/huyhandes/groxpi/internal/storage"
 )
 
 // testRequest performs an HTTP request against the router and returns the response
-func testRequest(router *gin.Engine, req *http.Request) *http.Response {
+func testRequest(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()
@@ -438,9 +432,13 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
-		// Should handle path traversal safely
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected status 404 for path traversal, got %d", resp.StatusCode)
+		// The mux cleans the path and redirects to the cleaned form; nothing
+		// under the cache directory must be reachable either way.
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusTemporaryRedirect {
+			t.Errorf("Expected 404 or redirect for path traversal, got %d", resp.StatusCode)
+		}
+		if loc := resp.Header.Get("Location"); strings.Contains(loc, "..") {
+			t.Errorf("redirect must not preserve traversal: %q", loc)
 		}
 	})
 }
@@ -1264,110 +1262,6 @@ func TestServer_URLRewriting(t *testing.T) {
 		// Ensure HTML does not contain direct PyPI URLs
 		if strings.Contains(bodyStr, "files.pythonhosted.org") {
 			t.Errorf("HTML should not contain files.pythonhosted.org URLs, got: %s", bodyStr)
-		}
-	})
-}
-
-// zeroCopyStorage is a fakeStorage that can also name a real file on disk, so
-// it satisfies storage.ZeroCopyCapable and the server must serve it by path
-// rather than pulling the bytes through Get.
-type zeroCopyStorage struct {
-	*fakeStorage
-	dir string
-}
-
-func (z *zeroCopyStorage) GetFilePath(_ context.Context, key string) (string, error) {
-	path := filepath.Join(z.dir, filepath.Base(key))
-	if _, err := os.Stat(path); err != nil {
-		return "", fmt.Errorf("%w: %s", storage.ErrNotFound, key)
-	}
-	return path, nil
-}
-
-// TestServer_ServeFromStorage_HeadersPrecedeBody pins the ordering contract:
-// every response header must be set before the first body byte, because Gin
-// flushes the header block on the first Write and silently discards whatever
-// is set afterwards. httptest.ResponseRecorder snapshots the headers at that
-// same moment, so Result().Header sees exactly what the client would.
-func TestServer_ServeFromStorage_HeadersPrecedeBody(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	const key = "packages/numpy/numpy-1.26.0.tar.gz"
-	payload := []byte(strings.Repeat("x", 4096))
-
-	serve := func(t *testing.T, st storage.Storage) *http.Response {
-		t.Helper()
-		w := httptest.NewRecorder()
-		c, _ := gin.CreateTestContext(w)
-		c.Request = httptest.NewRequest(http.MethodGet, "/"+key, nil)
-
-		s := &Server{storage: st}
-		if err := s.serveFromStorage(c, key); err != nil {
-			t.Fatalf("serveFromStorage: %v", err)
-		}
-		return w.Result()
-	}
-
-	t.Run("streaming backend", func(t *testing.T) {
-		st := newFakeStorage()
-		if _, err := st.Put(context.Background(), key, strings.NewReader(string(payload)), int64(len(payload)), ""); err != nil {
-			t.Fatalf("seed storage: %v", err)
-		}
-
-		resp := serve(t, st)
-		defer func() { _ = resp.Body.Close() }()
-
-		if got, want := resp.Header.Get("Content-Length"), strconv.Itoa(len(payload)); got != want {
-			t.Errorf("Content-Length written after the body: got %q, want %q", got, want)
-		}
-		if got := resp.Header.Get("Content-Type"); got != "application/octet-stream" {
-			t.Errorf("Content-Type written after the body: got %q", got)
-		}
-		if got := resp.Header.Get("Content-Disposition"); !strings.Contains(got, "numpy-1.26.0.tar.gz") {
-			t.Errorf("Content-Disposition written after the body: got %q", got)
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if string(body) != string(payload) {
-			t.Errorf("body truncated: got %d bytes, want %d", len(body), len(payload))
-		}
-	})
-
-	t.Run("zero-copy backend is served by path", func(t *testing.T) {
-		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "numpy-1.26.0.tar.gz"), payload, 0o644); err != nil {
-			t.Fatalf("seed file: %v", err)
-		}
-		// The object is deliberately absent from the in-memory map: if the
-		// server fell back to streaming it would 404 instead of serving.
-		st := &zeroCopyStorage{fakeStorage: newFakeStorage(), dir: dir}
-
-		resp := serve(t, st)
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("zero-copy path not taken: status %d", resp.StatusCode)
-		}
-		if got, want := resp.Header.Get("Content-Length"), strconv.Itoa(len(payload)); got != want {
-			t.Errorf("Content-Length: got %q, want %q", got, want)
-		}
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if string(body) != string(payload) {
-			t.Errorf("body mismatch: got %d bytes, want %d", len(body), len(payload))
-		}
-	})
-
-	t.Run("missing object is a 404, not a 500", func(t *testing.T) {
-		resp := serve(t, newFakeStorage())
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("expected 404 for a missing object, got %d", resp.StatusCode)
 		}
 	})
 }

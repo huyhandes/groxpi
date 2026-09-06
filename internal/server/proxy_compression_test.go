@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -48,7 +47,7 @@ func newFakeRootIndex(t *testing.T, delay time.Duration) *fakeRootIndex {
 	return f
 }
 
-func newProxyServer(t *testing.T, upstreamURL string) *gin.Engine {
+func newProxyServer(t *testing.T, upstreamURL string) http.Handler {
 	t.Helper()
 	srv := New(&config.Config{
 		IndexURL:        upstreamURL,

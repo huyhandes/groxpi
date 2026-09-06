@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/download"
 )
 
 // TestCredentialsNeverLeakFromDownloadFailures is the regression test for the
@@ -65,9 +66,9 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 
 	// Sanity: the resolved file URL really does carry the credential, so the
 	// assertions below are about redaction and not about an absent secret.
-	plan, err := srv.packageFiles.Plan(t.Context(), pkg, fileName)
+	plan, err := srv.downloads.Plan(t.Context(), pkg, fileName)
 	require.NoError(t, err)
-	require.Equal(t, ActionStreamAndCache, plan.Action)
+	require.Equal(t, download.ActionStreamAndCache, plan.Action)
 	require.Contains(t, plan.URL, secret, "the leak mechanism itself regressed: the file URL no longer carries user-info")
 
 	// 1. Download failure on the client path.
@@ -82,15 +83,17 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
 	require.Equal(t, http.StatusAccepted, w.Code)
-	srv.prefetches.Wait()
 
-	rows := httptest.NewRequest(http.MethodGet, "/admin/rows", nil)
-	rows.SetBasicAuth(cfg.AdminUsername, cfg.AdminPassword)
-	rowsRec := httptest.NewRecorder()
-	srv.Router().ServeHTTP(rowsRec, rows)
-	require.Equal(t, http.StatusOK, rowsRec.Code)
-	body := rowsRec.Body.String()
-	require.Contains(t, body, fileName, "the prefetch failure must have reached the page for this assertion to mean anything")
+	// The prefetch is detached: poll the page until its failure has landed.
+	var body string
+	require.Eventually(t, func() bool {
+		rows := httptest.NewRequest(http.MethodGet, "/admin/rows", nil)
+		rows.SetBasicAuth(cfg.AdminUsername, cfg.AdminPassword)
+		rowsRec := httptest.NewRecorder()
+		srv.Router().ServeHTTP(rowsRec, rows)
+		body = rowsRec.Body.String()
+		return rowsRec.Code == http.StatusOK && strings.Contains(body, fileName)
+	}, 5*time.Second, 10*time.Millisecond, "the prefetch failure must have reached the page for this assertion to mean anything")
 
 	assert.NotContains(t, body, secret, "the admin page must not render index credentials")
 	assert.NotContains(t, logs.String(), secret, "credentials must appear nowhere in log output")

@@ -1,4 +1,4 @@
-package pypi
+package index
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 
 func TestNewClient(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:               "https://pypi.org/simple/",
+		IndexURL:               "https://org/simple/",
 		DisableSSLVerification: false,
 		ConnectTimeout:         5 * time.Second,
 		ReadTimeout:            20 * time.Second,
@@ -34,7 +34,7 @@ func TestNewClient(t *testing.T) {
 
 func TestNewClient_SSLVerificationDisabled(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:               "https://pypi.org/simple/",
+		IndexURL:               "https://org/simple/",
 		DisableSSLVerification: true,
 	}
 
@@ -267,7 +267,7 @@ func TestFileInfo_GetYankedReason(t *testing.T) {
 // the #sha256=... fragment survives resolution.
 func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
 	client := &Client{}
-	const baseURL = "https://pypi.org/simple/foo/"
+	const baseURL = "https://org/simple/foo/"
 
 	testCases := []struct {
 		name        string
@@ -277,12 +277,12 @@ func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
 		{
 			name:        "parent-relative href",
 			html:        `<a href="../../packages/ab/cd/foo-1.0.tar.gz">foo-1.0.tar.gz</a>`,
-			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz",
+			expectedURL: "https://org/packages/ab/cd/foo-1.0.tar.gz",
 		},
 		{
 			name:        "same-directory relative href",
 			html:        `<a href="foo-1.0.whl">foo-1.0.whl</a>`,
-			expectedURL: "https://pypi.org/simple/foo/foo-1.0.whl",
+			expectedURL: "https://org/simple/foo/foo-1.0.whl",
 		},
 		{
 			name:        "absolute href passes through unchanged",
@@ -297,12 +297,12 @@ func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
 		{
 			name:        "relative href keeps sha256 fragment",
 			html:        `<a href="../../packages/ab/cd/foo-1.0.tar.gz#sha256=abc123">foo-1.0.tar.gz</a>`,
-			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
+			expectedURL: "https://org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
 		},
 		{
 			name:        "root-relative href",
 			html:        `<a href="/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123">foo-1.0.tar.gz</a>`,
-			expectedURL: "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
+			expectedURL: "https://org/packages/ab/cd/foo-1.0.tar.gz#sha256=abc123",
 		},
 	}
 
@@ -347,7 +347,7 @@ func TestClient_ParseHTMLPackageFiles_SHA256Fragment(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://pypi.org/simple/foo/")
+			files, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://org/simple/foo/")
 			require.NoError(t, err)
 			require.Len(t, files, 1)
 			assert.Equal(t, tc.expected, files[0].Hashes)
@@ -364,12 +364,12 @@ func TestClient_ParseHTMLPackageFiles_PreservesAttributes(t *testing.T) {
 	client := &Client{}
 	html := `<a href="../../packages/ab/cd/foo-1.0.tar.gz?token=a&amp;v=2#sha256=abc123" data-requires-python="&gt;=3.8,&lt;4" data-yanked="broken &amp; unusable">foo-1.0&amp;bar.tar.gz</a>`
 
-	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://pypi.org/simple/foo/")
+	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://org/simple/foo/")
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 
 	assert.Equal(t, "foo-1.0&bar.tar.gz", files[0].Name)
-	assert.Equal(t, "https://pypi.org/packages/ab/cd/foo-1.0.tar.gz?token=a&v=2#sha256=abc123", files[0].URL)
+	assert.Equal(t, "https://org/packages/ab/cd/foo-1.0.tar.gz?token=a&v=2#sha256=abc123", files[0].URL)
 	assert.Equal(t, ">=3.8,<4", files[0].RequiresPython)
 	assert.Equal(t, "broken & unusable", files[0].Yanked)
 }
@@ -381,10 +381,10 @@ func TestClient_ParseHTMLPackageFiles_MalformedHref(t *testing.T) {
 	html := `<a href="http://[::1]bad">bad.tar.gz</a>
 <a href="foo-1.0.whl">foo-1.0.whl</a>`
 
-	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://pypi.org/simple/foo/")
+	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://org/simple/foo/")
 	require.NoError(t, err)
 	require.Len(t, files, 1)
-	assert.Equal(t, "https://pypi.org/simple/foo/foo-1.0.whl", files[0].URL)
+	assert.Equal(t, "https://org/simple/foo/foo-1.0.whl", files[0].URL)
 }
 
 // TestClient_ParseHTMLPackageFiles_UnparseableBase falls back to leaving hrefs as-is
@@ -442,8 +442,8 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 </body>
 </html>`,
 			expected: []FileInfo{
-				{Name: "numpy-1.21.0.tar.gz", URL: "https://pypi.org/simple/numpy/numpy-1.21.0.tar.gz"},
-				{Name: "numpy-1.21.0-py3-none-any.whl", URL: "https://pypi.org/simple/numpy/numpy-1.21.0-py3-none-any.whl"},
+				{Name: "numpy-1.21.0.tar.gz", URL: "https://org/simple/numpy/numpy-1.21.0.tar.gz"},
+				{Name: "numpy-1.21.0-py3-none-any.whl", URL: "https://org/simple/numpy/numpy-1.21.0-py3-none-any.whl"},
 			},
 		},
 		{
@@ -457,11 +457,11 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 			expected: []FileInfo{
 				{
 					Name: "package-1.0.tar.gz",
-					URL:  "https://pypi.org/simple/numpy/package-1.0.tar.gz#sha256=abc123",
+					URL:  "https://org/simple/numpy/package-1.0.tar.gz#sha256=abc123",
 				},
 				{
 					Name: "package-1.0.whl",
-					URL:  "https://pypi.org/simple/numpy/package-1.0.whl#md5=def456",
+					URL:  "https://org/simple/numpy/package-1.0.whl#md5=def456",
 				},
 			},
 		},
@@ -474,7 +474,7 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://pypi.org/simple/numpy/")
+			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://org/simple/numpy/")
 			if err != nil {
 				t.Fatalf("parseHTMLPackageFiles failed: %v", err)
 			}

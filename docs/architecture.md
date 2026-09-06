@@ -1,30 +1,39 @@
 # Architecture
 
-groxpi is a caching PyPI proxy: a Gin HTTP transport over an index cache, an object store and one
-upstream client.
+groxpi is a caching PyPI proxy built on the standard library's `net/http`: four modules mounted on one
+`http.ServeMux`, over one storage seam. There is no web framework. See
+[adr/0003-stdlib-mux-and-module-boundaries.md](adr/0003-stdlib-mux-and-module-boundaries.md).
 
 ## Module map
+
+Each module is deep: a small surface (`Register(mux)` plus one or two methods) over everything it
+needs to own that surface. Modules talk to each other through those methods, never through each
+other's internals.
 
 ```
 cmd/groxpi/            main: config, telemetry, logger, server, graceful shutdown
 internal/
-  cache/     index.go        bounded index cache (LRU by last access + background TTL sweep)
-  config/    config.go       every environment variable, URL redaction, index resolution order
-  logger/    logger.go       slog setup: stdout handler plus the OpenTelemetry log bridge
-  pypi/      client.go       upstream index client (JSON first, HTML fallback)
+  server/    server.go       composition root: builds storage, index, download, admin; mounts them on
+                             the mux; wraps the mux in panic recovery and request tracing; shutdown
+  index/     service.go      Resolve / Invalidate: extras-first resolution, singleflight, root proxy
+             cache.go        bounded index cache (LRU by last access + background TTL sweep)
+             client.go       upstream index client (JSON first, HTML fallback)
              normalize.go    PEP 503 name normalisation
-  server/    server.go       routes, handlers, storage construction
-             packagefile.go  PackageFileService: index resolution, serve planning, root proxy
-             admin.go        admin page view model
-             prefetch.go     prefetch and newest-release selection
+             handler.go      GET /simple/, GET /simple/{package}/ and the /index/ aliases
+  download/  service.go      Plan / Fetch / Warm: storage check, serve planning, coalesced downloads
+             inflight.go     registry of running downloads (InFlight) — the singleflight made readable
+             downloader.go   tee download: client and cache from one upstream read, verified
+             handler.go      GET /simple/{package}/{file} and its /index/ alias
+  admin/     admin.go        basic auth, cross-site check, page, rows, cache eviction
+             prefetch.go     prefetch and newest-release selection, built on download.Warm
   storage/   storage.go      Storage interface plus capability interfaces
              local.go        plain filesystem backend
              lru.go          filesystem backend with LRU eviction
              s3.go           AWS SDK v2 backend
              tiered.go       hybrid: local L1 over S3 L2
              workerpool.go   bounded worker pool used by the tiered backend
-  streaming/ interfaces.go   StreamingDownloader
-             downloader.go   tee download: client and cache from one upstream read
+  config/    config.go       every environment variable, URL redaction, index resolution order
+  logger/    logger.go       slog setup: stdout handler plus the OpenTelemetry log bridge
   telemetry/ telemetry.go    OTLP providers for traces, metrics and logs
              instruments.go  the metrics groxpi records
 templates/                   admin.html, rows.html, htmx.min.js — embedded with go:embed
@@ -33,8 +42,16 @@ benchmarks/                  benchmark harness (see benchmarking.md)
 docs/adr/                    architecture decision records
 ```
 
-JSON is the standard library's `encoding/json`. groxpi does not use Sonic; it appears in `go.mod` only
-as an indirect dependency of gin.
+Dependencies point one way: `server → admin → download → index → storage`. `download` needs one thing
+from `index` — a resolved file list — and asks for it through a one-method interface it defines
+itself (`download.Resolver`), which is what lets its tests run against a fake index. Everywhere else a
+module is used as the concrete type it is: an interface with one implementation is a liability, not a
+boundary.
+
+Routing is the standard library's `http.ServeMux` with method-and-pattern routes (`GET
+/simple/{package}/{$}`). The mux supplies the trailing-slash redirect, the `405` with `Allow`, and the
+matched pattern (`r.Pattern`) that names each request span. JSON is the standard library's
+`encoding/json`.
 
 ## The index cache
 
@@ -72,10 +89,11 @@ about:
 Storage keys are `packages/<normalised-name>/<filename>`. The package prefix is what makes
 `DELETE /cache/<package>` a prefix delete rather than a second index.
 
-Serving a cached file whose backend can name a local path hands that path to `c.File`, so `net/http`
-does range and conditional-request handling. This is **not** a kernel-level zero copy: gin's response
-writer exposes neither the file nor the `io.ReaderFrom` hook `net/http` needs to skip user space, so
-the bytes still pass through it. The win is delegated correctness, not a saved copy.
+Serving a cached file whose backend can name a local path hands the open file to `http.ServeContent`,
+so `net/http` does range and conditional-request handling. The tracing middleware's response-writer
+wrapper forwards `io.ReaderFrom` and `Unwrap`, so the standard writer's own copy path is preserved.
+Whether that ever avoids a user-space copy depends on the platform and is neither claimed nor measured
+here: the win groxpi relies on is delegated correctness.
 
 ### `s3`
 
@@ -144,6 +162,12 @@ singleflight on the storage key
     └─ waiter: block, then re-plan onto storage (or 302)
 ```
 
+The singleflight is made visible: every running download is an entry in the download module's
+in-flight registry, keyed by storage key, recording the bytes streamed so far, the size the index
+declared, when it started and how many requests are coalesced onto it. The admin page renders the
+registry as "Downloading now" rows and `groxpi.download.inflight` reports its size. The entry is
+removed when the leader's download returns, whatever the outcome.
+
 The tee is one upstream read feeding two sinks: the client's socket and an `io.Pipe` the storage
 backend consumes. The bytes are hashed on the way through; the pipe is closed cleanly only if the
 digest and length check out, so a file that fails verification is never committed — the backend sees a
@@ -179,6 +203,7 @@ no `/metrics` route; `monitoring/prometheus.yml` scrapes a collector. See
 | `groxpi.upstream.fetch.duration` | histogram (seconds) | `fetch.outcome` = `ok`, `error` |
 | `groxpi.redirects` | counter | `redirect.reason` = `caching_disabled`, `fetch_failed`, `not_cached` |
 | `groxpi.verification.failures` | counter | — |
+| `groxpi.download.inflight` | gauge | — |
 
 `groxpi.redirects` is the counter that distinguishes a working cache from a time-to-first-byte budget
 set too tight: every increment is a request that was not served from cache.
@@ -189,7 +214,7 @@ as long as the collector keeps the series.
 ### Spans
 
 ```
-{METHOD} {route}
+{METHOD} {pattern}           e.g. GET /simple/{package}/{file}
 ├─ index.resolve
 │  └─ index.query          (one per index consulted)
 ├─ storage.exists
@@ -205,7 +230,7 @@ Nothing is read from disk at runtime and there is no asset build step: building 
 
 The cost is binary size. Measured on darwin/arm64 at this commit: about 48 MB for a plain `go build`,
 about 33 MB with `-ldflags="-w -s"` (the Dockerfile strips). Most of that is the OpenTelemetry and AWS
-SDKs, not the templates — `html/template` is pulled in by gin whether or not the admin page exists, so
+SDKs, not the templates — `html/template` and the embedded assets are a rounding error against them, so
 deleting the templates would reclaim close to nothing. Do not "optimize" them away on a size argument.
 
 ## Decisions
@@ -214,6 +239,8 @@ deleting the templates would reclaim close to nothing. Do not "optimize" them aw
   indexes are queried first and file lists are never merged.
 - [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md) — why there is no
   scrape endpoint.
+- [adr/0003-stdlib-mux-and-module-boundaries.md](adr/0003-stdlib-mux-and-module-boundaries.md) — why
+  there is no web framework, and what the four modules own.
 
 ## Known gaps
 

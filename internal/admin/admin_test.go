@@ -1,23 +1,30 @@
-package server
+package admin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/download"
+	"github.com/huyhandes/groxpi/internal/index"
+	"github.com/huyhandes/groxpi/internal/storage"
 )
 
 const (
@@ -33,14 +40,15 @@ type adminFakeFile struct {
 }
 
 // adminUpstream is the fake-upstream harness for the administrative tests: one
-// package with an arbitrary file list, and a switch that makes every file body
-// fail.
+// package with an arbitrary file list, a switch that makes every file body
+// fail, and an optional gate that holds file bodies until released.
 type adminUpstream struct {
 	*httptest.Server
 	pkg       string
 	files     []adminFakeFile
 	failFiles atomic.Bool
 	fileHits  atomic.Int64
+	gate      chan struct{} // nil: files are served immediately
 }
 
 func newAdminUpstream(t *testing.T, pkg string, files ...adminFakeFile) *adminUpstream {
@@ -84,6 +92,13 @@ func newAdminUpstream(t *testing.T, pkg string, files ...adminFakeFile) *adminUp
 			for _, f := range fake.files {
 				if f.name == name {
 					w.Header().Set("Content-Length", fmt.Sprintf("%d", len(f.body)))
+					if fake.gate != nil {
+						// Commit the headers so the download is registered as
+						// in flight, then hold the body until released.
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+						<-fake.gate
+					}
 					_, _ = w.Write(f.body)
 					return
 				}
@@ -97,9 +112,16 @@ func newAdminUpstream(t *testing.T, pkg string, files ...adminFakeFile) *adminUp
 	return fake
 }
 
-// adminConfig is the base configuration for these tests; the option mutates the
-// administrative settings under test.
-func adminConfig(t *testing.T, upstreamURL string, opts ...func(*config.Config)) *config.Config {
+// adminHarness is the admin module wired to a real index and download module
+// over local storage, mounted on a bare mux: exactly what the server does, minus
+// the server.
+type adminHarness struct {
+	svc      *Service
+	mux      *http.ServeMux
+	cacheDir string
+}
+
+func newAdminServer(t *testing.T, upstreamURL string) *adminHarness {
 	t.Helper()
 	cfg := &config.Config{
 		IndexURL:        upstreamURL,
@@ -109,39 +131,46 @@ func adminConfig(t *testing.T, upstreamURL string, opts ...func(*config.Config))
 		CacheSize:       1 << 30,
 		DownloadTimeout: 5 * time.Second,
 		LogLevel:        "ERROR",
+		AdminUsername:   adminUser,
+		AdminPassword:   adminPass,
 	}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	return cfg
-}
-
-func withCredentials(cfg *config.Config) {
-	cfg.AdminUsername = adminUser
-	cfg.AdminPassword = adminPass
-}
-
-func newAdminServer(t *testing.T, upstreamURL string, opts ...func(*config.Config)) *Server {
-	t.Helper()
-	srv, err := NewServer(adminConfig(t, upstreamURL, opts...))
+	st, err := storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Close() })
-	return srv
+	idx := index.New(cfg)
+	dl := download.New(cfg, st, idx)
+	svc, err := New(cfg, st, idx, dl)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	idx.Register(mux)
+	dl.Register(mux)
+	svc.Register(mux)
+
+	t.Cleanup(func() {
+		svc.Close(context.Background())
+		idx.Close()
+		_ = st.Close()
+	})
+	return &adminHarness{svc: svc, mux: mux, cacheDir: cfg.CacheDir}
 }
 
-func do(router *gin.Engine, req *http.Request) *http.Response {
+func do(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()
 }
 
-func authGet(router *gin.Engine, path string) *http.Response {
+func authGet(router http.Handler, path string) *http.Response {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.SetBasicAuth(adminUser, adminPass)
 	return do(router, req)
 }
 
-func postPrefetch(router *gin.Engine, pkg string, auth bool) *http.Response {
+func getFile(router http.Handler, pkg, file string) *http.Response {
+	return do(router, httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+file, nil))
+}
+
+func postPrefetch(router http.Handler, pkg string, auth bool) *http.Response {
 	body := url.Values{"package": {pkg}}.Encode()
 	req := httptest.NewRequest(http.MethodPost, "/admin/prefetch", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -149,6 +178,47 @@ func postPrefetch(router *gin.Engine, pkg string, auth bool) *http.Response {
 		req.SetBasicAuth(adminUser, adminPass)
 	}
 	return do(router, req)
+}
+
+func readBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return body
+}
+
+func testPayload(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i)
+	}
+	return b
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func cachedPath(cacheDir, pkg, file string) string {
+	return filepath.Join(cacheDir, "packages", pkg, file)
+}
+
+func waitCached(t *testing.T, cacheDir, pkg, file string) {
+	t.Helper()
+	waitFor(t, "the file to reach the cache", func() bool {
+		_, err := os.Stat(cachedPath(cacheDir, pkg, file))
+		return err == nil
+	})
+}
+
+func assertNotCached(t *testing.T, cacheDir, pkg, file string) {
+	t.Helper()
+	// Give the storage goroutine a moment to finish failing.
+	time.Sleep(100 * time.Millisecond)
+	_, err := os.Stat(cachedPath(cacheDir, pkg, file))
+	assert.True(t, os.IsNotExist(err), "expected no cached object for %s/%s", pkg, file)
 }
 
 // waitFor is the bounded wait every asynchronous assertion below uses: prefetch
@@ -166,9 +236,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // cachedFileNames reads the file names out of the same snapshot the page renders.
-func cachedFileNames(srv *Server) []string {
+func cachedFileNames(h *adminHarness) []string {
 	var names []string
-	for _, pkg := range srv.snapshotView().Packages {
+	for _, pkg := range h.svc.snapshotView().Packages {
 		for _, f := range pkg.Files {
 			names = append(names, f.Name)
 		}
@@ -178,111 +248,45 @@ func cachedFileNames(srv *Server) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
-// adminPaths is the whole surface that must disappear without credentials —
-// including the pre-existing cache routes, which used to be open.
-var adminPaths = []struct {
-	method string
-	path   string
-}{
-	{http.MethodGet, "/admin"},
-	{http.MethodGet, "/admin/rows"},
-	{http.MethodGet, "/admin/htmx.min.js"},
-	{http.MethodPost, "/admin/prefetch"},
-	{http.MethodDelete, "/cache/list"},
-	{http.MethodDelete, "/cache/somepkg"},
-}
-
-func TestAdminAuth_NoCredentials_SurfaceReturns404(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL).Router()
-
-	for _, tc := range adminPaths {
-		resp := do(router, httptest.NewRequest(tc.method, tc.path, nil))
-		_ = readBody(t, resp)
-		assert.Equal(t, http.StatusNotFound, resp.StatusCode,
-			"%s %s must not exist when no credentials are configured", tc.method, tc.path)
-	}
-}
-
-func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL, withCredentials).Router()
-
-	for _, tc := range adminPaths {
-		resp := do(router, httptest.NewRequest(tc.method, tc.path, nil))
-		_ = readBody(t, resp)
-		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
-			"%s %s must require credentials", tc.method, tc.path)
-	}
-
-	resp := authGet(router, "/admin")
-	_ = readBody(t, resp)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	resp = authGet(router, "/admin/rows")
-	_ = readBody(t, resp)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	resp = deletePackage(router, "somepkg")
-	_ = readBody(t, resp)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-}
-
-func TestAdminAuth_EnabledWithoutCredentials_ConstructionFails(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-
-	srv, err := NewServer(adminConfig(t, up.URL, func(cfg *config.Config) {
-		cfg.AdminEnabled = true
-	}))
-	require.Error(t, err, "enabling the admin interface without credentials must fail construction")
-	assert.Nil(t, srv, "a server that cannot be trusted must not be produced")
-}
-
-// TestAdminAuth_IndexRoutesStayUnauthenticated is the test that catches an
-// over-broad middleware group: whatever the administrative configuration, pip
-// must reach the index without credentials.
-func TestAdminAuth_IndexRoutesStayUnauthenticated(t *testing.T) {
-	file := adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(1024)}
-
-	configurations := map[string][]func(*config.Config){
-		"no credentials":       nil,
-		"credentials":          {withCredentials},
-		"enabled+credentials":  {withCredentials, func(cfg *config.Config) { cfg.AdminEnabled = true }},
-		"credentials, enabled": {func(cfg *config.Config) { cfg.AdminEnabled = true }, withCredentials},
-	}
-
-	for name, opts := range configurations {
-		t.Run(name, func(t *testing.T) {
-			up := newAdminUpstream(t, "pkg", file)
-			router := newAdminServer(t, up.URL, opts...).Router()
-
-			for _, path := range []string{
-				"/simple/pkg/",
-				"/index/pkg",
-				"/simple/pkg/" + file.name,
-				"/index/pkg/" + file.name,
-				"/health",
-				"/",
-			} {
-				resp := do(router, httptest.NewRequest(http.MethodGet, path, nil))
-				body := readBody(t, resp)
-				assert.Equal(t, http.StatusOK, resp.StatusCode,
-					"GET %s must succeed without credentials (body: %.80s)", path, body)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
 
+// TestAdminListing_ShowsInFlightDownload pins the "Downloading now" rows: a
+// download that has started but not finished is visible to the operator with
+// its progress, and disappears once it lands in the cache.
+func TestAdminListing_ShowsInFlightDownload(t *testing.T) {
+	up := newAdminUpstream(t, "slow", adminFakeFile{name: "slow-1.0.0.tar.gz", body: testPayload(8192)})
+	up.gate = make(chan struct{})
+	h := newAdminServer(t, up.URL)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = readBody(t, getFile(h.mux, "slow", "slow-1.0.0.tar.gz"))
+	}()
+
+	waitFor(t, "the download to register as in flight", func() bool {
+		return len(h.svc.snapshotView().Downloading) == 1
+	})
+	body := string(readBody(t, authGet(h.mux, "/admin/rows")))
+	assert.Contains(t, body, "Downloading now")
+	assert.Contains(t, body, "slow-1.0.0.tar.gz")
+	view := h.svc.snapshotView()
+	require.Len(t, view.Downloading, 1)
+	assert.Equal(t, "slow", view.Downloading[0].Package)
+	assert.Equal(t, int64(8192), view.Downloading[0].Size)
+	assert.Equal(t, 1, view.Downloading[0].Requests)
+
+	close(up.gate)
+	<-done
+	waitFor(t, "the download to leave the in-flight list", func() bool {
+		return len(h.svc.snapshotView().Downloading) == 0
+	})
+	assert.NotContains(t, string(readBody(t, authGet(h.mux, "/admin/rows"))), "Downloading now")
+}
 func TestAdminListing_EmptyCacheHasNoRows(t *testing.T) {
 	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL, withCredentials).Router()
+	router := newAdminServer(t, up.URL).mux
 
 	resp := authGet(router, "/admin")
 	body := string(readBody(t, resp))
@@ -295,12 +299,12 @@ func TestAdminListing_EmptyCacheHasNoRows(t *testing.T) {
 func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 	payload := testPayload(4096)
 	up := newAdminUpstream(t, "listme", adminFakeFile{name: "listme-1.0.0.tar.gz", body: payload})
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	_ = readBody(t, getFile(router, "listme", "listme-1.0.0.tar.gz"))
 	waitFor(t, "the download to reach the cache snapshot", func() bool {
-		return len(srv.snapshotView().Packages) == 1
+		return len(srv.svc.snapshotView().Packages) == 1
 	})
 
 	body := string(readBody(t, authGet(router, "/admin/rows")))
@@ -308,7 +312,7 @@ func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 	assert.Contains(t, body, "listme-1.0.0.tar.gz")
 	assert.Contains(t, body, "4.0 KB", "the row must carry the file size")
 
-	view := srv.snapshotView()
+	view := srv.svc.snapshotView()
 	require.Len(t, view.Packages, 1)
 	require.Len(t, view.Packages[0].Files, 1)
 	assert.Equal(t, int64(len(payload)), view.Packages[0].Files[0].Size)
@@ -317,9 +321,9 @@ func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 
 func TestAdminListing_HitCountTracksServes(t *testing.T) {
 	up := newAdminUpstream(t, "hitme", adminFakeFile{name: "hitme-1.0.0.tar.gz", body: testPayload(2048)})
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
-	cacheDir := srv.config.CacheDir
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
+	cacheDir := srv.cacheDir
 
 	// The first request populates the cache; it is a write, not a serve.
 	_ = readBody(t, getFile(router, "hitme", "hitme-1.0.0.tar.gz"))
@@ -332,7 +336,7 @@ func TestAdminListing_HitCountTracksServes(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 	}
 
-	view := srv.snapshotView()
+	view := srv.svc.snapshotView()
 	require.Len(t, view.Packages, 1)
 	assert.Equal(t, int64(serves), view.Packages[0].Hits,
 		"the hit count must reflect how many times the object was served from cache")
@@ -348,8 +352,8 @@ func TestPrefetch_ReturnsAcceptedAndFilesAppear(t *testing.T) {
 		adminFakeFile{name: "warmme-1.0.0.tar.gz", body: testPayload(8192)},
 		adminFakeFile{name: "warmme-1.0.0-py3-none-any.whl", body: testPayload(4096)},
 	)
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	resp := postPrefetch(router, "warmme", true)
 	_ = readBody(t, resp)
@@ -360,7 +364,7 @@ func TestPrefetch_ReturnsAcceptedAndFilesAppear(t *testing.T) {
 	})
 
 	assert.Equal(t, []string{"warmme-1.0.0-py3-none-any.whl", "warmme-1.0.0.tar.gz"}, cachedFileNames(srv))
-	assert.Empty(t, srv.snapshotView().Errors)
+	assert.Empty(t, srv.svc.snapshotView().Errors)
 }
 
 // TestPrefetch_OnlyNewestRelease also pins PEP 440 ordering: 1.10.0 is newer
@@ -373,9 +377,9 @@ func TestPrefetch_OnlyNewestRelease(t *testing.T) {
 		adminFakeFile{name: "manyver-1.10.0.tar.gz", body: testPayload(300)},
 		adminFakeFile{name: "manyver-1.10.0-py3-none-any.whl", body: testPayload(310)},
 	)
-	srv := newAdminServer(t, up.URL, withCredentials)
+	srv := newAdminServer(t, up.URL)
 
-	resp := postPrefetch(srv.Router(), "manyver", true)
+	resp := postPrefetch(srv.mux, "manyver", true)
 	_ = readBody(t, resp)
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
@@ -391,9 +395,9 @@ func TestPrefetch_SkipsPreReleases(t *testing.T) {
 		adminFakeFile{name: "prerel-2.0.0b3.tar.gz", body: testPayload(300)},
 		adminFakeFile{name: "prerel-3.0.0.dev1.tar.gz", body: testPayload(400)},
 	)
-	srv := newAdminServer(t, up.URL, withCredentials)
+	srv := newAdminServer(t, up.URL)
 
-	_ = readBody(t, postPrefetch(srv.Router(), "prerel", true))
+	_ = readBody(t, postPrefetch(srv.mux, "prerel", true))
 
 	want := []string{"prerel-1.10.0.tar.gz"}
 	waitFor(t, "the newest final release", func() bool { return len(cachedFileNames(srv)) == len(want) })
@@ -407,9 +411,9 @@ func TestPrefetch_ExcludesYankedFiles(t *testing.T) {
 		adminFakeFile{name: "yanked-1.10.0.tar.gz", body: testPayload(100)},
 		adminFakeFile{name: "yanked-1.10.0-py3-none-any.whl", body: testPayload(200), yanked: true},
 	)
-	srv := newAdminServer(t, up.URL, withCredentials)
+	srv := newAdminServer(t, up.URL)
 
-	_ = readBody(t, postPrefetch(srv.Router(), "yanked", true))
+	_ = readBody(t, postPrefetch(srv.mux, "yanked", true))
 
 	want := []string{"yanked-1.10.0.tar.gz"}
 	waitFor(t, "the unyanked file", func() bool { return len(cachedFileNames(srv)) == len(want) })
@@ -421,8 +425,8 @@ func TestPrefetch_UpstreamFailureLeavesNoFilesAndIsSurfaced(t *testing.T) {
 	up := newAdminUpstream(t, "brokenpkg", adminFakeFile{name: "brokenpkg-1.0.0.tar.gz", body: testPayload(4096)})
 	up.failFiles.Store(true)
 
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	resp := postPrefetch(router, "brokenpkg", true)
 	_ = readBody(t, resp)
@@ -435,13 +439,13 @@ func TestPrefetch_UpstreamFailureLeavesNoFilesAndIsSurfaced(t *testing.T) {
 	body := string(readBody(t, authGet(router, "/admin")))
 	assert.Contains(t, body, "Recent failures")
 	assert.Empty(t, cachedFileNames(srv), "a failed prefetch must leave no partial files")
-	assertNotCached(t, srv.config.CacheDir, "brokenpkg", "brokenpkg-1.0.0.tar.gz")
+	assertNotCached(t, srv.cacheDir, "brokenpkg", "brokenpkg-1.0.0.tar.gz")
 }
 
 func TestPrefetch_UnknownPackageIsSurfaced(t *testing.T) {
 	up := newAdminUpstream(t, "known", adminFakeFile{name: "known-1.0.0.tar.gz", body: testPayload(64)})
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	_ = readBody(t, postPrefetch(router, "nosuchpackage", true))
 
@@ -452,7 +456,7 @@ func TestPrefetch_UnknownPackageIsSurfaced(t *testing.T) {
 
 func TestPrefetch_RequiresPackageName(t *testing.T) {
 	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL, withCredentials).Router()
+	router := newAdminServer(t, up.URL).mux
 
 	resp := postPrefetch(router, "   ", true)
 	_ = readBody(t, resp)
@@ -467,7 +471,7 @@ func TestPrefetch_RequiresPackageName(t *testing.T) {
 // asset the page references is served from this binary.
 func TestAdminPage_MakesNoExternalAssetRequests(t *testing.T) {
 	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL, withCredentials).Router()
+	router := newAdminServer(t, up.URL).mux
 
 	body := string(readBody(t, authGet(router, "/admin")))
 	assert.NotContains(t, body, "//unpkg.com")
@@ -488,7 +492,7 @@ func TestAdminPage_MakesNoExternalAssetRequests(t *testing.T) {
 // postPrefetchSite issues the authenticated prefetch a cross-site form post would
 // issue, with the browser's own fetch-metadata declaration attached (or, for the
 // empty string, absent as a non-browser client leaves it).
-func postPrefetchSite(router *gin.Engine, pkg, site string) *http.Response {
+func postPrefetchSite(router http.Handler, pkg, site string) *http.Response {
 	body := url.Values{"package": {pkg}}.Encode()
 	req := httptest.NewRequest(http.MethodPost, "/admin/prefetch", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -501,8 +505,8 @@ func postPrefetchSite(router *gin.Engine, pkg, site string) *http.Response {
 
 func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
 	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	for _, site := range []string{"cross-site", "same-site"} {
 		resp := postPrefetchSite(router, "xsite", site)
@@ -518,7 +522,7 @@ func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
 
 func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {
 	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
-	router := newAdminServer(t, up.URL, withCredentials).Router()
+	router := newAdminServer(t, up.URL).mux
 
 	for _, site := range []string{"same-origin", "", "none"} {
 		resp := postPrefetchSite(router, "xsite", site)
@@ -532,11 +536,11 @@ func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {
 // group: nothing wires it to the eviction routes, yet they are covered.
 func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
 	up := newAdminUpstream(t, "keepme", adminFakeFile{name: "keepme-1.0.0.tar.gz", body: testPayload(2048)})
-	srv := newAdminServer(t, up.URL, withCredentials)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	_ = readBody(t, getFile(router, "keepme", "keepme-1.0.0.tar.gz"))
-	waitCached(t, srv.config.CacheDir, "keepme", "keepme-1.0.0.tar.gz")
+	waitCached(t, srv.cacheDir, "keepme", "keepme-1.0.0.tar.gz")
 
 	for _, path := range []string{"/cache/keepme", "/cache/list"} {
 		req := httptest.NewRequest(http.MethodDelete, path, nil)
@@ -562,16 +566,15 @@ func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
 // documented WaitGroup misuse, so the request is refused instead.
 func TestPrefetchRefusedAfterShutdown(t *testing.T) {
 	up := newAdminUpstream(t, "latecomer", adminFakeFile{name: "latecomer-1.0.0.tar.gz", body: testPayload(64)})
-	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
-	require.NoError(t, err)
-	router := srv.Router()
+	srv := newAdminServer(t, up.URL)
+	router := srv.mux
 
 	// Accepted while serving.
 	resp := postPrefetch(router, "latecomer", true)
 	_ = readBody(t, resp)
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	require.NoError(t, srv.Close())
+	srv.svc.Close(context.Background())
 
 	// Refused afterwards, and visibly so rather than silently dropped.
 	resp = postPrefetch(router, "latecomer", true)
@@ -587,14 +590,13 @@ func TestPrefetchRefusedAfterShutdown(t *testing.T) {
 // cached — not a failed write, an absent one.
 func TestCloseDrainsRunningPrefetch(t *testing.T) {
 	up := newAdminUpstream(t, "drainme", adminFakeFile{name: "drainme-1.0.0.tar.gz", body: testPayload(4096)})
-	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
-	require.NoError(t, err)
+	srv := newAdminServer(t, up.URL)
 
-	resp := postPrefetch(srv.Router(), "drainme", true)
+	resp := postPrefetch(srv.mux, "drainme", true)
 	_ = readBody(t, resp)
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
-	require.NoError(t, srv.Close())
+	srv.svc.Close(context.Background())
 
 	assert.Equal(t, []string{"drainme-1.0.0.tar.gz"}, cachedFileNames(srv),
 		"Close must wait for the in-flight prefetch before releasing storage")
@@ -614,10 +616,9 @@ func TestCloseGivesUpWhenBudgetSpent(t *testing.T) {
 	}))
 	defer up.Close()
 
-	srv, err := NewServer(adminConfig(t, up.URL, withCredentials))
-	require.NoError(t, err)
+	srv := newAdminServer(t, up.URL)
 
-	resp := postPrefetch(srv.Router(), "wedged", true)
+	resp := postPrefetch(srv.mux, "wedged", true)
 	_ = readBody(t, resp)
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
 
@@ -625,10 +626,9 @@ func TestCloseGivesUpWhenBudgetSpent(t *testing.T) {
 	cancel()
 
 	// Returns rather than hanging: the test failing here looks like a timeout.
-	assert.NoError(t, srv.CloseContext(ctx),
-		"a prefetch that cannot be drained must be stepped over, not waited for")
+	srv.svc.Close(ctx)
 
 	// Let the abandoned prefetch unwind before the temp cache directory goes.
 	close(release)
-	srv.prefetches.Wait()
+	srv.svc.prefetches.Wait()
 }

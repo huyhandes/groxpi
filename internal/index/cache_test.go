@@ -1,4 +1,4 @@
-package cache
+package index
 
 import (
 	"bytes"
@@ -8,12 +8,10 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/huyhandes/groxpi/internal/pypi"
 )
 
 func testEntry(body string) *Entry {
-	return NewPackageEntry([]pypi.FileInfo{{Name: "a.whl"}}, []byte(body))
+	return NewPackageEntry([]FileInfo{{Name: "a.whl"}}, []byte(body))
 }
 
 func TestEntry_GzipDecodesToJSON(t *testing.T) {

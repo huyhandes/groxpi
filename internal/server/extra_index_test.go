@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"log/slog"
@@ -437,16 +436,44 @@ func getBody(t *testing.T, srv *Server, path string) (string, int) {
 	return string(raw), resp.StatusCode
 }
 
-// captureLogs points the structured logger and gin's writers at w for the
-// duration of a test, and returns the restore function.
+// captureLogs points the structured logger at w for the duration of a test,
+// and returns the restore function.
 func captureLogs(t *testing.T, w io.Writer) func() {
 	t.Helper()
 	previousLogger := slog.Default()
-	previousOut, previousErr := gin.DefaultWriter, gin.DefaultErrorWriter
 	slog.SetDefault(slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	gin.DefaultWriter, gin.DefaultErrorWriter = w, w
-	return func() {
-		slog.SetDefault(previousLogger)
-		gin.DefaultWriter, gin.DefaultErrorWriter = previousOut, previousErr
-	}
+	return func() { slog.SetDefault(previousLogger) }
+}
+
+// PEP 691 wire shapes, as the fake upstream emits and the assertions decode them.
+type wireMeta struct {
+	APIVersion string `json:"api-version"`
+}
+
+type wireFile struct {
+	Filename       string            `json:"filename"`
+	Hashes         map[string]string `json:"hashes"`
+	RequiresPython string            `json:"requires-python,omitempty"`
+	URL            string            `json:"url"`
+	Yanked         bool              `json:"yanked,omitempty"`
+	YankedReason   string            `json:"yanked-reason,omitempty"`
+}
+
+type wireFiles struct {
+	Files []wireFile `json:"files"`
+	Meta  wireMeta   `json:"meta"`
+	Name  string     `json:"name"`
+}
+
+func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/?format=application/vnd.pypi.simple.v1+json", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	resp := w.Result()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return body
 }

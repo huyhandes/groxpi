@@ -8,6 +8,27 @@
 </div>
 {{end}}
 
+{{if .Downloading}}
+<div class="downloading">
+  <strong>Downloading now</strong>
+  <table>
+    <thead>
+      <tr><th>Package / file</th><th class="num">Progress</th><th class="num">Age</th><th class="num">Waiting</th></tr>
+    </thead>
+    <tbody>
+      {{range .Downloading}}
+      <tr class="inflight" data-package="{{.Package}}">
+        <td><strong>{{.Package}}</strong> <span class="muted">{{.File}}</span></td>
+        <td class="num">{{bytes .Bytes}}{{if gt .Size 0}} / {{bytes .Size}}{{end}}</td>
+        <td class="num muted">{{.Age}}</td>
+        <td class="num">{{.Requests}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+
 <table>
   <thead>
     <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Hits</th><th></th></tr>

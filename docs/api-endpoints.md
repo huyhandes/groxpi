@@ -22,6 +22,13 @@ Every route groxpi registers, and nothing else.
 Point pip at `/simple/` (or `/index/`, which exists only for compatibility with the Python
 implementation).
 
+The router is the standard library's `http.ServeMux`, and two of its behaviours are part of the API:
+
+- `GET /simple/<package>` without the trailing slash answers `307` with `Location: /simple/<package>/`
+  and never consults upstream. `/simple` likewise redirects to `/simple/`.
+- Paths are cleaned before matching, so `/index/../etc/passwd` redirects to the cleaned path rather
+  than reaching a handler.
+
 ## Package names
 
 Names are normalised per PEP 503 — lowercased, runs of `-`, `_` and `.` collapsed to a single `-` —
@@ -130,8 +137,11 @@ token, session or cookie is involved.
 ### `GET /admin`
 
 An HTML page listing what the local cache holds: packages, their files, sizes, hit counts and ages, plus
-the 20 most recent prefetch failures. The table polls `GET /admin/rows` for updates. Only backends that
-hold real local files can be listed, so in pure `s3` mode the table is empty.
+the 20 most recent prefetch failures. Above the table, a "Downloading now" section lists every upstream
+download in progress — package, file, bytes so far against the declared size, age, and how many client
+requests are coalesced onto it — and disappears when nothing is in flight. The page polls
+`GET /admin/rows` for updates. Only backends that hold real local files can be listed, so in pure `s3`
+mode the table is empty.
 
 ### `POST /admin/prefetch`
 
@@ -175,6 +185,7 @@ mode no files are deleted — see the note in [architecture.md](architecture.md)
 | Status | When |
 |---|---|
 | `302` | Redirect to upstream for a file groxpi will not serve itself. |
+| `307` | Trailing-slash or path-cleaning redirect issued by the router. |
 | `400` | Missing required parameter on an admin route. |
 | `401` | Missing or wrong basic-auth credentials on an admin route. |
 | `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |

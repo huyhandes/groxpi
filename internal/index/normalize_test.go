@@ -1,4 +1,4 @@
-package pypi
+package index
 
 import "testing"
 
