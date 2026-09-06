@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -129,16 +130,30 @@ func (s *Service) Plan(ctx context.Context, packageName, fileName string) (Serve
 	}
 
 	info, ok := findFile(entry.Files, fileName)
-	if !ok {
+	switch {
+	case ok:
+		plan.URL = info.URL
+		if info.Size > 0 {
+			plan.Size = info.Size
+		}
+		plan.SHA256 = info.Hashes["sha256"]
+	case strings.HasSuffix(fileName, metadataSuffix):
+		// PEP 658: the metadata file lives at the distribution's URL plus
+		// ".metadata" and is only served when the index advertises it.
+		base, found := findFile(entry.Files, strings.TrimSuffix(fileName, metadataSuffix))
+		if !found {
+			return plan, nil
+		}
+		hashes, advertised := base.Metadata()
+		if !advertised {
+			return plan, nil
+		}
+		plan.URL = metadataURL(base.URL)
+		plan.SHA256 = hashes["sha256"]
+	default:
 		return plan, nil
 	}
-
-	plan.URL = info.URL
 	plan.ContentType = contentTypeForFile(fileName)
-	if info.Size > 0 {
-		plan.Size = info.Size
-	}
-	plan.SHA256 = info.Hashes["sha256"]
 	plan.ETag = quoteETag(plan.SHA256)
 
 	if s.downloadTimeout <= 0 {
@@ -278,6 +293,25 @@ func findFile(files []index.FileInfo, fileName string) (index.FileInfo, bool) {
 	return files[i], true
 }
 
+// metadataSuffix is the PEP 658 filename suffix for a distribution's METADATA.
+const metadataSuffix = ".metadata"
+
+// metadataURL is the PEP 658 location of a distribution's metadata file: the
+// file URL with ".metadata" appended to its path, dropping any #sha256= fragment
+// a PEP 503 index carried on the href.
+func metadataURL(fileURL string) string {
+	u, err := url.Parse(fileURL)
+	if err != nil {
+		return strings.TrimSuffix(fileURL, "#") + metadataSuffix
+	}
+	u.Fragment = ""
+	u.Path += metadataSuffix
+	if u.RawPath != "" {
+		u.RawPath += metadataSuffix
+	}
+	return u.String()
+}
+
 // quoteETag normalises an entity-tag to exactly one layer of quotes. Sources
 // disagree: an index hash arrives bare, an S3 backend may echo the API's already
 // quoted form. This is the only place either is quoted, so neither path can emit
@@ -307,6 +341,8 @@ func contentTypeForFile(fileName string) string {
 		return "application/x-xz"
 	case strings.HasSuffix(name, ".tar"):
 		return "application/x-tar"
+	case strings.HasSuffix(name, metadataSuffix):
+		return "text/plain; charset=utf-8"
 	default:
 		return "application/octet-stream"
 	}

@@ -145,7 +145,8 @@ request instead of falling through. Losing queries are cancelled once a higher-p
 answered, which is what `index.result=cancelled` counts.
 
 The upstream client prefers the PEP 691 JSON representation and falls back to parsing HTML, resolving
-relative hrefs against the URL actually served and lifting `#sha256=` fragments into the file's hashes.
+relative hrefs against the URL actually served, lifting `#sha256=` fragments into the file's hashes and
+`data-core-metadata` / `data-dist-info-metadata` attributes into the PEP 658 marker.
 
 ### Download — `GET /simple/<package>/<file>`
 
@@ -154,6 +155,7 @@ storage.Exists ──hit──▶ serve from storage
     │miss
     ▼
 resolve index, find the file  ──not listed──▶ 404
+  (a <file>.metadata name is planned from <file>'s entry, PEP 658)
     ▼
 download timeout 0?  ──yes──▶ 302 upstream
     ▼

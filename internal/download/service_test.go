@@ -553,19 +553,32 @@ func TestServeFromStorage_ETagQuotedOnce(t *testing.T) {
 // a fake PyPI that lists one file.
 func newIndexedMux(t *testing.T, pkg, file string, content []byte, serveFile http.HandlerFunc) (*http.ServeMux, *storage.LRULocalStorage) {
 	t.Helper()
+	return newIndexedMuxWith(t, pkg, file, content, nil, serveFile)
+}
+
+// newIndexedMuxWithMetadata is newIndexedMux with the index advertising a PEP
+// 658 metadata file whose content is metadata.
+func newIndexedMuxWithMetadata(t *testing.T, pkg, file string, metadata []byte, serveFile http.HandlerFunc) (*http.ServeMux, *storage.LRULocalStorage) {
+	t.Helper()
+	return newIndexedMuxWith(t, pkg, file, []byte("wheel"), map[string]string{"sha256": sha256Hex(metadata)}, serveFile)
+}
+
+func newIndexedMuxWith(t *testing.T, pkg, file string, content []byte, metadata map[string]string, serveFile http.HandlerFunc) (*http.ServeMux, *storage.LRULocalStorage) {
+	t.Helper()
 	var mock *httptest.Server
 	mock = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/"+pkg+"/" {
+			entry := map[string]any{
+				"filename": file,
+				"url":      mock.URL + "/files/" + file,
+				"size":     len(content),
+				"hashes":   map[string]string{"sha256": sha256Hex(content)},
+			}
+			if metadata != nil {
+				entry["core-metadata"] = metadata
+			}
 			w.Header().Set("Content-Type", index.JSONContentType)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"name": pkg,
-				"files": []map[string]any{{
-					"filename": file,
-					"url":      mock.URL + "/files/" + file,
-					"size":     len(content),
-					"hashes":   map[string]string{"sha256": sha256Hex(content)},
-				}},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": pkg, "files": []map[string]any{entry}})
 			return
 		}
 		serveFile(w, r)
