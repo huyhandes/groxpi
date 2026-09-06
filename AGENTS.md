@@ -1,6 +1,6 @@
 # groxpi — Go PyPI Proxy
 
-A PyPI caching proxy in Go, reimplemented from the Python `proxpi` using Gin. Local filesystem, S3 (AWS/MinIO), or hybrid (local L1 + S3 L2) storage.
+A PyPI caching proxy in Go, reimplemented from the Python `proxpi` on the standard library's `net/http`. Local filesystem, S3 (AWS/MinIO), or hybrid (local L1 + S3 L2) storage.
 
 ## Commands
 
@@ -19,8 +19,8 @@ The Dockerfile builds to a `scratch` image; the health check calls `/groxpi --he
 
 ## Stack (non-obvious choices)
 
-- **Go 1.26**, **Gin v1.11**.
-- **JSON: stdlib `encoding/json` only.** `bytedance/sonic` appears in `go.mod` as an indirect dep of gin — do not use it directly.
+- **Go 1.26**, **stdlib `net/http` + `http.ServeMux`** with method-and-pattern routes (`GET /simple/{package}/{$}`). No web framework; see `docs/adr/0003-stdlib-mux-and-module-boundaries.md`.
+- **JSON: stdlib `encoding/json` only.**
 - **Templates: `html/template`** embedded with `go:embed` (admin page only). The scratch image ships only the binary.
 - **Logging: stdlib `log/slog`** bridged to OpenTelemetry via `otelslog`.
 - **Telemetry: OpenTelemetry SDK**, all three signals over OTLP/HTTP. Inert when no endpoint is configured. `monitoring/prometheus.yml` scrapes an OTel collector, not groxpi.
@@ -28,7 +28,8 @@ The Dockerfile builds to a `scratch` image; the health check calls `/groxpi --he
 
 ## Architecture traps
 
-- **"Zero-copy" is not kernel zero-copy.** `storage.ZeroCopyCapable` backends (Local, Tiered) let the handler serve cached files via `c.File`, so `net/http` handles range and conditional requests. But gin's response writer implements neither `File()` nor `io.ReaderFrom`, so bytes still copy through user space. **Never add code or docs claiming kernel-level zero copy.**
+- **"Zero-copy" is delegated correctness, not a measured saving.** `storage.ZeroCopyCapable` backends (Local, Tiered) let the download handler hand the open file to `http.ServeContent`, so `net/http` handles range and conditional requests. The tracing middleware's `statusWriter` must keep forwarding `io.ReaderFrom` and `Unwrap` (there is a test) so the stdlib writer's own copy path survives wrapping. **Never add code or docs claiming a kernel-level zero copy** — nothing here measures one.
+- **Modules are deep and one-directional:** `server → admin → download → index → storage`. Each exposes `Register(mux)` plus a couple of methods (`index.Resolve/Invalidate`, `download.Plan/Fetch/Warm/InFlight`). The only cross-module interface is `download.Resolver` (one method, consumer-defined, faked in tests). Don't add interfaces with one implementation.
 - **`tasks/` is gitignored** — task notes are local, never committed. Plan into `tasks/<name>.md` if the user asks for a plan.
 - **`context7`** is an MCP tool available in this workspace for searching package/framework docs. Use it when you need upstream library facts.
 - **A documented setting must exist in `internal/config/config.go`; a documented endpoint must exist in the router.** Add nothing aspirational — if you document it, implement it.
@@ -38,15 +39,17 @@ The Dockerfile builds to a `scratch` image; the health check calls `/groxpi --he
 ```
 cmd/groxpi/        main.go (entry point, --health-check flag)
 internal/
-  cache/           index.go: bounded index cache (files + JSON + gzip per entry)
-  config/          config, URL redaction, index resolution order
-  logger/          slog setup: stdout handler + OTel log bridge
-  pypi/            PyPI client (JSON first, HTML fallback) + PEP 503 normalisation
-  server/          server.go (Gin transport), packagefile.go (PackageFileService),
-                   admin.go + prefetch.go (admin surface)
+  server/          composition root: storage construction, mux, recover + trace middleware, shutdown
+  index/           service.go (Resolve/Invalidate, extras-first, singleflight, root proxy),
+                   cache.go (bounded index cache: files + JSON + gzip per entry),
+                   client.go (PyPI client, JSON first, HTML fallback), normalize.go, handler.go
+  download/        service.go (Plan/Fetch/Warm), inflight.go (running-download registry),
+                   downloader.go (verified tee download-and-cache), handler.go
+  admin/           admin.go (auth, cross-site, page, rows, eviction), prefetch.go
   storage/         storage.go (Storage + capability interfaces), local.go, lru.go,
                    s3.go, tiered.go, workerpool.go
-  streaming/       interfaces.go + downloader.go (tee download-and-cache)
+  config/          config, URL redaction, index resolution order
+  logger/          slog setup: stdout handler + OTel log bridge
   telemetry/       OTel provider setup (traces, metrics, logs) over OTLP
 docs/              six docs + adr/ (see below)
 benchmarks/        benchmark harness — publishes no figures
@@ -63,7 +66,7 @@ No duplication between these — each owns its surface:
 - `docs/architecture.md` — modules, caches, storage seam, request flows, telemetry spans
 - `docs/deployment.md` — Docker, Kubernetes, TLS, observability wiring
 - `docs/benchmarking.md` — how to run the suite
-- `docs/adr/` — decision records: extras-first index resolution, OTLP over Prometheus scrape
+- `docs/adr/` — decision records: extras-first index resolution, OTLP over Prometheus scrape, stdlib mux and module boundaries
 
 **No performance figures in documentation** until the benchmark suite is re-run against current code. Delete a stale number; never update one by guess.
 

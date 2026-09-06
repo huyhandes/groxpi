@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -65,7 +64,7 @@ func newCountingUpstream(t *testing.T, pkg, file string, payload []byte) *counti
 // mean the index entry was dropped. The cache routes are part of the
 // authenticated administrative group, so credentials are configured here and
 // every request below carries them.
-func newEvictionServer(t *testing.T, upstreamURL string) (*gin.Engine, string) {
+func newEvictionServer(t *testing.T, upstreamURL string) (http.Handler, string) {
 	t.Helper()
 	cacheDir := t.TempDir()
 	srv, err := NewServer(&config.Config{
@@ -84,7 +83,7 @@ func newEvictionServer(t *testing.T, upstreamURL string) (*gin.Engine, string) {
 	return srv.Router(), cacheDir
 }
 
-func deletePackage(router *gin.Engine, pkg string) *http.Response {
+func deletePackage(router http.Handler, pkg string) *http.Response {
 	req := httptest.NewRequest("DELETE", "/cache/"+pkg, nil)
 	req.SetBasicAuth(adminUser, adminPass)
 	w := httptest.NewRecorder()
@@ -92,7 +91,7 @@ func deletePackage(router *gin.Engine, pkg string) *http.Response {
 	return w.Result()
 }
 
-func getPackageIndex(router *gin.Engine, pkg string) *http.Response {
+func getPackageIndex(router http.Handler, pkg string) *http.Response {
 	req := httptest.NewRequest("GET", "/index/"+pkg, nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

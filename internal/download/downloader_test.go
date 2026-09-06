@@ -1,4 +1,4 @@
-package streaming
+package download
 
 import (
 	"bytes"
@@ -49,12 +49,25 @@ func (m *mockStorageWriter) Put(ctx context.Context, key string, reader io.Reade
 	return &storage.ObjectInfo{Key: key, Size: int64(len(data)), ContentType: contentType}, nil
 }
 
-func (m *mockStorageWriter) Get(key string) ([]byte, bool) {
+func (m *mockStorageWriter) data(key string) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	data, exists := m.storage[key]
 	return data, exists
 }
+
+// The downloader only ever calls Put; the rest exists to satisfy storage.Storage.
+func (m *mockStorageWriter) Exists(context.Context, string) (bool, error) { return false, nil }
+func (m *mockStorageWriter) Get(context.Context, string) (io.ReadCloser, *storage.ObjectInfo, error) {
+	return nil, nil, storage.ErrNotFound
+}
+func (m *mockStorageWriter) Stat(context.Context, string) (*storage.ObjectInfo, error) {
+	return nil, storage.ErrNotFound
+}
+func (m *mockStorageWriter) Delete(context.Context, string) error { return nil }
+func (m *mockStorageWriter) Close() error                         { return nil }
+
+var _ storage.Storage = (*mockStorageWriter)(nil)
 
 func (m *mockStorageWriter) SetError(err error) {
 	m.mu.Lock()
@@ -81,7 +94,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -97,7 +110,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		}
 
 		// Verify data was cached in storage
-		cachedData, exists := storage.Get("test-key")
+		cachedData, exists := storage.data("test-key")
 		if !exists {
 			t.Error("Data should be cached in storage")
 		}
@@ -125,7 +138,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		storage := newMockStorageWriter()
 		storage.SetError(errors.New("storage write failed"))
 
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -142,7 +155,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		}
 
 		// Storage should be empty due to error
-		_, exists := storage.Get("test-key")
+		_, exists := storage.data("test-key")
 		if exists {
 			t.Error("Data should not be cached due to storage error")
 		}
@@ -158,7 +171,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -177,7 +190,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -196,7 +209,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 10 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 10 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -223,7 +236,7 @@ func TestTeeStreamingDownloader_Behaviour(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var wg sync.WaitGroup
 		concurrency := 10
@@ -283,7 +296,7 @@ func TestTeeStreamingDownloader_RedactsCredentials(t *testing.T) {
 		dead := createTestServer("", http.StatusOK, 0)
 		dead.Close()
 
-		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
 
 		_, err := downloader.DownloadAndStream(context.Background(),
 			credentialed(dead.URL), "k", io.Discard, Expectation{})
@@ -299,7 +312,7 @@ func TestTeeStreamingDownloader_RedactsCredentials(t *testing.T) {
 		server := createTestServer("nope", http.StatusNotFound, 0)
 		defer server.Close()
 
-		downloader := NewTeeStreamingDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(newMockStorageWriter(), &http.Client{Timeout: 5 * time.Second})
 
 		_, err := downloader.DownloadAndStream(context.Background(),
 			credentialed(server.URL), "k", io.Discard, Expectation{})
@@ -315,6 +328,7 @@ func TestTeeStreamingDownloader_RedactsCredentials(t *testing.T) {
 // truncatingStorage accepts a fixed number of bytes and then fails, standing in
 // for a disk that fills up in the middle of a download.
 type truncatingStorage struct {
+	*mockStorageWriter
 	accept int64
 }
 
@@ -337,7 +351,7 @@ func TestTeeStreamingDownloader_StorageFailureIsNotFatal(t *testing.T) {
 	server := createTestServer(testData, http.StatusOK, 0)
 	defer server.Close()
 
-	downloader := NewTeeStreamingDownloader(&truncatingStorage{accept: 4096},
+	downloader := newTeeDownloader(&truncatingStorage{mockStorageWriter: newMockStorageWriter(), accept: 4096},
 		&http.Client{Timeout: 10 * time.Second})
 
 	var clientBuffer bytes.Buffer
@@ -385,7 +399,7 @@ func TestTeeStreamingDownloader_Verification(t *testing.T) {
 			defer server.Close()
 
 			store := newMockStorageWriter()
-			downloader := NewTeeStreamingDownloader(store, &http.Client{Timeout: 5 * time.Second})
+			downloader := newTeeDownloader(store, &http.Client{Timeout: 5 * time.Second})
 
 			_, err := downloader.DownloadAndStream(context.Background(),
 				server.URL, "test-key", io.Discard, tc.expect)
@@ -394,7 +408,7 @@ func TestTeeStreamingDownloader_Verification(t *testing.T) {
 				if !errors.Is(err, ErrVerification) {
 					t.Fatalf("expected ErrVerification, got %v", err)
 				}
-				if _, cached := store.Get("test-key"); cached {
+				if _, cached := store.data("test-key"); cached {
 					t.Error("bytes that failed verification must never be committed")
 				}
 				return
@@ -403,17 +417,17 @@ func TestTeeStreamingDownloader_Verification(t *testing.T) {
 			if err != nil {
 				t.Fatalf("verification rejected bytes that match the index: %v", err)
 			}
-			if _, cached := store.Get("test-key"); !cached {
+			if _, cached := store.data("test-key"); !cached {
 				t.Error("verified bytes should have been cached")
 			}
 		})
 	}
 }
 
-func TestNewTeeStreamingDownloader(t *testing.T) {
+func TestNewTeeDownloader(t *testing.T) {
 	t.Run("creates tee downloader", func(t *testing.T) {
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, nil)
+		downloader := newTeeDownloader(storage, nil)
 		if downloader == nil {
 			t.Fatal("NewTeeStreamingDownloader returned nil")
 		}
@@ -427,7 +441,7 @@ func TestTeeStreamingDownloader_DownloadAndStream(t *testing.T) {
 		defer server.Close()
 
 		storage := newMockStorageWriter()
-		downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+		downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 
 		var clientBuffer bytes.Buffer
 		ctx := context.Background()
@@ -443,7 +457,7 @@ func TestTeeStreamingDownloader_DownloadAndStream(t *testing.T) {
 		}
 
 		// Verify storage received data
-		cachedData, exists := storage.Get("tee-key")
+		cachedData, exists := storage.data("tee-key")
 		if !exists {
 			t.Error("Data should be cached with tee reader")
 		}
@@ -464,7 +478,7 @@ func BenchmarkTeeStreamingDownloader_Comparison(b *testing.B) {
 	defer server.Close()
 
 	storage := newMockStorageWriter()
-	downloader := NewTeeStreamingDownloader(storage, &http.Client{Timeout: 5 * time.Second})
+	downloader := newTeeDownloader(storage, &http.Client{Timeout: 5 * time.Second})
 	ctx := context.Background()
 
 	b.ResetTimer()

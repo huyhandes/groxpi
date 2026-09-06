@@ -65,6 +65,7 @@ var (
 	verifications  = counter("groxpi.verification.failures", "Downloads rejected because their bytes did not match the index")
 
 	cacheBytes    = gauge("groxpi.cache.occupancy", "By", "Bytes currently held by a cache, by layer")
+	inflight      = gauge("groxpi.download.inflight", "{download}", "Upstream package-file downloads currently in progress")
 	fetchDuration = histogram("groxpi.upstream.fetch.duration", "s", "Duration of an upstream package file fetch")
 )
 
@@ -124,3 +125,6 @@ func Redirect(ctx context.Context, reason string) {
 // VerificationFailure counts a download whose bytes did not match what the index
 // declared, and which was therefore not cached.
 func VerificationFailure(ctx context.Context) { verifications.Add(ctx, 1) }
+
+// DownloadsInFlight records how many upstream downloads are running right now.
+func DownloadsInFlight(ctx context.Context, n int64) { inflight.Record(ctx, n) }

@@ -11,12 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
 
 // testRequestBench performs an HTTP request against the router
-func testRequestBench(router *gin.Engine, req *http.Request) *http.Response {
+func testRequestBench(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()

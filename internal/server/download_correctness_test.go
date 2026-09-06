@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -76,7 +75,7 @@ func newFakeUpstream(t *testing.T, spec upstreamSpec) *fakeUpstream {
 
 // newCorrectnessServer builds a router against upstream with an explicit
 // time-to-first-byte budget and a per-test cache directory.
-func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) (*gin.Engine, string) {
+func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) (http.Handler, string) {
 	t.Helper()
 	cacheDir := t.TempDir()
 	srv := New(&config.Config{
@@ -89,7 +88,7 @@ func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) 
 	return srv.Router(), cacheDir
 }
 
-func getFile(router *gin.Engine, pkg, file string) *http.Response {
+func getFile(router http.Handler, pkg, file string) *http.Response {
 	req := httptest.NewRequest("GET", "/index/"+pkg+"/"+file, nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

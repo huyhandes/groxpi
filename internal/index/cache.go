@@ -1,6 +1,6 @@
 // Package cache holds the in-memory index cache: one entry per cached index
 // resource, carrying every representation that resource is served in.
-package cache
+package index
 
 import (
 	"bytes"
@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/huyhandes/groxpi/internal/pypi"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
@@ -20,9 +19,9 @@ import (
 // HTML is not stored: it is the uncommon content type and is cheap to render
 // from Files on demand.
 type Entry struct {
-	Files []pypi.FileInfo // parsed package file list
-	JSON  []byte          // marshalled PEP 691 body
-	GZIP  []byte          // gzip of JSON, produced once at fill time
+	Files []FileInfo // parsed package file list
+	JSON  []byte     // marshalled PEP 691 body
+	GZIP  []byte     // gzip of JSON, produced once at fill time
 
 	size      int64
 	expiresAt time.Time
@@ -33,7 +32,7 @@ type Entry struct {
 
 // NewPackageEntry builds the entry for one package's file list. body must be the
 // marshalled form of files.
-func NewPackageEntry(files []pypi.FileInfo, body []byte) *Entry {
+func NewPackageEntry(files []FileInfo, body []byte) *Entry {
 	e := &Entry{Files: files, JSON: body}
 	e.finish()
 	return e

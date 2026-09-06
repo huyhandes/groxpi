@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,26 @@ func RedactURL(raw string) string {
 // transport errors: *url.Error prints the URL it failed on, user-info and all, so
 // returning one unredacted leaks a private index's password into any log or
 // response that records the error.
+// credentialedURLPattern matches the user-info component of an absolute URL: a
+// scheme, then everything up to the "@" that is still inside the authority. The
+// character class cannot cross a "/", so a path containing "@" is not matched.
+var credentialedURLPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#\s"'@]+@`)
+
+// RedactErrorText renders an error for a log line, an HTTP body or the admin
+// page with any URL credentials stripped out of the whole message.
+//
+// Redacting the URL attribute beside the error is not enough: a package file's
+// URL is resolved against its index's base URL, which carries that index's
+// user-info, and both net/http's *url.Error and the downloader's own "HTTP 404
+// from <url>" print that URL into the error string itself. So the message is
+// rewritten rather than the field next to it.
+func RedactErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return credentialedURLPattern.ReplaceAllString(err.Error(), "${1}redacted@")
+}
+
 func RedactURLError(err error) error {
 	var uerr *url.Error
 	if errors.As(err, &uerr) {

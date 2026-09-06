@@ -1,4 +1,4 @@
-package streaming
+package download
 
 import (
 	"context"
@@ -23,29 +23,22 @@ import (
 // what the client received: see DownloadAndStream.
 var ErrVerification = errors.New("integrity check failed")
 
-// StorageWriter is the write half of storage.Storage, narrowed to what the
-// downloader needs. The signature matches storage.Storage.Put exactly so any
-// backend satisfies it directly, with no adapter in between.
-type StorageWriter interface {
-	Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*storage.ObjectInfo, error)
-}
-
-// teeStreamingDownloader streams a download to the client while teeing it into storage.
-type teeStreamingDownloader struct {
-	storage     StorageWriter
+// teeDownloader streams a download to the client while teeing it into storage.
+type teeDownloader struct {
+	storage     storage.Storage
 	httpClient  *http.Client
 	ttfb        time.Duration
 	copyBufPool *sync.Pool
 }
 
-// NewTeeStreamingDownloader creates a StreamingDownloader with TeeReader broadcasting.
+// newTeeDownloader builds the tee downloader.
 //
 // The client's Timeout is taken as the time-to-first-byte budget and then
 // cleared: it bounds only the wait for upstream response headers. Once headers
 // are in, the body runs to completion under the caller's context, because a
 // transfer that has already started streaming to the client must not be cut off
 // by a budget meant for connection setup.
-func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) StreamingDownloader {
+func newTeeDownloader(st storage.Storage, client *http.Client) *teeDownloader {
 	ttfb := 5 * time.Minute
 	if client == nil {
 		client = &http.Client{}
@@ -58,8 +51,8 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 	}
 	client.Timeout = 0
 
-	return &teeStreamingDownloader{
-		storage:    storage,
+	return &teeDownloader{
+		storage:    st,
 		httpClient: client,
 		ttfb:       ttfb,
 		copyBufPool: &sync.Pool{
@@ -71,7 +64,8 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 	}
 }
 
-// DownloadAndStream downloads using TeeReader for better streaming performance.
+// DownloadAndStream downloads url, streaming the body to writer while caching it
+// under storageKey.
 //
 // The bytes are hashed on the way through and checked against expect before the
 // storage pipe is closed cleanly, so a file that fails verification is never
@@ -86,7 +80,7 @@ func NewTeeStreamingDownloader(storage StorageWriter, client *http.Client) Strea
 //
 // A cache-write failure is not the client's problem: it is reported in
 // StreamResult.Error and the transfer completes.
-func (tsd *teeStreamingDownloader) DownloadAndStream(ctx context.Context, url, storageKey string, writer io.Writer, expect Expectation) (*StreamResult, error) {
+func (tsd *teeDownloader) DownloadAndStream(ctx context.Context, url, storageKey string, writer io.Writer, expect Expectation) (*StreamResult, error) {
 	// A deadline on the request context would outlive the headers and kill the
 	// body read, so the budget is a timer that cancels and is then stopped: it
 	// can only fire while we are still waiting for the response headers.

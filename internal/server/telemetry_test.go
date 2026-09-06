@@ -172,7 +172,7 @@ func TestTelemetry_RequestSpanTree(t *testing.T) {
 	waitCached(t, cacheDir, pkg, file)
 
 	put := waitForSpan(t, rec, "storage.put")
-	request := findSpan(rec, "GET /index/:package/:file")
+	request := findSpan(rec, "GET /index/{package}/{file}")
 	require.NotNil(t, request, "the request span should be recorded")
 	assert.False(t, request.Parent().IsValid(), "the request span is the root of the trace")
 

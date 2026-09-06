@@ -12,13 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/stretchr/testify/assert"
 )
 
 // testRequestIntegration performs an HTTP request against the router
-func testRequestIntegration(router *gin.Engine, req *http.Request) *http.Response {
+func testRequestIntegration(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()

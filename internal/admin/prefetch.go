@@ -1,18 +1,17 @@
-package server
+package admin
 
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
-	"github.com/gin-gonic/gin"
 
-	"github.com/huyhandes/groxpi/internal/pypi"
+	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/index"
 )
 
 // sdistExtensions are the source-distribution suffixes whose filenames end in
@@ -22,27 +21,27 @@ var sdistExtensions = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.Z", ".tgz
 // prefetchDeadline bounds one detached prefetch. It is deliberately far above
 // any real package: it stops a wedged upstream pinning a goroutine for the life
 // of the process, not a download from taking its time. It is far too long to
-// bound shutdown — that is prefetchDrainBudget's job.
+// bound shutdown — that is Close's context's job.
 const prefetchDeadline = 30 * time.Minute
 
 // handleAdminPrefetch accepts a prefetch and returns immediately. The download
 // runs on a context detached from the request so a large package does not time
 // out behind a reverse proxy; there is no job registry and no identifier,
 // because the polling table already shows the files arriving.
-// Cross-site protection lives on the admin route group, not here.
-func (s *Server) handleAdminPrefetch(c *gin.Context) {
-	packageName := pypi.NormalizeName(strings.TrimSpace(c.PostForm("package")))
+func (s *Service) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
+	packageName := index.NormalizeName(strings.TrimSpace(r.PostFormValue("package")))
 	if packageName == "" {
-		c.String(http.StatusBadRequest, "Package name required")
+		http.Error(w, "Package name required", http.StatusBadRequest)
 		return
 	}
 
-	if !s.startPrefetch(context.WithoutCancel(c.Request.Context()), packageName) {
-		c.String(http.StatusServiceUnavailable, "Shutting down; prefetch not accepted")
+	if !s.startPrefetch(context.WithoutCancel(r.Context()), packageName) {
+		http.Error(w, "Shutting down; prefetch not accepted", http.StatusServiceUnavailable)
 		return
 	}
 
-	c.String(http.StatusAccepted, "Prefetching %s", packageName)
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("Prefetching " + packageName))
 }
 
 // startPrefetch runs one prefetch in the background. Everything that makes a
@@ -50,12 +49,12 @@ func (s *Server) handleAdminPrefetch(c *gin.Context) {
 // it is registered so shutdown waits for it, deduplicated so an impatient
 // operator submitting the same name ten times gets one download, deadlined so it
 // cannot outlive the process it is holding open, and its panics are contained —
-// gin.Recovery() only wraps the request goroutine.
+// the server's recover middleware only wraps the request goroutine.
 //
 // It reports false once shutdown has begun, when the work could not have
 // finished anyway. Taking the lock around the registration is what keeps the Add
 // from racing Close's Wait.
-func (s *Server) startPrefetch(ctx context.Context, packageName string) bool {
+func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 	s.prefetchMu.Lock()
 	if s.shuttingDown {
 		s.prefetchMu.Unlock()
@@ -69,16 +68,14 @@ func (s *Server) startPrefetch(ctx context.Context, packageName string) bool {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("Prefetch panicked", "package", packageName, "panic", r)
-				s.adminErrors.record(packageName, "prefetch failed unexpectedly")
+				s.errors.record(packageName, "prefetch failed unexpectedly")
 			}
 		}()
 
 		ctx, cancel := context.WithTimeout(ctx, prefetchDeadline)
 		defer cancel()
 
-		// Same group the index and download paths use; the key namespace keeps it
-		// from colliding with either.
-		_, _, _ = s.packageFiles.sf.Do("prefetch:"+packageName, func() (any, error) {
+		_, _, _ = s.prefetchSF.Do(packageName, func() (any, error) {
 			s.prefetchPackage(ctx, packageName)
 			return nil, nil
 		})
@@ -88,55 +85,37 @@ func (s *Server) startPrefetch(ctx context.Context, packageName string) bool {
 }
 
 // prefetchPackage resolves the package's index, picks its newest release and
-// downloads that release's files. Failures are recorded for the page's
+// warms that release's files. Failures are recorded for the page's
 // recent-errors area as well as logged: an operator watching an empty table must
 // not have to read the server log to learn why it is empty.
-func (s *Server) prefetchPackage(ctx context.Context, packageName string) {
-	entry, err := s.packageFiles.resolveIndex(ctx, packageName)
+func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
+	entry, err := s.index.Resolve(ctx, packageName)
 	if err != nil {
-		if errors.Is(err, pypi.ErrNotFound) {
-			s.adminErrors.record(packageName, "not found on any configured index")
+		if errors.Is(err, index.ErrNotFound) {
+			s.errors.record(packageName, "not found on any configured index")
 		} else {
-			s.adminErrors.record(packageName, "index lookup failed: "+redactErrorText(err))
+			s.errors.record(packageName, "index lookup failed: "+config.RedactErrorText(err))
 		}
-		slog.ErrorContext(ctx, "Prefetch could not resolve index", "error", redactErrorText(err), "package", packageName)
+		slog.ErrorContext(ctx, "Prefetch could not resolve index", "error", config.RedactErrorText(err), "package", packageName)
 		return
 	}
 
 	files := newestReleaseFiles(entry.Files)
 	if len(files) == 0 {
-		s.adminErrors.record(packageName, "no downloadable final release (all files yanked, pre-release or unparseable)")
+		s.errors.record(packageName, "no downloadable final release (all files yanked, pre-release or unparseable)")
 		return
 	}
 
 	slog.InfoContext(ctx, "Prefetching newest release", "package", packageName, "files", len(files))
 
 	for _, file := range files {
-		plan, err := s.packageFiles.Plan(ctx, packageName, file.Name)
-		if err != nil {
-			s.adminErrors.record(packageName, file.Name+": "+redactErrorText(err))
-			continue
-		}
-
-		switch plan.Action {
-		case ActionFromStorage:
-			// Already cached; nothing to warm.
-		case ActionStreamAndCache:
-			// io.Discard: the point is the cache write the downloader performs on the
-			// way through, not the bytes. A failure aborts the cache write too, so a
-			// verification error leaves nothing partial behind.
-			if _, _, err := s.packageFiles.Fetch(ctx, plan, io.Discard); err != nil {
-				// Redacted, not raw: the file URL is resolved against the index base, so
-				// a credentialed private index puts its password inside this error — and
-				// this message is both logged and rendered onto the admin page.
-				s.adminErrors.record(packageName, file.Name+": "+redactErrorText(err))
-				slog.ErrorContext(ctx, "Prefetch download failed",
-					"error", redactErrorText(err), "package", packageName, "file", file.Name)
-			}
-		default:
-			// GROXPI_DOWNLOAD_TIMEOUT of 0 turns every download into a redirect, so
-			// there is nothing to cache and prefetch cannot do its job.
-			s.adminErrors.record(packageName, file.Name+": caching is disabled (download timeout is 0)")
+		if err := s.downloads.Warm(ctx, packageName, file.Name); err != nil {
+			// Redacted, not raw: the file URL is resolved against the index base, so
+			// a credentialed private index puts its password inside this error — and
+			// this message is both logged and rendered onto the admin page.
+			s.errors.record(packageName, file.Name+": "+config.RedactErrorText(err))
+			slog.ErrorContext(ctx, "Prefetch download failed",
+				"error", config.RedactErrorText(err), "package", packageName, "file", file.Name)
 		}
 	}
 }
@@ -152,9 +131,9 @@ func (s *Server) prefetchPackage(ctx context.Context, packageName string) {
 // The index carries no version field — PEP 691 does not supply one — so the
 // version comes from the filename. A filename whose version will not parse is
 // skipped rather than guessed at.
-func newestReleaseFiles(files []pypi.FileInfo) []pypi.FileInfo {
+func newestReleaseFiles(files []index.FileInfo) []index.FileInfo {
 	type candidate struct {
-		file    pypi.FileInfo
+		file    index.FileInfo
 		version pep440.Version
 	}
 
@@ -191,7 +170,7 @@ func newestReleaseFiles(files []pypi.FileInfo) []pypi.FileInfo {
 
 	// Every file of that release, not just the one that happened to be the
 	// maximum: a release is a wheel per platform plus a source distribution.
-	selected := make([]pypi.FileInfo, 0, 4)
+	selected := make([]index.FileInfo, 0, 4)
 	for _, c := range candidates {
 		if c.version.Equal(newest) {
 			selected = append(selected, c.file)
@@ -221,21 +200,12 @@ func versionFromFilename(name string) (string, bool) {
 			continue
 		}
 		stem := name[:len(name)-len(ext)]
-		_, version, found := lastCut(stem, "-")
-		if !found || version == "" {
+		i := strings.LastIndex(stem, "-")
+		if i < 0 || i == len(stem)-1 {
 			return "", false
 		}
-		return version, true
+		return stem[i+1:], true
 	}
 
 	return "", false
-}
-
-// lastCut is strings.Cut around the last separator rather than the first.
-func lastCut(s, sep string) (before, after string, found bool) {
-	i := strings.LastIndex(s, sep)
-	if i < 0 {
-		return s, "", false
-	}
-	return s[:i], s[i+len(sep):], true
 }
