@@ -72,7 +72,7 @@ func (s *Service) serveFromStorage(w http.ResponseWriter, r *http.Request, plan 
 	// assume, and do not branch on a boolean the backend has to lie about.
 	if zeroCopy, ok := s.storage.(storage.ZeroCopyCapable); ok {
 		if filePath, err := zeroCopy.GetFilePath(ctx, key); err == nil {
-			if f, err := os.Open(filePath); err == nil {
+			if f, err := os.Open(filePath); err == nil { // #nosec G304 -- path comes from the storage backend, not the request
 				defer func() { _ = f.Close() }()
 				if st, err := f.Stat(); err == nil {
 					slog.DebugContext(ctx, "Serving local file via http.ServeContent",

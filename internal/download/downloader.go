@@ -88,14 +88,14 @@ func (tsd *teeDownloader) DownloadAndStream(ctx context.Context, url, storageKey
 	defer cancel()
 	budget := time.AfterFunc(tsd.ttfb, cancel)
 
-	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil) // #nosec G704 -- url is the file URL advertised by the configured index, not client input
 	if err != nil {
 		budget.Stop()
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
-	resp, err := tsd.httpClient.Do(req)
+	resp, err := tsd.httpClient.Do(req) // #nosec G704 -- see NewRequestWithContext above
 	budget.Stop()
 	if err != nil {
 		// Both the URL we format and the one net/http embeds in its *url.Error

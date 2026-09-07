@@ -35,7 +35,7 @@ func NewWorkerPool[T any](name string, queueSize, workers int, run func(context.
 		queueSize = 1
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- cancel is kept on the pool and called by Close
 	pool := &WorkerPool[T]{
 		name:   name,
 		queue:  make(chan T, queueSize),

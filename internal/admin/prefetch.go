@@ -40,8 +40,9 @@ func (s *Service) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte("Prefetching " + packageName))
+	_, _ = w.Write([]byte("Prefetching " + packageName)) // #nosec G705 -- normalised name in a text/plain body
 }
 
 // startPrefetch runs one prefetch in the background. Everything that makes a

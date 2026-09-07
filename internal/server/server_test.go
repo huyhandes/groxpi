@@ -481,9 +481,22 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 }
 
 func TestServer_WantsJSON(t *testing.T) {
+	// The root index is proxied byte for byte, so the upstream decides the
+	// representation from the Accept groxpi forwards, exactly as pypi.org does.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "json") {
+			w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+			_, _ = w.Write([]byte(`{"meta":{"api-version":"1.0"},"projects":[{"name":"flask"}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<a href="flask/">flask</a>`))
+	}))
+	defer upstream.Close()
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
+		IndexURL: upstream.URL + "/simple/",
 		CacheDir: "/tmp/test-cache",
+		IndexTTL: time.Hour,
 	}
 
 	srv := New(cfg)
