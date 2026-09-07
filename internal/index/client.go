@@ -155,7 +155,8 @@ func NewClient(cfg *config.Config) *Client {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: cfg.DisableSSLVerification,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: cfg.DisableSSLVerification, // #nosec G402 -- explicit operator opt-in (GROXPI_DISABLE_SSL_VERIFICATION)
 		},
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   100,

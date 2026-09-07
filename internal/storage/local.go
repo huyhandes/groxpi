@@ -36,7 +36,7 @@ func localError(err error, key, op string) error {
 // NewLocalStorage creates a new local filesystem storage backend
 func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 	// Ensure base directory exists
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
 	}
 
@@ -45,14 +45,15 @@ func NewLocalStorage(baseDir string) (*LocalStorage, error) {
 
 // buildPath constructs the full filesystem path
 func (l *LocalStorage) buildPath(key string) string {
-	return filepath.Join(l.baseDir, key)
+	// Join cleans ".." segments, so a key can only ever name a path under baseDir.
+	return filepath.Join(l.baseDir, filepath.Clean("/"+key))
 }
 
 // Get retrieves an object from local filesystem
 func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
 	path := l.buildPath(key)
 
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- path is confined to baseDir by buildPath
 	if err != nil {
 		return nil, nil, localError(err, key, "open")
 	}
@@ -78,7 +79,7 @@ func (l *LocalStorage) Put(ctx context.Context, key string, reader io.Reader, si
 
 	// Ensure directory exists
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 

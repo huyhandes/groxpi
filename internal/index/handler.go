@@ -92,10 +92,10 @@ func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *Entry) {
 	// that the parser can wait for a client that actually sends it.
 	if len(entry.GZIP) > 0 && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		h.Set("Content-Encoding", "gzip")
-		_, _ = w.Write(entry.GZIP)
+		_, _ = w.Write(entry.GZIP) // #nosec G705 -- gzipped JSON, Content-Type set above
 		return
 	}
-	_, _ = w.Write(entry.JSON)
+	_, _ = w.Write(entry.JSON) // #nosec G705 -- encoding/json output, Content-Type set above
 }
 
 // renderPackageFilesHTML renders the index page from the parsed file list. HTML
