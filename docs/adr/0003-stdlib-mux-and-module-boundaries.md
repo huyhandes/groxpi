@@ -1,6 +1,6 @@
 # 0003 — Standard-library router and four deep modules
 
-- Status: accepted
+- Status: superseded in part by 0004 (decisions 2 and 3)
 - Date: 2026-09-06
 - Context: branch `stdlib-mux-deep-modules`; supersedes the Gin transport the project started with
 
