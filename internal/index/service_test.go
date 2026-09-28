@@ -3,6 +3,7 @@ package index
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,27 +52,22 @@ func (f *fakeIndexServer) hitsFor(pkg string) int {
 	return f.hits["/"+pkg+"/"]
 }
 
-// newTestMux mounts the index module over the upstream, with the cache reachable.
-func newTestMux(t *testing.T, cfg *config.Config) (*http.ServeMux, *Service) {
+// newTestService builds the index module over the upstream, with the cache
+// reachable.
+func newTestService(t *testing.T, cfg *config.Config) *Service {
 	t.Helper()
 	svc := New(cfg)
 	t.Cleanup(svc.Close)
-	mux := http.NewServeMux()
-	svc.Register(mux)
-	return mux, svc
+	return svc
 }
 
-func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
+// getIndex resolves a package and returns the JSON body the server writes for
+// it.
+func getIndex(t *testing.T, svc *Service, pkg string) []byte {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/?format=application/vnd.pypi.simple.v1+json", nil)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	resp := w.Result()
-	body, err := io.ReadAll(resp.Body)
+	entry, err := svc.Resolve(context.Background(), pkg)
 	require.NoError(t, err)
-	_ = resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	return body
+	return entry.JSON
 }
 
 // TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
@@ -79,7 +75,7 @@ func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
 // writes the same bytes.
 func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
 	upstream := newFakeIndexServer(t)
-	mux, svc := newTestMux(t, &config.Config{
+	svc := newTestService(t, &config.Config{
 		IndexURL:        upstream.URL,
 		CacheDir:        t.TempDir(),
 		IndexTTL:        time.Hour,
@@ -88,8 +84,8 @@ func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T
 		LogLevel:        "ERROR",
 	})
 
-	first := getIndex(t, mux, "numpy")
-	second := getIndex(t, mux, "numpy")
+	first := getIndex(t, svc, "numpy")
+	second := getIndex(t, svc, "numpy")
 
 	assert.Equal(t, string(first), string(second), "cached responses must be byte-identical")
 	assert.Equal(t, 1, upstream.hitsFor("numpy"), "the second request must be served from cache")
@@ -103,20 +99,13 @@ func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T
 	unzipped, err := io.ReadAll(zr)
 	require.NoError(t, err)
 	assert.Equal(t, string(entry.JSON), string(unzipped))
-
-	// HTML renders from the same parsed list.
-	req := httptest.NewRequest(http.MethodGet, "/simple/numpy/", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-	assert.Contains(t, w.Body.String(), "numpy-1.0.tar.gz")
-	assert.Equal(t, 1, upstream.hitsFor("numpy"), "HTML must not refetch")
 }
 
 // TestIndexCache_ByteBudgetForcesRefetch covers the bound: once the budget is
 // exceeded the least recently used package is dropped and has to be refetched.
 func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
 	upstream := newFakeIndexServer(t)
-	mux, svc := newTestMux(t, &config.Config{
+	svc := newTestService(t, &config.Config{
 		IndexURL: upstream.URL,
 		CacheDir: t.TempDir(),
 		IndexTTL: time.Hour,
@@ -128,12 +117,12 @@ func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
 
 	packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
 	for _, pkg := range packages {
-		getIndex(t, mux, pkg)
+		getIndex(t, svc, pkg)
 		time.Sleep(2 * time.Millisecond) // distinguish recency
 	}
 	assert.LessOrEqual(t, svc.cache.Bytes(), int64(400), "cache must stay inside its budget")
 
-	getIndex(t, mux, packages[0])
+	getIndex(t, svc, packages[0])
 	assert.Equal(t, 2, upstream.hitsFor(packages[0]),
 		"the earliest package should have been evicted and refetched")
 }
@@ -142,7 +131,7 @@ func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
 // its TTL is gone before anybody asks for it, and the next request refetches.
 func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
 	upstream := newFakeIndexServer(t)
-	mux, svc := newTestMux(t, &config.Config{
+	svc := newTestService(t, &config.Config{
 		IndexURL:        upstream.URL,
 		CacheDir:        t.TempDir(),
 		IndexTTL:        20 * time.Millisecond,
@@ -151,7 +140,7 @@ func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
 		LogLevel:        "ERROR",
 	})
 
-	getIndex(t, mux, "numpy")
+	getIndex(t, svc, "numpy")
 	require.Equal(t, 1, svc.cache.Len())
 
 	// No requests at all while we wait: only the background sweep can empty this.
@@ -161,6 +150,6 @@ func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
 	}
 	require.Zero(t, svc.cache.Len(), "the sweep should have reclaimed the expired entry")
 
-	getIndex(t, mux, "numpy")
+	getIndex(t, svc, "numpy")
 	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an expired package must be refetched")
 }

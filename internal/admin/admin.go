@@ -1,15 +1,13 @@
-// Package admin is the operator surface: the cache page, prefetch, eviction and
-// the credential check in front of them. It is mounted only when credentials are
-// configured; otherwise none of its routes exist.
+// Package admin is the operator's view of the cache: the listing, prefetch and
+// eviction. It is plain Go; the server owns its routes, the credential check and
+// the page templates, and builds it only when credentials are configured.
 package admin
 
 import (
 	"context"
-	"crypto/subtle"
+	"errors"
 	"fmt"
-	"html/template"
 	"log/slog"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -18,31 +16,22 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/huyhandes/groxpi/internal/download"
 	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/storage"
-	tmpl "github.com/huyhandes/groxpi/templates"
 )
 
-// cacheSnapshotter is the listing's data source: the local cache's own
-// in-memory index. It is a capability, asked for with a type assertion, because
-// only a backend holding real files knows its contents. Nothing here lists the
-// object store — the storage listing operation was deleted and stays deleted.
-type cacheSnapshotter interface {
-	Snapshot() []storage.LRUEntry
-}
+// ErrShuttingDown is Prefetch's refusal once Close has begun.
+var ErrShuttingDown = errors.New("shutting down; prefetch not accepted")
 
 // Service is the admin module.
 type Service struct {
-	username, password string
-	storage            storage.Storage
-	index              *index.Service
-	downloads          *download.Service
-	templates          *template.Template
-	errors             adminErrors
+	store   *storage.Store
+	index   *index.Service
+	noCache bool // redirect mode: prefetch has nothing to warm
+	errors  failures
 
 	// prefetches counts the detached prefetch goroutines so shutdown can wait for
-	// them: one of them may be inside storage.Put when the signal arrives.
+	// them: one of them may be writing to storage when the signal arrives.
 	//
 	// prefetchMu guards shuttingDown together with the Add it gates. An Add that
 	// lands after Wait has begun is documented WaitGroup misuse, and a handler
@@ -55,82 +44,13 @@ type Service struct {
 	prefetchSF   singleflight.Group
 }
 
-// New builds the admin module. A template parse failure is a broken build, not
-// a runtime condition, so it fails construction rather than every request.
-func New(cfg *config.Config, st storage.Storage, idx *index.Service, dl *download.Service) (*Service, error) {
-	t, err := template.New("admin").Funcs(template.FuncMap{
-		"bytes": humanBytes,
-	}).ParseFS(tmpl.FS, "*.html")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse admin templates: %w", err)
-	}
+// New builds the admin module.
+func New(cfg *config.Config, store *storage.Store, idx *index.Service) *Service {
 	return &Service{
-		username:  cfg.AdminUsername,
-		password:  cfg.AdminPassword,
-		storage:   st,
-		index:     idx,
-		downloads: dl,
-		templates: t,
-	}, nil
-}
-
-// Register mounts the administrative surface behind basic authentication.
-//
-// That deliberately includes the pre-existing /cache routes, which were open in
-// the Python implementation: an authenticated front door on a building with an
-// open side entrance is not authentication. The package index routes pip uses
-// are registered by other modules and are never behind this check.
-func (s *Service) Register(mux *http.ServeMux) {
-	// Basic auth rather than a bearer token: the browser prompts for the
-	// credential and resends it on every subsequent request, including the ones
-	// the page's interaction library issues, so there is no login form and no
-	// token in client-side storage. It travels in cleartext, so a deployment needs
-	// a TLS-terminating proxy.
-	guard := func(h http.HandlerFunc) http.Handler { return rejectCrossSite(s.basicAuth(h)) }
-
-	mux.Handle("GET /admin", guard(s.handleAdminPage))
-	mux.Handle("GET /admin/rows", guard(s.handleAdminRows))
-	mux.Handle("GET /admin/htmx.min.js", guard(s.handleAdminAsset))
-	mux.Handle("POST /admin/prefetch", guard(s.handleAdminPrefetch))
-
-	// Eviction is the pre-existing cache route: the page's Evict button issues the
-	// same DELETE an operator can curl.
-	mux.Handle("DELETE /cache/list", guard(s.handleCacheList))
-	mux.Handle("DELETE /cache/{package}", guard(s.handleCachePackage))
-}
-
-// basicAuth answers 401 unless the request carries the configured credential.
-// Both comparisons are constant-time so a wrong username and a wrong password
-// take the same time to reject.
-func (s *Service) basicAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, pass, ok := r.BasicAuth()
-		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(s.username)) == 1
-		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(s.password)) == 1
-		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="groxpi admin"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// rejectCrossSite refuses admin requests that the browser itself reports as
-// originating from another site, so a form on an attacker's page cannot ride the
-// operator's cached basic-auth credentials. It runs before the credential check,
-// so a cross-site request is refused without one.
-//
-// ponytail: absent Sec-Fetch-Site proceeds — see docs/api-endpoints.md.
-func rejectCrossSite(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Header.Get("Sec-Fetch-Site") {
-		case "", "same-origin", "none":
-			next.ServeHTTP(w, r)
-		default: // cross-site, same-site
-			http.Error(w, "Forbidden: cross-site request", http.StatusForbidden)
-		}
-	})
+		store:   store,
+		index:   idx,
+		noCache: cfg.DownloadTimeout <= 0,
+	}
 }
 
 // Close refuses further prefetches and waits for the ones already running, or
@@ -151,109 +71,98 @@ func (s *Service) Close(ctx context.Context) {
 	}
 }
 
-// handleCacheList is a no-op kept for API compatibility with the Python
-// implementation: the root index is proxied, so there is no cached list to
-// invalidate.
-func (s *Service) handleCacheList(w http.ResponseWriter, _ *http.Request) {
-	writeStatus(w, http.StatusOK, `{"status":"success","data":null}`)
-}
-
-func (s *Service) handleCachePackage(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(r.PathValue("package"))
-	if packageName == "" {
-		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Package name required"}`)
-		return
-	}
-
+// Evict drops a package's index entry and every cached file of it. Dropping the
+// index entry alone would report success while leaving every cached file on
+// disk; deleting goes through the cache's own path, keyed off the package prefix
+// every storage key already carries.
+func (s *Service) Evict(ctx context.Context, packageName string) error {
 	s.index.Invalidate(packageName)
 
-	// Dropping the index entry alone would report success while leaving every
-	// cached file on disk. Deleting goes through the cache's own path, keyed off
-	// the package prefix every storage key already carries.
-	if deleter, ok := s.storage.(storage.PrefixDeleter); ok {
-		deleted, err := deleter.DeletePrefix(r.Context(), download.StorageKey(packageName, ""))
-		if err != nil {
-			slog.ErrorContext(r.Context(), "Failed to delete cached files", "error", err, "package", packageName)
-			writeStatus(w, http.StatusInternalServerError, `{"status":"error","message":"Failed to delete cached files"}`)
-			return
-		}
-		slog.InfoContext(r.Context(), "Evicted package from cache", "package", packageName, "files_deleted", deleted)
+	deleted, err := s.store.DeletePrefix(ctx, storage.Key(packageName, ""))
+	if err != nil {
+		return fmt.Errorf("failed to delete cached files: %w", err)
 	}
-
-	writeStatus(w, http.StatusOK, `{"status":"success","data":null}`)
+	slog.InfoContext(ctx, "Evicted package from cache", "package", packageName, "files_deleted", deleted)
+	return nil
 }
 
-// writeStatus writes one of the fixed JSON bodies above. They are literals
-// because none of them carries a value that varies.
-func writeStatus(w http.ResponseWriter, code int, body string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_, _ = w.Write([]byte(body))
-}
-
-// maxAdminErrors bounds the recent-failures area. Prefetch has no job registry,
+// maxFailures bounds the recent-failures area. Prefetch has no job registry,
 // so this ring is the only place a failure is surfaced; it is deliberately small
 // because it is a display, not a log.
-const maxAdminErrors = 20
+const maxFailures = 20
 
-// adminErrors is a bounded, newest-first ring of prefetch failures.
-type adminErrors struct {
+// failures is a bounded, newest-first ring of prefetch failures.
+type failures struct {
 	mu      sync.Mutex
-	entries []adminError
+	entries []Failure
 }
 
-type adminError struct {
+// Failure is one prefetch failure on the page's recent-failures area.
+type Failure struct {
 	When    string
 	Package string
 	Message string
 }
 
-func (a *adminErrors) record(packageName, message string) {
+func (a *failures) record(packageName, message string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.entries = append([]adminError{{
+	a.entries = append([]Failure{{
 		When:    time.Now().UTC().Format(time.RFC3339),
 		Package: packageName,
 		Message: message,
 	}}, a.entries...)
-	if len(a.entries) > maxAdminErrors {
-		a.entries = a.entries[:maxAdminErrors]
+	if len(a.entries) > maxFailures {
+		a.entries = a.entries[:maxFailures]
 	}
 }
 
-func (a *adminErrors) list() []adminError {
+func (a *failures) list() []Failure {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return append([]adminError(nil), a.entries...)
+	return append([]Failure(nil), a.entries...)
 }
 
-// adminView is everything the page renders. Ages are pre-formatted strings: the
+// View is everything the page renders. Ages are pre-formatted strings: the
 // template's job is layout, not arithmetic on timestamps.
-type adminView struct {
-	Packages    []adminPackage
-	Errors      []adminError
-	Downloading []adminDownload
-	Size        int64
+type View struct {
+	Packages    []Package // the current page only
+	Errors      []Failure
+	Downloading []Download // filled by the caller from InFlight
+	Size        int64      // across every page
+	Total       int        // packages across every page
+
+	// Page is 1-based; PrevPage and NextPage are 0 when there is no such page.
+	Page, PrevPage, NextPage int
 }
 
-type adminPackage struct {
-	Name  string
-	Size  int64
-	Hits  int64
-	Age   string
-	Files []adminFile
+// PageSize is how many packages one page of the listing shows. Paging is
+// by package so a package's file rows never split across pages.
+//
+// ponytail: fixed page size, make it a query parameter when an operator asks.
+const PageSize = 50
+
+// Package is one cached package and its files.
+type Package struct {
+	Name     string
+	Size     int64
+	Age      string
+	Accessed string // most recent access across the package's files
+	Files    []File
 }
 
-type adminFile struct {
-	Name string
-	Size int64
-	Hits int64
-	Age  string
+// File is one cached file.
+type File struct {
+	Name     string
+	Size     int64
+	Age      string
+	Accessed string
 }
 
-type adminDownload struct {
+// Download is one download in flight.
+type Download struct {
 	Package  string
 	File     string
 	Bytes    int64
@@ -262,46 +171,16 @@ type adminDownload struct {
 	Requests int
 }
 
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	value, units := float64(n), []string{"KB", "MB", "GB", "TB", "PB"}
-	for _, u := range units {
-		value /= unit
-		if value < unit {
-			return fmt.Sprintf("%.1f %s", value, u)
-		}
-	}
-	return fmt.Sprintf("%.1f EB", value/unit)
-}
-
-// snapshotView groups the cache snapshot into the page's rows. Storage keys
+// List groups one page of the cache snapshot into the page's rows. Storage keys
 // already encode the package and filename in a fixed shape, so grouping is
 // string manipulation and needs no second index.
-func (s *Service) snapshotView() adminView {
+func (s *Service) List(_ context.Context, page int) View {
 	now := time.Now()
-	view := adminView{Errors: s.errors.list()}
+	view := View{Errors: s.errors.list(), Page: page}
 
-	for _, p := range s.downloads.InFlight() {
-		view.Downloading = append(view.Downloading, adminDownload{
-			Package:  p.Package,
-			File:     p.File,
-			Bytes:    p.Bytes,
-			Size:     p.Size,
-			Age:      humanAge(now, p.Started),
-			Requests: p.Requests,
-		})
-	}
-
-	snapshotter, ok := s.storage.(cacheSnapshotter)
-	if !ok {
-		return view
-	}
-
-	byName := make(map[string]*adminPackage)
-	for _, entry := range snapshotter.Snapshot() {
+	// The listing is the cache's own walk; the durable store is never listed.
+	byName := make(map[string]*Package)
+	for _, entry := range s.store.Snapshot() {
 		packageName, fileName, ok := splitPackageKey(entry.Key)
 		if !ok {
 			continue
@@ -309,21 +188,22 @@ func (s *Service) snapshotView() adminView {
 
 		pkg := byName[packageName]
 		if pkg == nil {
-			pkg = &adminPackage{Name: packageName, Age: humanAge(now, entry.CreatedAt)}
+			// The snapshot is most recently accessed first, so the first file
+			// seen carries the package's last access.
+			pkg = &Package{Name: packageName, Age: humanAge(now, entry.CreatedAt), Accessed: humanAge(now, entry.Accessed)}
 			byName[packageName] = pkg
 		}
 		pkg.Size += entry.Size
-		pkg.Hits += entry.Hits
-		pkg.Files = append(pkg.Files, adminFile{
-			Name: fileName,
-			Size: entry.Size,
-			Hits: entry.Hits,
-			Age:  humanAge(now, entry.CreatedAt),
+		pkg.Files = append(pkg.Files, File{
+			Name:     fileName,
+			Size:     entry.Size,
+			Age:      humanAge(now, entry.CreatedAt),
+			Accessed: humanAge(now, entry.Accessed),
 		})
 		view.Size += entry.Size
 	}
 
-	view.Packages = make([]adminPackage, 0, len(byName))
+	view.Packages = make([]Package, 0, len(byName))
 	for _, pkg := range byName {
 		sort.Slice(pkg.Files, func(i, j int) bool { return pkg.Files[i].Name < pkg.Files[j].Name })
 		view.Packages = append(view.Packages, *pkg)
@@ -333,7 +213,38 @@ func (s *Service) snapshotView() adminView {
 	// refresh. Name order is.
 	sort.Slice(view.Packages, func(i, j int) bool { return view.Packages[i].Name < view.Packages[j].Name })
 
+	view.Total = len(view.Packages)
+	// Clamp to the last page: a huge ?page= would overflow the offset below.
+	page = min(page, max(1, (view.Total+PageSize-1)/PageSize))
+	view.Page = page
+	lo := (page - 1) * PageSize
+	hi := min(lo+PageSize, view.Total)
+	view.Packages = view.Packages[lo:hi]
+	if page > 1 {
+		view.PrevPage = page - 1
+	}
+	if hi < view.Total {
+		view.NextPage = page + 1
+	}
 	return view
+}
+
+// InFlight lists the downloads running now, for the page's "Downloading now"
+// rows.
+func (s *Service) InFlight() []Download {
+	now := time.Now()
+	var out []Download
+	for _, p := range s.store.InFlight() {
+		out = append(out, Download{
+			Package:  p.Package,
+			File:     p.File,
+			Bytes:    p.Bytes,
+			Size:     p.Size,
+			Age:      humanAge(now, p.Started),
+			Requests: p.Requests,
+		})
+	}
+	return out
 }
 
 // splitPackageKey pulls the package and file names out of a storage key. The
@@ -368,40 +279,4 @@ func humanAge(now, then time.Time) string {
 	default:
 		return fmt.Sprintf("%dd", int(age.Hours())/24)
 	}
-}
-
-func (s *Service) handleAdminPage(w http.ResponseWriter, r *http.Request) {
-	s.renderAdmin(w, r, "admin.html")
-}
-
-// handleAdminRows serves the fragment the table polls for. It is the progress
-// display for prefetch: files appear here as they land.
-func (s *Service) handleAdminRows(w http.ResponseWriter, r *http.Request) {
-	s.renderAdmin(w, r, "rows")
-}
-
-func (s *Service) renderAdmin(w http.ResponseWriter, r *http.Request, name string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Rendered into a buffer first so a template failure can still be a 500
-	// instead of a half page with a 200 already committed.
-	var buf strings.Builder
-	if err := s.templates.ExecuteTemplate(&buf, name, s.snapshotView()); err != nil {
-		slog.ErrorContext(r.Context(), "Failed to render admin page", "error", err, "template", name)
-		http.Error(w, "Failed to render page", http.StatusInternalServerError)
-		return
-	}
-	_, _ = w.Write([]byte(buf.String()))
-}
-
-// handleAdminAsset serves the embedded interaction library. It is inside the
-// authenticated group so the page and its script share one credential prompt.
-func (s *Service) handleAdminAsset(w http.ResponseWriter, _ *http.Request) {
-	body, err := tmpl.FS.ReadFile("htmx.min.js")
-	if err != nil {
-		http.Error(w, "asset unavailable", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	_, _ = w.Write(body)
 }

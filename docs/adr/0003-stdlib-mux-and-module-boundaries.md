@@ -4,6 +4,11 @@
 - Date: 2026-09-06
 - Context: branch `stdlib-mux-deep-modules`; supersedes the Gin transport the project started with
 
+> **Superseded in part by [ADR 0004](0004-read-through-storage-and-server-owned-http.md).** The
+> per-module `Register(mux)` calls and the `download.Resolver` seam are gone: `server` owns every route,
+> and the one cross-module interface is now `storage.Fetcher`. The decision to use the stdlib
+> `http.ServeMux` stands. The text below is kept as written.
+
 ## Context
 
 groxpi began as a port of the Python `proxpi` and inherited a web framework by default: Gin, with its

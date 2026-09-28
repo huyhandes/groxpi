@@ -88,10 +88,19 @@ func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) 
 	return srv.Router(), cacheDir
 }
 
+// getFile serves one file request in-process. An aborted response (a download
+// that failed mid-stream) comes back as whatever was written before the abort.
 func getFile(router http.Handler, pkg, file string) *http.Response {
 	req := httptest.NewRequest("GET", "/index/"+pkg+"/"+file, nil)
 	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil && rec != http.ErrAbortHandler {
+				panic(rec)
+			}
+		}()
+		router.ServeHTTP(w, req)
+	}()
 	return w.Result()
 }
 
@@ -342,4 +351,40 @@ func TestDownload_UnverifiableFileIsStillCached(t *testing.T) {
 	resp := getFile(router, pkg, file)
 	assert.Equal(t, payload, readBody(t, resp))
 	waitCached(t, cacheDir, pkg, file)
+}
+
+// readFromRecorder records what the response writer's ReadFrom is handed.
+type readFromRecorder struct {
+	*httptest.ResponseRecorder
+	src io.Reader
+}
+
+func (w *readFromRecorder) ReadFrom(src io.Reader) (int64, error) {
+	w.src = src
+	return io.Copy(w.ResponseRecorder, src)
+}
+
+// TestDownload_LocalHitHandsServeContentTheFile guards the copy path: a local
+// hit must reach the writer's ReadFrom as the *os.File itself (under
+// ServeContent's LimitedReader), not behind the storage.Object wrapper.
+func TestDownload_LocalHitHandsServeContentTheFile(t *testing.T) {
+	payload := testPayload(64 * 1024)
+	pkg, file := "copypath", "copypath-1.0.0.tar.gz"
+	up := newFakeUpstream(t, upstreamSpec{
+		pkg: pkg, file: file, sha256: sha256Hex(payload), indexSize: int64(len(payload)),
+		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	})
+	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
+	readBody(t, getFile(router, pkg, file))
+	waitCached(t, cacheDir, pkg, file)
+
+	w := &readFromRecorder{ResponseRecorder: httptest.NewRecorder()}
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/index/"+pkg+"/"+file, nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, payload, w.Body.Bytes())
+	src := w.src
+	if lr, ok := src.(*io.LimitedReader); ok {
+		src = lr.R
+	}
+	assert.IsType(t, (*os.File)(nil), src)
 }

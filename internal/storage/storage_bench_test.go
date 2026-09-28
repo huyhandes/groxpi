@@ -56,12 +56,12 @@ func BenchmarkS3Storage(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				key := fmt.Sprintf("bench/put_%d_%d", size, i)
-				_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
+				err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 				if err != nil {
 					b.Fatalf("Failed to put: %v", err)
 				}
 				// Clean up immediately to avoid filling storage
-				_ = storage.Delete(ctx, key)
+				_, _ = storage.DeletePrefix(ctx, key)
 			}
 		})
 
@@ -70,11 +70,11 @@ func BenchmarkS3Storage(b *testing.B) {
 			data := make([]byte, size)
 			_, _ = rand.Read(data)
 			key := fmt.Sprintf("bench/get_%d", size)
-			_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
+			err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
 			if err != nil {
 				b.Fatalf("Failed to setup: %v", err)
 			}
-			defer func() { _ = storage.Delete(ctx, key) }()
+			defer func() { _, _ = storage.DeletePrefix(ctx, key) }()
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -96,7 +96,7 @@ func BenchmarkS3Storage(b *testing.B) {
 func BenchmarkLocalStorage(b *testing.B) {
 	tmpDir := b.TempDir()
 
-	storage, err := NewLocalStorage(tmpDir)
+	storage, err := NewLocalStorage(tmpDir, 0, 0)
 	if err != nil {
 		b.Fatalf("Failed to create local storage: %v", err)
 	}
@@ -115,31 +115,12 @@ func BenchmarkLocalStorage(b *testing.B) {
 	for _, size := range sizes {
 		sizeName := formatSize(size)
 
-		b.Run(fmt.Sprintf("Put_%s", sizeName), func(b *testing.B) {
-			data := make([]byte, size)
-			_, _ = rand.Read(data)
-
-			b.SetBytes(int64(size))
-			b.ResetTimer()
-
-			for i := 0; i < b.N; i++ {
-				key := fmt.Sprintf("bench/put_%d_%d", size, i)
-				_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
-				if err != nil {
-					b.Fatalf("Failed to put: %v", err)
-				}
-			}
-		})
-
 		b.Run(fmt.Sprintf("Get_%s", sizeName), func(b *testing.B) {
 			// Setup: write test data
 			data := make([]byte, size)
 			_, _ = rand.Read(data)
 			key := fmt.Sprintf("bench/get_%d", size)
-			_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(size), "application/octet-stream")
-			if err != nil {
-				b.Fatalf("Failed to setup: %v", err)
-			}
+			put(b, storage, key, data)
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -154,25 +135,6 @@ func BenchmarkLocalStorage(b *testing.B) {
 			}
 		})
 	}
-
-	b.Run("Exists", func(b *testing.B) {
-		// Setup: write test file
-		key := "bench/exists"
-		data := []byte("test")
-		_, err := storage.Put(ctx, key, bytes.NewReader(data), int64(len(data)), "text/plain")
-		if err != nil {
-			b.Fatalf("Failed to setup: %v", err)
-		}
-
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			_, err := storage.Exists(ctx, key)
-			if err != nil {
-				b.Fatalf("Failed to check existence: %v", err)
-			}
-		}
-	})
 }
 
 // formatSize formats bytes into human-readable string

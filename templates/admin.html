@@ -34,7 +34,7 @@
 <!-- The table polls: prefetch has no progress bar, so files appearing here are
      the progress display. The first render is server-side, so the poll only
      needs to pick up changes. -->
-<div id="cache" hx-get="/admin/rows" hx-trigger="every 3s" hx-swap="innerHTML">
+<div id="cache" hx-get="/admin/rows?page={{.Page}}" hx-trigger="every 3s" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>
 

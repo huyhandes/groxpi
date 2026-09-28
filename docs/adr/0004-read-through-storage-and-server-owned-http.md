@@ -19,7 +19,7 @@ scan re-adds files in directory-walk order.
 
 1. **Server owns HTTP.** Every route, handler, content negotiation, redirect decision, admin page and
    template lives in `server`. `index`, `storage`, `download` and `admin` are Go APIs with no `net/http`
-   handler code and no `Register(mux)`.
+   handler code, and none of them registers its own routes.
 
 2. **Storage is the cache, read-through.** `storage.Open(ctx, pkg, file)` returns an object the server
    hands to `http.ServeContent`. On a miss storage coalesces concurrent requests (singleflight), asks
@@ -38,11 +38,11 @@ scan re-adds files in directory-walk order.
    The single cross-module interface is `storage.Fetcher`, defined by its consumer, implemented by
    `download`, faked in tests.
 
-4. **Three storage modes, two backends.** `local`, `s3`, `hybrid`. Local and S3 sit behind an unexported
-   backend interface inside `storage`; hybrid is "local then S3" logic in the store, not a third backend.
-   An L1 miss with an L2 hit streams from S3 and promotes into L1 through the same spool-and-tail path as
-   an upstream miss. An S3 hit is a lazy `io.ReadSeeker`: the seek-then-read `ServeContent` performs
-   becomes one ranged `GetObject`. No presigned redirects.
+4. **Three storage modes, two concrete stores.** `local`, `s3`, `hybrid`. The `Store` holds a concrete
+   local cache and/or a concrete S3 store — no backend interface; hybrid is "cache then S3" logic in the
+   store, not a third backend. A cache miss with an S3 hit streams from S3 and promotes into the cache
+   through the same spool-and-tail path as an upstream miss. An S3 hit is an `io.ReadSeeker` handed to
+   `ServeContent`; see the amendment for how it reads. No presigned redirects.
 
 5. **The filesystem is the LRU index.** A hit sets the file's atime with `os.Chtimes` (throttled to about
    once an hour per file, mtime untouched because it is `Last-Modified`). One atomic counter tracks total
@@ -70,3 +70,31 @@ Dependencies point one way: `server → admin → storage → download → index
 - `LRUCache`, `LRULocalStorage` and the `l1Storage` interface are deleted.
 - The atime helper needs a small build-tagged file per OS (`Stat_t.Atim` on Linux, `Atimespec` on darwin).
 - Eviction cost is an O(n) directory walk, paid only when the cache crosses its limit.
+
+## Amendment — 2026-09-28: the cache and the durable store
+
+Implementing decision 4 showed that the local tier and S3 have different jobs, and the tiered backend
+blurred them.
+
+- **Roles.** The local tier is the **cache**: bounded by size limit, TTL and atime LRU, disposable, and
+  the only thing that evicts. S3 is the **durable store**: every verified download lands there, it is
+  unbounded, and groxpi never expires objects from it — retention is the operator's, through bucket
+  lifecycle rules. `local` is the cache only, `s3` the durable store only, `hybrid` the cache in front
+  of the durable store. Admin eviction still deletes from both, or the next request would restore the
+  package from S3; the admin listing shows the cache only.
+- **Inline upload replaces the best-effort pool.** In hybrid mode a download spools under the cache
+  directory, is verified (sha256 and length) and renamed into the cache; readers are done and the next
+  request is a hit. The same download goroutine then uploads the finished file to S3 synchronously — no
+  queue, no worker pool, nothing dropped. A failed upload is logged; the file is still served and
+  cached. A promoted S3 hit is not re-uploaded. Shutdown waits, within the existing shutdown timeout,
+  for running downloads and their uploads. `TieredStorage`, its L1→L2 upload worker pool and the
+  `Storage` backend interface are deleted. Uploads are a single `PutObject`, so an object is limited to
+  S3's single-PUT maximum (5 GiB), which PyPI files stay under; the transfer-manager dependency is gone.
+- **Removed settings — a deliberate exception to "no externally visible change".**
+  `GROXPI_TIERED_SYNC_WORKERS` and `GROXPI_TIERED_SYNC_QUEUE_SIZE` configured the deleted pool and are
+  no longer read. Nothing replaces them; a deployment that sets them is unaffected otherwise.
+- **S3 hits fetch up front, in bounded windows.** A pure `s3` hit issues its `GetObject` before any
+  response header is sent; if it fails, the request is treated as a miss (fetched upstream, or
+  redirected in redirect mode) rather than a `200` cut off mid-body. `Range` and conditional requests
+  still go through `http.ServeContent`; a ranged read fetches bounded windows, starting at 1 MiB and
+  doubling up to a cap, instead of an open-ended `bytes=<off>-`. S3 hits still carry no `ETag`.

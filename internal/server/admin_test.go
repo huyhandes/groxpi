@@ -1,12 +1,9 @@
-package admin
+package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,15 +18,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/huyhandes/groxpi/internal/admin"
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/huyhandes/groxpi/internal/download"
-	"github.com/huyhandes/groxpi/internal/index"
-	"github.com/huyhandes/groxpi/internal/storage"
-)
-
-const (
-	adminUser = "op"
-	adminPass = "s3cret"
 )
 
 // adminFakeFile is one file in the fake index's package listing.
@@ -112,12 +102,11 @@ func newAdminUpstream(t *testing.T, pkg string, files ...adminFakeFile) *adminUp
 	return fake
 }
 
-// adminHarness is the admin module wired to a real index and download module
-// over local storage, mounted on a bare mux: exactly what the server does, minus
-// the server.
+// adminHarness is the full server with credentials configured, plus the admin
+// module it built, so tests can read the same listing the page renders.
 type adminHarness struct {
-	svc      *Service
-	mux      *http.ServeMux
+	svc      *admin.Service
+	mux      http.Handler
 	cacheDir string
 }
 
@@ -134,40 +123,16 @@ func newAdminServer(t *testing.T, upstreamURL string) *adminHarness {
 		AdminUsername:   adminUser,
 		AdminPassword:   adminPass,
 	}
-	st, err := storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
+	srv, err := NewServer(cfg)
 	require.NoError(t, err)
-	idx := index.New(cfg)
-	dl := download.New(cfg, st, idx)
-	svc, err := New(cfg, st, idx, dl)
-	require.NoError(t, err)
-
-	mux := http.NewServeMux()
-	idx.Register(mux)
-	dl.Register(mux)
-	svc.Register(mux)
-
-	t.Cleanup(func() {
-		svc.Close(context.Background())
-		idx.Close()
-		_ = st.Close()
-	})
-	return &adminHarness{svc: svc, mux: mux, cacheDir: cfg.CacheDir}
-}
-
-func do(router http.Handler, req *http.Request) *http.Response {
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	return w.Result()
+	t.Cleanup(func() { _ = srv.Close() })
+	return &adminHarness{svc: srv.admin, mux: srv.Router(), cacheDir: cfg.CacheDir}
 }
 
 func authGet(router http.Handler, path string) *http.Response {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.SetBasicAuth(adminUser, adminPass)
 	return do(router, req)
-}
-
-func getFile(router http.Handler, pkg, file string) *http.Response {
-	return do(router, httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+file, nil))
 }
 
 func postPrefetch(router http.Handler, pkg string, auth bool) *http.Response {
@@ -178,47 +143,6 @@ func postPrefetch(router http.Handler, pkg string, auth bool) *http.Response {
 		req.SetBasicAuth(adminUser, adminPass)
 	}
 	return do(router, req)
-}
-
-func readBody(t *testing.T, resp *http.Response) []byte {
-	t.Helper()
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	return body
-}
-
-func testPayload(n int) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(i)
-	}
-	return b
-}
-
-func sha256Hex(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
-func cachedPath(cacheDir, pkg, file string) string {
-	return filepath.Join(cacheDir, "packages", pkg, file)
-}
-
-func waitCached(t *testing.T, cacheDir, pkg, file string) {
-	t.Helper()
-	waitFor(t, "the file to reach the cache", func() bool {
-		_, err := os.Stat(cachedPath(cacheDir, pkg, file))
-		return err == nil
-	})
-}
-
-func assertNotCached(t *testing.T, cacheDir, pkg, file string) {
-	t.Helper()
-	// Give the storage goroutine a moment to finish failing.
-	time.Sleep(100 * time.Millisecond)
-	_, err := os.Stat(cachedPath(cacheDir, pkg, file))
-	assert.True(t, os.IsNotExist(err), "expected no cached object for %s/%s", pkg, file)
 }
 
 // waitFor is the bounded wait every asynchronous assertion below uses: prefetch
@@ -238,7 +162,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // cachedFileNames reads the file names out of the same snapshot the page renders.
 func cachedFileNames(h *adminHarness) []string {
 	var names []string
-	for _, pkg := range h.svc.snapshotView().Packages {
+	for _, pkg := range h.svc.List(context.Background(), 1).Packages {
 		for _, f := range pkg.Files {
 			names = append(names, f.Name)
 		}
@@ -266,21 +190,21 @@ func TestAdminListing_ShowsInFlightDownload(t *testing.T) {
 	}()
 
 	waitFor(t, "the download to register as in flight", func() bool {
-		return len(h.svc.snapshotView().Downloading) == 1
+		return len(h.svc.InFlight()) == 1
 	})
 	body := string(readBody(t, authGet(h.mux, "/admin/rows")))
 	assert.Contains(t, body, "Downloading now")
 	assert.Contains(t, body, "slow-1.0.0.tar.gz")
-	view := h.svc.snapshotView()
-	require.Len(t, view.Downloading, 1)
-	assert.Equal(t, "slow", view.Downloading[0].Package)
-	assert.Equal(t, int64(8192), view.Downloading[0].Size)
-	assert.Equal(t, 1, view.Downloading[0].Requests)
+	downloading := h.svc.InFlight()
+	require.Len(t, downloading, 1)
+	assert.Equal(t, "slow", downloading[0].Package)
+	assert.Equal(t, int64(8192), downloading[0].Size)
+	assert.Equal(t, 1, downloading[0].Requests)
 
 	close(up.gate)
 	<-done
 	waitFor(t, "the download to leave the in-flight list", func() bool {
-		return len(h.svc.snapshotView().Downloading) == 0
+		return len(h.svc.InFlight()) == 0
 	})
 	assert.NotContains(t, string(readBody(t, authGet(h.mux, "/admin/rows"))), "Downloading now")
 }
@@ -296,6 +220,41 @@ func TestAdminListing_EmptyCacheHasNoRows(t *testing.T) {
 	assert.Contains(t, body, "Nothing cached.")
 }
 
+// TestAdminListing_Paginates pins ?page=N on the listing: a fixed number of
+// packages per page, a package's files never split, next/prev links, and the
+// poll staying on the page it was rendered for.
+func TestAdminListing_Paginates(t *testing.T) {
+	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
+	h := newAdminServer(t, up.URL)
+	for i := range admin.PageSize + 1 {
+		for _, f := range []string{"a.whl", "b.tar.gz"} {
+			path := filepath.Join(h.cacheDir, "packages", fmt.Sprintf("p%03d", i), f)
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+			require.NoError(t, os.WriteFile(path, []byte("x"), 0o600))
+		}
+	}
+
+	first := string(readBody(t, authGet(h.mux, "/admin/rows")))
+	assert.Equal(t, admin.PageSize, strings.Count(first, `class="pkg"`))
+	assert.Contains(t, first, `data-package="p000"`)
+	assert.NotContains(t, first, `data-package="p050"`)
+	assert.Contains(t, first, `href="/admin?page=2"`)
+	assert.NotContains(t, first, "prev")
+	assert.Contains(t, first, "51 package(s)")
+
+	second := string(readBody(t, authGet(h.mux, "/admin/rows?page=2")))
+	assert.Equal(t, 1, strings.Count(second, `class="pkg"`))
+	assert.Equal(t, 2, strings.Count(second, `class="file" data-package="p050"`), "a package's files stay on one page")
+	assert.Contains(t, second, `href="/admin?page=1"`)
+	assert.NotContains(t, second, "next")
+
+	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin?page=2"))), `hx-get="/admin/rows?page=2"`,
+		"the poll must keep the page the operator navigated to")
+	assert.Equal(t, first, string(readBody(t, authGet(h.mux, "/admin/rows?page=bogus"))), "a malformed page is page 1")
+	assert.Equal(t, second, string(readBody(t, authGet(h.mux, "/admin/rows?page=9223372036854775807"))),
+		"a page past the end is the last page, and must not overflow")
+}
+
 func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 	payload := testPayload(4096)
 	up := newAdminUpstream(t, "listme", adminFakeFile{name: "listme-1.0.0.tar.gz", body: payload})
@@ -304,7 +263,7 @@ func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 
 	_ = readBody(t, getFile(router, "listme", "listme-1.0.0.tar.gz"))
 	waitFor(t, "the download to reach the cache snapshot", func() bool {
-		return len(srv.svc.snapshotView().Packages) == 1
+		return len(srv.svc.List(context.Background(), 1).Packages) == 1
 	})
 
 	body := string(readBody(t, authGet(router, "/admin/rows")))
@@ -312,34 +271,41 @@ func TestAdminListing_ShowsDownloadedPackageWithSizeAndAge(t *testing.T) {
 	assert.Contains(t, body, "listme-1.0.0.tar.gz")
 	assert.Contains(t, body, "4.0 KB", "the row must carry the file size")
 
-	view := srv.svc.snapshotView()
+	view := srv.svc.List(context.Background(), 1)
 	require.Len(t, view.Packages, 1)
 	require.Len(t, view.Packages[0].Files, 1)
 	assert.Equal(t, int64(len(payload)), view.Packages[0].Files[0].Size)
 	assert.NotEmpty(t, view.Packages[0].Files[0].Age, "the row must carry an age")
 }
 
-func TestAdminListing_HitCountTracksServes(t *testing.T) {
+func TestAdminListing_LastAccessedTracksServes(t *testing.T) {
 	up := newAdminUpstream(t, "hitme", adminFakeFile{name: "hitme-1.0.0.tar.gz", body: testPayload(2048)})
 	srv := newAdminServer(t, up.URL)
 	router := srv.mux
 	cacheDir := srv.cacheDir
 
-	// The first request populates the cache; it is a write, not a serve.
 	_ = readBody(t, getFile(router, "hitme", "hitme-1.0.0.tar.gz"))
 	waitCached(t, cacheDir, "hitme", "hitme-1.0.0.tar.gz")
+	path := cachedPath(cacheDir, "hitme", "hitme-1.0.0.tar.gz")
 
-	const serves = 3
-	for range serves {
-		resp := getFile(router, "hitme", "hitme-1.0.0.tar.gz")
-		_ = readBody(t, resp)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-	}
+	// Age the access far past the touch throttle, so the next serve must bump it.
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(path, old, old))
+	require.Equal(t, "2d", srv.svc.List(context.Background(), 1).Packages[0].Accessed)
 
-	view := srv.svc.snapshotView()
+	resp := getFile(router, "hitme", "hitme-1.0.0.tar.gz")
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body := string(readBody(t, authGet(router, "/admin/rows")))
+	assert.Contains(t, body, "Last accessed")
+	assert.NotContains(t, body, "Hits")
+
+	view := srv.svc.List(context.Background(), 1)
 	require.Len(t, view.Packages, 1)
-	assert.Equal(t, int64(serves), view.Packages[0].Hits,
-		"the hit count must reflect how many times the object was served from cache")
+	assert.Equal(t, "0s", view.Packages[0].Accessed, "a serve must refresh the package's last access")
+	assert.Equal(t, "0s", view.Packages[0].Files[0].Accessed)
+	assert.Equal(t, "2d", view.Packages[0].Files[0].Age, "the age is the mtime, which a serve must not touch")
 	assert.Equal(t, int64(1), up.fileHits.Load(), "only the first request should have gone upstream")
 }
 
@@ -364,7 +330,7 @@ func TestPrefetch_ReturnsAcceptedAndFilesAppear(t *testing.T) {
 	})
 
 	assert.Equal(t, []string{"warmme-1.0.0-py3-none-any.whl", "warmme-1.0.0.tar.gz"}, cachedFileNames(srv))
-	assert.Empty(t, srv.svc.snapshotView().Errors)
+	assert.Empty(t, srv.svc.List(context.Background(), 1).Errors)
 }
 
 // TestPrefetch_OnlyNewestRelease also pins PEP 440 ordering: 1.10.0 is newer
@@ -630,5 +596,5 @@ func TestCloseGivesUpWhenBudgetSpent(t *testing.T) {
 
 	// Let the abandoned prefetch unwind before the temp cache directory goes.
 	close(release)
-	srv.svc.prefetches.Wait()
+	srv.svc.Close(context.Background())
 }

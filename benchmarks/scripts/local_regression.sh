@@ -13,7 +13,7 @@ PORT=5099
 PKG=requests
 WHEEL=requests-2.32.3-py3-none-any.whl
 
-go build -o "$BIN" "$DIR/cmd/groxpi"
+go -C "$DIR" build -o "$BIN" ./cmd/groxpi
 GROXPI_CACHE_DIR="$CACHE" PORT=$PORT GROXPI_LOGGING_LEVEL=WARN GROXPI_DOWNLOAD_TIMEOUT=30s \
   "$BIN" >/dev/null 2>&1 &
 PID=$!

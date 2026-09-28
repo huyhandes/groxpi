@@ -39,50 +39,27 @@ func TestS3WithMinIO(t *testing.T) {
 		contentType := "text/plain"
 
 		// Test Put
-		info, err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), contentType)
+		err := storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), contentType)
 		require.NoError(t, err, "Failed to put object")
-		assert.Equal(t, key, info.Key)
-		assert.Equal(t, int64(len(content)), info.Size)
-		assert.Equal(t, contentType, info.ContentType)
-		assert.NotEmpty(t, info.ETag)
 
 		// Test Get
 		reader, getInfo, err := storage.Get(ctx, key)
 		require.NoError(t, err, "Failed to get object")
 		defer func() { _ = reader.Close() }()
 
-		assert.Equal(t, key, getInfo.Key)
 		assert.Equal(t, int64(len(content)), getInfo.Size)
-		assert.NotEmpty(t, getInfo.ETag)
 
 		data, err := io.ReadAll(reader)
 		require.NoError(t, err, "Failed to read object data")
 		assert.Equal(t, content, data)
 
-		// Streaming put of an unseekable body whose length is unknown, which is
-		// how pure object-storage mode writes a live download. This is the
-		// transfer-manager path rather than a single-object put.
-		streamKey := key + ".stream"
-		stream := io.NopCloser(bytes.NewReader(content)) // hides ReadSeeker
-		_, err = storage.Put(ctx, streamKey, stream, -1, contentType)
-		require.NoError(t, err, "Failed to stream object of unknown size")
-
-		streamed, _, err := storage.Get(ctx, streamKey)
-		require.NoError(t, err)
-		streamedData, err := io.ReadAll(streamed)
-		require.NoError(t, err)
-		_ = streamed.Close()
-		assert.Equal(t, content, streamedData)
-		require.NoError(t, storage.Delete(ctx, streamKey))
-
 		// Test Delete
-		err = storage.Delete(ctx, key)
+		_, err = storage.DeletePrefix(ctx, key)
 		assert.NoError(t, err, "Failed to delete test object")
 
 		// Verify deletion
-		exists, err := storage.Exists(ctx, key)
-		require.NoError(t, err, "Failed to check existence after delete")
-		assert.False(t, exists, "Object should not exist after deletion")
+		_, _, err = storage.Get(ctx, key)
+		assert.ErrorIs(t, err, ErrNotFound, "Object should not exist after deletion")
 	})
 }
 
@@ -117,17 +94,10 @@ func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
 	key := fmt.Sprintf("test/no-trailers-%d.txt", time.Now().UnixNano())
 	content := []byte("no checksum trailers here")
 
-	_, err = storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
+	err = storage.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "text/plain")
 	require.NoError(t, err, "put must succeed against a server that rejects checksum trailers")
 
-	// The streaming path is where the SDK's newer default emits a trailer, so
-	// it is the case that actually breaks against an older MinIO.
-	streamKey := key + ".stream"
-	_, err = storage.Put(ctx, streamKey, io.NopCloser(bytes.NewReader(content)), -1, "text/plain")
-	require.NoError(t, err, "streaming put must succeed against a server that rejects checksum trailers")
-
 	assert.Zero(t, rejected.Load(), "the client sent a checksum trailer")
-	require.NoError(t, storage.Delete(ctx, streamKey))
 
 	reader, _, err := storage.Get(ctx, key)
 	require.NoError(t, err)
@@ -137,7 +107,8 @@ func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, content, data)
 
-	require.NoError(t, storage.Delete(ctx, key))
+	_, err = storage.DeletePrefix(ctx, key)
+	require.NoError(t, err)
 }
 
 // sendsChecksum reports whether a request carries the checksum trailer or

@@ -1,7 +1,7 @@
 // Package index answers one question: what files does a package have. It owns
 // the upstream client, the bounded entry cache, extras-first resolution and the
 // singleflight that deduplicates upstream index fetches. Everything else in
-// groxpi asks it through Resolve or through the routes it registers.
+// groxpi asks it through Resolve; the server renders the answer.
 package index
 
 import (
@@ -238,25 +238,25 @@ func (s *Service) queryConcurrently(ctx context.Context, indexes []config.Index,
 	return config.Index{}, nil, fmt.Errorf("%w: %s", ErrNotFound, packageName)
 }
 
-// maxRootIndexBytes caps the proxied root index. See the read in proxyRoot.
+// maxRootIndexBytes caps the proxied root index. See the read in ProxyRoot.
 // Documented in docs/api-endpoints.md, since a client meets it as a 502.
 const maxRootIndexBytes int64 = 256 << 20
 
-// rootResponse is one upstream root-index response, held only as long as it
+// RootResponse is one upstream root-index response, held only as long as it
 // takes to answer the burst of clients that shared its fetch.
-type rootResponse struct {
-	status          int
-	contentType     string
-	contentEncoding string
-	body            []byte
+type RootResponse struct {
+	Status          int
+	ContentType     string
+	ContentEncoding string
+	Body            []byte
 }
 
-// proxyRoot fetches the upstream root index verbatim: the client's accepted
+// ProxyRoot fetches the upstream root index verbatim: the client's accepted
 // content type and encoding are forwarded and the body is copied back
 // undecoded. Nothing is cached — the full project list is tens of megabytes and
 // is served through, not stored — but concurrent callers asking for the same
 // representation still share one upstream fetch.
-func (s *Service) proxyRoot(ctx context.Context, accept, acceptEncoding string) (*rootResponse, error) {
+func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) (*RootResponse, error) {
 	result, err, _ := s.sf.Do("root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
 		// The fetch serves every waiter, so it must not die with whichever client
 		// happened to trigger it; the HTTP client's own timeout bounds it.
@@ -297,18 +297,18 @@ func (s *Service) proxyRoot(ctx context.Context, accept, acceptEncoding string) 
 		if int64(len(body)) > maxRootIndexBytes {
 			return nil, fmt.Errorf("root index exceeds the %d byte limit", maxRootIndexBytes)
 		}
-		return &rootResponse{
-			status:          resp.StatusCode,
-			contentType:     resp.Header.Get("Content-Type"),
-			contentEncoding: resp.Header.Get("Content-Encoding"),
-			body:            body,
+		return &RootResponse{
+			Status:          resp.StatusCode,
+			ContentType:     resp.Header.Get("Content-Type"),
+			ContentEncoding: resp.Header.Get("Content-Encoding"),
+			Body:            body,
 		}, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to proxy root index: %w", err)
 	}
 
-	root, ok := result.(*rootResponse)
+	root, ok := result.(*RootResponse)
 	if !ok {
 		return nil, fmt.Errorf("unexpected root index result type %T", result)
 	}

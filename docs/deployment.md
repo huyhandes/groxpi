@@ -9,16 +9,16 @@ GROXPI_CACHE_DIR=/var/cache/groxpi ./groxpi
 
 groxpi listens on `PORT` (default `5000`) on all interfaces. It shuts down gracefully on `SIGINT` and
 `SIGTERM`: in-flight requests drain, admin prefetches are refused and the running ones are waited for,
-the index cache sweeper stops, and the storage backend is closed — which is what drains pending uploads
-in `hybrid` mode.
+the index cache sweeper stops, and storage waits for running downloads — in `hybrid` mode including the
+S3 upload each one finishes with.
 
 ### Shutdown budget
 
 Those steps share **one 5-second budget**, plus up to 5 seconds after it to flush telemetry. A step that
 overruns is reported and stepped over rather than waited out: an unreachable object store or a wedged
 upstream index would otherwise hold the process open until the runtime killed it, which loses more than
-giving up does. What is lost by giving up is a cache entry the next request re-fetches, or a pending L2
-upload whose object still exists in L1.
+giving up does. What is lost by giving up is a cache entry the next request re-fetches, or an S3
+upload whose file is still in the local cache.
 
 Allow at least 15 seconds of stop grace so the process exits on its own rather than being killed
 mid-flush. Docker's default is 10 seconds, so set `stop_grace_period: 30s` on the service in Compose;
@@ -91,7 +91,7 @@ spec:
 ```
 
 Each replica keeps its own cache. To share one cache between replicas, use `GROXPI_STORAGE_TYPE=hybrid`
-with a common S3 bucket: each pod keeps a local L1 and the bucket is the shared L2.
+with a common S3 bucket: each pod keeps its own local cache in front of the shared durable store.
 
 ## Storage choice
 
@@ -100,6 +100,10 @@ with a common S3 bucket: each pod keeps a local L1 and the bucket is the shared 
 | `local` | One instance, or per-instance caches are acceptable. |
 | `s3` | Cache must be shared and durable, and local disk is unavailable. Note that files are then always served across the network — there is no local path to hand to `net/http`. |
 | `hybrid` | Several instances that should share a durable cache while still serving hot files from local disk. |
+
+groxpi never expires objects from the bucket in `s3` or `hybrid` mode: every verified download stays
+until something else removes it. Set retention with bucket lifecycle rules (for example, expire objects
+under `GROXPI_S3_PREFIX` after a period). The local cache bounds itself.
 
 See [configuration.md](configuration.md) for the settings each mode reads.
 
@@ -124,8 +128,9 @@ startup log line records `static_credentials=true|false`, which is the quickest 
 really using its role.
 
 The role needs `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the bucket — `ListBucket` covers the
-`HeadBucket` probe. No request path deletes an S3 object, so `s3:DeleteObject` is not required; see the
-eviction note in [api-endpoints.md](api-endpoints.md).
+`HeadBucket` probe. Only admin eviction (`DELETE /cache/<package>`) deletes S3 objects, so
+`s3:DeleteObject` is needed only if the admin surface is enabled; see the eviction note in
+[api-endpoints.md](api-endpoints.md).
 
 ## Reverse proxy and TLS
 

@@ -3,8 +3,8 @@ package admin
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"time"
 
@@ -24,25 +24,19 @@ var sdistExtensions = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".tar.Z", ".tgz
 // bound shutdown — that is Close's context's job.
 const prefetchDeadline = 30 * time.Minute
 
-// handleAdminPrefetch accepts a prefetch and returns immediately. The download
-// runs on a context detached from the request so a large package does not time
-// out behind a reverse proxy; there is no job registry and no identifier,
-// because the polling table already shows the files arriving.
-func (s *Service) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(strings.TrimSpace(r.PostFormValue("package")))
-	if packageName == "" {
-		http.Error(w, "Package name required", http.StatusBadRequest)
-		return
+// Prefetch warms the newest release of each package in the background and
+// returns at once. The downloads run on a context detached from ctx so a large
+// package does not time out behind a reverse proxy; there is no job registry and
+// no identifier, because the polling table already shows the files arriving.
+// It returns ErrShuttingDown once Close has begun.
+func (s *Service) Prefetch(ctx context.Context, pkgs ...string) error {
+	ctx = context.WithoutCancel(ctx)
+	for _, pkg := range pkgs {
+		if !s.startPrefetch(ctx, pkg) {
+			return ErrShuttingDown
+		}
 	}
-
-	if !s.startPrefetch(context.WithoutCancel(r.Context()), packageName) {
-		http.Error(w, "Shutting down; prefetch not accepted", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte("Prefetching " + packageName)) // #nosec G705 -- normalised name in a text/plain body
+	return nil
 }
 
 // startPrefetch runs one prefetch in the background. Everything that makes a
@@ -110,7 +104,7 @@ func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
 	slog.InfoContext(ctx, "Prefetching newest release", "package", packageName, "files", len(files))
 
 	for _, file := range files {
-		if err := s.downloads.Warm(ctx, packageName, file.Name); err != nil {
+		if err := s.warm(ctx, packageName, file.Name); err != nil {
 			// Redacted, not raw: the file URL is resolved against the index base, so
 			// a credentialed private index puts its password inside this error — and
 			// this message is both logged and rendered onto the admin page.
@@ -119,6 +113,24 @@ func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
 				"error", config.RedactErrorText(err), "package", packageName, "file", file.Name)
 		}
 	}
+}
+
+// warm caches one file with no client attached: open it through the store and
+// drain it. A hit is already cached; a miss drains the whole download path.
+func (s *Service) warm(ctx context.Context, packageName, fileName string) error {
+	if s.noCache {
+		return errors.New("caching is disabled (download timeout is 0)")
+	}
+	obj, err := s.store.Open(ctx, packageName, fileName, true)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = obj.Close() }()
+	if !obj.InFlight {
+		return nil
+	}
+	_, err = io.Copy(io.Discard, obj)
+	return err
 }
 
 // newestReleaseFiles returns the files of the newest final release in a

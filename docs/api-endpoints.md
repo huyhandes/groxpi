@@ -78,24 +78,30 @@ has cached.
 
 `GET /simple/<package>/<file>` resolves to one of four outcomes:
 
-1. **Cached** — served from the object store. When the backend can name a local file, the path is handed
-   to `net/http`, which brings range requests and conditional requests with it.
-2. **Stream and cache** — the file is fetched from upstream and streamed to the client while the same
-   bytes are written into the cache. Concurrent requests for the same file are deduplicated: one request
-   streams, and the others are served the freshly cached object once it lands.
+1. **Cached** — served from the cache through `net/http`'s `ServeContent`, which brings range requests,
+   conditional requests and `Last-Modified` with it. In `hybrid` mode a cache miss that hits S3 is
+   copied into the cache while it streams, like a download: that first serve ignores `Range`, carries no
+   `Last-Modified`, and takes its `Content-Length` from S3. In pure `s3` mode the `GetObject` is issued
+   before any response header is sent; if it fails, the request is handled as a miss (outcome 2 or 3)
+   rather than a `200` cut off mid-body.
+2. **Stream and cache** — the file is fetched from upstream into a spool file, and the client is sent
+   the bytes as they land. Concurrent requests for the same file share that one fetch: every one of them,
+   the first included, reads the same growing spool. `Range` is ignored while a download is in flight.
 3. **Redirect (`302`)** — the client is sent to the upstream URL. This happens when caching is disabled
-   (`GROXPI_DOWNLOAD_TIMEOUT=0`), when the upstream fetch failed or exceeded its time-to-first-byte
-   budget, or when a coordinated download left nothing cached.
+   (`GROXPI_DOWNLOAD_TIMEOUT=0`) or when the upstream fetch failed or exceeded its time-to-first-byte
+   budget before upstream answered `200`.
 4. **`404`** — the package's index could not be resolved, or the index does not list that filename.
 
-Every cached file is verified before it is committed: against the SHA-256 the index declared, or failing
-that against the declared content length. A file that matches neither is cached **unverified** and a
-warning is logged. A file that contradicts either is not cached at all and the partial write is
-discarded.
+Every downloaded file is verified before it is committed: against the SHA-256 the index declared, and
+against the expected length (the declared size, else the upstream `Content-Length`) when one is known.
+A file with neither is cached **unverified** and a warning is logged. A file that contradicts either is
+not cached. The spool is discarded, and every client streaming it has
+its response aborted before the last byte, so no client sees a complete body that failed verification.
 
-Response headers on a download are `Content-Type` (derived from the filename extension), `Content-Length`
-and `ETag` (the SHA-256, quoted) when the index supplied them. Files served from storage additionally
-carry `Content-Disposition: attachment` and `Cache-Control: public, max-age=3600`.
+Response headers on a download in flight are `Content-Type` (derived from the filename extension), plus
+`Content-Length` and `ETag` (the SHA-256, quoted) when the index supplied them. A cache hit carries
+`Content-Type`, `Content-Length` and `Last-Modified`; a `hybrid` S3 hit streams like a download in
+flight, with `Content-Length` from S3. No S3 hit carries an `ETag`.
 
 Package files are never compressed by groxpi — they are already-compressed archives.
 
@@ -150,12 +156,14 @@ token, session or cookie is involved.
 
 ### `GET /admin`
 
-An HTML page listing what the local cache holds: packages, their files, sizes, hit counts and ages, plus
+An HTML page listing what the local cache holds: packages, their files, sizes, ages and last-accessed times, plus
 the 20 most recent prefetch failures. Above the table, a "Downloading now" section lists every upstream
 download in progress — package, file, bytes so far against the declared size, age, and how many client
 requests are coalesced onto it — and disappears when nothing is in flight. The page polls
-`GET /admin/rows` for updates. Only backends that hold real local files can be listed, so in pure `s3`
-mode the table is empty.
+`GET /admin/rows` for updates. Both `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
+malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
+across pages, and the page's poll keeps the page it was rendered for. The listing shows the local cache only, so in pure `s3`
+mode, which has no cache, the table is empty.
 
 ### `POST /admin/prefetch`
 
@@ -183,8 +191,8 @@ cached, so there is no cached list to invalidate. The route exists so Python-pro
 Drops the package's index cache entry **and deletes its cached files**. Answers
 `{"status":"success","data":null}`, `400` for an empty package name, or `500` if the deletion failed.
 
-In `hybrid` mode only the local L1 copies are deleted; the objects stay in S3 by design. In pure `s3`
-mode no files are deleted — see the note in [architecture.md](architecture.md).
+In `hybrid` mode both the cached copies and the S3 objects are deleted, so the next request cannot promote
+the package back from S3. In pure `s3` mode the objects under the package's prefix are deleted.
 
 > **Breaking change, and deliberate.** Both `DELETE /cache/*` routes required no authentication in the
 > Python implementation and in earlier groxpi releases. They now sit inside the admin group, so **in the
