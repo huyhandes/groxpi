@@ -111,9 +111,10 @@ gofmt -l . && go vet ./... && golangci-lint run
 
 - [Configuration](docs/configuration.md) — every environment variable
 - [API](docs/api-endpoints.md) — every route, content negotiation, error codes
-- [Architecture](docs/architecture.md) — modules, caches, storage seam, request flows, telemetry
+- [Architecture](docs/architecture.md) — modules, caches, cache and durable store, request flows, telemetry
 - [Deployment](docs/deployment.md) — Docker, Kubernetes, TLS, observability wiring
 - [Benchmarking](docs/benchmarking.md) — how to measure it
+- [Backlog](docs/backlog.md) — known limits and their proposed fixes
 - [Decision records](docs/adr/) — why index resolution and telemetry work the way they do
 
 ## License

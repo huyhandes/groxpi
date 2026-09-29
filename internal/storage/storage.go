@@ -1,9 +1,7 @@
 package storage
 
 import (
-	"context"
 	"errors"
-	"io"
 	"time"
 )
 
@@ -14,53 +12,6 @@ var ErrNotFound = errors.New("object not found")
 
 // ObjectInfo contains metadata about a stored object
 type ObjectInfo struct {
-	Key          string
 	Size         int64
 	LastModified time.Time
-	ETag         string
-	ContentType  string
-}
-
-// Storage is the core contract every backend satisfies. It is deliberately
-// small: anything a backend can only fake belongs in a capability interface
-// below, so callers never have to ask which backend they are talking to.
-type Storage interface {
-	// Get opens an object for reading. The returned ObjectInfo is complete
-	// before any byte of the body is produced, so a caller can emit response
-	// headers and only then copy from the reader. Returns an error matching
-	// ErrNotFound if the key does not exist.
-	Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error)
-
-	// Put stores an object.
-	Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error)
-
-	// Delete removes an object. Deleting a missing object is not an error.
-	Delete(ctx context.Context, key string) error
-
-	// Exists reports whether an object is present. A missing object is
-	// (false, nil); a non-nil error always means the check itself failed.
-	Exists(ctx context.Context, key string) (bool, error)
-
-	// Close releases any resources held by the backend.
-	Close() error
-}
-
-// ZeroCopyCapable is implemented only by backends whose objects are real files
-// on the local filesystem, so the transport can serve them by path instead of
-// opening the object and copying the body itself. Serving by path lets net/http
-// handle range requests, If-Modified-Since and Content-Type detection, and lets
-// it use whatever fast copy the runtime can apply for the concrete writer.
-//
-// It is not a guarantee that the bytes bypass user space: whether any such
-// optimisation engages depends on the response writer in play, and a writer
-// wrapped by middleware (compression, for instance) will always be copied
-// through.
-//
-// Callers opt in with a type assertion:
-//
-//	if zc, ok := s.(storage.ZeroCopyCapable); ok { ... }
-type ZeroCopyCapable interface {
-	// GetFilePath returns the local filesystem path backing key. Returns an
-	// error matching ErrNotFound if the key does not exist.
-	GetFilePath(ctx context.Context, key string) (string, error)
 }

@@ -1,8 +1,13 @@
 # 0003 — Standard-library router and four deep modules
 
-- Status: accepted
+- Status: superseded in part by 0004 (decisions 2 and 3)
 - Date: 2026-09-06
 - Context: branch `stdlib-mux-deep-modules`; supersedes the Gin transport the project started with
+
+> **Superseded in part by [ADR 0004](0004-read-through-storage-and-server-owned-http.md).** The
+> per-module `Register(mux)` calls and the `download.Resolver` seam are gone: `server` owns every route,
+> and the one cross-module interface is now `storage.Fetcher`. The decision to use the stdlib
+> `http.ServeMux` stands. The text below is kept as written.
 
 ## Context
 

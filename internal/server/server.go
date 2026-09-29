@@ -1,7 +1,7 @@
-// Package server is the transport: it owns the mux, the middleware, the storage
-// backend's construction and the shutdown order. Every route belongs to one of
-// the modules it wires together — index, download, admin — and is registered by
-// that module.
+// Package server is the transport: it owns the mux, every route and handler, the
+// middleware, the admin templates, the storage backend's construction and the
+// shutdown order. The index, download and admin modules are plain Go services
+// it calls.
 package server
 
 import (
@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -32,10 +35,11 @@ import (
 // Server wires the modules together over one storage backend.
 type Server struct {
 	config    *config.Config
-	storage   storage.Storage
+	store     *storage.Store
 	index     *index.Service
 	downloads *download.Service
-	admin     *admin.Service // nil when no credentials are configured
+	admin     *admin.Service     // nil when no credentials are configured
+	templates *template.Template // admin page; nil with admin
 	handler   http.Handler
 }
 
@@ -59,31 +63,39 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, errors.New("admin interface is enabled but GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD are not both set")
 	}
 
-	st, err := initStorage(cfg)
+	cache, durable, err := initStorage(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
 
-	s := &Server{config: cfg, storage: st}
+	s := &Server{config: cfg}
 	s.index = index.New(cfg)
-	s.downloads = download.New(cfg, st, s.index)
+	s.downloads = download.New(cfg, s.index)
+	// Pure-s3 spools get a directory of their own: the cache dir defaults to
+	// the shared OS temp dir, and the store reaps stale files in its spool dir.
+	s.store = storage.NewStore(cache, durable, s.downloads, filepath.Join(cfg.CacheDir, "spool"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleHome)
 	mux.HandleFunc("GET /health", s.handleHealth)
-	s.index.Register(mux)
-	s.downloads.Register(mux)
+	mux.HandleFunc("GET /simple/{$}", s.handleListPackages)
+	mux.HandleFunc("GET /simple/{package}/{$}", s.handleListFiles)
+	mux.HandleFunc("GET /index/{$}", s.handleListPackages)
+	mux.HandleFunc("GET /index/{package}", s.handleListFiles)
+	mux.HandleFunc("GET /simple/{package}/{file}", s.handleFile)
+	mux.HandleFunc("GET /index/{package}/{file}", s.handleFile)
 
 	// With no credentials configured nothing is registered, so every admin path
 	// falls through to the mux's 404 — the surface does not exist rather than
 	// existing unauthenticated.
 	if cfg.AdminConfigured() {
-		s.admin, err = admin.New(cfg, st, s.index, s.downloads)
+		s.templates, err = parseAdminTemplates()
 		if err != nil {
-			_ = st.Close()
+			_ = s.store.Close()
 			return nil, err
 		}
-		s.admin.Register(mux)
+		s.admin = admin.New(cfg, s.store, s.index)
+		s.registerAdmin(mux)
 	}
 
 	// No compression middleware: package files are already-compressed archives and
@@ -217,18 +229,84 @@ func (s *Server) CloseContext(ctx context.Context) error {
 	}
 	s.index.Close()
 
-	// Bounded for the same reason: the tiered backend drains queued uploads on
-	// close, and an unreachable object store makes that drain the longest step in
-	// the shutdown. The step keeps running past the deadline: the process is
-	// exiting, and interrupting a half-written upload buys nothing.
+	// Bounded for the same reason: the store waits for detached downloads,
+	// including each one's upload to the durable store, and an unreachable
+	// object store makes that wait the longest step in the shutdown. The step
+	// keeps running past the deadline: the process is exiting, and
+	// interrupting a half-written upload buys nothing. An upload cut off here is
+	// only missing from S3; the file is already in the cache (hybrid) or
+	// refetched on the next miss (s3).
 	done := make(chan error, 1)
-	go func() { done <- s.storage.Close() }()
+	go func() { done <- s.store.Close() }()
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
 		slog.Warn("Shutdown budget spent; no longer waiting for the storage backend to close", "error", ctx.Err())
 		return nil
+	}
+}
+
+// handleFile serves a package file through the read-through store: a cached
+// object goes to http.ServeContent (ranges, conditionals); a download in flight
+// is streamed as it arrives, Range ignored. A miss the store will not or could
+// not fetch is redirected upstream.
+func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	pkg := index.NormalizeName(r.PathValue("package"))
+	file := r.PathValue("file")
+
+	fetch := s.config.DownloadTimeout > 0
+	obj, err := s.store.Open(ctx, pkg, file, fetch)
+	if err != nil {
+		target, rerr := s.downloads.Resolve(ctx, pkg, file)
+		switch {
+		case errors.Is(rerr, download.ErrNotListed):
+			http.Error(w, "File not found", http.StatusNotFound)
+		case rerr != nil:
+			slog.DebugContext(ctx, "Package index unavailable",
+				"error", config.RedactErrorText(rerr), "package", pkg, "file", file)
+			http.Error(w, "Package not found", http.StatusNotFound)
+		default:
+			reason := telemetry.RedirectCachingDisabled
+			if fetch {
+				reason = telemetry.RedirectFetchFailed
+				slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
+					"error", config.RedactErrorText(err), "package", pkg, "file", file,
+					"file_url", config.RedactURL(target.URL))
+			}
+			telemetry.Redirect(ctx, reason)
+			http.Redirect(w, r, target.URL, http.StatusFound)
+		}
+		return
+	}
+	defer func() { _ = obj.Close() }()
+
+	h := w.Header()
+	h.Set("Content-Type", obj.ContentType)
+	if obj.ETag != "" {
+		h.Set("ETag", obj.ETag)
+	}
+	if !obj.InFlight {
+		// The bare ReadSeekCloser, not obj: on a local hit it is the *os.File the
+		// stdlib's copy path looks for, which the Object wrapper would hide.
+		http.ServeContent(w, r, obj.Name, obj.ModTime, obj.ReadSeekCloser)
+		return
+	}
+	if obj.Size > 0 {
+		h.Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+	}
+	// HEAD drains too: the response ends once the file is cached.
+	var dst io.Writer = w
+	if r.Method == http.MethodHead {
+		dst = io.Discard
+	}
+	if _, err := io.Copy(dst, obj); err != nil {
+		// The status line is gone; aborting is the only way to tell the client
+		// the body is bad rather than hand it a clean end.
+		slog.ErrorContext(ctx, "Download failed mid-stream, aborting response",
+			"error", config.RedactErrorText(err), "package", pkg, "file", file)
+		panic(http.ErrAbortHandler)
 	}
 }
 
@@ -284,10 +362,17 @@ func redactedIndexes(urls []string) []string {
 	return out
 }
 
-// initStorage creates the appropriate storage backend based on configuration.
-func initStorage(cfg *config.Config) (storage.Storage, error) {
-	// Both S3-backed modes take the same client configuration; build it once.
-	s3Config := &storage.S3Config{
+// initStorage builds the cache (local disk), the durable store (S3), or both,
+// as the storage type asks.
+func initStorage(cfg *config.Config) (*storage.LocalStorage, *storage.S3Storage, error) {
+	switch cfg.StorageType {
+	case "hybrid", "s3":
+	default:
+		// Local storage with atime eviction (no TTL for non-hybrid mode).
+		cache, err := storage.NewLocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
+		return cache, nil, err
+	}
+	durable, err := storage.NewS3Storage(&storage.S3Config{
 		Endpoint:        cfg.S3Endpoint,
 		AccessKeyID:     cfg.S3AccessKeyID,
 		SecretAccessKey: cfg.S3SecretAccessKey,
@@ -299,22 +384,14 @@ func initStorage(cfg *config.Config) (storage.Storage, error) {
 		EnableHTTP2:     cfg.S3EnableHTTP2,
 		ConnectTimeout:  cfg.ConnectTimeout,
 		RequestTimeout:  cfg.DownloadTimeout,
+	})
+	if err != nil || cfg.StorageType == "s3" {
+		return nil, durable, err
 	}
-
-	switch cfg.StorageType {
-	case "hybrid":
-		return storage.NewTieredStorage(&storage.TieredConfig{
-			LocalCacheDir:  cfg.LocalCacheDir,
-			LocalCacheSize: cfg.LocalCacheSize,
-			LocalCacheTTL:  cfg.LocalCacheTTL,
-			S3Config:       s3Config,
-			SyncWorkers:    cfg.TieredSyncWorkers,
-			SyncQueueSize:  cfg.TieredSyncQueueSize,
-		})
-	case "s3":
-		return storage.NewS3Storage(s3Config)
-	default:
-		// Local storage with LRU eviction (no TTL for non-hybrid mode).
-		return storage.NewLRULocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
+	cache, err := storage.NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
+	if err != nil {
+		_ = durable.Close()
+		return nil, nil, fmt.Errorf("failed to create local cache: %w", err)
 	}
+	return cache, durable, nil
 }

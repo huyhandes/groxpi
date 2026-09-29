@@ -14,13 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	"golang.org/x/sync/singleflight"
-
-	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
 // S3Config holds S3 storage configuration
@@ -62,26 +58,13 @@ func newS3Transport(cfg *S3Config) *http.Transport {
 	}
 }
 
-// S3Storage implements Storage for S3-compatible backends.
-//
-// Its objects live across the network rather than on the local filesystem, so it
-// deliberately does not implement ZeroCopyCapable: there is no local path to
-// serve.
+// S3Storage is the durable store on an S3-compatible backend.
 type S3Storage struct {
 	client    *s3.Client
-	uploader  *transfermanager.Client
 	transport *http.Transport
 	bucket    string
 	prefix    string
-
-	// existsSF deduplicates concurrent metadata lookups
-	existsSF singleflight.Group
 }
-
-var (
-	_ Storage       = (*S3Storage)(nil)
-	_ PrefixDeleter = (*S3Storage)(nil)
-)
 
 // endpointURL turns a bare host, or a host that already carries a scheme, into
 // the absolute URL the SDK wants as a base endpoint.
@@ -162,12 +145,7 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		"static_credentials", cfg.AccessKeyID != "")
 
 	return &S3Storage{
-		client: client,
-		// The transfer manager keeps its own checksum setting, which overrides
-		// the client's, so it has to be pinned here too.
-		uploader: transfermanager.New(client, func(o *transfermanager.Options) {
-			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		}),
+		client:    client,
 		transport: transport,
 		bucket:    cfg.Bucket,
 		prefix:    strings.TrimSuffix(cfg.Prefix, "/"),
@@ -234,12 +212,7 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *Object
 
 	// The response headers are complete before any byte of the body is read,
 	// so the caller can emit its own headers and only then copy.
-	info := &ObjectInfo{
-		Key:         key,
-		Size:        aws.ToInt64(out.ContentLength),
-		ETag:        aws.ToString(out.ETag),
-		ContentType: aws.ToString(out.ContentType),
-	}
+	info := &ObjectInfo{Size: aws.ToInt64(out.ContentLength)}
 	if out.LastModified != nil {
 		info.LastModified = *out.LastModified
 	}
@@ -247,84 +220,42 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *Object
 	return out.Body, info, nil
 }
 
-// Put stores an object in S3.
-//
-// A seekable body of known size is a plain single-object put; anything else — a
-// live download, a pipe — goes through the transfer manager, the only path able
-// to upload a stream whose length is not known up front.
-func (s *S3Storage) Put(ctx context.Context, key string, reader io.Reader, size int64, contentType string) (*ObjectInfo, error) {
-	fullKey := s.buildKey(key)
-
-	var etag string
-	if seeker, ok := reader.(io.ReadSeeker); ok && size >= 0 {
-		out, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(s.bucket),
-			Key:           aws.String(fullKey),
-			Body:          seeker,
-			ContentLength: aws.Int64(size),
-			ContentType:   aws.String(contentType),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to put object %s: %w", key, err)
-		}
-		etag = aws.ToString(out.ETag)
-	} else {
-		counter := &countingReader{r: reader}
-		out, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
-			Bucket:      aws.String(s.bucket),
-			Key:         aws.String(fullKey),
-			Body:        counter,
-			ContentType: aws.String(contentType),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to put object %s: %w", key, err)
-		}
-		etag = aws.ToString(out.ETag)
-		size = counter.n
-	}
-
-	slog.Debug("Object stored in S3", "key", key, "size", size)
-
-	return &ObjectInfo{
-		Key:         key,
-		Size:        size,
-		ETag:        etag,
-		ContentType: contentType,
-	}, nil
-}
-
-// countingReader reports how many bytes went out when the caller could not say
-// up front.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
-// Delete removes an object from S3
-func (s *S3Storage) Delete(ctx context.Context, key string) error {
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+// getRange opens bytes off through end (inclusive) of an object's body.
+func (s *S3Storage) getRange(ctx context.Context, key string, off, end int64) (io.ReadCloser, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.buildKey(key)),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, end)),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to delete object %s: %w", key, err)
+		return nil, s3Error(err, key)
 	}
+	return out.Body, nil
+}
+
+// Put stores an object in S3 as one PutObject of known size.
+//
+// ponytail: a single PUT caps an object at 5 GiB; switch to multipart for
+// larger bodies when a package that size shows up.
+func (s *S3Storage) Put(ctx context.Context, key string, body io.ReadSeeker, size int64, contentType string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(s.buildKey(key)),
+		Body:          body,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to put object %s: %w", key, err)
+	}
+	slog.Debug("Object stored in S3", "key", key, "size", size)
 	return nil
 }
 
 // deleteBatchSize is the most keys S3 accepts in one DeleteObjects request.
 const deleteBatchSize = 1000
 
-// DeletePrefix removes every object under prefix and reports how many went. It is
-// what makes evicting a package mean anything in pure-S3 mode: the transport
-// evicts only through PrefixDeleter, so without this the admin endpoint answered
-// 200 having deleted nothing.
+// DeletePrefix removes every object under prefix and reports how many went.
 //
 // Listing and deleting are interleaved page by page rather than collected first,
 // so evicting a package with thousands of files costs one page of keys in memory
@@ -371,51 +302,6 @@ func (s *S3Storage) DeletePrefix(ctx context.Context, prefix string) (int, error
 	slog.Debug("Deleted object prefix from S3", "prefix", prefix, "deleted", deleted)
 
 	return deleted, nil
-}
-
-// Exists checks if an object exists in S3, deduplicating concurrent lookups.
-func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
-	// A caller who arrived with a dead context is answered from its own context,
-	// never by starting or joining a flight.
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-
-	result, err, _ := s.existsSF.Do(key, func() (any, error) {
-		// The flight is shared, so it must not be cancellable by whichever caller
-		// happened to start it: one client disconnecting used to fail every other
-		// caller waiting on the same key with context.Canceled, which the read path
-		// reads as a miss and re-downloads a file that is sitting in the bucket.
-		// Values (the trace context) are kept; the deadline comes from the
-		// transport's response-header timeout instead.
-		_, err := s.client.HeadObject(context.WithoutCancel(ctx), &s3.HeadObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(s.buildKey(key)),
-		})
-		if err != nil {
-			// Absence is the answer, not a failure. Anything else is a failure
-			// and must not be reported as "does not exist".
-			if isNotFoundResponse(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
-		}
-		return true, nil
-	})
-	if err != nil {
-		return false, err
-	}
-
-	// Counted per caller rather than per flight: every caller that got an answer
-	// out of this either hit or missed, whether or not it did the lookup.
-	exists := result.(bool)
-	if exists {
-		telemetry.CacheHit(ctx, telemetry.LayerRemote)
-	} else {
-		telemetry.CacheMiss(ctx, telemetry.LayerRemote)
-	}
-
-	return exists, nil
 }
 
 // Close releases any resources held by the storage backend

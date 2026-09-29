@@ -31,7 +31,7 @@
 
 <table>
   <thead>
-    <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Hits</th><th></th></tr>
+    <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Last accessed</th><th></th></tr>
   </thead>
   <tbody>
     {{range $pkg := .Packages}}
@@ -39,7 +39,7 @@
       <td><strong>{{$pkg.Name}}</strong> <span class="muted">{{len $pkg.Files}} file(s)</span></td>
       <td class="num">{{bytes $pkg.Size}}</td>
       <td class="num muted">{{$pkg.Age}}</td>
-      <td class="num">{{$pkg.Hits}}</td>
+      <td class="num">{{$pkg.Accessed}}</td>
       <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none">Evict</button></td>
     </tr>
     {{range $file := $pkg.Files}}
@@ -47,7 +47,7 @@
       <td>{{$file.Name}}</td>
       <td class="num">{{bytes $file.Size}}</td>
       <td class="num muted">{{$file.Age}}</td>
-      <td class="num">{{$file.Hits}}</td>
+      <td class="num">{{$file.Accessed}}</td>
       <td></td>
     </tr>
     {{end}}
@@ -56,5 +56,8 @@
     {{end}}
   </tbody>
 </table>
-<p class="muted">{{len .Packages}} package(s), {{bytes .Size}} cached.</p>
+<p class="muted">{{.Total}} package(s), {{bytes .Size}} cached.
+{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}">&larr; prev</a>{{end}}
+{{if or .PrevPage .NextPage}}page {{.Page}}{{end}}
+{{if .NextPage}}<a href="/admin?page={{.NextPage}}">next &rarr;</a>{{end}}</p>
 {{end}}

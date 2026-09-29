@@ -41,8 +41,8 @@ body. An unparseable URL is reported as `[unparseable-url]` rather than risk lea
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. LRU eviction. |
-| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). |
+| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. |
+| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. |
 | `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. |
 
 There is one index cache. Per package it holds the parsed file list plus the JSON and gzipped-JSON
@@ -57,13 +57,30 @@ sweep) or by LRU when the budget is exceeded. There is no separate response cach
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_STORAGE_TYPE` | `local` | `local`, `s3`, or `hybrid`. |
+| `GROXPI_STORAGE_TYPE` | `local` | `local` (the cache only), `s3` (the durable store only), or `hybrid` (the cache in front of the durable store). |
+
+The local cache is bounded (a size limit, LRU by atime, and in hybrid mode an optional TTL) and disposable; it is the only thing groxpi evicts.
+The S3 durable store receives every verified download and is unbounded: groxpi never expires objects
+from it, so retention there is set with bucket lifecycle rules. See
+[architecture.md](architecture.md#the-cache-and-the-durable-store).
 
 ### `local`
 
-Files live under `GROXPI_CACHE_DIR`, bounded by `GROXPI_CACHE_SIZE` with LRU eviction.
+The cache only. Files live under `GROXPI_CACHE_DIR`, bounded by `GROXPI_CACHE_SIZE`. The filesystem is the LRU index:
+a cache hit sets the file's atime explicitly (at most once an hour per file, so a `noatime` mount still
+works; mtime is untouched because it is `Last-Modified`). A write that takes the cache past its budget
+walks the directory and deletes the least recently accessed files until it is at 90% of the budget.
+Recency lives on disk, so it survives a restart. A walk at startup seeds the size counter, and every
+walk re-counts the cache size and removes temp files left behind by a crashed write (untouched for
+more than an hour).
+
+A TTL (`GROXPI_LOCAL_CACHE_TTL`, hybrid only) is measured from when the file was written (its mtime),
+not from its last access. The same walk applies it, and a background sweep runs the walk every half
+TTL (at least once a minute), so an idle cache still expires.
 
 ### `s3`
+
+The durable store only: every verified download is uploaded to the bucket and never expired by groxpi.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -91,20 +108,23 @@ older MinIO releases reject the checksum trailers the SDK emits by default.
 
 ### `hybrid`
 
-A local L1 cache in front of an S3 L2. Every `s3` setting applies, plus:
+The local cache in front of the S3 durable store. Every `s3` setting applies, plus:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for L1. |
-| `GROXPI_LOCAL_CACHE_DIR` | value of `GROXPI_CACHE_DIR` | Where L1 lives. |
-| `GROXPI_LOCAL_CACHE_TTL` | `0` (disabled) | Age at which an L1 entry is dropped regardless of the byte budget. |
-| `GROXPI_TIERED_SYNC_WORKERS` | `5` | Workers that back-fill L1 from L2 and upload L1 to L2. |
-| `GROXPI_TIERED_SYNC_QUEUE_SIZE` | `100` | Depth of the sync queue. |
+| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for the cache. |
+| `GROXPI_LOCAL_CACHE_DIR` | value of `GROXPI_CACHE_DIR` | Where the cache lives. |
+| `GROXPI_LOCAL_CACHE_TTL` | `0` (disabled) | Age at which a cached file is dropped regardless of the byte budget, measured from when the file was written. |
+A download is verified and renamed into the cache first, so readers are served from local disk; the
+same download then uploads the finished file to S3 before it ends, with nothing queued. A
+failed upload is logged, not surfaced to the client — the file is still served and cached. Shutdown
+waits for running downloads and their uploads within the shutdown budget (see
+[deployment.md](deployment.md#shutdown-budget)); a `SIGKILL` can lose an upload, and the file is then
+fetched again on a later miss.
 
-Writes are **local-first**: a download is committed to L1 and the request completes there. The upload
-to L2 is queued on the worker pool and is best-effort — a failed upload is logged, not surfaced to the
-client. The queue is drained on shutdown, bounded at 30 seconds, so a normal restart does not lose
-pending uploads. A `SIGKILL` can.
+When a file misses the cache but hits S3, it streams from S3 into the cache through the same spool as an
+upstream download (a promotion), without calling upstream, and is not uploaded back. The cache follows
+the LRU and TTL rules in [`local`](#local), with `GROXPI_LOCAL_CACHE_SIZE` as its budget.
 
 ## Timeouts
 
@@ -183,5 +203,5 @@ groxpi reads the same variable names as proxpi where the setting still exists: `
 `GROXPI_LOGGING_LEVEL`, `GROXPI_DISABLE_INDEX_SSL_VERIFICATION`. `PROXPI_`-prefixed spellings are not
 read.
 
-`GROXPI_BINARY_FILE_MIME_TYPE` does not exist. A cached file's content type comes from what upstream
-sent, or from the filename extension.
+`GROXPI_BINARY_FILE_MIME_TYPE` does not exist. A package file's content type comes from its filename
+extension.

@@ -42,7 +42,6 @@ const (
 const (
 	RedirectCachingDisabled = "caching_disabled" // no download budget configured
 	RedirectFetchFailed     = "fetch_failed"     // budget exceeded, or upstream failed
-	RedirectNotCached       = "not_cached"       // coordinated download left nothing cached
 )
 
 // Upstream fetch outcomes, the values of AttrFetchOutcome.

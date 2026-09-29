@@ -1,4 +1,4 @@
-package index
+package server
 
 import (
 	"errors"
@@ -7,23 +7,13 @@ import (
 	"strings"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/index"
 )
-
-// Register mounts the index routes: the root listing and the per-package page,
-// under /simple/ (PEP 503) and the /index/ aliases kept for proxpi
-// compatibility. Package-file downloads are a different module and register
-// their own patterns beside these.
-func (s *Service) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /simple/{$}", s.handleListPackages)
-	mux.HandleFunc("GET /simple/{package}/{$}", s.handleListFiles)
-	mux.HandleFunc("GET /index/{$}", s.handleListPackages)
-	mux.HandleFunc("GET /index/{package}", s.handleListFiles)
-}
 
 // handleListPackages proxies the upstream root index byte for byte. It is not
 // cached and not decoded: the full project list is tens of megabytes, and every
 // representation the client can ask for is one the upstream already produces.
-func (s *Service) handleListPackages(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 	// ?format= overrides Accept here exactly as it does on a package page, but
 	// neither value is forwarded verbatim: both are attacker-controlled and both
 	// are part of the singleflight key, so N distinct spellings would be N
@@ -32,14 +22,14 @@ func (s *Service) handleListPackages(w http.ResponseWriter, r *http.Request) {
 	// for, which is the whole set it can serve.
 	accept := "text/html"
 	if wantsJSON(r) {
-		accept = JSONContentType
+		accept = index.JSONContentType
 	}
 	acceptEncoding := ""
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		acceptEncoding = "gzip"
 	}
 
-	root, err := s.proxyRoot(r.Context(), accept, acceptEncoding)
+	root, err := s.index.ProxyRoot(r.Context(), accept, acceptEncoding)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "Failed to proxy root index", "error", config.RedactErrorText(err))
 		http.Error(w, "Failed to fetch package list", http.StatusBadGateway)
@@ -48,23 +38,23 @@ func (s *Service) handleListPackages(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Vary", "Accept, Accept-Encoding")
-	if root.contentEncoding != "" {
-		h.Set("Content-Encoding", root.contentEncoding)
+	if root.ContentEncoding != "" {
+		h.Set("Content-Encoding", root.ContentEncoding)
 	}
-	if root.contentType != "" {
-		h.Set("Content-Type", root.contentType)
+	if root.ContentType != "" {
+		h.Set("Content-Type", root.ContentType)
 	}
-	w.WriteHeader(root.status)
-	_, _ = w.Write(root.body)
+	w.WriteHeader(root.Status)
+	_, _ = w.Write(root.Body)
 }
 
-func (s *Service) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	packageName := NormalizeName(r.PathValue("package"))
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	packageName := index.NormalizeName(r.PathValue("package"))
 
-	entry, err := s.Resolve(r.Context(), packageName)
+	entry, err := s.index.Resolve(r.Context(), packageName)
 	if err != nil {
 		// A miss means every configured index was consulted and none had it.
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, index.ErrNotFound) {
 			http.Error(w, "Package not found", http.StatusNotFound)
 			return
 		}
@@ -84,10 +74,10 @@ func (s *Service) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // writeIndexJSON serves the body built when the entry was filled, preferring its
 // pre-compressed form when the client accepts it. Nothing is compressed on the
 // request path.
-func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *Entry) {
+func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *index.Entry) {
 	h := w.Header()
 	h.Set("Vary", "Accept-Encoding")
-	h.Set("Content-Type", JSONContentType)
+	h.Set("Content-Type", index.JSONContentType)
 	// ponytail: substring match, not a q-value parse. "gzip;q=0" is rare enough
 	// that the parser can wait for a client that actually sends it.
 	if len(entry.GZIP) > 0 && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
@@ -101,7 +91,7 @@ func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *Entry) {
 // renderPackageFilesHTML renders the index page from the parsed file list. HTML
 // is the uncommon content type, so it is produced on demand rather than stored
 // as a third copy per package.
-func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []FileInfo) {
+func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []index.FileInfo) {
 	var sb strings.Builder
 	sb.Grow(1024 + len(files)*200)
 
@@ -118,7 +108,7 @@ func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []F
 
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
-		sb.WriteString(ProxyFileURL(packageName, file.Name))
+		sb.WriteString(index.ProxyFileURL(packageName, file.Name))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {

@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
-	"github.com/huyhandes/groxpi/internal/download"
 )
 
 // TestCredentialsNeverLeakFromDownloadFailures is the regression test for the
@@ -66,10 +65,9 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 
 	// Sanity: the resolved file URL really does carry the credential, so the
 	// assertions below are about redaction and not about an absent secret.
-	plan, err := srv.downloads.Plan(t.Context(), pkg, fileName)
+	target, err := srv.downloads.Resolve(t.Context(), pkg, fileName)
 	require.NoError(t, err)
-	require.Equal(t, download.ActionStreamAndCache, plan.Action)
-	require.Contains(t, plan.URL, secret, "the leak mechanism itself regressed: the file URL no longer carries user-info")
+	require.Contains(t, target.URL, secret, "the leak mechanism itself regressed: the file URL no longer carries user-info")
 
 	// 1. Download failure on the client path.
 	_, status := getBody(t, srv, "/simple/"+pkg+"/"+fileName)

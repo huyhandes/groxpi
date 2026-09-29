@@ -1,9 +1,13 @@
 package download
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +15,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/index"
 )
+
+// newService builds the fetcher over a real index.Service whose upstream is an
+// httptest simple index serving files per package (404 for any other).
+func newService(t *testing.T, files map[string][]index.FileInfo, ttfb time.Duration) *Service {
+	t.Helper()
+	simple := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fi, ok := files[strings.Trim(r.URL.Path, "/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]string{"api-version": "1.0"}, "files": fi})
+	}))
+	t.Cleanup(simple.Close)
+	cfg := &config.Config{IndexURL: simple.URL, IndexTTL: time.Minute, IndexCacheSize: 1 << 20, DownloadTimeout: ttfb}
+	return New(cfg, index.New(cfg))
+}
 
 func TestMetadataURL(t *testing.T) {
 	assert.Equal(t, "https://h/f/x.whl.metadata", metadataURL("https://h/f/x.whl"))
@@ -20,71 +43,79 @@ func TestMetadataURL(t *testing.T) {
 	assert.Equal(t, "https://h/f/x.whl.metadata?t=1", metadataURL("https://h/f/x.whl?t=1#sha256=abc"))
 }
 
-// TestPlan_Metadata pins PEP 658 planning: the .metadata sibling is planned
-// from the distribution's index entry, only when the index advertises it.
-func TestPlan_Metadata(t *testing.T) {
+// TestResolve pins resolution: listed files, PEP 658 siblings only when
+// advertised, ErrNotListed for anything else, and index failures kept apart.
+func TestResolve(t *testing.T) {
 	const pkg = "meta"
-	wheel := index.FileInfo{Name: "meta-1.0-py3-none-any.whl", URL: "https://files/meta-1.0-py3-none-any.whl#sha256=whl", CoreMetadata: map[string]any{"sha256": "md"}}
+	wheel := index.FileInfo{Name: "meta-1.0-py3-none-any.whl", URL: "https://files/meta-1.0-py3-none-any.whl#sha256=whl", CoreMetadata: map[string]any{"sha256": "md"}, Size: 10, Hashes: map[string]string{"sha256": "whl"}}
 	sdist := index.FileInfo{Name: "meta-1.0.tar.gz", URL: "https://files/meta-1.0.tar.gz", DistInfoMetadata: true}
 	plain := index.FileInfo{Name: "meta-0.9.tar.gz", URL: "https://files/meta-0.9.tar.gz"}
-	svc := newTestService(t, newFakeStorage(), resolverWith(pkg, wheel, sdist, plain), time.Minute)
+	svc := newService(t, map[string][]index.FileInfo{pkg: {wheel, sdist, plain}}, time.Minute)
 
-	plan, err := svc.Plan(t.Context(), pkg, wheel.Name+".metadata")
+	got, err := svc.Resolve(t.Context(), pkg, wheel.Name)
 	require.NoError(t, err)
-	assert.Equal(t, ActionStreamAndCache, plan.Action)
-	assert.Equal(t, "https://files/meta-1.0-py3-none-any.whl.metadata", plan.URL)
-	assert.Equal(t, "md", plan.SHA256)
-	assert.Equal(t, `"md"`, plan.ETag)
-	assert.Equal(t, "packages/meta/meta-1.0-py3-none-any.whl.metadata", plan.StorageKey)
-	assert.Equal(t, "text/plain; charset=utf-8", plan.ContentType)
-	assert.Equal(t, int64(-1), plan.Size)
+	assert.Equal(t, Target{URL: wheel.URL, SHA256: "whl", Size: 10}, got)
 
-	plan, err = svc.Plan(t.Context(), pkg, sdist.Name+".metadata")
+	got, err = svc.Resolve(t.Context(), pkg, wheel.Name+".metadata")
 	require.NoError(t, err)
-	assert.Equal(t, ActionStreamAndCache, plan.Action)
-	assert.Empty(t, plan.SHA256, "a bare true carries no hash to verify against")
+	assert.Equal(t, Target{URL: "https://files/meta-1.0-py3-none-any.whl.metadata", SHA256: "md", Size: -1}, got)
 
-	for _, name := range []string{plain.Name + ".metadata", "nosuch.whl.metadata", ".metadata"} {
-		plan, err = svc.Plan(t.Context(), pkg, name)
-		require.NoError(t, err)
-		assert.Equal(t, ActionNotFound, plan.Action, name)
+	got, err = svc.Resolve(t.Context(), pkg, sdist.Name+".metadata")
+	require.NoError(t, err)
+	assert.Empty(t, got.SHA256, "a bare true carries no hash to verify against")
+
+	for _, name := range []string{plain.Name + ".metadata", "nosuch.whl.metadata", ".metadata", "nosuch.tar.gz"} {
+		_, err = svc.Resolve(t.Context(), pkg, name)
+		assert.ErrorIs(t, err, ErrNotListed, name)
 	}
+
+	_, err = svc.Resolve(t.Context(), "nope", "nope-1.0.tar.gz")
+	assert.ErrorIs(t, err, index.ErrNotFound)
+	assert.False(t, errors.Is(err, ErrNotListed))
 }
 
-// TestHandler_MetadataStreamsAndCaches drives the route end to end: the
-// .metadata request goes upstream once, is verified, cached and then served from
-// storage.
-func TestHandler_MetadataStreamsAndCaches(t *testing.T) {
-	const pkg, file = "mdpkg", "mdpkg-1.0-py3-none-any.whl"
-	content := []byte("Metadata-Version: 2.1\nName: mdpkg\n")
-	var hits int
-	mux, st := newIndexedMuxWithMetadata(t, pkg, file, content, func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, ".metadata") {
-			http.NotFound(w, r)
+// TestFetch covers the budget (headers only, never the body), upstream failure
+// and credential redaction.
+func TestFetch(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+	body := []byte("payload")
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/slowhdr":
+			time.Sleep(300 * time.Millisecond)
+		case "/slowbody":
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			_, _ = w.Write(body[:1])
+			w.(http.Flusher).Flush()
+			time.Sleep(300 * time.Millisecond)
+			_, _ = w.Write(body[1:])
+			return
+		case "/gone":
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		hits++
-		_, _ = w.Write(content)
-	})
-
-	for i := range 2 {
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+file+".metadata", nil))
-		resp := w.Result()
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, resp.StatusCode, "request %d", i)
-		assert.Equal(t, content, body)
-		if i == 0 {
-			// The streamed response carries the index's hash; the cached one is
-			// handed to http.ServeContent, which sets its own validators.
-			assert.Equal(t, `"`+sha256Hex(content)+`"`, resp.Header.Get("ETag"))
-		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(up.Close)
+	u, _ := url.Parse(up.URL)
+	u.User = url.UserPassword("deploy", secret)
+	var fi []index.FileInfo
+	for _, n := range []string{"slowhdr", "slowbody", "gone"} {
+		fi = append(fi, index.FileInfo{Name: n, URL: u.String() + "/" + n})
 	}
-	assert.Equal(t, 1, hits, "the second request must come from the cache")
+	svc := newService(t, map[string][]index.FileInfo{"p": fi}, 100*time.Millisecond)
 
-	exists, err := st.Exists(t.Context(), StorageKey(pkg, file+".metadata"))
+	f, err := svc.Fetch(t.Context(), "p", "slowbody")
 	require.NoError(t, err)
-	assert.True(t, exists)
+	got, err := io.ReadAll(f.Body)
+	require.NoError(t, err, "the budget must not cut off a body already streaming")
+	require.NoError(t, f.Body.Close())
+	assert.Equal(t, body, got)
+	assert.Equal(t, int64(len(body)), f.Length)
+
+	for _, name := range []string{"slowhdr", "gone"} {
+		_, err = svc.Fetch(t.Context(), "p", name)
+		require.Error(t, err, name)
+		assert.False(t, strings.Contains(err.Error(), secret), "credential leaked: %v", err)
+	}
 }
