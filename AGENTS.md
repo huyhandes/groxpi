@@ -12,7 +12,8 @@ go build -o groxpi ./cmd/groxpi                  # build binary
 docker compose up -d                             # production
 gofmt -s -l .                                    # format check (must print nothing)
 go vet ./...                                     # static analysis
-staticcheck ./...                                # CI runs this, NOT golangci-lint
+staticcheck ./...                                # CI test job runs this
+golangci-lint run --timeout=10m                  # CI lint job (golangci-lint v2.12.2)
 ```
 
 The Dockerfile builds to a `scratch` image; the health check calls `/groxpi --health-check`.

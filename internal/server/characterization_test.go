@@ -263,7 +263,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/xml")
-			fmt.Fprintf(w, `<ListBucketResult><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>%s</ListBucketResult>`,
+			_, _ = fmt.Fprintf(w, `<ListBucketResult><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>%s</ListBucketResult>`,
 				bucket, prefix, n, sb.String())
 		case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
 			var req struct {
