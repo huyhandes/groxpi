@@ -23,12 +23,15 @@ type fakeUpstreamIndex struct {
 	*httptest.Server
 	name  string
 	delay time.Duration
+	hold  <-chan struct{} // if set, every query waits for it before answering
 
-	mu        sync.Mutex
-	packages  map[string][]string // package name -> file names it serves
-	hits      map[string]int
-	cancelled chan struct{} // closed the first time a query is cancelled mid-flight
-	closeOnce sync.Once
+	mu         sync.Mutex
+	packages   map[string][]string // package name -> file names it serves
+	hits       map[string]int
+	cancelled  chan struct{} // closed the first time a query is cancelled mid-flight
+	closeOnce  sync.Once
+	arrived    chan struct{} // closed when the first query reaches the handler
+	arriveOnce sync.Once
 }
 
 func newFakeUpstreamIndex(t *testing.T, name string, packages map[string][]string) *fakeUpstreamIndex {
@@ -38,6 +41,7 @@ func newFakeUpstreamIndex(t *testing.T, name string, packages map[string][]strin
 		packages:  packages,
 		hits:      map[string]int{},
 		cancelled: make(chan struct{}),
+		arrived:   make(chan struct{}),
 	}
 	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.Close)
@@ -53,6 +57,15 @@ func (f *fakeUpstreamIndex) serve(w http.ResponseWriter, r *http.Request) {
 	f.hits[pkg]++
 	files := f.packages[pkg]
 	f.mu.Unlock()
+	f.arriveOnce.Do(func() { close(f.arrived) })
+
+	if f.hold != nil {
+		select {
+		case <-f.hold:
+		case <-r.Context().Done():
+			return
+		}
+	}
 
 	if f.delay > 0 {
 		select {
@@ -268,6 +281,9 @@ func TestResolution_CancelsLowerPriorityQueriesOnceAnswered(t *testing.T) {
 	winner := newFakeUpstreamIndex(t, "winner", map[string][]string{"internal": {"internal-1.0.whl"}})
 	loser := newFakeUpstreamIndex(t, "loser", map[string][]string{"internal": {"internal-2.0.whl"}})
 	loser.delay = 10 * time.Second
+	// The winner answers only once the loser's query is in flight; otherwise a
+	// slow dial lets the client cancel a request the loser never sees.
+	winner.hold = loser.arrived
 	primary := newFakeUpstreamIndex(t, "primary", nil)
 
 	srv := newMultiIndexServer(t, nil, primary, winner, loser)
