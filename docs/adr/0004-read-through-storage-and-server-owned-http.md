@@ -111,3 +111,23 @@ left the server, admin and download each re-deriving the mode from `GROXPI_DOWNL
   disabled" prefetch refusal read `Store.Redirects()`. Download no longer substitutes a 5-minute budget
   for a zero timeout, because a redirect-mode store never calls `Fetch`.
 - The externally visible behaviour of redirect mode is unchanged.
+
+## Amendment — 2026-10-27: a miss says why it missed
+
+Decisions 2 and 3 left the server re-resolving the index after every miss it could not serve, to
+learn whether to redirect or answer `404`. A failed miss cost two index resolutions, and every
+coalesced joiner of a failed flight paid its own.
+
+- **The Fetcher is Resolve + Fetch** (§3). `storage.Fetcher` is `Resolve(ctx, pkg, file)
+  (download.Target, error)` and `Fetch(ctx, download.Target)`. The store holds the target: the flight's
+  leader resolves once and fetches that target; joiners take the leader's outcome and never resolve.
+- **A miss returns an error that says why** (§2). `Object` stays success-only. A miss the store does not
+  serve is a `*storage.RedirectError{URL, Reason, Err}` — `caching_disabled` in redirect mode (resolved
+  on the request, no flight) or `fetch_failed` when the fetch or its spool failed before the body
+  started — a wrapped `download.ErrNotListed`, or an index-resolution error. The server maps those to
+  `302`, `404 File not found` and `404 Package not found`, records the redirect telemetry, and never
+  calls `download`. Failures after the spool starts, verification included, still abort and never
+  redirect.
+- **One place strips credentials.** `RedirectError.URL` comes only from `download.Target.RedirectURL`,
+  which drops userinfo and reports that it did (`RedirectError.Stripped`, for the server's warning); an
+  unparseable URL yields none and the server answers `502` rather than hand it out.

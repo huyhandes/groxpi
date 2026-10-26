@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -38,7 +37,6 @@ type Server struct {
 	config    *config.Config
 	store     *storage.Store
 	index     *index.Service
-	downloads *download.Service
 	admin     *admin.Service     // nil when no credentials are configured
 	templates *template.Template // admin page; nil with admin
 	handler   http.Handler
@@ -71,11 +69,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	s := &Server{config: cfg}
 	s.index = index.New(cfg)
-	s.downloads = download.New(cfg, s.index)
 	// Pure-s3 spools get a directory of their own: the cache dir defaults to
 	// the shared OS temp dir, and the store reaps stale files in its spool dir.
 	// A download budget of 0 is redirect mode: misses are never fetched.
-	s.store = storage.NewStore(cache, durable, s.downloads, filepath.Join(cfg.CacheDir, "spool"),
+	s.store = storage.NewStore(cache, durable, download.New(cfg, s.index), filepath.Join(cfg.CacheDir, "spool"),
 		cfg.DownloadTimeout <= 0)
 
 	mux := http.NewServeMux()
@@ -250,22 +247,6 @@ func (s *Server) CloseContext(ctx context.Context) error {
 	}
 }
 
-// redirectURL is the Location for an upstream redirect: the file URL with any
-// user-info removed. A file URL resolved against a credentialed index carries
-// the index password, and a 302 would hand it to every client; without it a
-// private index answers the client 401 instead. Logs a Warn, with the redacted
-// URL, when it strips something.
-func redirectURL(ctx context.Context, raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
-	}
-	slog.WarnContext(ctx, "Stripped index credentials from upstream redirect",
-		"file_url", config.RedactURL(raw))
-	u.User = nil
-	return u.String()
-}
-
 // handleFile serves a package file through the read-through store: a cached
 // object goes to http.ServeContent (ranges, conditionals); a download in flight
 // is streamed as it arrives, Range ignored. A miss the store will not or could
@@ -281,24 +262,16 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		target, rerr := s.downloads.Resolve(ctx, pkg, file)
+		var re *storage.RedirectError
 		switch {
-		case errors.Is(rerr, download.ErrNotListed):
+		case errors.As(err, &re):
+			s.redirect(w, r, re, pkg, file)
+		case errors.Is(err, download.ErrNotListed):
 			http.Error(w, "File not found", http.StatusNotFound)
-		case rerr != nil:
-			slog.DebugContext(ctx, "Package index unavailable",
-				"error", config.RedactErrorText(rerr), "package", pkg, "file", file)
-			http.Error(w, "Package not found", http.StatusNotFound)
 		default:
-			reason := telemetry.RedirectCachingDisabled
-			if !s.store.Redirects() {
-				reason = telemetry.RedirectFetchFailed
-				slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
-					"error", config.RedactErrorText(err), "package", pkg, "file", file,
-					"file_url", config.RedactURL(target.URL))
-			}
-			telemetry.Redirect(ctx, reason)
-			http.Redirect(w, r, redirectURL(ctx, target.URL), http.StatusFound)
+			slog.DebugContext(ctx, "Package index unavailable",
+				"error", config.RedactErrorText(err), "package", pkg, "file", file)
+			http.Error(w, "Package not found", http.StatusNotFound)
 		}
 		return
 	}
@@ -330,6 +303,29 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 			"error", config.RedactErrorText(err), "package", pkg, "file", file)
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// redirect sends the client upstream for a miss the store did not serve, and
+// records why. The URL carries no userinfo: a private index in redirect mode
+// answers the client 401 rather than the proxy handing out its password. A
+// target that did not parse is never handed out.
+func (s *Server) redirect(w http.ResponseWriter, r *http.Request, re *storage.RedirectError, pkg, file string) {
+	ctx := r.Context()
+	if re.Reason == telemetry.RedirectFetchFailed {
+		slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
+			"error", config.RedactErrorText(re.Err), "package", pkg, "file", file,
+			"file_url", config.RedactURL(re.URL))
+	}
+	if re.URL == "" {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	if re.Stripped {
+		slog.WarnContext(ctx, "Stripped index credentials from upstream redirect",
+			"file_url", config.RedactURL(re.URL))
+	}
+	telemetry.Redirect(ctx, re.Reason)
+	http.Redirect(w, r, re.URL, http.StatusFound)
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {

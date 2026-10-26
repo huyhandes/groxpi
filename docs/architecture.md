@@ -44,8 +44,9 @@ docs/adr/                    architecture decision records
 
 Dependencies point one way: `server → admin → storage → download → index`. `download` needs one thing
 from `index` — a resolved file list — and takes the concrete `*index.Service`; its tests fake upstream
-over HTTP. `storage` needs one thing from `download` — an open upstream body — and asks for it through
-a one-method interface it defines itself (`storage.Fetcher`), the one interface a module depends on
+over HTTP. `storage` needs two things from `download` — a resolved target and its open upstream body — and asks
+for them through an interface it defines itself (`storage.Fetcher`: `Resolve` + `Fetch`), the one
+interface a module depends on
 another through, so its tests run against a fake fetcher. Everywhere else a module is used as the
 concrete type it is: an interface with one implementation is a liability, not a boundary.
 
@@ -162,8 +163,9 @@ opens its `GetObject` before response headers are sent and reads ranges in bound
 the cache through the same spool path as a download, with no upstream fetch.
 
 On a miss, `storage` keeps one flight per storage key. The first request starts it: a detached leader
-calls `download.Fetch`, which resolves the file through the index (a `<file>.metadata` name resolves
-from `<file>`'s entry, PEP 658) and opens it upstream. The leader copies the body into a `.tmp-*` spool
+calls `download.Resolve`, which resolves the file through the index (a `<file>.metadata` name resolves
+from `<file>`'s entry, PEP 658), then `download.Fetch` on that target to open it upstream. The index is
+resolved once per miss; requests coalesced onto the flight take the leader's outcome. The leader copies the body into a `.tmp-*` spool
 file (next to its final path locally, under `GROXPI_CACHE_DIR/spool` for `s3`) while hashing it, through
 one pooled copy buffer. Every request for that key, the first included, tails the growing spool; Range
 is ignored while in flight. Readers are held one byte short of the expected length (or of the bytes
@@ -179,10 +181,18 @@ The flight is visible: `storage.InFlight` lists each running download with the b
 the size the index declared, when it started and how many requests are coalesced onto it. The admin
 page renders it as "Downloading now" rows and `groxpi.download.inflight` reports its size.
 
-With `GROXPI_DOWNLOAD_TIMEOUT=0` the store is built in redirect mode (`Store.Redirects()`): a miss
-starts no flight, a hybrid durable hit is still promoted, and the server resolves the file and answers `302`
-to the upstream URL. A fetch that fails before upstream answers `200` also ends in a `302`, counted as
-`fetch_failed`. A file the index does not list is a `404`.
+A miss the store does not serve crosses the seam as an error that says why, and the server maps it
+to a response without calling `download` itself:
+
+- `*storage.RedirectError` (`errors.As`) — answer `302` to its `URL` and count `groxpi.redirects` by
+  its `Reason`. With `GROXPI_DOWNLOAD_TIMEOUT=0` the store is built in redirect mode
+  (`Store.Redirects()`): a miss resolves the file and returns `caching_disabled`, starting no flight
+  (a hybrid durable hit is still promoted). A fetch that fails before upstream answers `200`, or whose
+  spool cannot be created, returns `fetch_failed` with the leader's target, to every coalesced
+  request. The `URL` comes from `download.Target.RedirectURL`, the one place userinfo is stripped; it
+  is empty, and the server answers `502`, when the upstream URL does not parse.
+- a wrapped `download.ErrNotListed` — `404 File not found`.
+- anything else (the package index could not be resolved) — `404 Package not found`.
 
 The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
 only fire while groxpi is still waiting for upstream response headers. A body already streaming is never

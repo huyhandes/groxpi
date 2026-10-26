@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -23,45 +24,81 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/download"
+	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
-// fakeFetcher serves one body per call. With a gate, the first half is
-// readable at once and the rest only after the gate closes.
+// fakeFetcher resolves every file to one target and serves one body per Fetch.
+// With a gate, the first half is readable at once and the rest only after the
+// gate closes.
 type fakeFetcher struct {
-	body  []byte
-	sha   string // declared digest; defaults to the body's
-	size  int64  // declared size; 0 means the body's length, -1 unknown
-	gate  chan struct{}
-	err   error
-	calls atomic.Int64
+	body       []byte
+	sha        string // declared digest; defaults to the body's
+	size       int64  // declared size; 0 means the body's length, -1 unknown
+	url        string // the resolved target's URL
+	gate       chan struct{}
+	fetchGate  chan struct{} // when set, Fetch waits for it to close
+	resolveErr error
+	err        error // returned by Fetch
+	resolves   atomic.Int64
+	calls      atomic.Int64 // Fetch calls
 }
 
-func (f *fakeFetcher) Fetch(context.Context, string, string) (*download.File, error) {
-	f.calls.Add(1)
-	if f.err != nil {
-		return nil, f.err
+func (f *fakeFetcher) Resolve(context.Context, string, string) (download.Target, error) {
+	f.resolves.Add(1)
+	if f.resolveErr != nil {
+		return download.Target{}, f.resolveErr
 	}
 	sha := f.sha
 	if sha == "" {
 		sum := sha256.Sum256(f.body)
 		sha = hex.EncodeToString(sum[:])
 	}
+	n := int64(len(f.body))
+	switch {
+	case f.size < 0:
+		n = -1
+	case f.size > 0:
+		n = f.size
+	}
+	if n == 0 {
+		n = -1 // like production: the index never declares a zero size
+	}
+	return download.Target{URL: f.url, SHA256: sha, Size: n}, nil
+}
+
+func (f *fakeFetcher) Fetch(_ context.Context, t download.Target) (*download.File, error) {
+	f.calls.Add(1)
+	if f.fetchGate != nil {
+		<-f.fetchGate
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
 	var body io.Reader = bytes.NewReader(f.body)
 	if f.gate != nil {
 		half := len(f.body) / 2
 		body = io.MultiReader(bytes.NewReader(f.body[:half]), gated{f.gate}, bytes.NewReader(f.body[half:]))
 	}
-	n, length := int64(len(f.body)), int64(len(f.body))
-	switch {
-	case f.size < 0:
-		n, length = -1, -1
-	case f.size > 0:
-		n, length = f.size, f.size
+	length := t.Size
+	if f.size == 0 {
+		length = int64(len(f.body))
 	}
-	if n == 0 {
-		n = -1 // like production: the index never declares a zero size
-	}
-	return &download.File{Target: download.Target{SHA256: sha, Size: n}, Body: io.NopCloser(body), Length: length}, nil
+	return &download.File{Target: t, Body: io.NopCloser(body), Length: length}, nil
+}
+
+// credentialedURL is a file URL resolved against an index with a password.
+const credentialedURL = "https://user:s3cret@files.example/pkg-1.0.tar.gz"
+
+// requireRedirect asserts err is a RedirectError with reason and the
+// credential-free target URL.
+func requireRedirect(t *testing.T, err error, reason string) {
+	t.Helper()
+	var re *RedirectError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, reason, re.Reason)
+	assert.Equal(t, "https://files.example/pkg-1.0.tar.gz", re.URL)
+	assert.True(t, re.Stripped, "the userinfo was stripped")
+	assert.NotContains(t, err.Error(), "s3cret")
 }
 
 // gated blocks until its channel closes, then reads as empty.
@@ -212,6 +249,7 @@ func TestStore_HybridPromotion(t *testing.T) {
 	_ = obj.Close()
 	assert.Equal(t, data, got)
 	assert.Zero(t, f.calls.Load())
+	assert.Zero(t, f.resolves.Load(), "a durable hit resolves nothing")
 
 	require.NoError(t, s.Close())
 	rc, _, err := l1.Get(context.Background(), key)
@@ -341,31 +379,105 @@ func TestStore_S3UploadsSpoolAndRemovesIt(t *testing.T) {
 	assert.Empty(t, files(t, spool), "the spool is removed after upload")
 }
 
-func TestStore_FetchErrorPropagates(t *testing.T) {
+// TestStore_FetchErrorRedirects: a fetch that fails before its body starts is a
+// fetch_failed redirect to the target the leader resolved.
+func TestStore_FetchErrorRedirects(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	boom := errors.New("boom")
-	s := NewStore(l, nil, &fakeFetcher{err: boom}, "", false)
+	f := &fakeFetcher{err: boom, url: credentialedURL}
+	s := NewStore(l, nil, f, "", false)
 
 	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	requireRedirect(t, err, telemetry.RedirectFetchFailed)
 	require.ErrorIs(t, err, boom)
 	assert.Empty(t, s.InFlight())
+	assert.Equal(t, int64(1), f.resolves.Load())
 	require.NoError(t, s.Close())
 }
 
-// TestStore_RedirectMissStartsNoFlight: a store built in redirect mode answers a
-// miss with ErrNotFound and never fetches.
+// TestStore_JoinersShareTheLeadersRedirect: clients coalesced onto a fetch that
+// fails all get the leader's redirect, and the index is resolved once.
+func TestStore_JoinersShareTheLeadersRedirect(t *testing.T) {
+	l, err := NewLocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	f := &fakeFetcher{err: errors.New("boom"), url: credentialedURL, fetchGate: make(chan struct{})}
+	s := NewStore(l, nil, f, "", false)
+
+	const n = 5
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Go(func() {
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+			if obj != nil {
+				_ = obj.Close()
+			}
+			errs[i] = err
+		})
+	}
+	require.Eventually(t, func() bool {
+		p := s.InFlight()
+		return len(p) == 1 && p[0].Requests == n
+	}, 5*time.Second, time.Millisecond)
+	close(f.fetchGate)
+	wg.Wait()
+	for _, err := range errs {
+		requireRedirect(t, err, telemetry.RedirectFetchFailed)
+	}
+	assert.Equal(t, int64(1), f.resolves.Load(), "joiners do not resolve again")
+	assert.Equal(t, int64(1), f.calls.Load())
+	require.NoError(t, s.Close())
+}
+
+// TestStore_SpoolCreateFailureRedirects: with nowhere to spool, the miss is a
+// fetch_failed redirect rather than an error the client cannot act on.
+func TestStore_SpoolCreateFailureRedirects(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(blocker, nil, 0o600))
+	remote, _ := newFakeS3(t)
+	f := &fakeFetcher{body: []byte("z"), url: credentialedURL}
+	s := NewStore(nil, remote, f, filepath.Join(blocker, "spool"), false)
+
+	_, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	requireRedirect(t, err, telemetry.RedirectFetchFailed)
+	assert.Empty(t, s.InFlight())
+	assert.Equal(t, int64(1), f.resolves.Load())
+	require.NoError(t, s.Close())
+}
+
+// TestStore_NotListedIsNotARedirect: a file the index does not list is
+// download.ErrNotListed in either mode, and nothing is fetched.
+func TestStore_NotListedIsNotARedirect(t *testing.T) {
+	l, err := NewLocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	f := &fakeFetcher{resolveErr: fmt.Errorf("%w: pkg/pkg-1.0.tar.gz", download.ErrNotListed)}
+	for _, redirect := range []bool{false, true} {
+		s := NewStore(l, nil, f, "", redirect)
+		_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+		require.ErrorIs(t, err, download.ErrNotListed, "redirect=%v", redirect)
+		var re *RedirectError
+		assert.NotErrorAs(t, err, &re, "redirect=%v", redirect)
+		assert.Empty(t, s.InFlight())
+	}
+	assert.Equal(t, int64(2), f.resolves.Load())
+	assert.Zero(t, f.calls.Load())
+}
+
+// TestStore_RedirectMissStartsNoFlight: a store built in redirect mode resolves
+// a miss once and answers caching_disabled without fetching.
 func TestStore_RedirectMissStartsNoFlight(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
-	f := &fakeFetcher{body: []byte("z")}
+	f := &fakeFetcher{body: []byte("z"), url: credentialedURL}
 	s := NewStore(l, nil, f, "", true)
 	assert.True(t, s.Redirects())
 	assert.False(t, NewStore(l, nil, f, "", false).Redirects())
 
 	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
-	require.ErrorIs(t, err, ErrNotFound)
+	requireRedirect(t, err, telemetry.RedirectCachingDisabled)
 	assert.Empty(t, s.InFlight())
+	assert.Equal(t, int64(1), f.resolves.Load())
 	assert.Zero(t, f.calls.Load())
 	require.NoError(t, s.Close())
 }
