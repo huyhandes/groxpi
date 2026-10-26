@@ -74,11 +74,16 @@ func (s *Service) Close(ctx context.Context) {
 // Evict drops a package's index entry and every cached file of it. Dropping the
 // index entry alone would report success while leaving every cached file on
 // disk; deleting goes through the cache's own path, keyed off the package prefix
-// every storage key already carries.
+// every storage key already carries. A name the storage key refuses returns a
+// wrapped storage.ErrInvalidKey before anything is dropped.
 func (s *Service) Evict(ctx context.Context, packageName string) error {
+	prefix, err := storage.Key(packageName, "")
+	if err != nil {
+		return fmt.Errorf("cannot evict package: %w", err)
+	}
 	s.index.Invalidate(packageName)
 
-	deleted, err := s.store.DeletePrefix(ctx, storage.Key(packageName, ""))
+	deleted, err := s.store.DeletePrefix(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("failed to delete cached files: %w", err)
 	}

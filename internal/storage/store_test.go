@@ -69,6 +69,13 @@ type gated struct{ c chan struct{} }
 
 func (g gated) Read([]byte) (int, error) { <-g.c; return 0, io.EOF }
 
+func mustKey(t *testing.T, pkg, file string) string {
+	t.Helper()
+	key, err := Key(pkg, file)
+	require.NoError(t, err)
+	return key
+}
+
 func files(t *testing.T, dir string) []string {
 	t.Helper()
 	var out []string
@@ -181,13 +188,13 @@ func TestStore_DisconnectAllStillCaches(t *testing.T) {
 
 	close(f.gate)
 	require.NoError(t, s.Close(), "Close waits for the detached download")
-	ok, err := exists(l, Key("pkg", "pkg-1.0.tar.gz"))
+	ok, err := exists(l, mustKey(t, "pkg", "pkg-1.0.tar.gz"))
 	require.NoError(t, err)
 	assert.True(t, ok, "the download finished and cached with no client left")
 }
 
 func TestStore_HybridPromotion(t *testing.T) {
-	key := Key("pkg", "pkg-1.0.tar.gz")
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
 	data := []byte("remote bytes")
 	l1, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
@@ -231,15 +238,15 @@ func TestStore_HybridUploadsEveryDownload(t *testing.T) {
 		assert.Equal(t, f.body, bodies[i])
 	}
 	require.NoError(t, s.Close(), "Close waits for the upload")
-	ok, err := exists(l1, Key("pkg", "pkg-1.0.tar.gz"))
+	ok, err := exists(l1, mustKey(t, "pkg", "pkg-1.0.tar.gz"))
 	require.NoError(t, err)
 	assert.True(t, ok, "the download is in the cache")
-	assert.Equal(t, f.body, bucket.object(Key("pkg", "pkg-1.0.tar.gz")), "and in the durable store")
+	assert.Equal(t, f.body, bucket.object(mustKey(t, "pkg", "pkg-1.0.tar.gz")), "and in the durable store")
 	assert.Equal(t, int64(1), bucket.puts.Load(), "uploaded once, however many readers")
 }
 
 func TestStore_HybridCancelledPromotionStillCommits(t *testing.T) {
-	key := Key("pkg", "pkg-1.0.tar.gz")
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
 	data := bytes.Repeat([]byte("p"), 200000)
 	l1, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
@@ -272,7 +279,7 @@ func TestStore_HybridCancelledPromotionStillCommits(t *testing.T) {
 }
 
 func TestStore_S3GetFailureIsAMiss(t *testing.T) {
-	key := Key("pkg", "pkg-1.0.tar.gz")
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
 	remote, bucket := newFakeS3(t)
 	bucket.seed(key, []byte("stored"))
 	bucket.failGet = true // HEAD would still say the object is there
@@ -306,10 +313,10 @@ func TestStore_HybridDeletePrefixEvictsBothTiers(t *testing.T) {
 	require.NoError(t, err)
 	s = NewStore(l1, remote, &fakeFetcher{}, "")
 
-	deleted, err := s.DeletePrefix(context.Background(), Key("numpy", ""))
+	deleted, err := s.DeletePrefix(context.Background(), mustKey(t, "numpy", ""))
 	require.NoError(t, err)
 	assert.Equal(t, 1, deleted)
-	ok, err := exists(l1, Key("numpy", "numpy-1.0.tar.gz"))
+	ok, err := exists(l1, mustKey(t, "numpy", "numpy-1.0.tar.gz"))
 	require.NoError(t, err)
 	assert.False(t, ok, "gone from the cache")
 	assert.Equal(t, []string{"packages/pandas/pandas-1.0.tar.gz"}, bucket.remaining(), "and from the durable store")
@@ -330,7 +337,7 @@ func TestStore_S3UploadsSpoolAndRemovesIt(t *testing.T) {
 	assert.Equal(t, f.body, got)
 	require.NoError(t, s.Close())
 
-	assert.Equal(t, f.body, bucket.object(Key("pkg", "pkg-1.0.tar.gz")))
+	assert.Equal(t, f.body, bucket.object(mustKey(t, "pkg", "pkg-1.0.tar.gz")))
 	assert.Empty(t, files(t, spool), "the spool is removed after upload")
 }
 
@@ -356,6 +363,57 @@ func TestStore_NoFetchMissIsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 	assert.Zero(t, f.calls.Load())
 	require.NoError(t, s.Close())
+}
+
+// TestStore_OpenRejectsInvalidKey pins A1: a name that could leave the package
+// directory is refused before the cache, the durable store or the fetcher is
+// touched, so a file planted beside packages/ is never served.
+func TestStore_OpenRejectsInvalidKey(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewLocalStorage(dir, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret"), []byte("planted"), 0o600))
+	f := &fakeFetcher{body: []byte("z")}
+	s := NewStore(l, nil, f, "")
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	for _, tc := range []struct{ pkg, file string }{
+		{"pkg", "../../secret"},
+		{"pkg", "../secret"},
+		{"pkg", "a/b"},
+		{"pkg", `a\b`},
+		{"pkg", "a\x00b"},
+		{"pkg", ".hidden"},
+		{"pkg", ".."},
+		{"pkg", ""},
+		{"", "pkg-1.0.tar.gz"},
+		{"..", "secret"},
+		{"a/b", "pkg-1.0.tar.gz"},
+	} {
+		for _, fetch := range []bool{true, false} {
+			obj, err := s.Open(t.Context(), tc.pkg, tc.file, fetch)
+			if obj != nil {
+				_ = obj.Close()
+			}
+			require.ErrorIs(t, err, ErrInvalidKey, "pkg=%q file=%q", tc.pkg, tc.file)
+			assert.NotErrorIs(t, err, ErrNotFound, "pkg=%q file=%q", tc.pkg, tc.file)
+		}
+	}
+	assert.Zero(t, f.calls.Load(), "an invalid key never reaches upstream")
+
+	for _, file := range []string{
+		"pkg-1.0-py3-none-any.whl",
+		"pkg-1.0.tar.gz",
+		"pkg-1.0-py3-none-any.whl.metadata",
+		"pkg-1.0+local.1-cp312-cp312-manylinux_2_17_x86_64.whl",
+	} {
+		obj, err := s.Open(t.Context(), "pkg", file, true)
+		require.NoError(t, err, file)
+		_, err = io.ReadAll(obj)
+		require.NoError(t, err, file)
+		require.NoError(t, obj.Close())
+	}
+	assert.Equal(t, int64(4), f.calls.Load(), "real names reach Fetch")
 }
 
 // TestStore_OversizeBodyWithBadShaFailsEveryReader pins H1: upstream sending
@@ -480,7 +538,7 @@ func TestStore_ZeroLengthBody(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got)
 	require.NoError(t, s.Close())
-	ok, err := exists(l, Key("pkg", "pkg-1.0.tar.gz"))
+	ok, err := exists(l, mustKey(t, "pkg", "pkg-1.0.tar.gz"))
 	require.NoError(t, err)
 	assert.True(t, ok, "an empty verified file is cached")
 }
@@ -512,7 +570,7 @@ func TestStore_UnknownSizeHoldsLastByteUntilDone(t *testing.T) {
 	assert.Equal(t, f.body, append(head, <-rest...))
 	_ = obj.Close()
 	require.NoError(t, s.Close())
-	ok, err := exists(l, Key("pkg", "pkg-1.0.tar.gz"))
+	ok, err := exists(l, mustKey(t, "pkg", "pkg-1.0.tar.gz"))
 	require.NoError(t, err)
 	assert.True(t, ok)
 }

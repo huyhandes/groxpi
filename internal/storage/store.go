@@ -48,9 +48,25 @@ type Progress struct {
 	Requests int // clients coalesced onto this download, leader included
 }
 
-// Key is the storage key of a package file. An empty file names the package's
-// prefix.
-func Key(pkg, file string) string { return "packages/" + pkg + "/" + file }
+// ErrInvalidKey is returned for a package or file name that cannot be a single
+// path segment under packages/. It is distinct from ErrNotFound: nothing was
+// looked up.
+var ErrInvalidKey = errors.New("invalid storage key")
+
+// Key is the storage key of a package file, packages/{pkg}/{file}. An empty
+// file names the package's prefix. Each name must be one path segment: not
+// empty, no '/', '\' or NUL, and no leading '.', so a key never leaves its
+// package directory.
+func Key(pkg, file string) (string, error) {
+	if !validSegment(pkg) || (file != "" && !validSegment(file)) {
+		return "", fmt.Errorf("%w: package %q, file %q", ErrInvalidKey, pkg, file)
+	}
+	return "packages/" + pkg + "/" + file, nil
+}
+
+func validSegment(s string) bool {
+	return s != "" && s[0] != '.' && !strings.ContainsAny(s, "/\\\x00")
+}
 
 var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return &b }}
 
@@ -96,9 +112,16 @@ func reapSpool(dir string) {
 }
 
 // Open opens a package file. On a miss it fetches upstream when fetch is set,
-// and otherwise returns ErrNotFound (redirect mode).
+// and otherwise returns ErrNotFound (redirect mode). A name Key refuses, an
+// empty file included, returns ErrInvalidKey before anything is touched.
 func (s *Store) Open(ctx context.Context, pkg, file string, fetch bool) (*Object, error) {
-	key := Key(pkg, file)
+	if file == "" {
+		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
+	}
+	key, err := Key(pkg, file)
+	if err != nil {
+		return nil, err
+	}
 	if f := s.join(key); f != nil {
 		return f.open(ctx)
 	}

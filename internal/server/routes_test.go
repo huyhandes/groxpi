@@ -4,6 +4,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +55,58 @@ func do(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()
+}
+
+// TestFileRoute_EncodedTraversalIsNotFound pins A1: an encoded "../" in the
+// file name is answered 404 without reading a file planted beside packages/,
+// without a redirect and without asking upstream, in fetch and redirect mode.
+func TestFileRoute_EncodedTraversalIsNotFound(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(up.Close)
+
+	for _, timeout := range []time.Duration{5 * time.Second, 0} {
+		cfg := routesConfig(t, up.URL, func(c *config.Config) { c.DownloadTimeout = timeout })
+		require.NoError(t, os.WriteFile(filepath.Join(cfg.CacheDir, "secret"), []byte("planted"), 0o600))
+		srv, err := NewServer(cfg)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = srv.Close() })
+
+		for _, path := range []string{
+			"/index/pkg/..%2F..%2Fsecret",
+			"/simple/pkg/..%2F..%2Fsecret",
+			"/index/pkg/a%5Cb",
+			"/index/pkg/.hidden",
+		} {
+			resp := do(srv.Router(), httptest.NewRequest("GET", path, nil))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode, "%s (timeout %v)", path, timeout)
+			assert.Equal(t, "File not found\n", string(body), path)
+			assert.Empty(t, resp.Header.Get("Location"), path)
+		}
+	}
+	assert.Zero(t, hits.Load(), "an invalid file name never reaches upstream")
+}
+
+// TestEvictRoute_InvalidNameIsBadRequest pins A1 on eviction: a package name
+// that is not one path segment is refused with 400 in the JSON error shape.
+func TestEvictRoute_InvalidNameIsBadRequest(t *testing.T) {
+	router := newRoutesServer(t, "http://127.0.0.1:1", withCredentials)
+	req := httptest.NewRequest("DELETE", "/cache/a%2Fb", nil)
+	req.SetBasicAuth(adminUser, adminPass)
+	resp := do(router, req)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	assert.JSONEq(t, `{"status":"error","message":"Invalid package name"}`, string(body))
 }
 
 // adminPaths is the whole surface that must disappear without credentials —

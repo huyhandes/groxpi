@@ -258,6 +258,10 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	fetch := s.config.DownloadTimeout > 0
 	obj, err := s.store.Open(ctx, pkg, file, fetch)
+	if errors.Is(err, storage.ErrInvalidKey) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		target, rerr := s.downloads.Resolve(ctx, pkg, file)
 		switch {

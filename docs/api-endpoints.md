@@ -91,6 +91,9 @@ has cached.
    (`GROXPI_DOWNLOAD_TIMEOUT=0`) or when the upstream fetch failed or exceeded its time-to-first-byte
    budget before upstream answered `200`.
 4. **`404`** — the package's index could not be resolved, or the index does not list that filename.
+   A filename that is not a single path segment (empty, containing `/`, `\` or NUL, or starting with
+   `.`, so an encoded `..%2F` too) answers `404 File not found` before anything else: no upstream query,
+   no cache read, no redirect.
 
 Every downloaded file is verified before it is committed: against the SHA-256 the index declared, and
 against the expected length (the declared size, else the upstream `Content-Length`) when one is known.
@@ -189,7 +192,10 @@ cached, so there is no cached list to invalidate. The route exists so Python-pro
 ### `DELETE /cache/<package>`
 
 Drops the package's index cache entry **and deletes its cached files**. Answers
-`{"status":"success","data":null}`, `400` for an empty package name, or `500` if the deletion failed.
+`{"status":"success","data":null}`, `400` for an empty package name, `400`
+(`{"status":"error","message":"Invalid package name"}`) for a name that is not a single path segment
+(containing `/`, `\` or NUL, or starting with `.`, after normalisation), in which case nothing is
+deleted and the index entry is kept, or `500` if the deletion failed.
 
 In `hybrid` mode both the cached copies and the S3 objects are deleted, so the next request cannot promote
 the package back from S3. In pure `s3` mode the objects under the package's prefix are deleted.
@@ -208,7 +214,7 @@ the package back from S3. In pure `s3` mode the objects under the package's pref
 |---|---|
 | `302` | Redirect to upstream for a file groxpi will not serve itself. |
 | `307` | Trailing-slash or path-cleaning redirect issued by the router. |
-| `400` | Missing required parameter on an admin route. |
+| `400` | Missing required parameter on an admin route, or an invalid package name on `DELETE /cache/<package>`. |
 | `401` | Missing or wrong basic-auth credentials on an admin route. |
 | `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
