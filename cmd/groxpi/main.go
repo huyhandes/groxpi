@@ -72,7 +72,6 @@ func main() {
 	// Log startup info
 	slog.Info("🚀 Starting groxpi server",
 		"version", "1.0.0",
-		"storage_type", cfg.StorageType,
 		"log_level", cfg.LogLevel,
 		"log_format", cfg.LogFormat,
 		"otlp_endpoint", cfg.OTLPEndpoint)
@@ -80,23 +79,11 @@ func main() {
 	// Log configuration
 	slog.Info("📋 Configuration loaded",
 		"index_url", config.RedactURL(cfg.IndexURL),
-		"cache_size_bytes", cfg.CacheSize,
-		"cache_size_human", FormatBytes(cfg.CacheSize),
 		"index_ttl", cfg.IndexTTL,
 		"port", cfg.Port)
 
-	// Log storage configuration
-	if cfg.StorageType == "s3" {
-		slog.Info("☁️  S3 storage configured",
-			"endpoint", cfg.S3Endpoint,
-			"bucket", cfg.S3Bucket,
-			"prefix", cfg.S3Prefix,
-			"region", cfg.S3Region,
-			"ssl", cfg.S3UseSSL)
-	} else {
-		slog.Info("💾 Local storage configured", "cache_dir", cfg.CacheDir)
-	}
-
+	// The storage module logs its own "storage configured" line: it alone
+	// knows which cache the mode really uses.
 	// Create server
 	srv := server.New(cfg)
 	router := srv.Router()

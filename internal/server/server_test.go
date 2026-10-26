@@ -379,18 +379,10 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 			CacheDir:    "/tmp/test-cache",
 		}
 
-		srv := New(cfg)
-
-		// Test that server was created successfully even with invalid storage type
-		if srv == nil {
-			t.Error("Server should not be nil even with invalid storage type")
-			return
-		}
-
-		// Now we can test internal fields since we're in the same package
-		if srv.store == nil {
-			t.Error("Server storage should not be nil even with invalid type")
-		}
+		// A typo must not silently run local storage without the durable store.
+		srv, err := NewServer(cfg)
+		require.Error(t, err)
+		assert.Nil(t, srv)
 	})
 
 	t.Run("Local storage configuration", func(t *testing.T) {
