@@ -29,6 +29,11 @@ const (
 	lowWatermarkPercent = 90
 
 	tmpPrefix = ".tmp-"
+
+	// packagesDir is the only part of baseDir the cache owns: every Key lives
+	// under it, so the walk never lists, counts or deletes anything else in a
+	// shared directory such as the default os.TempDir().
+	packagesDir = "packages"
 )
 
 // CacheEntry is one cached file as the listing shows it. The filesystem is the
@@ -131,13 +136,14 @@ func removeStaleTemp(path string, mtime time.Time) {
 	}
 }
 
-// scan walks the cache directory and reports every committed file. Temp files
+// scan walks <baseDir>/packages and reports every committed file, keyed
+// relative to baseDir. Nothing outside packages/ is touched. Temp files
 // are not reported; one whose mtime is older than touchInterval is a crash
 // leftover (a write in progress keeps its mtime fresh) and is removed. Files
 // vanishing mid-walk are not errors.
 func (l *LocalStorage) scan() ([]CacheEntry, error) {
 	var entries []CacheEntry
-	err := filepath.WalkDir(l.baseDir, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(filepath.Join(l.baseDir, packagesDir), func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			var info fs.FileInfo
 			if info, err = d.Info(); err == nil && strings.HasPrefix(d.Name(), tmpPrefix) {

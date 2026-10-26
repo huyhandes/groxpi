@@ -68,6 +68,16 @@ that proves it. Delete an entry when it ships.
 - **Fix:** multipart upload from the spool file (`io.SectionReader` per part) above a threshold.
 - **Check:** a fake S3 that accepts multipart; upload a file over a lowered threshold.
 
+### The default cache dir is the shared temp directory
+
+- **Where:** `internal/config/config.go` — the `GROXPI_CACHE_DIR` default (`os.TempDir()`).
+- **What:** the bare binary caches under `/tmp/packages`. Another local user can pre-create files
+  there, and a cache hit is served without re-verifying its hash, so a planted file is served as the
+  package. The Docker image sets `GROXPI_CACHE_DIR=/cache` and is not affected.
+- **Fix:** default to `os.UserCacheDir()/groxpi`, falling back to `os.TempDir()/groxpi` when there is
+  no user cache dir.
+- **Check:** a config test asserting the default `CacheDir`.
+
 ## Observability
 
 ### The upstream-fetch metric includes the S3 upload in hybrid mode
