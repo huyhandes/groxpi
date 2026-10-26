@@ -240,9 +240,13 @@ as long as the collector keeps the series.
 ├─ storage.exists
 ├─ index.resolve
 │  └─ index.query          (one per index consulted)
-└─ upstream.fetch
-   └─ storage.put
+└─ upstream.fetch          (the flight: resolve, fetch, spool, commit)
+   ├─ storage.put          (the spool: copy, hash, verify)
+   └─ storage.upload       (the PUT to the durable store, hybrid and s3)
 ```
+
+`groxpi.upstream.fetch.duration` is recorded when the spool is verified, so it never includes
+`storage.upload`.
 
 ## Embedded assets
 
