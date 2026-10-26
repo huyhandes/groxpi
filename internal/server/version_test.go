@@ -26,9 +26,8 @@ func TestVersion_OneConstant(t *testing.T) {
 		defer mu.Unlock()
 		agents[kind] = r.Header.Get("User-Agent")
 	}
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		serveFile: func(w http.ResponseWriter, r *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{
+		Handler: func(w http.ResponseWriter, r *http.Request) {
 			record("file", r)
 			_, _ = w.Write(testPayload(64))
 		},

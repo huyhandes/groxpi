@@ -25,15 +25,14 @@ func TestNewLocalStorage(t *testing.T) {
 			t.Fatalf("NewLocalStorage failed: %v", err)
 		}
 
-		// Now we can test internal fields since we're in the same package
-		if localStorage.baseDir != baseDir {
-			t.Errorf("Expected baseDir %s, got %s", baseDir, localStorage.baseDir)
-		}
-
 		// Verify directory was created
 		if _, err := os.Stat(baseDir); os.IsNotExist(err) {
 			t.Error("Base directory was not created")
 		}
+
+		// Files land under it.
+		putN(t, localStorage, "packages/p/f", 1)
+		assert.FileExists(t, filepath.Join(baseDir, "packages", "p", "f"))
 	})
 
 	t.Run("handles_existing_directory", func(t *testing.T) {
@@ -44,9 +43,8 @@ func TestNewLocalStorage(t *testing.T) {
 			t.Fatalf("NewLocalStorage failed with existing directory: %v", err)
 		}
 
-		if storage.baseDir != tmpDir {
-			t.Errorf("Expected baseDir %s, got %s", tmpDir, storage.baseDir)
-		}
+		putN(t, storage, "packages/p/f", 1)
+		assert.FileExists(t, filepath.Join(tmpDir, "packages", "p", "f"))
 	})
 
 	t.Run("fails_with_permission_error", func(t *testing.T) {
@@ -161,6 +159,35 @@ func keys(entries []CacheEntry) []string {
 	return out
 }
 
+func total(entries []CacheEntry) int64 {
+	var n int64
+	for _, e := range entries {
+		n += e.Size
+	}
+	return n
+}
+
+// assertAccounted pins the size accounting through eviction, the only thing
+// it drives: filling the cache to exactly maxSize evicts nothing, and one byte
+// more evicts down to the low watermark. A cache that undercounts what is on
+// disk never crosses. The probe files are the newest, so they outlive the
+// eviction; the test's own files may not, so this ends a scenario.
+func assertAccounted(t *testing.T, s *LocalStorage, maxSize int64) {
+	t.Helper()
+	before := s.Snapshot()
+	held := keys(before)
+	if fill := maxSize - total(before); fill > 0 {
+		putN(t, s, "packages/zz-probe/fill", int(fill))
+		held = append(held, "packages/zz-probe/fill")
+	}
+	assert.ElementsMatch(t, held, keys(s.Snapshot()), "a cache at exactly maxSize must evict nothing")
+
+	putN(t, s, "packages/zz-probe/over", 1)
+	after := s.Snapshot()
+	assert.LessOrEqual(t, total(after), maxSize*lowWatermarkPercent/100, "crossing maxSize must evict to the low watermark")
+	assert.Contains(t, keys(after), "packages/zz-probe/over", "eviction takes the oldest-accessed files first")
+}
+
 func TestLocalStorage_EvictsOldestByAtime(t *testing.T) {
 	s, err := NewLocalStorage(t.TempDir(), 1000, 0)
 	require.NoError(t, err)
@@ -175,7 +202,7 @@ func TestLocalStorage_EvictsOldestByAtime(t *testing.T) {
 	putN(t, s, "packages/e", 250) // 1250 > 1000: evict oldest down to 900
 
 	assert.ElementsMatch(t, []string{"packages/b", "packages/d", "packages/e"}, keys(s.Snapshot()))
-	assert.Equal(t, int64(750), s.size.Load(), "the counter must match what is left on disk")
+	assertAccounted(t, s, 1000) // what is left on disk is what is counted
 }
 
 func TestLocalStorage_RestartPreservesRecency(t *testing.T) {
@@ -195,9 +222,9 @@ func TestLocalStorage_RestartPreservesRecency(t *testing.T) {
 
 	s, err = NewLocalStorage(dir, 1000, 0)
 	require.NoError(t, err)
-	assert.Equal(t, int64(750), s.size.Load(), "the startup walk must seed the size counter")
 	assert.Equal(t, []string{"packages/a", "packages/c", "packages/b"}, keys(s.Snapshot()))
 
+	// Over only if the startup walk seeded the size with the 750 on disk.
 	putN(t, s, "packages/d", 250)
 	putN(t, s, "packages/e", 250) // over: b then c go, a survives
 	assert.ElementsMatch(t, []string{"packages/a", "packages/d", "packages/e"}, keys(s.Snapshot()))
@@ -226,7 +253,6 @@ func TestLocalStorage_TTLExpiresIdleCacheByWriteTime(t *testing.T) {
 		ks := keys(s.Snapshot())
 		return len(ks) == 1 && ks[0] == "packages/fresh"
 	}, 2*time.Second, 20*time.Millisecond, "a recently read file written past the TTL must expire with no writes")
-	assert.Equal(t, int64(10), s.size.Load())
 
 	assert.Eventually(t, func() bool { return len(s.Snapshot()) == 0 }, 2*time.Second, 20*time.Millisecond,
 		"an idle file must expire once its write is older than the TTL")
@@ -247,33 +273,44 @@ func TestLocalStorage_RemovesStaleTempFiles(t *testing.T) {
 	old := time.Now().Add(-2 * touchInterval)
 	require.NoError(t, os.Chtimes(stale, old, old))
 
-	s, err := NewLocalStorage(dir, 0, 0)
+	s, err := NewLocalStorage(dir, 100, 0)
 	require.NoError(t, err)
 
 	assert.NoFileExists(t, stale)
 	assert.FileExists(t, fresh)
 	assert.Empty(t, s.Snapshot())
-	assert.Zero(t, s.size.Load())
+	assertAccounted(t, s, 100) // temp files do not count
 }
 
-// TestLocalStorage_SizeAccounting pins the counter across an overwrite and a
-// prefix delete: it must equal the bytes on disk.
+// TestLocalStorage_SizeAccounting pins the accounting across an overwrite and
+// a prefix delete: eviction must see the bytes on disk.
 func TestLocalStorage_SizeAccounting(t *testing.T) {
-	ctx := context.Background()
-	s, err := NewLocalStorage(t.TempDir(), 0, 0)
-	require.NoError(t, err)
+	const maxSize = 1000
+	fill := func(t *testing.T) *LocalStorage {
+		t.Helper()
+		s, err := NewLocalStorage(t.TempDir(), maxSize, 0)
+		require.NoError(t, err)
+		putN(t, s, "packages/a/1", 100)
+		putN(t, s, "packages/a/1", 40) // overwrite replaces, not adds
+		putN(t, s, "packages/a/2", 10)
+		putN(t, s, "packages/b/1", 7)
+		return s
+	}
 
-	putN(t, s, "packages/a/1", 100)
-	putN(t, s, "packages/a/1", 40) // overwrite replaces, not adds
-	putN(t, s, "packages/a/2", 10)
-	putN(t, s, "packages/b/1", 7)
-	assert.Equal(t, int64(57), s.size.Load())
+	t.Run("overwrite", func(t *testing.T) {
+		s := fill(t)
+		assert.Equal(t, int64(57), total(s.Snapshot()))
+		assertAccounted(t, s, maxSize)
+	})
 
-	n, err := s.DeletePrefix(ctx, "packages/a/")
-	require.NoError(t, err)
-	assert.Equal(t, 2, n)
-	assert.Equal(t, int64(7), s.size.Load())
-	assert.Equal(t, []string{"packages/b/1"}, keys(s.Snapshot()))
+	t.Run("delete_prefix", func(t *testing.T) {
+		s := fill(t)
+		n, err := s.DeletePrefix(context.Background(), "packages/a/")
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.Equal(t, []string{"packages/b/1"}, keys(s.Snapshot()))
+		assertAccounted(t, s, maxSize)
+	})
 }
 
 func TestLocalStorage_HitSetsAtimeExplicitly(t *testing.T) {
@@ -334,12 +371,11 @@ func TestLocalStorage_OwnsOnlyPackagesDir(t *testing.T) {
 	s, err := NewLocalStorage(dir, 100, 0)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"packages/p/f"}, keys(s.Snapshot()))
-	assert.Equal(t, int64(len("cached")), s.size.Load(), "foreign files must not count toward the budget")
 
 	putN(t, s, "packages/p/g", 200) // over budget: evicts only under packages/
 	for _, p := range foreign {
 		assert.FileExists(t, p)
 	}
 	assert.Empty(t, s.Snapshot())
-	assert.Zero(t, s.size.Load())
+	assertAccounted(t, s, 100) // foreign files do not count toward the budget
 }

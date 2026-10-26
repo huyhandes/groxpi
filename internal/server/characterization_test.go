@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/md5" // #nosec G501 -- S3 ETag shape in a test double, not security
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -42,27 +41,19 @@ const (
 	present = "\x00present"
 )
 
-// ---- upstream PyPI double -------------------------------------------------
+// ---- upstream PyPI fixtures ----------------------------------------------
+//
+// The fake itself is server.FakePyPI, shared with the in-package tests.
 
-type upFile struct {
-	body    []byte
-	sha256  string // advertised
-	size    int64  // advertised, 0 = omitted
-	metaSHA string // advertised core-metadata sha256, "" = not advertised
-	gated   bool   // first half, flush, wait for release, rest
-}
+const (
+	rootHTML = server.FakeRootHTML
+	rootJSON = server.FakeRootJSON
+)
 
-type upstream struct {
-	*httptest.Server
-	pkgs    map[string][]string // package -> filenames
-	files   map[string]upFile   // filename -> file (".metadata" names included)
-	release chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	hits    map[string]int
-}
-
-func sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
+var (
+	sum = server.Sum
+	gz  = server.Gzip
+)
 
 func payload(n int, seed byte) []byte {
 	b := make([]byte, n)
@@ -87,115 +78,15 @@ const (
 	slowFile = "slow-1.0.0.tar.gz"
 )
 
-func newUpstream(t *testing.T) *upstream {
+func newUpstream(t *testing.T) *server.FakePyPI {
 	t.Helper()
-	up := &upstream{
-		pkgs: map[string][]string{
-			"demo": {demoFile, oldFile},
-			"bad":  {badFile},
-			"slow": {slowFile},
-		},
-		files: map[string]upFile{
-			demoFile:               {body: demoWheel, sha256: sum(demoWheel), size: int64(len(demoWheel)), metaSHA: sum(demoMeta)},
-			demoFile + ".metadata": {body: demoMeta},
-			oldFile:                {body: demoOld, sha256: sum(demoOld)},
-			badFile:                {body: badBody, sha256: sum([]byte("something else"))},
-			slowFile:               {body: slowBody, sha256: sum(slowBody), size: int64(len(slowBody)), gated: true},
-		},
-		release: make(chan struct{}),
-		hits:    map[string]int{},
-	}
-	up.Server = httptest.NewServer(http.HandlerFunc(up.serve))
-	t.Cleanup(up.Close)
-	t.Cleanup(up.open) // runs first: never leave a gated handler blocking Close
-	return up
-}
-
-func (u *upstream) open() { u.once.Do(func() { close(u.release) }) }
-
-func (u *upstream) fileHits(name string) int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.hits[name]
-}
-
-func (u *upstream) serve(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	switch {
-	case path == "/":
-		u.serveRoot(w, r)
-	case path == "/broken/":
-		http.Error(w, "boom", http.StatusInternalServerError)
-	case strings.HasPrefix(path, "/files/"):
-		name := strings.TrimPrefix(path, "/files/")
-		f, ok := u.files[name]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		u.mu.Lock()
-		u.hits[name]++
-		u.mu.Unlock()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprint(len(f.body)))
-		if !f.gated {
-			_, _ = w.Write(f.body)
-			return
-		}
-		half := len(f.body) / 2
-		_, _ = w.Write(f.body[:half])
-		w.(http.Flusher).Flush()
-		<-u.release
-		_, _ = w.Write(f.body[half:])
-	default:
-		pkg := strings.Trim(path, "/")
-		names, ok := u.pkgs[pkg]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		files := make([]map[string]any, 0, len(names))
-		for _, n := range names {
-			f := u.files[n]
-			e := map[string]any{"filename": n, "url": u.URL + "/files/" + n, "hashes": map[string]string{"sha256": f.sha256}}
-			if f.size > 0 {
-				e["size"] = f.size
-			}
-			if f.metaSHA != "" {
-				e["core-metadata"] = map[string]string{"sha256": f.metaSHA}
-			}
-			files = append(files, e)
-		}
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]string{"api-version": "1.0"}, "name": pkg, "files": files})
-	}
-}
-
-const (
-	rootHTML = `<!DOCTYPE html><html><body><a href="/simple/demo/">demo</a></body></html>`
-	rootJSON = `{"meta":{"api-version":"1.0"},"projects":[{"name":"demo"}]}`
-)
-
-func (u *upstream) serveRoot(w http.ResponseWriter, r *http.Request) {
-	body, ctype := rootHTML, "text/html"
-	if strings.Contains(r.Header.Get("Accept"), "json") {
-		body, ctype = rootJSON, "application/vnd.pypi.simple.v1+json"
-	}
-	w.Header().Set("Content-Type", ctype)
-	if r.Header.Get("Accept-Encoding") == "gzip" {
-		w.Header().Set("Content-Encoding", "gzip")
-		_, _ = w.Write(gz(body))
-		return
-	}
-	_, _ = io.WriteString(w, body)
-}
-
-func gz(s string) []byte {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	_, _ = zw.Write([]byte(s))
-	_ = zw.Close()
-	return buf.Bytes()
+	return server.NewFakePyPI(t).
+		Add("demo", demoFile, server.FakeFile{Body: demoWheel, SHA256: sum(demoWheel), Size: int64(len(demoWheel)), MetaSHA: sum(demoMeta)}).
+		Add("demo", oldFile, server.FakeFile{Body: demoOld, SHA256: sum(demoOld)}).
+		AddFile(demoFile+".metadata", server.FakeFile{Body: demoMeta}).
+		Add("bad", badFile, server.FakeFile{Body: badBody, SHA256: sum([]byte("something else"))}).
+		Add("slow", slowFile, server.FakeFile{Body: slowBody, SHA256: sum(slowBody), Size: int64(len(slowBody)), Gated: true}).
+		Fail("broken")
 }
 
 func gunzip(t *testing.T, b []byte) []byte {
@@ -313,7 +204,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 
 type env struct {
 	mode string
-	up   *upstream
+	up   *server.FakePyPI
 	s3   *fakeS3 // hybrid and s3 only
 }
 
@@ -351,6 +242,7 @@ func withAdmin(cfg *config.Config) { cfg.AdminUsername, cfg.AdminPassword = char
 
 type proxy struct {
 	t      *testing.T
+	srv    *server.Server
 	url    string
 	client *http.Client
 	stop   func()
@@ -375,6 +267,7 @@ func start(t *testing.T, cfg *config.Config) *proxy {
 	}
 	return &proxy{
 		t:      t,
+		srv:    srv,
 		url:    hs.URL,
 		settle: settle,
 		client: &http.Client{
@@ -651,7 +544,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders(gzipType, len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile), "the hit is served without going upstream")
+		assert.Equal(t, 1, e.up.FileHits(demoFile), "the hit is served without going upstream")
 
 		resp, body = p.get("/index/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "/index/ alias serves the same cached file")
@@ -759,10 +652,10 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 			_ = resp.Body.Close()
 			follower <- result{resp, b}
 		}()
-		// ponytail: no external signal says the follower has joined the flight;
-		// the outcome below is identical either way, only the sharing is timing.
-		time.Sleep(50 * time.Millisecond)
-		e.up.open()
+		// Release only once the follower has joined the leader's flight.
+		require.Eventually(t, func() bool { return server.InFlightRequests(p.srv) == 2 },
+			5*time.Second, time.Millisecond, "the follower never joined the flight")
+		e.up.Release()
 
 		rest, err := io.ReadAll(leader.Body)
 		require.NoError(t, err)
@@ -773,7 +666,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, r.resp.StatusCode)
 		// Follower headers not pinned: #62 has it tail the spool (streamed headers).
 		assert.Equal(t, slowBody, r.body)
-		assert.Equal(t, 1, e.up.fileHits(slowFile), "one upstream fetch serves both clients")
+		assert.Equal(t, 1, e.up.FileHits(slowFile), "one upstream fetch serves both clients")
 	})
 
 	t.Run("range_ignored_during_inflight_download", func(t *testing.T) {
@@ -785,7 +678,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		resp, err := p.client.Do(req)
 		require.NoError(t, err)
 		defer func() { _ = resp.Body.Close() }()
-		e.up.open()
+		e.up.Release()
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -814,7 +707,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		}
 		fetch()
 		fetch()
-		assert.Equal(t, 2, e.up.fileHits(badFile), "a failed verification is refetched, not served from cache")
+		assert.Equal(t, 2, e.up.FileHits(badFile), "a failed verification is refetched, not served from cache")
 	})
 
 	t.Run("not_listed_404", func(t *testing.T) {
@@ -849,7 +742,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders(textType, len(demoMeta)))
 		assert.Equal(t, demoMeta, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile+".metadata"))
+		assert.Equal(t, 1, e.up.FileHits(demoFile+".metadata"))
 
 		resp, body = p.get("/simple/demo/" + oldFile + ".metadata")
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "metadata not advertised by the index")
@@ -873,7 +766,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 			pin(t, resp, map[string]string{"Content-Length": fmt.Sprint(len(demoWheel))})
 
 			assert.Equal(t, demoWheel, body)
-			assert.Equal(t, 1, e.up.fileHits(demoFile))
+			assert.Equal(t, 1, e.up.FileHits(demoFile))
 		})
 	}
 }
@@ -898,7 +791,7 @@ func TestHybridPromotionFailureIs500(t *testing.T) {
 
 	resp, _ := p.get(demoPath)
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-	assert.Equal(t, 1, e.up.fileHits(demoFile), "no upstream fetch or redirect")
+	assert.Equal(t, 1, e.up.FileHits(demoFile), "no upstream fetch or redirect")
 }
 
 func characterizeRedirectMode(t *testing.T, e *env) {
@@ -921,7 +814,7 @@ func characterizeRedirectMode(t *testing.T, e *env) {
 		resp, _ := p.get("/simple/demo/" + oldFile)
 		assert.Equal(t, http.StatusFound, resp.StatusCode)
 		pin(t, resp, map[string]string{"Location": e.up.URL + "/files/" + oldFile})
-		assert.Equal(t, 0, e.up.fileHits(oldFile))
+		assert.Equal(t, 0, e.up.FileHits(oldFile))
 	})
 	t.Run("uncached_metadata_is_302", func(t *testing.T) {
 		resp, _ := p.get("/simple/demo/" + demoFile + ".metadata")
@@ -1034,7 +927,7 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, streamedMissHeaders("application/gzip", q(sum(demoWheel)), len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 2, e.up.fileHits(demoFile), "evicted file is fetched upstream again")
+		assert.Equal(t, 2, e.up.FileHits(demoFile), "evicted file is fetched upstream again")
 
 		resp, body = p.admin(http.MethodDelete, "/cache/list", nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -1065,7 +958,7 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders("application/gzip", len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile), "prefetch warmed the cache")
+		assert.Equal(t, 1, e.up.FileHits(demoFile), "prefetch warmed the cache")
 	})
 }
 
