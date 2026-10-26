@@ -2,7 +2,10 @@ package config
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -304,5 +307,79 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 				t.Errorf("malformed %s was ignored silently; logs were:\n%s", tc.key, logs)
 			}
 		})
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	tests := []struct {
+		raw, want string
+	}{
+		{"https://pypi.org/simple/", "https://pypi.org/simple/"},
+		{"https://user:s3cr3t@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
+		{"https://token@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
+		{"://nonsense", "[unparseable-url]"},
+	}
+	for _, tt := range tests {
+		if got := RedactURL(tt.raw); got != tt.want {
+			t.Errorf("RedactURL(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+	idx := Index{URL: "https://user:s3cr3t@private.example.com/simple/"}
+	if got := idx.Redacted(); got != "https://redacted@private.example.com/simple/" {
+		t.Errorf("Index.Redacted() = %q", got)
+	}
+}
+
+func TestRedactErrorText(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"no url", errors.New("boom"), "boom"},
+		{"plain url", errors.New("HTTP 404 from https://pypi.org/simple/x/"), "HTTP 404 from https://pypi.org/simple/x/"},
+		{"password", errors.New("HTTP 404 from https://user:s3cr3t@h.example/x"), "HTTP 404 from https://redacted@h.example/x"},
+		{"token as username", errors.New(`Get "https://tok3n@h.example/x": EOF`), `Get "https://redacted@h.example/x": EOF`},
+		{"two urls", errors.New("a https://u:p@one/x b http://t@two/y"), "a https://redacted@one/x b http://redacted@two/y"},
+		{"at sign in path", errors.New("https://h.example/a@b"), "https://h.example/a@b"},
+		{"wrapped", fmt.Errorf("outer: %w", errors.New("https://u:s3cr3t@h/x")), "outer: https://redacted@h/x"},
+	}
+	for _, tt := range tests {
+		if got := RedactErrorText(tt.err); got != tt.want {
+			t.Errorf("%s: RedactErrorText = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestRedactURLError(t *testing.T) {
+	if RedactURLError(nil) != nil {
+		t.Error("RedactURLError(nil) should stay nil")
+	}
+	plain := errors.New("boom")
+	if !errors.Is(RedactURLError(plain), plain) || RedactURLError(plain).Error() != "boom" {
+		t.Error("an error without a *url.Error should pass through untouched")
+	}
+
+	for _, raw := range []string{"https://deploy:s3cr3t@h.example/x", "https://s3cr3t@h.example/x"} {
+		// Redact before wrapping, as the callers do: fmt.Errorf renders its text
+		// when it is created, so rewriting the *url.Error afterwards cannot reach it.
+		uerr := &url.Error{Op: "Get", URL: raw, Err: errors.New("EOF")}
+		got := fmt.Errorf("wrapped: %w", RedactURLError(uerr))
+		if strings.Contains(got.Error(), "s3cr3t") {
+			t.Errorf("secret survived: %v", got)
+		}
+		var found *url.Error
+		if !errors.As(got, &found) || found.URL != "https://redacted@h.example/x" {
+			t.Errorf("unwrapping should find the redacted *url.Error, got %v", found)
+		}
+	}
+
+	// An unparseable URL is dropped whole: there is no telling where its
+	// credentials end.
+	perr := &url.Error{Op: "parse", URL: "https://u:s3cr3t@h.example:bad port/x", Err: errors.New(`invalid port ":bad port" after host`)}
+	got := RedactURLError(perr)
+	if strings.Contains(got.Error(), "s3cr3t") || !strings.Contains(got.Error(), "[unparseable-url]") {
+		t.Errorf("unparseable URL not dropped: %v", got)
 	}
 }

@@ -119,3 +119,24 @@ func TestFetch(t *testing.T) {
 		assert.False(t, strings.Contains(err.Error(), secret), "credential leaked: %v", err)
 	}
 }
+
+// TestFetch_RequestErrorIsRedacted pins that download returns already-redacted
+// errors: a credentialed target URL that cannot even become a request must not
+// carry its password or token-as-username into the error, and the *url.Error
+// stays reachable for callers that unwrap.
+func TestFetch_RequestErrorIsRedacted(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+	fi := []index.FileInfo{
+		{Name: "password.tar.gz", URL: "https://deploy:" + secret + "@files.example.com:bad port/password.tar.gz"},
+		{Name: "token.tar.gz", URL: "https://" + secret + "@files.example.com:bad port/token.tar.gz"},
+	}
+	svc := newService(t, map[string][]index.FileInfo{"p": fi}, time.Minute)
+
+	for _, f := range fi {
+		_, err := svc.Fetch(t.Context(), "p", f.Name)
+		require.Error(t, err, f.Name)
+		assert.NotContains(t, err.Error(), secret, f.Name)
+		var uerr *url.Error
+		assert.True(t, errors.As(err, &uerr), "unwrapping must still find the URL error: %v", err)
+	}
+}

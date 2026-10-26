@@ -339,24 +339,6 @@ func TestResolution_IndexFailureDoesNotFallThroughToThePrimary(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, indexStatus(t, srv, "internal"))
 }
 
-// --- Credential redaction ----------------------------------------------------
-
-func TestRedactURL(t *testing.T) {
-	tests := []struct {
-		raw, want string
-	}{
-		{"https://pypi.org/simple/", "https://pypi.org/simple/"},
-		{"https://user:s3cr3t@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
-		{"https://token@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
-		{"://nonsense", "[unparseable-url]"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, config.RedactURL(tt.raw), tt.raw)
-	}
-	assert.Equal(t, "https://redacted@private.example.com/simple/",
-		config.Index{URL: "https://user:s3cr3t@private.example.com/simple/"}.Redacted())
-}
-
 // lockedBuffer collects log output from concurrent writers.
 type lockedBuffer struct {
 	mu  sync.Mutex
