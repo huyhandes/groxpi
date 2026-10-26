@@ -232,9 +232,9 @@ the package back from S3. In pure `s3` mode the objects under the package's pref
 | `400` | Missing required parameter on an admin route, or an invalid package name on `DELETE /cache/<package>`. |
 | `401` | Missing or wrong basic-auth credentials on an admin route. |
 | `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |
-| `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
+| `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. On a file route (`/simple/<package>/<file>`, `/index/<package>/<file>`) also any index resolution failure, absence or not (`Package not found`). |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
-| `500` | Index resolution failed for a reason other than absence (including an index body over the 64 MiB cap), or a storage operation failed. |
+| `500` | On a package index route (`/simple/<package>/`, `/index/<package>`), index resolution failed for a reason other than absence (including an index body over the 64 MiB cap); or a storage operation failed. |
 | `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap; or a file to redirect has an upstream URL that does not parse. |
 | `503` | A prefetch was submitted after shutdown had begun. |
 
