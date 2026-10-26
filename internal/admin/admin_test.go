@@ -378,7 +378,8 @@ func TestPrefetch_UnknownPackageIsSurfaced(t *testing.T) {
 
 // TestPrefetch_DuplicatesRunOnce: duplicate submissions while a prefetch of the
 // same package runs are skipped, and once it has ended a new submission runs.
-// Files fail so nothing is cached and every run must reach upstream.
+// Any spelling of the name is the same package. Files fail so nothing is
+// cached and every run must reach upstream.
 func TestPrefetch_DuplicatesRunOnce(t *testing.T) {
 	up := newUpstream(t, "dup", fakeFile{name: "dup-1.0.0.tar.gz"})
 	up.hold, up.failFiles = true, true
@@ -387,8 +388,8 @@ func TestPrefetch_DuplicatesRunOnce(t *testing.T) {
 	require.NoError(t, h.svc.Prefetch(t.Context(), "dup"))
 	<-up.reached // the first run is now parked at upstream
 	var wg sync.WaitGroup
-	for range 10 {
-		wg.Go(func() { assert.NoError(t, h.svc.Prefetch(t.Context(), "dup")) })
+	for _, name := range []string{"dup", "DUP", "Dup", "dup", "dUp"} {
+		wg.Go(func() { assert.NoError(t, h.svc.Prefetch(t.Context(), name)) })
 	}
 	wg.Wait()
 	up.release <- struct{}{} // let the first run's request go; the rest stay held

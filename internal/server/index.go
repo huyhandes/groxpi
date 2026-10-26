@@ -50,7 +50,7 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(r.PathValue("package"))
+	packageName := r.PathValue("package")
 
 	entry, err := s.index.Resolve(r.Context(), packageName)
 	if err != nil {
@@ -69,7 +69,9 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		writeIndexJSON(w, r, entry)
 		return
 	}
-	renderPackageFilesHTML(w, packageName, entry.Files)
+	// The page names the package the way the index entry does. ponytail: goes
+	// when the index module renders this page itself.
+	renderPackageFilesHTML(w, index.NormalizeName(packageName), entry.Files)
 }
 
 // writeIndexJSON serves the body built when the entry was filled, preferring its

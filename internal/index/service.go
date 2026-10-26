@@ -82,13 +82,18 @@ func (s *Service) Transport() http.RoundTripper { return s.transport }
 func (s *Service) Close() { s.cache.Close() }
 
 // Invalidate drops a package's cached entry so the next request goes upstream.
-func (s *Service) Invalidate(packageName string) { s.cache.InvalidatePackage(packageName) }
+// Any spelling of the name drops the one normalised entry.
+func (s *Service) Invalidate(packageName string) {
+	s.cache.InvalidatePackage(NormalizeName(packageName))
+}
 
 // Resolve returns the cache entry for a package — parsed file list and
 // serialised bodies, produced together — using the index cache and
 // deduplicating concurrent upstream fetches. It is the only path to the upstream
-// package index. A miss on every configured index is ErrNotFound.
+// package index. A miss on every configured index is ErrNotFound. The name is
+// normalised first, so every spelling shares one entry and one upstream query.
 func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, error) {
+	packageName = NormalizeName(packageName)
 	ctx, span := telemetry.Tracer().Start(ctx, "index.resolve")
 	defer span.End()
 

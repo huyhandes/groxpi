@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/download"
+	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
@@ -82,11 +83,13 @@ type Progress struct {
 // looked up.
 var ErrInvalidKey = errors.New("invalid storage key")
 
-// Key is the storage key of a package file, packages/{pkg}/{file}. An empty
-// file names the package's prefix. Each name must be one path segment: not
-// empty, no '/', '\' or NUL, and no leading '.', so a key never leaves its
-// package directory.
+// Key is the storage key of a package file, packages/{pkg}/{file}, with pkg
+// PEP 503 normalised so every spelling of a name is one key. An empty file
+// names the package's prefix. The normalised pkg and the raw file must each be
+// one path segment: not empty, no '/', '\' or NUL, and no leading '.', so a key
+// never leaves its package directory.
 func Key(pkg, file string) (string, error) {
+	pkg = index.NormalizeName(pkg)
 	if !validSegment(pkg) || (file != "" && !validSegment(file)) {
 		return "", fmt.Errorf("%w: package %q, file %q", ErrInvalidKey, pkg, file)
 	}
@@ -158,6 +161,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if file == "" {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
 	}
+	pkg = index.NormalizeName(pkg) // once, so the resolve below sees it too
 	key, err := Key(pkg, file)
 	if err != nil {
 		return nil, err

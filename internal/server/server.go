@@ -253,7 +253,7 @@ func (s *Server) CloseContext(ctx context.Context) error {
 // not fetch is redirected upstream.
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	pkg := index.NormalizeName(r.PathValue("package"))
+	pkg := r.PathValue("package")
 	file := r.PathValue("file")
 
 	obj, err := s.store.Open(ctx, pkg, file)
