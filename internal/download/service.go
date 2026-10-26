@@ -68,8 +68,10 @@ type Service struct {
 // headers. Once headers are in, the body runs to completion under the caller's
 // context, because a transfer already streaming must not be cut off by a budget
 // meant for connection setup. At 0 (redirect mode) the store never calls Fetch.
+// Requests go through the index's upstream transport, so the TLS setting and
+// connection pool are shared; the client has no whole-request timeout.
 func New(cfg *config.Config, idx *index.Service) *Service {
-	return &Service{index: idx, client: &http.Client{}, ttfb: cfg.DownloadTimeout}
+	return &Service{index: idx, client: &http.Client{Transport: idx.Transport()}, ttfb: cfg.DownloadTimeout}
 }
 
 // Resolve finds a package file in the index. A file the index does not list is

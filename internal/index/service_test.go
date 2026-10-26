@@ -186,3 +186,29 @@ func TestResolve_UpstreamFailureIsRedacted(t *testing.T) {
 		}
 	}
 }
+
+// TestResolve_OversizedIndexBodyFailsAndIsNotCached pins the per-package body
+// cap: a body past it is an error, never a truncated list, and nothing is cached
+// so the next request goes upstream again.
+func TestResolve_OversizedIndexBodyFailsAndIsNotCached(t *testing.T) {
+	upstream := newFakeIndexServer(t)
+	svc := newTestService(t, &config.Config{
+		IndexURL:       upstream.URL,
+		IndexTTL:       time.Minute,
+		IndexCacheSize: 1 << 20,
+		LogLevel:       "ERROR",
+	})
+
+	saved := maxPackageIndexBytes
+	t.Cleanup(func() { maxPackageIndexBytes = saved })
+	maxPackageIndexBytes = 16
+
+	_, err := svc.Resolve(t.Context(), "numpy")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "byte limit")
+
+	maxPackageIndexBytes = saved
+	_, err = svc.Resolve(t.Context(), "numpy")
+	require.NoError(t, err)
+	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an oversized body must not be cached")
+}

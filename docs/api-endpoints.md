@@ -73,6 +73,11 @@ the process. It is a fixed limit with no setting, far above PyPI's own project l
 `GROXPI_INDEX_CACHE_SIZE`, which bounds the per-package index cache and happens to default to a
 similar number.
 
+A per-package index body (`GET /simple/<package>/`, JSON or HTML) is capped the same way at
+**64 MiB**. A body above it fails the resolution with `500` rather than serving a truncated file list,
+and nothing is cached, so the next request asks upstream again. It is also a fixed limit with no
+setting.
+
 Because it is a pass-through, the HTML form lists the real upstream projects, not just the ones groxpi
 has cached.
 
@@ -177,7 +182,8 @@ mode, which has no cache, the table is empty.
 
 Form-encoded, field `package`. Answers `202 Accepted` immediately and downloads on a context detached
 from the request, so a large package cannot be cut off by a reverse-proxy timeout. There is no job ID:
-progress is the files appearing in the table.
+progress is the files appearing in the table. A package whose prefetch is still running is accepted
+again but not queued: one prefetch per package runs at a time.
 
 Prefetch downloads the **newest final release only** — yanked files and pre-releases are excluded,
 versions are compared under PEP 440 ordering, and all files of the winning release (wheels plus sdist)
@@ -224,7 +230,7 @@ the package back from S3. In pure `s3` mode the objects under the package's pref
 | `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
-| `500` | Index resolution failed for a reason other than absence, or a storage operation failed. |
+| `500` | Index resolution failed for a reason other than absence (including an index body over the 64 MiB cap), or a storage operation failed. |
 | `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap; or a file to redirect has an upstream URL that does not parse. |
 | `503` | A prefetch was submitted after shutdown had begun. |
 
