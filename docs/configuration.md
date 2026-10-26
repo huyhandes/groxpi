@@ -31,6 +31,8 @@ than falling through to a lower-priority index: a private index that is down mus
 to the public one.
 
 Each index carries its own TTL, so a fast-moving private index can be refreshed more often than PyPI.
+A package that no index has is remembered as missing for the **shortest** of these TTLs; until then
+it answers `404` without an upstream query. `DELETE /cache/{package}` clears it sooner.
 
 Credentials may be embedded in an index URL (`https://user:pass@host/simple/`). They are redacted to
 `https://redacted@host/simple/` in every log record, error message, metric attribute and HTTP response
