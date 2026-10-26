@@ -1,8 +1,6 @@
 package index
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -15,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
@@ -30,7 +27,6 @@ var ErrNotFound = errors.New("package not found")
 // requests for the same package are coalesced by the package-file service, not
 // here.
 type Client struct {
-	config     *config.Config
 	httpClient *http.Client
 }
 
@@ -108,47 +104,32 @@ type PyPISimpleResponse struct {
 	Files []FileInfo `json:"files,omitempty"`
 }
 
-// Buffer pool for reducing allocations
-var bufferPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
+// maxPackageIndexBytes caps one per-package index body, JSON or HTML. The body
+// is held in memory to parse, so an upstream answering with an endless body
+// would otherwise exhaust the process. A var only so a test can lower it.
+// Documented in docs/api-endpoints.md beside the root cap.
+var maxPackageIndexBytes int64 = 64 << 20
+
+// readCapped reads r whole, failing rather than truncating past limit bytes.
+// Reading one byte past the cap is what tells the two apart: a body of exactly
+// the cap is returned, the first byte over is an error.
+func readCapped(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("body exceeds the %d byte limit", limit)
+	}
+	return body, nil
 }
 
-// Copy buffer pool for zero-copy optimizations
-var copyBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 32*1024) // 32KB copy buffers
-		return &buf
-	},
-}
-
-// Helper functions to reduce duplication (DRY principle)
-
-// copyToBuffer copies from reader to buffer using pooled copy buffer for zero-copy optimization
-func copyToBuffer(dst *bytes.Buffer, src io.Reader) error {
-	copyBufPtr := copyBufferPool.Get().(*[]byte)
-	defer copyBufferPool.Put(copyBufPtr)
-	copyBuf := *copyBufPtr
-
-	_, err := io.CopyBuffer(dst, src, copyBuf)
-	return err
-}
-
-// withBuffers provides pooled buffers for parsing operations, following DRY principle
-func withBuffers(fn func(*bytes.Buffer) error) error {
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer func() {
-		buf.Reset()
-		bufferPool.Put(buf)
-	}()
-
-	return fn(buf)
-}
-
-func NewClient(cfg *config.Config) *Client {
-	// Optimized transport with better connection pooling
-	transport := &http.Transport{
+// newTransport builds the one upstream transport every client shares: the
+// per-package index, the root proxy and file downloads. It is where
+// GROXPI_DISABLE_INDEX_SSL_VERIFICATION applies, so the setting reaches all
+// three.
+func newTransport(cfg *config.Config) *http.Transport {
+	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -156,7 +137,7 @@ func NewClient(cfg *config.Config) *Client {
 		}).DialContext,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: cfg.DisableSSLVerification, // #nosec G402 -- explicit operator opt-in (GROXPI_DISABLE_SSL_VERIFICATION)
+			InsecureSkipVerify: cfg.DisableSSLVerification, // #nosec G402 -- explicit operator opt-in (GROXPI_DISABLE_INDEX_SSL_VERIFICATION)
 		},
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   100,
@@ -164,14 +145,13 @@ func NewClient(cfg *config.Config) *Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,  // Enable HTTP/2 for better multiplexing
-		DisableCompression:    false, // Let transport handle compression
+		ForceAttemptHTTP2:     true,
 	}
+}
 
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   60 * time.Second, // Increased for large responses
-	}
+// newClient builds the per-package index client over the shared transport.
+func newClient(cfg *config.Config, transport http.RoundTripper) *Client {
+	httpClient := &http.Client{Transport: transport, Timeout: 60 * time.Second}
 
 	// http.Client.Timeout is one budget for the whole request - connect, headers
 	// and body - so the two configured phases are summed rather than applied
@@ -180,11 +160,7 @@ func NewClient(cfg *config.Config) *Client {
 	if budget := cfg.ConnectTimeout + cfg.ReadTimeout; budget > 0 {
 		httpClient.Timeout = budget
 	}
-
-	return &Client{
-		config:     cfg,
-		httpClient: httpClient,
-	}
+	return &Client{httpClient: httpClient}
 }
 
 // GetPackageFiles fetches one package's file list from one index. The index is a
@@ -243,34 +219,21 @@ func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.
 }
 
 func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
-	var files []FileInfo
-
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		// Use buffered reader for better performance
-		bufReader := bufio.NewReaderSize(body, 64*1024)
-
-		if err := copyToBuffer(buf, bufReader); err != nil {
-			return err
-		}
-
-		var response PyPISimpleResponse
-		if err := json.Unmarshal(buf.Bytes(), &response); err != nil {
-			return fmt.Errorf("failed to parse JSON response: %w", err)
-		}
-
-		files = response.Files
-		return nil
-	})
-
-	return files, err
+	buf, err := readCapped(body, maxPackageIndexBytes)
+	if err != nil {
+		return nil, err
+	}
+	var response PyPISimpleResponse
+	if err := json.Unmarshal(buf, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+	return response.Files, nil
 }
 
 // parseHTMLPackageFiles parses a PEP 503 HTML index page. baseURL is the URL the
 // page was served from; relative and protocol-relative hrefs are resolved against
 // it so that FileInfo.URL is always usable on its own.
 func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileInfo, error) {
-	var files []FileInfo
-
 	// A base we cannot parse means we cannot resolve anything; fall back to
 	// emitting hrefs verbatim rather than dropping the whole index.
 	base, baseErr := url.Parse(baseURL)
@@ -281,109 +244,104 @@ func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileIn
 		base = nil
 	}
 
-	err := withBuffers(func(buf *bytes.Buffer) error {
-		if err := copyToBuffer(buf, body); err != nil {
-			return err
+	page, err := readCapped(body, maxPackageIndexBytes)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]FileInfo, 0, 50)
+
+	// Simple HTML parsing for package files
+	lines := strings.SplitSeq(string(page), "\n")
+	for line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "<a ") {
+			continue
 		}
 
-		page := buf.String()
-		files = make([]FileInfo, 0, 50)
+		// Extract href
+		hrefStart := strings.Index(line, `href="`)
+		if hrefStart == -1 {
+			continue
+		}
+		hrefStart += 6
+		hrefEnd := strings.Index(line[hrefStart:], `"`)
+		if hrefEnd == -1 {
+			continue
+		}
+		// Attribute values and anchor text arrive HTML-escaped: a PEP 503
+		// index must write "&gt;=3.8", and re-emitting that escape into the
+		// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
+		// "&amp;" in a query string.
+		href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
 
-		// Simple HTML parsing for package files
-		lines := strings.SplitSeq(page, "\n")
-		for line := range lines {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "<a ") {
+		// Resolve the href against the index page URL. ResolveReference
+		// correctly handles absolute, protocol-relative, root-relative and
+		// path-relative hrefs, and carries the #sha256=... fragment through.
+		fileURL := href
+		if base != nil {
+			ref, err := url.Parse(href)
+			if err != nil {
+				slog.Warn("Skipping package file with unparseable href",
+					"error", err,
+					"href", href,
+					"base_url", config.RedactURL(baseURL))
 				continue
 			}
-
-			// Extract href
-			hrefStart := strings.Index(line, `href="`)
-			if hrefStart == -1 {
-				continue
-			}
-			hrefStart += 6
-			hrefEnd := strings.Index(line[hrefStart:], `"`)
-			if hrefEnd == -1 {
-				continue
-			}
-			// Attribute values and anchor text arrive HTML-escaped: a PEP 503
-			// index must write "&gt;=3.8", and re-emitting that escape into the
-			// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
-			// "&amp;" in a query string.
-			href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
-
-			// Resolve the href against the index page URL. ResolveReference
-			// correctly handles absolute, protocol-relative, root-relative and
-			// path-relative hrefs, and carries the #sha256=... fragment through.
-			fileURL := href
-			if base != nil {
-				ref, err := url.Parse(href)
-				if err != nil {
-					slog.Warn("Skipping package file with unparseable href",
-						"error", err,
-						"href", href,
-						"base_url", config.RedactURL(baseURL))
-					continue
-				}
-				fileURL = base.ResolveReference(ref).String()
-			}
-
-			// Extract filename from anchor text
-			textStart := strings.Index(line, ">")
-			textEnd := strings.Index(line, "</a>")
-			if textStart == -1 || textEnd == -1 || textStart >= textEnd {
-				continue
-			}
-			filename := html.UnescapeString(line[textStart+1 : textEnd])
-
-			// Extract data-requires-python if present
-			var requiresPython string
-			if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
-				rpStart += 22
-				if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
-					requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
-				}
-			}
-
-			// Extract data-yanked if present
-			var yanked any
-			if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
-				yankStart += 13
-				if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
-					yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
-					if yankedStr == "" {
-						yanked = true
-					} else {
-						yanked = yankedStr
-					}
-				}
-			}
-
-			// PEP 503 carries the digest in the href fragment as
-			// #sha256=<hex>; lift it into the same hash map shape the JSON
-			// index produces so downstream code needs no format branch.
-			var hashes map[string]string
-			if _, fragment, found := strings.Cut(href, "#"); found {
-				if sum, ok := strings.CutPrefix(fragment, "sha256="); ok && sum != "" {
-					hashes = map[string]string{"sha256": sum}
-				}
-			}
-
-			files = append(files, FileInfo{
-				Name:           filename,
-				URL:            fileURL,
-				Hashes:         hashes,
-				RequiresPython: requiresPython,
-				Yanked:         yanked,
-				CoreMetadata:   htmlMetadataAttr(line),
-			})
+			fileURL = base.ResolveReference(ref).String()
 		}
 
-		return nil
-	})
+		// Extract filename from anchor text
+		textStart := strings.Index(line, ">")
+		textEnd := strings.Index(line, "</a>")
+		if textStart == -1 || textEnd == -1 || textStart >= textEnd {
+			continue
+		}
+		filename := html.UnescapeString(line[textStart+1 : textEnd])
 
-	return files, err
+		// Extract data-requires-python if present
+		var requiresPython string
+		if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
+			rpStart += 22
+			if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
+				requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
+			}
+		}
+
+		// Extract data-yanked if present
+		var yanked any
+		if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
+			yankStart += 13
+			if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
+				yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
+				if yankedStr == "" {
+					yanked = true
+				} else {
+					yanked = yankedStr
+				}
+			}
+		}
+
+		// PEP 503 carries the digest in the href fragment as
+		// #sha256=<hex>; lift it into the same hash map shape the JSON
+		// index produces so downstream code needs no format branch.
+		var hashes map[string]string
+		if _, fragment, found := strings.Cut(href, "#"); found {
+			if sum, ok := strings.CutPrefix(fragment, "sha256="); ok && sum != "" {
+				hashes = map[string]string{"sha256": sum}
+			}
+		}
+
+		files = append(files, FileInfo{
+			Name:           filename,
+			URL:            fileURL,
+			Hashes:         hashes,
+			RequiresPython: requiresPython,
+			Yanked:         yanked,
+			CoreMetadata:   htmlMetadataAttr(line),
+		})
+	}
+
+	return files, nil
 }
 
 // htmlMetadataAttr lifts a PEP 658 data-core-metadata (or the older

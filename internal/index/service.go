@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -46,16 +45,21 @@ type Service struct {
 	// its own instead of the typed index client.
 	rootURL    string
 	rootClient *http.Client
+
+	// transport is the one upstream transport, shared by the index client, the
+	// root client and download (through Transport).
+	transport *http.Transport
 }
 
 // New builds the index module from configuration. Expired entries are swept at
 // the index TTL cadence: an entry outlives its TTL by at most one interval, and
 // nothing scans on the read path.
 func New(cfg *config.Config) *Service {
-	return newService(cfg, NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), NewClient(cfg))
+	transport := newTransport(cfg)
+	return newService(cfg, NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), newClient(cfg, transport), transport)
 }
 
-func newService(cfg *config.Config, cache *IndexCache, up upstream) *Service {
+func newService(cfg *config.Config, cache *IndexCache, up upstream, transport *http.Transport) *Service {
 	return &Service{
 		cache:    cache,
 		upstream: up,
@@ -64,9 +68,15 @@ func newService(cfg *config.Config, cache *IndexCache, up upstream) *Service {
 		// ponytail: one fixed timeout for the whole proxied response. The root list
 		// is large but a single upstream GET; a byte-rate budget can come later if a
 		// slow index actually shows up.
-		rootClient: &http.Client{Timeout: 60 * time.Second},
+		rootClient: &http.Client{Transport: transport, Timeout: 60 * time.Second},
+		transport:  transport,
 	}
 }
+
+// Transport is the upstream transport index built from configuration. download
+// sends file requests through it, so TLS settings and connection pooling are
+// the same for every upstream call.
+func (s *Service) Transport() http.RoundTripper { return s.transport }
 
 // Close stops the cache sweeper.
 func (s *Service) Close() { s.cache.Close() }
@@ -284,18 +294,10 @@ func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) 
 		// upstream that answers this route with an endless body would otherwise be
 		// an unauthenticated way to exhaust the process's memory. The ceiling is far
 		// above PyPI's own project list; exceeding it fails loudly rather than
-		// serving a truncated index. Reading one byte past the cap is what tells
-		// the two apart: a body of exactly the cap is served, the first byte over
-		// is an error.
-		//
-		// ponytail: the overflow branch is untested — reaching it needs a
-		// 256 MiB response body, which is not a test worth running.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRootIndexBytes+1))
+		// serving a truncated index.
+		body, err := readCapped(resp.Body, maxRootIndexBytes)
 		if err != nil {
 			return nil, err
-		}
-		if int64(len(body)) > maxRootIndexBytes {
-			return nil, fmt.Errorf("root index exceeds the %d byte limit", maxRootIndexBytes)
 		}
 		return &RootResponse{
 			Status:          resp.StatusCode,
