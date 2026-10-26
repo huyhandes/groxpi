@@ -105,8 +105,10 @@ Decision 2 made redirect mode a server decision built on a per-call no-fetch opt
 left the server, admin and download each re-deriving the mode from `GROXPI_DOWNLOAD_TIMEOUT`.
 
 - **The mode is set once, when the store is built.** `storage.NewStore(..., redirect bool)` takes it
-  and `Store.Open(ctx, pkg, file)` has no fetch flag. A redirect-mode store answers a miss in every
-  tier with `ErrNotFound` and starts no flight; a hybrid durable hit is still promoted into the cache.
+  and `Store.Open(ctx, pkg, file)` has no fetch flag. A redirect-mode store starts no flight on a miss
+  in every tier; a hybrid durable hit is still promoted into the cache. What the miss returns is a
+  `*storage.RedirectError` with reason `caching_disabled` (see "a miss says why it missed" below),
+  not `ErrNotFound`.
 - **Everyone else asks the store.** The server's redirect reason and admin's up-front "caching is
   disabled" prefetch refusal read `Store.Redirects()`. Download no longer substitutes a 5-minute budget
   for a zero timeout, because a redirect-mode store never calls `Fetch`.
@@ -131,3 +133,15 @@ coalesced joiner of a failed flight paid its own.
 - **One place strips credentials.** `RedirectError.URL` comes only from `download.Target.RedirectURL`,
   which drops userinfo and reports that it did (`RedirectError.Stripped`, for the server's warning); an
   unparseable URL yields none and the server answers `502` rather than hand it out.
+
+## Amendment — 2026-10-27: index renders the PEP 503 body
+
+Decision 1 put every template in `server`. The PEP 503 HTML page is not a template: it is the HTML
+form of the index's own file list, and the parser that reads upstream pages lives in `index`.
+
+- **`index` owns both directions of the simple-index body.** `parseSimpleHTML` reads an upstream page
+  and `index.RenderSimpleHTML(pkg, files)` writes groxpi's page, so a change to what a file entry
+  carries is made in one package. Rendering escapes every interpolated value, and a round-trip test
+  (render, then parse) keeps the two directions in step.
+- **The server still owns HTTP.** Routes, status codes, headers, content negotiation and the write of
+  the rendered bytes stay in `server`; `index` returns a body and knows nothing of the request.

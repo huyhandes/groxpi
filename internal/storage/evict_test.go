@@ -130,6 +130,55 @@ func TestStore_EvictMidUploadWins(t *testing.T) {
 	}
 }
 
+// TestStore_EvictCancelledMidUploadDeletesNothing: an evict whose own context
+// ends while the PUT it waits on is still running returns that error and
+// deletes nothing, so it never deletes before a PUT that may still land.
+func TestStore_EvictCancelledMidUploadDeletesNothing(t *testing.T) {
+	for _, mode := range []string{"hybrid", "s3"} {
+		t.Run(mode, func(t *testing.T) {
+			f := &fakeFetcher{body: bytes.Repeat([]byte("c"), 100000)}
+			s, l, bucket, _ := evictStore(t, mode, f)
+			bucket.putGate, bucket.putSeen = make(chan struct{}), make(chan struct{})
+			release := sync.OnceFunc(func() { close(bucket.putGate) })
+			t.Cleanup(release)
+			key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
+
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+			require.NoError(t, err)
+			_, err = io.ReadAll(obj)
+			require.NoError(t, err)
+			_ = obj.Close()
+			select {
+			case <-bucket.putSeen:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the upload never reached the bucket")
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				_, err := s.DeletePrefix(ctx, key[:len(key)-len("pkg-1.0.tar.gz")])
+				done <- err
+			}()
+			cancel()
+			select {
+			case err := <-done:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				t.Fatal("DeletePrefix outlived its own context")
+			}
+			if l != nil {
+				ok, err := exists(l, key)
+				require.NoError(t, err)
+				assert.True(t, ok, "a cancelled evict leaves the cache alone")
+			}
+			release()
+			require.NoError(t, s.Close())
+			assert.Equal(t, f.body, bucket.object(key), "a cancelled evict deleted nothing behind the PUT")
+		})
+	}
+}
+
 // list answers a ListObjectsV2 under prefix in one page. Caller holds b.mu.
 func (b *fakeS3) list(w http.ResponseWriter, prefix string) {
 	var body strings.Builder

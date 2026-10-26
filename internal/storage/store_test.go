@@ -520,6 +520,29 @@ func TestStore_SpoolCreateFailureRedirects(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
+// TestStore_HybridPromotionSpoolFailureIsAStorageError: a durable hit that
+// cannot be spooled into the cache is a storage failure, not a miss: the file
+// exists, so a client must not be told it does not.
+func TestStore_HybridPromotionSpoolFailureIsAStorageError(t *testing.T) {
+	dir := t.TempDir()
+	l1, err := NewLocalStorage(dir, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "packages"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "packages", "pkg"), nil, 0o600)) // the spool dir cannot be made
+	remote, bucket := newFakeS3(t)
+	bucket.seed(mustKey(t, "pkg", "pkg-1.0.tar.gz"), []byte("remote bytes"))
+	f := &fakeFetcher{err: errors.New("upstream must not be called")}
+	s := NewStore(l1, remote, f, "", false)
+
+	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	require.ErrorIs(t, err, ErrStorage)
+	var re *RedirectError
+	assert.NotErrorAs(t, err, &re, "the durable store has it: no upstream redirect")
+	assert.Zero(t, f.resolves.Load())
+	assert.Empty(t, s.InFlight())
+	require.NoError(t, s.Close())
+}
+
 // TestStore_NotListedIsNotARedirect: a file the index does not list is
 // download.ErrNotListed in either mode, and nothing is fetched.
 func TestStore_NotListedIsNotARedirect(t *testing.T) {

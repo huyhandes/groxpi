@@ -115,7 +115,7 @@ var maxPackageIndexBytes int64 = 64 << 20
 func readCapped(r io.Reader, limit int64) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 	if int64(len(body)) > limit {
 		return nil, fmt.Errorf("body exceeds the %d byte limit", limit)
