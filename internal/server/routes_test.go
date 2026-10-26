@@ -43,6 +43,15 @@ func withCredentials(cfg *config.Config) {
 	cfg.AdminPassword = adminPass
 }
 
+// newTestServer builds a server from cfg and fails the test if that errors.
+// Closing it stays the caller's business, as it was with the old New.
+func newTestServer(tb testing.TB, cfg *config.Config) *Server {
+	tb.Helper()
+	srv, err := NewServer(cfg)
+	require.NoError(tb, err)
+	return srv
+}
+
 func newRoutesServer(t *testing.T, upstreamURL string, opts ...func(*config.Config)) http.Handler {
 	t.Helper()
 	srv, err := NewServer(routesConfig(t, upstreamURL, opts...))

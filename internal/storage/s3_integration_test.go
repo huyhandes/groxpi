@@ -197,7 +197,6 @@ func newIntegrationS3Storage(t *testing.T, endpoint string) *S3Storage {
 		UseSSL:          false,
 		ForcePathStyle:  true,
 		ConnectTimeout:  30 * time.Second,
-		RequestTimeout:  5 * time.Minute,
 	})
 	require.NoError(t, err, "Failed to create S3 storage")
 

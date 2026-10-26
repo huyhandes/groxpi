@@ -130,12 +130,6 @@ func cacheMisses(t *testing.T, reader *sdkmetric.ManualReader) int64 {
 // TestStore_RetriedLookupCountsOneMiss: when a commit in the same commit slot
 // makes Open look a second time, the second lookup's miss is not counted again.
 func TestStore_RetriedLookupCountsOneMiss(t *testing.T) {
-	keyA, err := Key("a", "a-1.0.tar.gz")
-	require.NoError(t, err)
-	keyB, err := Key("b10", "b10-1.0.tar.gz")
-	require.NoError(t, err)
-	require.Equal(t, commitSlot(keyA), commitSlot(keyB), "the keys must share a slot")
-
 	_, reader := installTestTelemetry(t)
 	held, release := make(chan struct{}), make(chan struct{})
 	var lookups atomic.Int64
@@ -155,6 +149,7 @@ func TestStore_RetriedLookupCountsOneMiss(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = remote.Close() })
 	s := NewStore(nil, remote, &fakeFetcher{body: []byte("bytes")}, t.TempDir(), false)
+	pkgB, fileB := pkgBySlot(t, s, "b", "a", "a-1.0.tar.gz", true)
 
 	before := cacheMisses(t, reader)
 	late := make(chan error, 1)
@@ -168,7 +163,7 @@ func TestStore_RetriedLookupCountsOneMiss(t *testing.T) {
 	}()
 	<-held
 
-	obj, err := s.Open(t.Context(), "b10", "b10-1.0.tar.gz")
+	obj, err := s.Open(t.Context(), pkgB, fileB)
 	require.NoError(t, err)
 	_, err = io.ReadAll(obj)
 	require.NoError(t, err)

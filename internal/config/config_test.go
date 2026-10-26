@@ -47,7 +47,7 @@ func TestLoad(t *testing.T) {
 	}()
 
 	t.Run("default values", func(t *testing.T) {
-		cfg := Load()
+		cfg := mustLoad(t)
 
 		if cfg.IndexURL != "https://pypi.org/simple/" {
 			t.Errorf("Expected default IndexURL to be 'https://pypi.org/simple/', got %s", cfg.IndexURL)
@@ -88,7 +88,7 @@ func TestLoad(t *testing.T) {
 		_ = os.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
 		_ = os.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
 
-		cfg := Load()
+		cfg := mustLoad(t)
 
 		if cfg.IndexURL != "https://test.pypi.org/simple/" {
 			t.Errorf("Expected IndexURL to be 'https://test.pypi.org/simple/', got %s", cfg.IndexURL)
@@ -127,7 +127,7 @@ func TestLoad(t *testing.T) {
 		_ = os.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://extra1.example.com,https://extra2.example.com")
 		_ = os.Setenv("GROXPI_EXTRA_INDEX_TTLS", "120,240")
 
-		cfg := Load()
+		cfg := mustLoad(t)
 
 		expectedURLs := []string{"https://extra1.example.com", "https://extra2.example.com"}
 		if len(cfg.ExtraIndexURLs) != len(expectedURLs) {
@@ -156,7 +156,7 @@ func TestLoad(t *testing.T) {
 		_ = os.Setenv("GROXPI_CONNECT_TIMEOUT", "5.0")
 		_ = os.Setenv("GROXPI_READ_TIMEOUT", "30.0")
 
-		cfg := Load()
+		cfg := mustLoad(t)
 
 		if cfg.ConnectTimeout != 5*time.Second {
 			t.Errorf("Expected ConnectTimeout to be 5s, got %v", cfg.ConnectTimeout)
@@ -180,7 +180,7 @@ func TestLoadS3WithoutStaticCredentials(t *testing.T) {
 		t.Run(storageType, func(t *testing.T) {
 			t.Setenv("GROXPI_STORAGE_TYPE", storageType)
 
-			cfg := Load()
+			cfg := mustLoad(t)
 
 			if cfg.S3AccessKeyID != "" || cfg.S3SecretAccessKey != "" {
 				t.Fatalf("expected no static credentials, got %q/%q", cfg.S3AccessKeyID, cfg.S3SecretAccessKey)
@@ -197,13 +197,20 @@ func TestLoadS3RequiresBucket(t *testing.T) {
 	t.Setenv("GROXPI_STORAGE_TYPE", "s3")
 	t.Setenv("GROXPI_S3_BUCKET", "")
 
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected Load to abort without a bucket name")
-		}
-	}()
+	cfg, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "GROXPI_S3_BUCKET") {
+		t.Fatalf("Load() = %v, %v; want an error naming GROXPI_S3_BUCKET", cfg, err)
+	}
+}
 
-	Load()
+// mustLoad is Load for a test whose environment is valid.
+func mustLoad(t *testing.T) *Config {
+	t.Helper()
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
 }
 
 func TestResolutionOrder(t *testing.T) {
@@ -270,7 +277,7 @@ func TestDurationEnvAcceptsUnits(t *testing.T) {
 	for value, want := range cases {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("GROXPI_DOWNLOAD_TIMEOUT", value)
-			if got := Load().DownloadTimeout; got != want {
+			if got := mustLoad(t).DownloadTimeout; got != want {
 				t.Fatalf("GROXPI_DOWNLOAD_TIMEOUT=%s gave %v, want %v", value, got, want)
 			}
 		})
@@ -291,7 +298,7 @@ func TestDownloadIdleTimeout(t *testing.T) {
 	for value, want := range cases {
 		t.Run("value="+value, func(t *testing.T) {
 			t.Setenv("GROXPI_DOWNLOAD_IDLE_TIMEOUT", value)
-			if got := Load().DownloadIdleTimeout; got != want {
+			if got := mustLoad(t).DownloadIdleTimeout; got != want {
 				t.Fatalf("GROXPI_DOWNLOAD_IDLE_TIMEOUT=%q gave %v, want %v", value, got, want)
 			}
 		})
@@ -319,7 +326,7 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
 
 			var cfg *Config
-			logs := captureLogs(t, func() { cfg = Load() })
+			logs := captureLogs(t, func() { cfg = mustLoad(t) })
 
 			if got := tc.read(cfg); got != tc.want {
 				t.Errorf("expected the default %v, got %v", tc.want, got)
@@ -338,13 +345,10 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 func TestLoadRejectsUnknownStorageType(t *testing.T) {
 	t.Setenv("GROXPI_STORAGE_TYPE", "minio")
 
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected Load to abort on an unknown storage type")
-		}
-	}()
-
-	Load()
+	cfg, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "GROXPI_STORAGE_TYPE") {
+		t.Fatalf("Load() = %v, %v; want an error naming GROXPI_STORAGE_TYPE", cfg, err)
+	}
 }
 
 // TestLoadStorageTypeIsCaseInsensitive pins that the storage type is trimmed
@@ -355,7 +359,7 @@ func TestLoadStorageTypeIsCaseInsensitive(t *testing.T) {
 	for value, want := range map[string]string{"S3": "s3", " Hybrid ": "hybrid", "LOCAL": "local"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("GROXPI_STORAGE_TYPE", value)
-			if got := Load().StorageType; got != want {
+			if got := mustLoad(t).StorageType; got != want {
 				t.Fatalf("GROXPI_STORAGE_TYPE=%q gave %q, want %q", value, got, want)
 			}
 		})

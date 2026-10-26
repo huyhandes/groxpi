@@ -453,15 +453,29 @@ func TestStore_CommitBetweenLookupAndLeadServesTheCommit(t *testing.T) {
 	assert.Equal(t, int64(1), puts.Load(), "uploaded once")
 }
 
+// pkgBySlot finds a package named base plus a number whose sdist key shares
+// the commit slot of (pkgA, fileA) when same is set, or does not otherwise.
+// The slot hash is seeded per Store, so the pair is chosen at test time.
+func pkgBySlot(t *testing.T, s *Store, base, pkgA, fileA string, same bool) (pkg, file string) {
+	t.Helper()
+	keyA, err := Key(pkgA, fileA)
+	require.NoError(t, err)
+	for i := range 100 * commitSlots {
+		pkg = fmt.Sprintf("%s%d", base, i)
+		file = pkg + "-1.0.tar.gz"
+		key, err := Key(pkg, file)
+		require.NoError(t, err)
+		if (s.commitSlot(key) == s.commitSlot(keyA)) == same {
+			return pkg, file
+		}
+	}
+	t.Fatalf("no %s package with same=%v slot as %s", base, same, keyA)
+	return "", ""
+}
+
 // TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup: a commit of an unrelated
 // key between a miss and its lead does not send the miss back to the store.
 func TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup(t *testing.T) {
-	keyA, err := Key("pkg-a", "a-1.0.tar.gz")
-	require.NoError(t, err)
-	keyB, err := Key("pkg-b", "b-1.0.tar.gz")
-	require.NoError(t, err)
-	require.NotEqual(t, commitSlot(keyA), commitSlot(keyB), "the keys must not share a slot")
-
 	var lookupsA atomic.Int64
 	held, release := make(chan struct{}), make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +494,7 @@ func TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = remote.Close() })
 	s := NewStore(nil, remote, &fakeFetcher{body: []byte("bytes")}, t.TempDir(), false)
+	pkgB, fileB := pkgBySlot(t, s, "pkg-b", "pkg-a", "a-1.0.tar.gz", false)
 
 	done := make(chan struct{})
 	go func() {
@@ -492,7 +507,7 @@ func TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup(t *testing.T) {
 	}()
 	<-held
 
-	obj, err := s.Open(t.Context(), "pkg-b", "b-1.0.tar.gz")
+	obj, err := s.Open(t.Context(), pkgB, fileB)
 	require.NoError(t, err)
 	_, _ = io.Copy(io.Discard, obj)
 	_ = obj.Close()

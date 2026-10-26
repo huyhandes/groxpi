@@ -153,7 +153,8 @@ func TestNew_S3ResponseHeaderBudgetIsNotTheDownloadBudget(t *testing.T) {
 	s, err := New(cfg, &fakeFetcher{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
-	assert.Equal(t, 5*time.Minute, s.durable.transport.ResponseHeaderTimeout)
+	assert.Equal(t, s3ResponseHeaderTimeout, s.durable.transport.ResponseHeaderTimeout)
+	assert.NotEqual(t, cfg.DownloadTimeout, s.durable.transport.ResponseHeaderTimeout)
 }
 
 func TestNew_HybridLocalCacheFailureClosesDurable(t *testing.T) {

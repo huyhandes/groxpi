@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"os"
@@ -126,6 +127,7 @@ type Store struct {
 	flights    map[string]*flight
 	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
 	commits    [commitSlots]uint64  // per commitSlot, bumped at each post-commit unregister, under mu
+	slotSeed   maphash.Seed         // commitSlot's hash seed, fixed for the Store's life
 	leaders    sync.WaitGroup
 }
 
@@ -137,7 +139,7 @@ type Store struct {
 // promoted.
 func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
 	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
-		flights: map[string]*flight{}, committing: map[*flight]struct{}{}}
+		flights: map[string]*flight{}, committing: map[*flight]struct{}{}, slotSeed: maphash.MakeSeed()}
 	switch {
 	case cache == nil:
 		s.commit = s.commitS3
@@ -267,7 +269,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 
 	// A flight that commits between the lookup and the lock below changes its
 	// key's commit slot; the lookup then runs once more instead of fetching again.
-	slot := commitSlot(key)
+	slot := s.commitSlot(key)
 	var promote *download.File
 	for retried := false; ; retried = true {
 		var obj *Object
@@ -322,20 +324,15 @@ func (s *Store) join(key string) (*flight, uint64) {
 	if f != nil {
 		f.ref()
 	}
-	return f, s.commits[commitSlot(key)]
+	return f, s.commits[s.commitSlot(key)]
 }
 
-// commitSlot is the slot of s.commits that counts the commits of key: FNV-1a
+// commitSlot is the slot of s.commits that counts the commits of key: a hash
 // of the key, so a commit only re-checks lookups of keys sharing its slot.
 const commitSlots = 64
 
-func commitSlot(key string) int {
-	h := uint64(14695981039346656037)
-	for i := 0; i < len(key); i++ {
-		h ^= uint64(key[i])
-		h *= 1099511628211
-	}
-	return int(h % commitSlots)
+func (s *Store) commitSlot(key string) int {
+	return int(maphash.String(s.slotSeed, key) % commitSlots)
 }
 
 func (s *Store) unregister(f *flight) { s.drop(f, false) }
@@ -348,7 +345,7 @@ func (s *Store) drop(f *flight, committed bool) {
 	s.mu.Lock()
 	delete(s.flights, f.key)
 	if committed {
-		s.commits[commitSlot(f.key)]++
+		s.commits[s.commitSlot(f.key)]++
 	}
 	n := len(s.flights)
 	s.mu.Unlock()
@@ -364,10 +361,10 @@ func (s *Store) lookup(ctx context.Context, key, file string, countMiss bool) (*
 	defer span.End()
 
 	if s.cache != nil {
-		rc, info, err := s.cache.Get(ctx, key)
+		f, info, err := s.cache.Get(ctx, key)
 		if err == nil {
 			telemetry.CacheHit(ctx, telemetry.LayerLocal)
-			return &Object{ReadSeekCloser: rc.(*os.File), Name: file, Size: info.Size, ModTime: info.LastModified, ContentType: contentType(file)}, nil
+			return &Object{ReadSeekCloser: f, Name: file, Size: info.Size, ModTime: info.LastModified, ContentType: contentType(file)}, nil
 		}
 		if countMiss {
 			telemetry.CacheMiss(ctx, telemetry.LayerLocal)

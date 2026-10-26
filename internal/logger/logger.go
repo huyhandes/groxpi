@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 
@@ -25,11 +26,6 @@ import (
 // that admits errors. slog has no fatal level of its own.
 const LevelFatal = slog.Level(12)
 
-// Logger is the global logger. Init replaces it and also installs it as the
-// slog default, which is what the package-level slog calls throughout the
-// codebase use.
-var Logger = slog.Default()
-
 // LogConfig holds logging configuration
 type LogConfig struct {
 	Level  string // DEBUG, INFO, WARN, ERROR
@@ -37,7 +33,8 @@ type LogConfig struct {
 	Color  bool   // enable color output for console
 }
 
-// Init initializes the global logger
+// Init installs the configured logger as the slog default, which is what the
+// package-level slog calls throughout the codebase use.
 func Init(cfg LogConfig) {
 	level := ParseLevel(cfg.Level)
 
@@ -54,11 +51,10 @@ func Init(cfg LogConfig) {
 		sink = newConsoleHandler(os.Stdout, cfg.Color)
 	}
 
-	Logger = slog.New(&fanout{
+	slog.SetDefault(slog.New(&fanout{
 		level:    level,
 		handlers: []slog.Handler{sink, otelslog.NewHandler(telemetry.ScopeName)},
-	})
-	slog.SetDefault(Logger)
+	}))
 }
 
 // ParseLevel converts a string level to a slog.Level.
@@ -83,7 +79,7 @@ func ParseLevel(level string) slog.Level {
 // which is why this one wrapper exists where the rest of the codebase calls
 // slog directly.
 func Fatal(msg string, args ...any) {
-	Logger.Log(context.Background(), LevelFatal, msg, args...)
+	slog.Log(context.Background(), LevelFatal, msg, args...)
 	os.Exit(1)
 }
 
@@ -155,8 +151,8 @@ type consoleHandler struct {
 	mu     *sync.Mutex
 	w      io.Writer
 	color  bool
-	prefix string // accumulated group prefix
-	attrs  []slog.Attr
+	prefix string // accumulated group prefix, applied to attrs added later
+	pre    string // attrs from WithAttrs, rendered with the prefix they were added under
 }
 
 // consoleTimeFormat is the wall-clock stamp on a console line. Console output is
@@ -182,9 +178,7 @@ func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 	b.WriteByte(' ')
 	b.WriteString(r.Message)
-	for _, a := range h.attrs {
-		appendAttr(&b, h.prefix, a)
-	}
+	b.WriteString(h.pre)
 	r.Attrs(func(a slog.Attr) bool {
 		appendAttr(&b, h.prefix, a)
 		return true
@@ -198,8 +192,13 @@ func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	var b strings.Builder
+	b.WriteString(h.pre)
+	for _, a := range attrs {
+		appendAttr(&b, h.prefix, a)
+	}
 	next := *h
-	next.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
+	next.pre = b.String()
 	return &next
 }
 
@@ -225,10 +224,22 @@ func appendAttr(b *strings.Builder, prefix string, a slog.Attr) {
 	b.WriteString(a.Key)
 	b.WriteByte('=')
 	v := a.Value.String()
-	if strings.ContainsAny(v, " \"=\n\r\t") {
+	if needsQuote(v) {
 		v = strconv.Quote(v)
 	}
 	b.WriteString(v)
+}
+
+// needsQuote reports whether a console value must be quoted: it holds a
+// key=value delimiter (space, quote, equals) or a rune that is not printable,
+// such as a newline or a terminal escape.
+func needsQuote(v string) bool {
+	for _, r := range v {
+		if !unicode.IsPrint(r) || r == ' ' || r == '"' || r == '=' {
+			return true
+		}
+	}
+	return false
 }
 
 func levelTag(l slog.Level) string {

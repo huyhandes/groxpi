@@ -29,7 +29,7 @@ func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) 
 // itself, to wait for its downloads.
 func newCorrectnessSrv(t *testing.T, upstreamURL string, ttfb time.Duration) *Server {
 	t.Helper()
-	return New(&config.Config{
+	return newTestServer(t, &config.Config{
 		IndexURL:        upstreamURL,
 		CacheDir:        t.TempDir(),
 		CacheSize:       1 << 30,
@@ -170,7 +170,9 @@ func TestDownload_DefaultConfigurationCaches(t *testing.T) {
 	t.Setenv("GROXPI_INDEX_URL", up.URL)
 	t.Setenv("GROXPI_CACHE_DIR", cacheDir)
 	t.Setenv("GROXPI_LOGGING_LEVEL", "ERROR")
-	router := New(config.Load()).Router()
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	router := newTestServer(t, cfg).Router()
 
 	first := getFile(router, pkg, file)
 	assert.Equal(t, http.StatusOK, first.StatusCode)

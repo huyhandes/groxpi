@@ -35,16 +35,24 @@ func healthCheck(baseURL string) error {
 func main() {
 	// The health-check probe runs before anything else is constructed: no
 	// telemetry, no logger, no server, no storage backend.
+	cfg, cfgErr := config.Load()
 	if len(os.Args) > 1 && os.Args[1] == "--health-check" {
-		if err := healthCheck("http://127.0.0.1:" + config.Load().Port); err != nil {
+		err := cfgErr
+		if err == nil {
+			err = healthCheck("http://127.0.0.1:" + cfg.Port)
+		}
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "health check failed:", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	// Load configuration
-	cfg := config.Load()
+	// Bad configuration stops the process before anything is constructed. The
+	// logger is not configured yet, so this goes to slog's default (stderr).
+	if cfgErr != nil {
+		logger.Fatal("Invalid configuration", "error", cfgErr)
+	}
 
 	// Install the OpenTelemetry providers before the logger, so that the log
 	// bridge picks up a real provider when one is configured. With no endpoint
@@ -85,7 +93,10 @@ func main() {
 	// The storage module logs its own "storage configured" line: it alone
 	// knows which cache the mode really uses.
 	// Create server
-	srv := server.New(cfg)
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		logger.Fatal("Failed to construct server", "error", err)
+	}
 	router := srv.Router()
 
 	// Create HTTP server

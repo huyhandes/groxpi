@@ -29,7 +29,7 @@ func TestStartupWithoutOTLPEndpoint(t *testing.T) {
 	t.Setenv("GROXPI_CACHE_DIR", t.TempDir())
 	t.Setenv("GROXPI_LOGGING_LEVEL", "ERROR")
 
-	cfg := config.Load()
+	cfg := loadConfig(t)
 	if cfg.OTLPEndpoint != "" {
 		t.Fatalf("expected no OTLP endpoint, got %q", cfg.OTLPEndpoint)
 	}
@@ -42,7 +42,10 @@ func TestStartupWithoutOTLPEndpoint(t *testing.T) {
 
 	logger.Init(logger.LogConfig{Level: cfg.LogLevel, Format: cfg.LogFormat, Color: cfg.LogColor})
 
-	srv := server.New(cfg)
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = srv.Close() })
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -127,7 +130,7 @@ func TestMainConfiguration(t *testing.T) {
 	})
 
 	// Test default configuration loading
-	cfg := config.Load()
+	cfg := loadConfig(t)
 
 	if cfg == nil {
 		t.Fatal("config.Load() returned nil")
@@ -194,7 +197,7 @@ func TestMainConfigurationWithEnv(t *testing.T) {
 	}
 
 	// Load configuration with environment variables
-	cfg := config.Load()
+	cfg := loadConfig(t)
 
 	if cfg.Port != "9999" {
 		t.Errorf("Expected port 9999, got %s", cfg.Port)
@@ -258,7 +261,7 @@ func TestS3Configuration(t *testing.T) {
 	}
 
 	// Load configuration with S3 settings
-	cfg := config.Load()
+	cfg := loadConfig(t)
 
 	if cfg.StorageType != "s3" {
 		t.Errorf("Expected storage type s3, got %s", cfg.StorageType)
@@ -354,7 +357,7 @@ func TestConfigurationEdgeCases(t *testing.T) {
 				_ = os.Setenv(key, val)
 			}
 
-			cfg := config.Load()
+			cfg := loadConfig(t)
 			tc.testFunc(t, cfg)
 		})
 	}
@@ -377,7 +380,7 @@ func TestApplicationLifecycle(t *testing.T) {
 		_ = os.Unsetenv("GROXPI_LOGGING_LEVEL")
 	})
 
-	cfg := config.Load()
+	cfg := loadConfig(t)
 
 	// Verify configuration is valid for starting a server
 	if cfg.Port != "0" {
@@ -452,7 +455,7 @@ func TestBooleanEnvironmentVariables(t *testing.T) {
 						_ = os.Setenv(tt.envVar, envVal)
 					}
 
-					cfg := config.Load()
+					cfg := loadConfig(t)
 
 					var actualResult bool
 					switch tt.envVar {
@@ -501,7 +504,7 @@ func TestConfigLoadingWithAllDefaults(t *testing.T) {
 		}
 	})
 
-	cfg := config.Load()
+	cfg := loadConfig(t)
 
 	// Test that all defaults are reasonable
 	if cfg.Port != "5000" {
@@ -582,7 +585,7 @@ func TestMultiIndexConfiguration(t *testing.T) {
 				_ = os.Unsetenv("GROXPI_EXTRA_INDEX_TTLS")
 			}
 
-			cfg := config.Load()
+			cfg := loadConfig(t)
 
 			if len(cfg.ExtraIndexURLs) != tc.expectUrls {
 				t.Errorf("Expected %d extra URLs, got %d", tc.expectUrls, len(cfg.ExtraIndexURLs))
@@ -661,31 +664,29 @@ func TestTimeoutConfigurations(t *testing.T) {
 				_ = os.Setenv(key, val)
 			}
 
-			cfg := config.Load()
+			cfg := loadConfig(t)
 			tc.testFunc(t, cfg)
 		})
 	}
 }
 
-// This would test the actual main function, but since it runs indefinitely,
-// we'll just verify it can be imported and the function exists
-func TestMainExists(t *testing.T) {
-	// This test simply verifies that main() function is defined
-	// The actual testing of main() would require more complex integration testing
-	// or refactoring main() to be more testable (e.g., accepting a context for shutdown)
-
-	// For now, just verify we can load config and the function signature is correct
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("main package should be importable without panicking: %v", r)
-		}
-	}()
-
-	// Load config to ensure all dependencies work
-	cfg := config.Load()
-	if cfg == nil {
-		t.Error("config.Load() should not return nil")
+// TestLoadReportsBadConfig: a bad environment is an error main can log, not a
+// panic.
+func TestLoadReportsBadConfig(t *testing.T) {
+	t.Setenv("GROXPI_STORAGE_TYPE", "minio")
+	if cfg, err := config.Load(); err == nil {
+		t.Fatalf("config.Load() = %+v, nil; want an error for an unknown storage type", cfg)
 	}
+}
+
+// loadConfig is config.Load for a test whose environment is valid.
+func loadConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	return cfg
 }
 
 // TestHealthCheck covers the three states the container probe can observe: a

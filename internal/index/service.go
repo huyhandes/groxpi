@@ -248,12 +248,11 @@ func (s *Service) queryConcurrently(ctx context.Context, indexes []config.Index,
 		}
 	}()
 
+	// ctx carries no cancellation (Resolve detaches it so one client cannot
+	// abort a shared resolution), so each wait ends only when its query does;
+	// the HTTP client's timeout bounds that.
 	for i, index := range indexes {
-		select {
-		case <-done[i]:
-		case <-ctx.Done():
-			return config.Index{}, nil, ctx.Err()
-		}
+		<-done[i]
 
 		switch answer := answers[i]; {
 		case answer.err == nil:

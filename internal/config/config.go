@@ -182,7 +182,10 @@ func (c *Config) AdminConfigured() bool {
 	return c.AdminUsername != "" && c.AdminPassword != ""
 }
 
-func Load() *Config {
+// Load reads the configuration from the environment. A malformed optional value
+// falls back to its default with a warning; a setting the proxy cannot run
+// without (storage type, bucket) is an error.
+func Load() (*Config, error) {
 	cfg := &Config{
 		IndexURL:               getEnv("GROXPI_INDEX_URL", "https://pypi.org/simple/"),
 		IndexTTL:               getDurationEnv("GROXPI_INDEX_TTL", 30*time.Minute),
@@ -271,7 +274,7 @@ func Load() *Config {
 	switch cfg.StorageType {
 	case "local", "s3", "hybrid":
 	default:
-		panic(`GROXPI_STORAGE_TYPE must be "local", "s3" or "hybrid", got "` + cfg.StorageType + `"`)
+		return nil, errors.New(`GROXPI_STORAGE_TYPE must be "local", "s3" or "hybrid", got "` + cfg.StorageType + `"`)
 	}
 
 	// Validate S3 configuration if S3 or hybrid storage is selected
@@ -285,11 +288,11 @@ func Load() *Config {
 		// checked: with none configured the AWS default chain takes over, which
 		// is how instance, task and web-identity roles work.
 		if cfg.S3Bucket == "" {
-			panic("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
+			return nil, errors.New("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func getEnv(key, defaultValue string) string {
