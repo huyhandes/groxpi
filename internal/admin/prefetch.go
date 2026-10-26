@@ -118,10 +118,10 @@ func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
 // warm caches one file with no client attached: open it through the store and
 // drain it. A hit is already cached; a miss drains the whole download path.
 func (s *Service) warm(ctx context.Context, packageName, fileName string) error {
-	if s.noCache {
+	if s.store.Redirects() {
 		return errors.New("caching is disabled (download timeout is 0)")
 	}
-	obj, err := s.store.Open(ctx, packageName, fileName, true)
+	obj, err := s.store.Open(ctx, packageName, fileName)
 	if err != nil {
 		return err
 	}

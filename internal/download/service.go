@@ -50,13 +50,9 @@ type Service struct {
 // time-to-first-byte budget: it bounds only the wait for upstream response
 // headers. Once headers are in, the body runs to completion under the caller's
 // context, because a transfer already streaming must not be cut off by a budget
-// meant for connection setup. At 0 (redirect mode) a fetch still gets 5 minutes.
+// meant for connection setup. At 0 (redirect mode) the store never calls Fetch.
 func New(cfg *config.Config, idx *index.Service) *Service {
-	ttfb := cfg.DownloadTimeout
-	if ttfb <= 0 {
-		ttfb = 5 * time.Minute
-	}
-	return &Service{index: idx, client: &http.Client{}, ttfb: ttfb}
+	return &Service{index: idx, client: &http.Client{}, ttfb: cfg.DownloadTimeout}
 }
 
 // Resolve finds a package file in the index. A file the index does not list is

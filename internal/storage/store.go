@@ -82,6 +82,7 @@ type Store struct {
 	durable  *S3Storage    // nil in local mode
 	fetcher  Fetcher
 	spoolDir string // spool directory when there is no cache
+	redirect bool   // a miss is never fetched; the caller redirects upstream
 
 	mu      sync.Mutex
 	flights map[string]*flight
@@ -91,9 +92,11 @@ type Store struct {
 // NewStore builds a store over a cache, a durable store, or both (at least one
 // must be non-nil). spoolDir holds the spool files when there is no cache (pure
 // s3); crash leftovers in it are removed by the same rule the cache's scan
-// applies.
-func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string) *Store {
-	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, flights: map[string]*flight{}}
+// applies. With redirect set the store never fetches: a miss in every tier is
+// ErrNotFound, while a durable hit in hybrid mode is still promoted.
+func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
+	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
+		flights: map[string]*flight{}}
 	if cache == nil {
 		reapSpool(spoolDir)
 	}
@@ -111,10 +114,14 @@ func reapSpool(dir string) {
 	}
 }
 
-// Open opens a package file. On a miss it fetches upstream when fetch is set,
-// and otherwise returns ErrNotFound (redirect mode). A name Key refuses, an
-// empty file included, returns ErrInvalidKey before anything is touched.
-func (s *Store) Open(ctx context.Context, pkg, file string, fetch bool) (*Object, error) {
+// Redirects reports whether the store was built in redirect mode, where a miss
+// is never fetched.
+func (s *Store) Redirects() bool { return s.redirect }
+
+// Open opens a package file. On a miss it fetches upstream, or in redirect mode
+// returns ErrNotFound. A name Key refuses, an empty file included, returns
+// ErrInvalidKey before anything is touched.
+func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if file == "" {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
 	}
@@ -130,7 +137,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string, fetch bool) (*Object
 	if obj != nil {
 		return obj, nil
 	}
-	if promote == nil && !fetch {
+	if promote == nil && s.redirect {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 

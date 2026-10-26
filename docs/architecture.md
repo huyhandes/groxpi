@@ -175,7 +175,8 @@ The flight is visible: `storage.InFlight` lists each running download with the b
 the size the index declared, when it started and how many requests are coalesced onto it. The admin
 page renders it as "Downloading now" rows and `groxpi.download.inflight` reports its size.
 
-With `GROXPI_DOWNLOAD_TIMEOUT=0`, a miss is not fetched: the server resolves the file and answers `302`
+With `GROXPI_DOWNLOAD_TIMEOUT=0` the store is built in redirect mode (`Store.Redirects()`): a miss
+starts no flight, a hybrid durable hit is still promoted, and the server resolves the file and answers `302`
 to the upstream URL. A fetch that fails before upstream answers `200` also ends in a `302`, counted as
 `fetch_failed`. A file the index does not list is a `404`.
 

@@ -103,7 +103,7 @@ func openAll(t *testing.T, s *Store, n int) []*Object {
 	var wg sync.WaitGroup
 	for i := range objs {
 		wg.Go(func() {
-			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 			assert.NoError(t, err)
 			objs[i] = obj
 		})
@@ -130,7 +130,7 @@ func TestStore_CoalescedReadersGetIdenticalBytes(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("0123456789"), 20000), gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
 	objs := openAll(t, s, 5)
 	for _, o := range objs {
@@ -146,7 +146,7 @@ func TestStore_CoalescedReadersGetIdenticalBytes(t *testing.T) {
 	assert.Equal(t, int64(1), f.calls.Load(), "one fetch serves every reader")
 
 	// The next open is a cached hit, and the flight is gone.
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	assert.False(t, obj.InFlight)
 	_ = obj.Close()
@@ -159,7 +159,7 @@ func TestStore_ShaMismatchFailsAllReadersLeavesNoFile(t *testing.T) {
 	l, err := NewLocalStorage(dir, 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("x"), 100000), sha: "00", gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
 	objs := openAll(t, s, 3)
 	close(f.gate)
@@ -176,10 +176,10 @@ func TestStore_DisconnectAllStillCaches(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("y"), 100000), gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	obj, err := s.Open(ctx, "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(ctx, "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	_, err = obj.Read(make([]byte, 10))
 	require.NoError(t, err)
@@ -201,10 +201,10 @@ func TestStore_HybridPromotion(t *testing.T) {
 	remote, bucket := newFakeS3(t)
 	bucket.seed(key, data)
 	f := &fakeFetcher{err: errors.New("upstream must not be called")}
-	s := NewStore(l1, remote, f, "")
+	s := NewStore(l1, remote, f, "", true)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", false)
-	require.NoError(t, err, "an L2 hit is served even with fetching off")
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	require.NoError(t, err, "an L2 hit is served even in redirect mode")
 	assert.True(t, obj.InFlight, "an L2 hit streams through the spool")
 	assert.Equal(t, int64(len(data)), obj.Size)
 	got, err := io.ReadAll(obj)
@@ -228,7 +228,7 @@ func TestStore_HybridUploadsEveryDownload(t *testing.T) {
 	require.NoError(t, err)
 	remote, bucket := newFakeS3(t)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("h"), 100000), gate: make(chan struct{})}
-	s := NewStore(l1, remote, f, "")
+	s := NewStore(l1, remote, f, "", false)
 
 	objs := openAll(t, s, 3)
 	close(f.gate)
@@ -253,14 +253,14 @@ func TestStore_HybridCancelledPromotionStillCommits(t *testing.T) {
 	remote, bucket := newFakeS3(t)
 	bucket.seed(key, data)
 	bucket.gate = make(chan struct{})
-	s := NewStore(l1, remote, &fakeFetcher{err: errors.New("upstream must not be called")}, "")
+	s := NewStore(l1, remote, &fakeFetcher{err: errors.New("upstream must not be called")}, "", true)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	obj, err := s.Open(ctx, "pkg", "pkg-1.0.tar.gz", false)
+	obj, err := s.Open(ctx, "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	_, err = obj.Read(make([]byte, 10))
 	require.NoError(t, err)
-	other, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", false)
+	other, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	_ = obj.Close()
 	cancel()
@@ -284,9 +284,9 @@ func TestStore_S3GetFailureIsAMiss(t *testing.T) {
 	bucket.seed(key, []byte("stored"))
 	bucket.failGet = true // HEAD would still say the object is there
 	f := &fakeFetcher{body: []byte("upstream")}
-	s := NewStore(nil, remote, f, t.TempDir())
+	s := NewStore(nil, remote, f, t.TempDir(), false)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err, "a failed GET is a miss, not a 200 that dies after its headers")
 	assert.True(t, obj.InFlight, "served by a fresh download")
 	got, err := io.ReadAll(obj)
@@ -300,8 +300,8 @@ func TestStore_S3GetFailureIsAMiss(t *testing.T) {
 func TestStore_HybridDeletePrefixEvictsBothTiers(t *testing.T) {
 	l1, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
-	s := NewStore(l1, nil, &fakeFetcher{body: []byte("cached")}, "")
-	obj, err := s.Open(t.Context(), "numpy", "numpy-1.0.tar.gz", true)
+	s := NewStore(l1, nil, &fakeFetcher{body: []byte("cached")}, "", false)
+	obj, err := s.Open(t.Context(), "numpy", "numpy-1.0.tar.gz")
 	require.NoError(t, err)
 	_, _ = io.ReadAll(obj)
 	_ = obj.Close()
@@ -311,7 +311,7 @@ func TestStore_HybridDeletePrefixEvictsBothTiers(t *testing.T) {
 	remote, err := NewS3Storage(&S3Config{Endpoint: bucket.URL, AccessKeyID: "test", SecretAccessKey: "test",
 		Bucket: "b", ForcePathStyle: true})
 	require.NoError(t, err)
-	s = NewStore(l1, remote, &fakeFetcher{}, "")
+	s = NewStore(l1, remote, &fakeFetcher{}, "", false)
 
 	deleted, err := s.DeletePrefix(context.Background(), mustKey(t, "numpy", ""))
 	require.NoError(t, err)
@@ -327,9 +327,9 @@ func TestStore_S3UploadsSpoolAndRemovesIt(t *testing.T) {
 	spool := t.TempDir()
 	remote, bucket := newFakeS3(t)
 	f := &fakeFetcher{body: []byte("s3 bytes")}
-	s := NewStore(nil, remote, f, spool)
+	s := NewStore(nil, remote, f, spool, false)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	got, err := io.ReadAll(obj)
 	require.NoError(t, err)
@@ -345,22 +345,27 @@ func TestStore_FetchErrorPropagates(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	boom := errors.New("boom")
-	s := NewStore(l, nil, &fakeFetcher{err: boom}, "")
+	s := NewStore(l, nil, &fakeFetcher{err: boom}, "", false)
 
-	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.ErrorIs(t, err, boom)
 	assert.Empty(t, s.InFlight())
 	require.NoError(t, s.Close())
 }
 
-func TestStore_NoFetchMissIsNotFound(t *testing.T) {
+// TestStore_RedirectMissStartsNoFlight: a store built in redirect mode answers a
+// miss with ErrNotFound and never fetches.
+func TestStore_RedirectMissStartsNoFlight(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: []byte("z")}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", true)
+	assert.True(t, s.Redirects())
+	assert.False(t, NewStore(l, nil, f, "", false).Redirects())
 
-	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", false)
+	_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.ErrorIs(t, err, ErrNotFound)
+	assert.Empty(t, s.InFlight())
 	assert.Zero(t, f.calls.Load())
 	require.NoError(t, s.Close())
 }
@@ -374,8 +379,9 @@ func TestStore_OpenRejectsInvalidKey(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "secret"), []byte("planted"), 0o600))
 	f := &fakeFetcher{body: []byte("z")}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	redirect := NewStore(l, nil, f, "", true)
 
 	for _, tc := range []struct{ pkg, file string }{
 		{"pkg", "../../secret"},
@@ -390,8 +396,8 @@ func TestStore_OpenRejectsInvalidKey(t *testing.T) {
 		{"..", "secret"},
 		{"a/b", "pkg-1.0.tar.gz"},
 	} {
-		for _, fetch := range []bool{true, false} {
-			obj, err := s.Open(t.Context(), tc.pkg, tc.file, fetch)
+		for _, st := range []*Store{s, redirect} {
+			obj, err := st.Open(t.Context(), tc.pkg, tc.file)
 			if obj != nil {
 				_ = obj.Close()
 			}
@@ -407,7 +413,7 @@ func TestStore_OpenRejectsInvalidKey(t *testing.T) {
 		"pkg-1.0-py3-none-any.whl.metadata",
 		"pkg-1.0+local.1-cp312-cp312-manylinux_2_17_x86_64.whl",
 	} {
-		obj, err := s.Open(t.Context(), "pkg", file, true)
+		obj, err := s.Open(t.Context(), "pkg", file)
 		require.NoError(t, err, file)
 		_, err = io.ReadAll(obj)
 		require.NoError(t, err, file)
@@ -424,7 +430,7 @@ func TestStore_OversizeBodyWithBadShaFailsEveryReader(t *testing.T) {
 	l, err := NewLocalStorage(dir, 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("x"), 100001), size: 100000, sha: "00", gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
 	objs := openAll(t, s, 3)
 	close(f.gate)
@@ -443,9 +449,9 @@ func TestStore_OversizeBodyWithGoodShaFails(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("x"), 1001), size: 1000}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	got, err := io.ReadAll(obj)
 	_ = obj.Close()
@@ -459,7 +465,7 @@ func TestStore_UnknownSizeBadShaFailsEveryReader(t *testing.T) {
 	l, err := NewLocalStorage(dir, 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("x"), 100000), size: -1, sha: "00", gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
 	objs := openAll(t, s, 3)
 	for _, o := range objs {
@@ -512,9 +518,9 @@ func TestStore_UndersizeBodyFails(t *testing.T) {
 			dir := t.TempDir()
 			l, err := NewLocalStorage(dir, 0, 0)
 			require.NoError(t, err)
-			s := NewStore(l, nil, &fakeFetcher{body: body, size: 1000, sha: sha}, "")
+			s := NewStore(l, nil, &fakeFetcher{body: body, size: 1000, sha: sha}, "", false)
 
-			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 			require.NoError(t, err)
 			got, err := io.ReadAll(obj)
 			_ = obj.Close()
@@ -529,9 +535,9 @@ func TestStore_UndersizeBodyFails(t *testing.T) {
 func TestStore_ZeroLengthBody(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
-	s := NewStore(l, nil, &fakeFetcher{body: []byte{}}, "")
+	s := NewStore(l, nil, &fakeFetcher{body: []byte{}}, "", false)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	got, err := io.ReadAll(obj)
 	_ = obj.Close()
@@ -549,9 +555,9 @@ func TestStore_UnknownSizeHoldsLastByteUntilDone(t *testing.T) {
 	l, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("0123456789"), 1000), size: -1, gate: make(chan struct{})}
-	s := NewStore(l, nil, f, "")
+	s := NewStore(l, nil, f, "", false)
 
-	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz", true)
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 	require.NoError(t, err)
 	waitInFlight(t, s, 1)
 	half := len(f.body) / 2
@@ -579,7 +585,7 @@ func TestStore_S3ShaMismatchFailsAllReadersUploadsNothing(t *testing.T) {
 	spool := t.TempDir()
 	remote, bucket := newFakeS3(t)
 	f := &fakeFetcher{body: bytes.Repeat([]byte("x"), 100000), sha: "00", gate: make(chan struct{})}
-	s := NewStore(nil, remote, f, spool)
+	s := NewStore(nil, remote, f, spool, false)
 
 	objs := openAll(t, s, 3)
 	close(f.gate)
@@ -602,7 +608,7 @@ func TestStore_ReapsStaleSpoolFiles(t *testing.T) {
 	require.NoError(t, os.Chtimes(stale, old, old))
 
 	remote, _ := newFakeS3(t)
-	s := NewStore(nil, remote, &fakeFetcher{}, spool)
+	s := NewStore(nil, remote, &fakeFetcher{}, spool, false)
 	assert.NoFileExists(t, stale)
 	assert.FileExists(t, fresh, "a spool in progress stays")
 	require.NoError(t, s.Close())
@@ -730,11 +736,11 @@ func TestStore_S3HitTransfersOnlyTheRange(t *testing.T) {
 		Bucket: "b", ForcePathStyle: true})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = remote.Close() })
-	s := NewStore(nil, remote, &fakeFetcher{err: errors.New("upstream must not be called")}, t.TempDir())
+	s := NewStore(nil, remote, &fakeFetcher{err: errors.New("upstream must not be called")}, t.TempDir(), true)
 	t.Cleanup(func() { _ = s.Close() })
 
 	serve := func(rng string) *httptest.ResponseRecorder {
-		obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.whl", false)
+		obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.whl")
 		require.NoError(t, err)
 		assert.False(t, obj.InFlight)
 		assert.Equal(t, int64(len(body)), obj.Size)
