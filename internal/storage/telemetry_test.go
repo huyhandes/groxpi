@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,4 +107,72 @@ func TestStore_FetchMetricExcludesTheUpload(t *testing.T) {
 	require.NotNil(t, upload, "the PUT has its own span")
 	require.NotNil(t, flight)
 	assert.Equal(t, flight.SpanContext().SpanID(), upload.Parent().SpanID(), "storage.upload is a child of the flight span")
+}
+
+// cacheMisses sums the storage cache-miss counter over every layer.
+func cacheMisses(t *testing.T, reader *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	var n int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if s, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == "groxpi.cache.misses" {
+				for _, dp := range s.DataPoints {
+					n += dp.Value
+				}
+			}
+		}
+	}
+	return n
+}
+
+// TestStore_RetriedLookupCountsOneMiss: when another key's commit makes Open
+// look a second time, the second lookup's miss is not counted again.
+func TestStore_RetriedLookupCountsOneMiss(t *testing.T) {
+	_, reader := installTestTelemetry(t)
+	held, release := make(chan struct{}), make(chan struct{})
+	var lookups atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Count(r.URL.Path, "/") < 2 || r.Method == http.MethodPut {
+			return // bucket check, upload
+		}
+		if strings.HasSuffix(r.URL.Path, "/a-1.0.tar.gz") && lookups.Add(1) == 1 {
+			close(held) // a's first lookup waits until b has committed
+			<-release
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := NewS3Storage(&S3Config{Endpoint: srv.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "b", ForcePathStyle: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = remote.Close() })
+	s := NewStore(nil, remote, &fakeFetcher{body: []byte("bytes")}, t.TempDir(), false)
+
+	before := cacheMisses(t, reader)
+	late := make(chan error, 1)
+	go func() {
+		obj, err := s.Open(t.Context(), "a", "a-1.0.tar.gz")
+		if err == nil {
+			_, err = io.ReadAll(obj)
+			_ = obj.Close()
+		}
+		late <- err
+	}()
+	<-held
+
+	obj, err := s.Open(t.Context(), "b", "b-1.0.tar.gz")
+	require.NoError(t, err)
+	_, err = io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond,
+		"b commits, so a's Open looks again")
+	close(release)
+	require.NoError(t, <-late)
+	require.NoError(t, s.Close())
+
+	assert.Equal(t, int64(2), lookups.Load(), "a was looked up twice")
+	assert.Equal(t, before+2, cacheMisses(t, reader), "one miss per Open: a once, b once")
 }

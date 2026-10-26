@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -874,6 +876,29 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 			assert.Equal(t, 1, e.up.fileHits(demoFile))
 		})
 	}
+}
+
+// TestHybridPromotionFailureIs500: a file in S3 that cannot be copied into the
+// cache is a 500, never a 404 pip would take as authoritative.
+func TestHybridPromotionFailureIs500(t *testing.T) {
+	const demoPath = "/simple/demo/" + demoFile
+	e := &env{mode: "hybrid", up: newUpstream(t), s3: newFakeS3(t)}
+	first := e.config(t)
+	p := start(t, first)
+	_, _ = p.get(demoPath)
+	p.stop() // drains the upload to the object store
+	require.True(t, e.s3.has("packages/demo/"+demoFile))
+
+	second := *first
+	second.LocalCacheDir = t.TempDir()
+	p = start(t, &second)
+	// A file where the package directory belongs: the promotion cannot spool.
+	require.NoError(t, os.MkdirAll(filepath.Join(second.LocalCacheDir, "packages"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(second.LocalCacheDir, "packages", "demo"), nil, 0o600))
+
+	resp, _ := p.get(demoPath)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, 1, e.up.fileHits(demoFile), "no upstream fetch or redirect")
 }
 
 func characterizeRedirectMode(t *testing.T, e *env) {

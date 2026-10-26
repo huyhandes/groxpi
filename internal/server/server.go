@@ -263,6 +263,9 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 			s.redirect(w, r, re, pkg, file)
 		case errors.Is(err, download.ErrNotListed):
 			http.Error(w, "File not found", http.StatusNotFound)
+		case errors.Is(err, storage.ErrStorage):
+			// The store logged it, once per flight.
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		default:
 			slog.DebugContext(ctx, "Package index unavailable",
 				"error", config.RedactErrorText(err), "package", pkg, "file", file)

@@ -267,7 +267,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	var promote *download.File
 	for retried := false; ; retried = true {
 		var obj *Object
-		obj, promote = s.lookup(ctx, key, file)
+		obj, promote = s.lookup(ctx, key, file, !retried) // one miss per Open
 		if obj != nil {
 			return obj, nil
 		}
@@ -340,7 +340,8 @@ func (s *Store) drop(f *flight, committed bool) {
 // lookup finds a stored object. In hybrid mode a cache miss with a durable hit
 // returns the durable body as promote, to be spooled into the cache like a
 // download. A backend failure other than a miss is logged and treated as a miss.
-func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *download.File) {
+// Misses are counted only with countMiss, so a retried lookup is not a second.
+func (s *Store) lookup(ctx context.Context, key, file string, countMiss bool) (*Object, *download.File) {
 	ctx, span := telemetry.Tracer().Start(ctx, "storage.exists")
 	defer span.End()
 
@@ -350,7 +351,9 @@ func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *downloa
 			telemetry.CacheHit(ctx, telemetry.LayerLocal)
 			return &Object{ReadSeekCloser: rc.(*os.File), Name: file, Size: info.Size, ModTime: info.LastModified, ContentType: contentType(file)}, nil
 		}
-		telemetry.CacheMiss(ctx, telemetry.LayerLocal)
+		if countMiss {
+			telemetry.CacheMiss(ctx, telemetry.LayerLocal)
+		}
 		if !errors.Is(err, ErrNotFound) {
 			// Safe to log raw: a local filesystem error, no index URL in it.
 			slog.ErrorContext(ctx, "Failed to read local cache", "error", err, "key", key)
@@ -366,7 +369,14 @@ func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *downloa
 	// miss here, never a 200 that dies after its headers.
 	rc, info, err := s.durable.Get(rctx, key)
 	if err != nil {
-		s.remoteMiss(ctx, key, err)
+		if countMiss {
+			telemetry.CacheMiss(ctx, telemetry.LayerRemote)
+		}
+		if !errors.Is(err, ErrNotFound) {
+			// Safe to log raw: an object-store error; S3 credentials sign requests
+			// and are never part of the endpoint URL.
+			slog.ErrorContext(ctx, "Failed to read remote cache", "error", err, "key", key)
+		}
 		return nil, nil
 	}
 	telemetry.CacheHit(ctx, telemetry.LayerRemote)
@@ -381,15 +391,6 @@ func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *downloa
 		}, nil
 	}
 	return nil, &download.File{Target: download.Target{Size: info.Size}, Body: rc, Length: info.Size}
-}
-
-func (s *Store) remoteMiss(ctx context.Context, key string, err error) {
-	telemetry.CacheMiss(ctx, telemetry.LayerRemote)
-	if !errors.Is(err, ErrNotFound) {
-		// Safe to log raw: an object-store error; S3 credentials sign requests
-		// and are never part of the endpoint URL.
-		slog.ErrorContext(ctx, "Failed to read remote cache", "error", err, "key", key)
-	}
 }
 
 // lead runs one flight: fetch (or take the promotion source), spool, then
@@ -446,8 +447,10 @@ func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 	telemetry.UpstreamFetch(ctx, time.Since(started), outcome)
 	if err != nil {
 		span.RecordError(err)
-		// Safe to log raw: download redacts its errors at the source.
-		slog.ErrorContext(ctx, "Upstream download failed",
+		// Debug: the server logs the failure per request. Kept for prefetch
+		// flights, which have no request. Safe to log raw: download redacts its
+		// errors at the source.
+		slog.DebugContext(ctx, "Upstream download failed",
 			"error", err, "package", f.pkg, "file", f.file)
 		return
 	}
@@ -460,7 +463,7 @@ func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 // under the leader's ref, with the flight still registered and unfinished: the
 // commit owns both. On any failure it unregisters the flight, fails every
 // reader and removes the spool; a spool that cannot be created fails a
-// download with a fetch_failed RedirectError (a promotion with the bare error).
+// download with a fetch_failed RedirectError (a promotion with ErrStorage).
 func (s *Store) spool(ctx context.Context, f *flight, src *download.File, promote bool) (_ *os.File, written int64, err error) {
 	ctx, span := telemetry.Tracer().Start(ctx, "storage.put")
 	defer span.End()
@@ -478,7 +481,8 @@ func (s *Store) spool(ctx context.Context, f *flight, src *download.File, promot
 		span.RecordError(err)
 		s.unregister(f)
 		if promote {
-			f.finish(err)
+			// The durable store holds the file: a failure, not a miss.
+			f.finish(fmt.Errorf("%w: %w", ErrStorage, err))
 		} else {
 			f.finish(newRedirectError(src.Target, telemetry.RedirectFetchFailed, err))
 		}
@@ -657,8 +661,11 @@ func (s *Store) Snapshot() []CacheEntry {
 // best-effort: an object left there is promoted straight back.
 //
 // It first marks every flight under prefix evicted, so its commit stores
-// nothing, and waits (bounded by ctx) for any upload that already started,
-// so the delete runs after it. A flight still spooling is never waited on.
+// nothing, and waits for any upload that already started, so the delete runs
+// after it. That wait is bounded by the flight's context, which the Put runs
+// on. If ctx ends first, DeletePrefix returns its error and deletes nothing:
+// it never deletes while a Put may still land. A flight still spooling is
+// never waited on.
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	var uploads []chan struct{}
 	s.mu.Lock()
@@ -681,6 +688,7 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 		select {
 		case <-c:
 		case <-ctx.Done():
+			return 0, ctx.Err()
 		}
 	}
 

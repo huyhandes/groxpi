@@ -69,6 +69,25 @@ that proves it. Delete an entry when it ships.
   no user cache dir.
 - **Check:** a config test asserting the default `CacheDir`.
 
+### Package names that are not valid PEP 508 reach the upstream index
+
+- **Where:** `internal/storage/store.go` — `Key`; `internal/index/service.go` — `Service.Resolve`.
+- **What:** a name that normalises to something no project can have (`..` becomes `-`) passes `Key`'s
+  single-segment check, so the request costs an upstream index query before it answers `404`.
+- **Fix:** one shared `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` check on the normalised name, applied in
+  `storage.Key` and `index.Resolve`.
+- **Check:** a table test of junk names asserting `ErrInvalidKey` and zero upstream hits.
+
+### In s3 mode an upload still shows as in flight
+
+- **Where:** `internal/storage/store.go` — `Store.commitS3`.
+- **What:** `commitS3` unregisters the flight after its S3 Put, so `InFlight()` (the admin page)
+  lists a download whose bytes are all served for as long as the upload takes.
+- **Fix:** mark the flight as uploading once it finishes, and leave it out of `InFlight()` (or show it
+  as an upload) while it stays registered for joiners.
+- **Check:** an s3 store test that gates the fake S3 PUT and asserts `InFlight()` no longer lists the
+  file once its reader has the whole body.
+
 ## Index
 
 ### The HTML package page carries no `#sha256=` href fragment

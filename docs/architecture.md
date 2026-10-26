@@ -136,7 +136,9 @@ cached. Shutdown waits, within the shutdown timeout, for downloads and their upl
 A read that misses the cache and hits S3 is a promotion: the `Store` opens the S3 body and streams it
 through the same flight, spool and tail as an upstream download, so it lands in the cache checked
 against the S3 object's length and every concurrent reader tails it. It runs detached, so it survives
-the request that triggered it. A promoted file is not uploaded back — it is already in S3.
+the request that triggered it. A promoted file is not uploaded back — it is already in S3. A
+promotion whose spool file cannot be created fails with `storage.ErrStorage`, which the server
+answers with `500`: the file exists, so it is not a `404`.
 
 ## Request flows
 

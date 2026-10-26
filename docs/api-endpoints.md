@@ -88,7 +88,8 @@ has cached.
 1. **Cached** — served from the cache through `net/http`'s `ServeContent`, which brings range requests,
    conditional requests and `Last-Modified` with it. In `hybrid` mode a cache miss that hits S3 is
    copied into the cache while it streams, like a download: that first serve ignores `Range`, carries no
-   `Last-Modified`, and takes its `Content-Length` from S3. In pure `s3` mode the `GetObject` is issued
+   `Last-Modified`, and takes its `Content-Length` from S3. If that copy cannot start (no spool file
+   can be created in the cache), the request answers `500`, not `404`. In pure `s3` mode the `GetObject` is issued
    before any response header is sent; if it fails, the request is handled as a miss (outcome 2 or 3)
    rather than a `200` cut off mid-body.
 2. **Stream and cache** — the file is fetched from upstream into a spool file, and the client is sent
