@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"html"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -69,7 +68,8 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		writeIndexJSON(w, r, entry)
 		return
 	}
-	renderPackageFilesHTML(w, packageName, entry.Files)
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = w.Write(index.RenderSimpleHTML(packageName, entry.Files)) // #nosec G705 -- every value escaped by RenderSimpleHTML
 }
 
 // writeIndexJSON serves the body built when the entry was filled, preferring its
@@ -87,61 +87,6 @@ func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *index.Entry) 
 		return
 	}
 	_, _ = w.Write(entry.JSON) // #nosec G705 -- encoding/json output, Content-Type set above
-}
-
-// renderPackageFilesHTML renders the index page from the parsed file list. HTML
-// is the uncommon content type, so it is produced on demand rather than stored
-// as a third copy per package.
-func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []index.FileInfo) {
-	var sb strings.Builder
-	sb.Grow(1024 + len(files)*200)
-
-	sb.WriteString(`<!DOCTYPE html>
-<html>
-<head><title>Links for `)
-	sb.WriteString(html.EscapeString(packageName))
-	sb.WriteString(`</title></head>
-<body>
-	<h1>Links for `)
-	sb.WriteString(html.EscapeString(packageName))
-	sb.WriteString(`</h1>
-`)
-
-	for _, file := range files {
-		sb.WriteString(`	<a href="`)
-		sb.WriteString(html.EscapeString(index.ProxyFileURL(packageName, file.Name)))
-		sb.WriteString(`"`)
-
-		if file.RequiresPython != "" {
-			sb.WriteString(` data-requires-python="`)
-			sb.WriteString(html.EscapeString(file.RequiresPython))
-			sb.WriteString(`"`)
-		}
-		if file.IsYanked() {
-			sb.WriteString(` data-yanked="`)
-			if reason := file.GetYankedReason(); reason != "" {
-				sb.WriteString(html.EscapeString(reason))
-			}
-			sb.WriteString(`"`)
-		}
-		if hashes, ok := file.Metadata(); ok {
-			value := "true"
-			if sum := hashes["sha256"]; sum != "" {
-				value = "sha256=" + html.EscapeString(sum)
-			}
-			sb.WriteString(` data-core-metadata="` + value + `" data-dist-info-metadata="` + value + `"`)
-		}
-
-		sb.WriteString(`>`)
-		sb.WriteString(html.EscapeString(file.Name))
-		sb.WriteString(`</a><br>
-`)
-	}
-
-	sb.WriteString(`</body>
-</html>`)
-	w.Header().Set("Content-Type", "text/html")
-	_, _ = w.Write([]byte(sb.String()))
 }
 
 // wantsJSON reports whether the client asked for the PEP 691 representation,

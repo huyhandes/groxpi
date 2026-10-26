@@ -78,6 +78,18 @@ that proves it. Delete an entry when it ships.
   no user cache dir.
 - **Check:** a config test asserting the default `CacheDir`.
 
+## Index
+
+### The HTML package page carries no `#sha256=` href fragment
+
+- **Where:** `internal/index/simple.go` — `RenderSimpleHTML`.
+- **What:** PEP 503 lets a link carry its digest as `#sha256=<hex>`; the page groxpi renders links to
+  `/simple/<pkg>/<file>` with no fragment, so an HTML-only client cannot verify the download against
+  the index (the PEP 691 JSON body does carry `hashes`).
+- **Fix:** append `#sha256=` plus the file's `Hashes["sha256"]` to the href when the upstream gave one.
+- **Check:** a `RenderSimpleHTML` case with a hash asserting the fragment, and the round-trip test
+  comparing `Hashes`.
+
 ## Observability
 
 ### The upstream-fetch metric includes the S3 upload in hybrid mode
