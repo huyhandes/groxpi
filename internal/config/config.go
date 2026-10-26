@@ -192,7 +192,7 @@ func Load() *Config {
 		ReadTimeout:            getDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
 		// Storage configuration
-		StorageType:       getEnv("GROXPI_STORAGE_TYPE", "local"),
+		StorageType:       strings.ToLower(strings.TrimSpace(getEnv("GROXPI_STORAGE_TYPE", "local"))),
 		S3Endpoint:        getEnv("AWS_ENDPOINT_URL", ""),
 		S3AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", ""),
 		S3SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", ""),
@@ -245,6 +245,14 @@ func Load() *Config {
 	// Set default local cache dir for hybrid mode
 	if cfg.LocalCacheDir == "" {
 		cfg.LocalCacheDir = cfg.CacheDir
+	}
+
+	// An unknown storage type is fatal, like a missing bucket: falling back to
+	// local would run without the durable store the operator asked for.
+	switch cfg.StorageType {
+	case "local", "s3", "hybrid":
+	default:
+		panic(`GROXPI_STORAGE_TYPE must be "local", "s3" or "hybrid", got "` + cfg.StorageType + `"`)
 	}
 
 	// Validate S3 configuration if S3 or hybrid storage is selected
@@ -323,12 +331,22 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 	return d
 }
 
+// getBoolEnv reads a boolean from a fixed set of spellings. Anything else keeps
+// the default and is announced: reading every unknown value as true turned
+// GROXPI_S3_USE_SSL=disable into SSL on.
 func getBoolEnv(key string, defaultValue bool) bool {
-	value := strings.ToLower(os.Getenv(key))
-	if value == "" {
+	value := os.Getenv(key)
+	switch strings.ToLower(value) {
+	case "":
+		return defaultValue
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		invalidEnv(key, value, defaultValue)
 		return defaultValue
 	}
-	return value != "0" && value != "no" && value != "off" && value != "false"
 }
 
 func splitAndTrim(s, sep string) []string {
