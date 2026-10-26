@@ -198,7 +198,7 @@ func TestTelemetry_CacheHitAndMissCounters(t *testing.T) {
 	// An explicit index TTL, because an index cache entry stored with a zero TTL
 	// expires the instant it is written and could never report a hit.
 	cacheDir := t.TempDir()
-	srv := New(&config.Config{
+	srv := newTestServer(t, &config.Config{
 		IndexURL:        up.URL,
 		CacheDir:        cacheDir,
 		CacheSize:       1 << 30,
@@ -316,7 +316,7 @@ func TestTelemetry_IndexResolutionIsRedacted(t *testing.T) {
 		DownloadTimeout: time.Second,
 		LogLevel:        "DEBUG",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	redactedExtra := config.RedactURL(extraURL)

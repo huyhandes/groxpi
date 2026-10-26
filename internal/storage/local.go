@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -137,13 +137,16 @@ func removeStaleTemp(path string, mtime time.Time) {
 }
 
 // scan walks <baseDir>/packages and reports every committed file, keyed
-// relative to baseDir. Nothing outside packages/ is touched. Temp files
+// relative to baseDir. Nothing outside packages/ is touched.
+func (l *LocalStorage) scan() ([]CacheEntry, error) { return l.scanDir(packagesDir) }
+
+// scanDir is scan restricted to dir, a slash-separated path under packages/. Temp files
 // are not reported; one whose mtime is older than touchInterval is a crash
 // leftover (a write in progress keeps its mtime fresh) and is removed. Files
 // vanishing mid-walk are not errors.
-func (l *LocalStorage) scan() ([]CacheEntry, error) {
+func (l *LocalStorage) scanDir(dir string) ([]CacheEntry, error) {
 	var entries []CacheEntry
-	err := filepath.WalkDir(filepath.Join(l.baseDir, packagesDir), func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(filepath.Join(l.baseDir, filepath.FromSlash(dir)), func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			var info fs.FileInfo
 			if info, err = d.Info(); err == nil && strings.HasPrefix(d.Name(), tmpPrefix) {
@@ -277,8 +280,9 @@ func (l *LocalStorage) Snapshot() []CacheEntry {
 
 // DeletePrefix removes every cached file whose key starts with prefix and
 // reports how many were removed. A prefix matching nothing is not an error.
+// Only the directory holding the prefix is walked, not the whole cache.
 func (l *LocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
-	entries, err := l.scan()
+	entries, err := l.scanDir(prefixDir(prefix))
 	if err != nil {
 		return 0, err
 	}
@@ -299,6 +303,17 @@ func (l *LocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, er
 	return deleted, errors.Join(errs...)
 }
 
+// prefixDir is the deepest directory under packages/ that holds every key
+// starting with prefix: "packages/a/" gives "packages/a", "packages/a" gives
+// "packages". A prefix that does not stay under packages/ gives packages/ itself.
+func prefixDir(prefix string) string {
+	dir := path.Clean(path.Dir(prefix + "x"))
+	if dir != packagesDir && !strings.HasPrefix(dir, packagesDir+"/") {
+		return packagesDir
+	}
+	return dir
+}
+
 // buildPath constructs the full filesystem path
 func (l *LocalStorage) buildPath(key string) string {
 	// Defence in depth: Key already refuses names that leave their segment, and
@@ -306,8 +321,9 @@ func (l *LocalStorage) buildPath(key string) string {
 	return filepath.Join(l.baseDir, filepath.Clean("/"+key))
 }
 
-// Get retrieves an object from local filesystem
-func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
+// Get opens a cached file. The concrete *os.File is what the Store hands to
+// http.ServeContent as a seekable body.
+func (l *LocalStorage) Get(ctx context.Context, key string) (*os.File, *ObjectInfo, error) {
 	path := l.buildPath(key)
 
 	file, err := os.Open(path) // #nosec G304 -- path is confined to baseDir by buildPath

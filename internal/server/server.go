@@ -26,7 +26,6 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/download"
 	"github.com/huyhandes/groxpi/internal/index"
-	"github.com/huyhandes/groxpi/internal/logger"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
@@ -39,17 +38,6 @@ type Server struct {
 	admin     *admin.Service     // nil when no credentials are configured
 	templates *template.Template // admin page; nil without admin
 	handler   http.Handler
-}
-
-// New builds a server or terminates the process. It is the entry point's
-// constructor; anything that needs to observe a construction failure calls
-// NewServer.
-func New(cfg *config.Config) *Server {
-	s, err := NewServer(cfg)
-	if err != nil {
-		logger.Fatal("Failed to construct server", "error", err)
-	}
-	return s
 }
 
 // NewServer builds a server, returning an error rather than producing one that

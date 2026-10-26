@@ -313,6 +313,28 @@ func TestLocalStorage_SizeAccounting(t *testing.T) {
 	})
 }
 
+// TestLocalStorage_DeletePrefixWalksOnlyItsDirectory: evicting one package
+// reads that package's directory, not the whole cache. An unreadable sibling
+// would fail a whole-cache walk; a missing prefix directory deletes nothing.
+func TestLocalStorage_DeletePrefixWalksOnlyItsDirectory(t *testing.T) {
+	s, err := NewLocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	putN(t, s, "packages/a/1", 10)
+	putN(t, s, "packages/b/1", 10)
+	sibling := filepath.Dir(s.buildPath("packages/b/1"))
+	require.NoError(t, os.Chmod(sibling, 0))
+	t.Cleanup(func() { _ = os.Chmod(sibling, 0o700) })
+
+	n, err := s.DeletePrefix(context.Background(), "packages/a/")
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.NoFileExists(t, s.buildPath("packages/a/1"))
+
+	n, err = s.DeletePrefix(context.Background(), "packages/absent/")
+	require.NoError(t, err)
+	assert.Zero(t, n)
+}
+
 func TestLocalStorage_HitSetsAtimeExplicitly(t *testing.T) {
 	s, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)

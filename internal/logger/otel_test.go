@@ -39,10 +39,9 @@ func (e *recordingExporter) collected() []sdklog.Record {
 // runs after them.
 func restoreGlobals(t *testing.T) {
 	t.Helper()
-	provider, global, def := otellog.GetLoggerProvider(), Logger, slog.Default()
+	provider, def := otellog.GetLoggerProvider(), slog.Default()
 	t.Cleanup(func() {
 		otellog.SetLoggerProvider(provider)
-		Logger = global
 		slog.SetDefault(def)
 	})
 }
@@ -62,7 +61,7 @@ func TestLogRecordsCarryTraceContext(t *testing.T) {
 	_ = captureStdout(t, func() {
 		// Init after the provider is installed: the bridge resolves it here.
 		Init(LogConfig{Level: "INFO", Format: "json"})
-		Logger.InfoContext(ctx, "handled", "package", "numpy")
+		slog.InfoContext(ctx, "handled", "package", "numpy")
 	})
 	span.End()
 
@@ -97,8 +96,8 @@ func TestLogRecordsRespectLevelWhenBridged(t *testing.T) {
 
 	_ = captureStdout(t, func() {
 		Init(LogConfig{Level: "WARN", Format: "json"})
-		Logger.Info("filtered out")
-		Logger.Warn("kept")
+		slog.Info("filtered out")
+		slog.Warn("kept")
 	})
 
 	records := exporter.collected()

@@ -100,6 +100,17 @@ that proves it. Delete an entry when it ships.
   to `502` (or `500`, matching the package routes).
 - **Check:** a server test with a failing upstream index asserting a file route no longer answers `404`.
 
+### A failed index resolution sends its error text to the client
+
+- **Where:** `internal/server/index.go` — `Server.handleListFiles`, the `500` branch (pinned by
+  `internal/server/characterization_test.go`).
+- **What:** the body is `Error fetching package: ` plus the resolution error. Credentials are
+  redacted, but the text still names the index, so an unauthenticated client learns the host of a
+  private extra index.
+- **Fix:** answer a generic body (`Error fetching package`); the detail stays in the error log line.
+- **Check:** a characterization test with a failing private index URL asserting its host is absent
+  from the response body.
+
 ### The HTML package page carries no `#sha256=` href fragment
 
 - **Where:** `internal/index/simple.go` — `RenderSimpleHTML`.

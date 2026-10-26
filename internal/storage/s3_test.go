@@ -81,6 +81,20 @@ func newFakeS3Storage(t *testing.T, rec *recordingS3Server) *S3Storage {
 	return s
 }
 
+// TestNewS3Storage_LeavesCallerConfigAlone: defaults are applied to a copy, so
+// the caller's settings are not rewritten behind its back.
+func TestNewS3Storage_LeavesCallerConfigAlone(t *testing.T) {
+	rec := newRecordingS3Server(t)
+	cfg := &S3Config{Endpoint: rec.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "test-bucket", ForcePathStyle: true}
+	want := *cfg
+
+	s, err := NewS3Storage(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	assert.Equal(t, want, *cfg)
+}
+
 func responseError(status int) error {
 	return &smithyhttp.ResponseError{
 		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},

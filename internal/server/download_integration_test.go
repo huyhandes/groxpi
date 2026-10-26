@@ -91,7 +91,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 		LogLevel:        "ERROR",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	// Test concurrent downloads are deduplicated
@@ -197,7 +197,7 @@ func TestServer_PackageNameNormalization_Integration(t *testing.T) {
 		DownloadTimeout: 10 * time.Second,
 		LogLevel:        "ERROR",
 	}
-	router := New(cfg).Router()
+	router := newTestServer(t, cfg).Router()
 
 	for _, spelling := range []string{"zope.interface", "zope-interface", "Zope__Interface", "zope---interface"} {
 		req := httptest.NewRequest("GET", "/simple/"+spelling+"/", nil)
@@ -279,7 +279,7 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 		LogLevel:        "INFO",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	// Simulate multiple pip clients trying to download the same large package

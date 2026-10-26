@@ -36,7 +36,7 @@ func TestNew(t *testing.T) {
 		LogLevel:  "INFO",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 
 	if srv == nil {
 		t.Fatal("New() returned nil")
@@ -60,7 +60,7 @@ func TestServer_HandleHome(t *testing.T) {
 		LogLevel:  "INFO",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -97,7 +97,7 @@ func TestServer_HandleHealth(t *testing.T) {
 		CacheDir: "/tmp/test-cache",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -216,7 +216,7 @@ func TestServer_HandleListFiles(t *testing.T) {
 		LogLevel: "INFO",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/nonexistent-test-package-xyz", nil)
@@ -236,7 +236,7 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 		LogLevel: "INFO",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/index/numpy/numpy-1.21.0-py3-none-any.whl", nil)
@@ -257,7 +257,7 @@ func TestServer_HandleCacheList(t *testing.T) {
 		AdminPassword: adminPass,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	// The cache routes are part of the authenticated administrative group.
@@ -297,7 +297,7 @@ func TestServer_HandleCachePackage(t *testing.T) {
 		AdminPassword: adminPass,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	// Test DELETE method with package name
@@ -326,7 +326,7 @@ func TestServer_Handle404(t *testing.T) {
 		CacheDir: "/tmp/test-cache",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/non-existent-path", nil)
@@ -391,7 +391,7 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 			CacheDir:    "/tmp/test-cache",
 		}
 
-		srv := New(cfg)
+		srv := newTestServer(t, cfg)
 
 		// Test that server was created successfully with local storage
 		if srv == nil {
@@ -413,7 +413,7 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 		DownloadTimeout: 1.0,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	t.Run("Missing file returns 404", func(t *testing.T) {
@@ -449,7 +449,7 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		IndexTTL: 5 * time.Minute,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	t.Run("Package with special characters", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestServer_WantsJSON(t *testing.T) {
 		IndexTTL: time.Hour,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	tests := []struct {
@@ -548,7 +548,7 @@ func TestServer_NormalizePackageName(t *testing.T) {
 	}
 
 	cfg := &config.Config{IndexURL: "https://pypi.org/simple/", CacheDir: "/tmp/test"}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	for _, tt := range tests {
@@ -600,7 +600,7 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 		AdminPassword: adminPass,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	t.Run("Cache list with invalid method", func(t *testing.T) {
@@ -640,7 +640,7 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 		StorageType: "local",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -676,7 +676,7 @@ func TestServer_ErrorHandling(t *testing.T) {
 		IndexTTL: 1 * time.Second,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	t.Run("Network error handling", func(t *testing.T) {
@@ -729,7 +729,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 		IndexTTL: 1 * time.Hour, // Long TTL to avoid cache expiry during test
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	const numConcurrentRequests = 10
@@ -841,7 +841,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 		IndexTTL: 1 * time.Hour, // Long TTL to avoid cache expiry during test
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	const numConcurrentRequests = 8
@@ -944,7 +944,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 		IndexTTL: 1 * time.Hour,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	const numConcurrentRequests = 6
@@ -1024,7 +1024,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 		IndexTTL: 1 * time.Hour,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	packages := []string{"package-a", "package-b", "package-c"}
@@ -1122,7 +1122,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 		IndexTTL: 1 * time.Second, // Short TTL for benchmarking
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(b, cfg)
 	router := srv.Router()
 
 	b.ResetTimer()
@@ -1165,7 +1165,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 		IndexTTL: 1 * time.Second, // Short TTL for benchmarking
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(b, cfg)
 	router := srv.Router()
 
 	b.ResetTimer()
@@ -1216,7 +1216,7 @@ func TestServer_URLRewriting(t *testing.T) {
 		IndexTTL: 1 * time.Hour,
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	t.Run("JSON response URLs rewritten to proxy", func(t *testing.T) {

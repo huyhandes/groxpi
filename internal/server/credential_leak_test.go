@@ -61,7 +61,7 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 		AdminUsername:   "operator",
 		AdminPassword:   "adminpw",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	// Sanity: the resolved file URL really does carry the credential, so the
@@ -135,7 +135,7 @@ func TestRedirectNeverHandsOutIndexCredentials(t *testing.T) {
 				IndexCacheSize:  1 << 20,
 				DownloadTimeout: timeout,
 			}
-			srv := New(cfg)
+			srv := newTestServer(t, cfg)
 			t.Cleanup(func() { _ = srv.Close() })
 
 			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+fileName, nil)

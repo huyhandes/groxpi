@@ -131,7 +131,7 @@ func newMultiIndexServer(t *testing.T, cfg *config.Config, primary *fakeUpstream
 	}
 	cfg.LogLevel = "ERROR"
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 	return srv
 }
@@ -398,7 +398,7 @@ func TestCredentialsNeverAppearInLogsOrHealth(t *testing.T) {
 		DownloadTimeout: time.Second,
 		LogLevel:        "DEBUG",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	// Request path: resolved by the first extra, which never reaches the broken one.

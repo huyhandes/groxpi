@@ -32,9 +32,13 @@ type S3Config struct {
 
 	// Performance tuning
 	ConnectTimeout time.Duration
-	RequestTimeout time.Duration
 	EnableHTTP2    bool // Enable HTTP/2 for better multiplexing (default: true)
 }
+
+// s3ResponseHeaderTimeout bounds how long S3 may take to start answering any
+// request. It is deliberately not the download budget, which bounds a package
+// fetch from upstream.
+const s3ResponseHeaderTimeout = 5 * time.Minute
 
 // s3MaxConns bounds the single HTTP connection pool shared by every S3 operation.
 const s3MaxConns = 100
@@ -47,7 +51,7 @@ func newS3Transport(cfg *S3Config) *http.Transport {
 		MaxConnsPerHost:       s3MaxConns,
 		IdleConnTimeout:       90 * time.Second,
 		DisableCompression:    true, // S3 handles compression
-		ResponseHeaderTimeout: cfg.RequestTimeout,
+		ResponseHeaderTimeout: s3ResponseHeaderTimeout,
 		TLSHandshakeTimeout:   cfg.ConnectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     cfg.EnableHTTP2,
@@ -84,12 +88,12 @@ func endpointURL(endpoint string, useSSL bool) string {
 // instance metadata, container credentials, web identity — unless a static key
 // pair is configured explicitly. Nothing here requires static keys, which is
 // what makes instance and task roles usable.
-func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
+func NewS3Storage(settings *S3Config) (*S3Storage, error) {
+	// Defaults go on a copy: the caller's config is not ours to rewrite.
+	c := *settings
+	cfg := &c
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 10 * time.Second
-	}
-	if cfg.RequestTimeout == 0 {
-		cfg.RequestTimeout = 5 * time.Minute
 	}
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"

@@ -18,7 +18,7 @@ import (
 
 func newProxyServer(t *testing.T, upstreamURL string) http.Handler {
 	t.Helper()
-	srv := New(&config.Config{
+	srv := newTestServer(t, &config.Config{
 		IndexURL:        upstreamURL,
 		CacheDir:        t.TempDir(),
 		CacheSize:       1 << 30,
