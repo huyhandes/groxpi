@@ -306,3 +306,77 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadRejectsUnknownStorageType pins that a mistyped storage type stops the
+// proxy at startup, the same way a missing bucket does. It used to fall through
+// to local storage silently, so an operator who wrote "minio" ran without their
+// durable store and never knew.
+func TestLoadRejectsUnknownStorageType(t *testing.T) {
+	t.Setenv("GROXPI_STORAGE_TYPE", "minio")
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected Load to abort on an unknown storage type")
+		}
+	}()
+
+	Load()
+}
+
+// TestLoadStorageTypeIsCaseInsensitive pins that the storage type is trimmed
+// and lowercased before it is checked.
+func TestLoadStorageTypeIsCaseInsensitive(t *testing.T) {
+	t.Setenv("GROXPI_S3_BUCKET", "groxpi-cache")
+
+	for value, want := range map[string]string{"S3": "s3", " Hybrid ": "hybrid", "LOCAL": "local"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("GROXPI_STORAGE_TYPE", value)
+			if got := Load().StorageType; got != want {
+				t.Fatalf("GROXPI_STORAGE_TYPE=%q gave %q, want %q", value, got, want)
+			}
+		})
+	}
+}
+
+// TestBoolEnvSpellings pins the accepted boolean spellings. Anything else keeps
+// the default and is announced: "disable" used to read as true, which turned
+// SSL on for an operator trying to turn it off.
+func TestBoolEnvSpellings(t *testing.T) {
+	const key = "GROXPI_TEST_BOOL"
+	cases := []struct {
+		value      string
+		defaultVal bool
+		want       bool
+		warns      bool
+	}{
+		{"1", false, true, false},
+		{"true", false, true, false},
+		{"TRUE", false, true, false},
+		{"yes", false, true, false},
+		{"on", false, true, false},
+		{"0", true, false, false},
+		{"false", true, false, false},
+		{"False", true, false, false},
+		{"no", true, false, false},
+		{"off", true, false, false},
+		{"", true, true, false},
+		{"disable", true, true, true},
+		{"enabled", false, false, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv(key, tc.value)
+
+			var got bool
+			logs := captureLogs(t, func() { got = getBoolEnv(key, tc.defaultVal) })
+
+			if got != tc.want {
+				t.Errorf("%s=%q (default %v) gave %v, want %v", key, tc.value, tc.defaultVal, got, tc.want)
+			}
+			if warned := strings.Contains(logs, key); warned != tc.warns {
+				t.Errorf("%s=%q: warned=%v, want %v; logs were:\n%s", key, tc.value, warned, tc.warns, logs)
+			}
+		})
+	}
+}

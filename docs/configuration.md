@@ -5,6 +5,9 @@ groxpi is configured entirely through environment variables. Every setting below
 
 Durations are in **seconds**. The timeout settings accept a decimal fraction; the others are integers.
 
+Booleans accept `1`, `true`, `yes`, `on` for true and `0`, `false`, `no`, `off` for false, in any case.
+Any other value is logged as a warning and the default is kept.
+
 ## Index
 
 | Variable | Default | Meaning |
@@ -57,7 +60,7 @@ sweep) or by LRU when the budget is exceeded. There is no separate response cach
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_STORAGE_TYPE` | `local` | `local` (the cache only), `s3` (the durable store only), or `hybrid` (the cache in front of the durable store). |
+| `GROXPI_STORAGE_TYPE` | `local` | `local` (the cache only), `s3` (the durable store only), or `hybrid` (the cache in front of the durable store). Case-insensitive and trimmed (`S3` means `s3`); any other value stops groxpi at startup. |
 
 The local cache is bounded (a size limit, LRU by atime, and in hybrid mode an optional TTL) and disposable; it is the only thing groxpi evicts.
 The S3 durable store receives every verified download and is unbounded: groxpi never expires objects
