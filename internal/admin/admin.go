@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
-
 	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/storage"
 )
@@ -36,17 +34,21 @@ type Service struct {
 	// still parked reading its request body when shutdown starts could otherwise
 	// do exactly that: http.Server.Shutdown reports its timeout but does not kill
 	// the handler.
+	//
+	// running holds the packages with a prefetch goroutine alive, under the same
+	// lock, so a duplicate submission is skipped before any goroutine starts.
 	prefetches   sync.WaitGroup
 	prefetchMu   sync.Mutex
 	shuttingDown bool
-	prefetchSF   singleflight.Group
+	running      map[string]struct{}
 }
 
 // New builds the admin module.
 func New(store *storage.Store, idx *index.Service) *Service {
 	return &Service{
-		store: store,
-		index: idx,
+		store:   store,
+		index:   idx,
+		running: map[string]struct{}{},
 	}
 }
 

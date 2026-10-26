@@ -31,6 +31,23 @@ type Target struct {
 	Size   int64  // declared by the index, -1 when unknown
 }
 
+// RedirectURL is the target as a Location for an upstream redirect: the URL
+// with any userinfo removed, since a file URL resolved against a credentialed
+// index carries the index password and a 302 would hand it to every client.
+// stripped reports whether userinfo was removed. A URL that does not parse
+// yields "": it may still hold the password, so it is never handed out.
+func (t Target) RedirectURL() (u string, stripped bool) {
+	parsed, err := url.Parse(t.URL)
+	if err != nil {
+		return "", false
+	}
+	if parsed.User == nil {
+		return t.URL, false
+	}
+	parsed.User = nil
+	return parsed.String(), true
+}
+
 // File is an open upstream body plus what it has to verify against. Closing
 // Body releases the upstream request.
 type File struct {
@@ -90,15 +107,10 @@ func (s *Service) Resolve(ctx context.Context, packageName, fileName string) (Ta
 	return Target{URL: metadataURL(base.URL), SHA256: hashes["sha256"], Size: -1}, nil
 }
 
-// Fetch resolves a package file and opens its upstream body. It is the one
-// method storage calls on a miss.
-func (s *Service) Fetch(ctx context.Context, packageName, fileName string) (*File, error) {
-	t, err := s.Resolve(ctx, packageName, fileName)
-	if err != nil {
-		return nil, err
-	}
+// Fetch opens the upstream body of a resolved target. Storage resolves once per
+// miss and calls Fetch with that target.
+func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 	slog.InfoContext(ctx, "🚀 Starting upstream download",
-		"package", packageName, "file", fileName,
 		"file_url", config.RedactURL(t.URL), "file_size", t.Size, "timeout", s.ttfb)
 
 	// A deadline on the request context would outlive the headers and kill the

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/download"
 )
 
 // TestCredentialsNeverLeakFromDownloadFailures is the regression test for the
@@ -65,7 +66,7 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 
 	// Sanity: the resolved file URL really does carry the credential, so the
 	// assertions below are about redaction and not about an absent secret.
-	target, err := srv.downloads.Resolve(t.Context(), pkg, fileName)
+	target, err := download.New(cfg, srv.index).Resolve(t.Context(), pkg, fileName)
 	require.NoError(t, err)
 	require.Contains(t, target.URL, secret, "the leak mechanism itself regressed: the file URL no longer carries user-info")
 
@@ -101,7 +102,7 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 // credentialed index carries the index password, and a 302 to it would hand
 // that password to every client. Both redirect paths (redirect mode and a
 // failed fetch) must point at the same host and path with the user-info
-// stripped, and log a Warn carrying the redacted URL.
+// stripped, and log a Warn carrying the stripped URL.
 func TestRedirectNeverHandsOutIndexCredentials(t *testing.T) {
 	const (
 		secret   = "sup3rs3cr3tpassw0rd"
@@ -151,7 +152,7 @@ func TestRedirectNeverHandsOutIndexCredentials(t *testing.T) {
 			out := logs.String()
 			assert.NotContains(t, out, secret)
 			assert.Contains(t, out, `"level":"WARN","msg":"Stripped index credentials from upstream redirect"`)
-			assert.Contains(t, out, config.RedactURL(indexURL+pkg+"/"+fileName), "the Warn carries the redacted URL")
+			assert.Contains(t, out, `"file_url":"`+location+`"`, "the Warn carries the stripped URL")
 		})
 	}
 }

@@ -67,7 +67,11 @@ func TestUpstreamTLSVerificationSetting(t *testing.T) {
 			return err
 		}},
 		{"download.Fetch", plainIndex.URL, func(ctx context.Context, _ *index.Service, dl *Service) error {
-			f, err := dl.Fetch(ctx, "p", "p-1.0.tar.gz")
+			tgt, err := dl.Resolve(ctx, "p", "p-1.0.tar.gz")
+			if err != nil {
+				return err
+			}
+			f, err := dl.Fetch(ctx, tgt)
 			if err != nil {
 				return err
 			}
