@@ -9,10 +9,10 @@ import (
 // TestHTMLMetadataAttr covers PEP 658's attribute in both spellings and both
 // value forms.
 func TestHTMLMetadataAttr(t *testing.T) {
-	assert.Nil(t, htmlMetadataAttr(`<a href="x">x</a>`))
-	assert.Equal(t, true, htmlMetadataAttr(`<a href="x" data-core-metadata="true">x</a>`))
-	assert.Equal(t, true, htmlMetadataAttr(`<a href="x" data-dist-info-metadata="true">x</a>`))
-	assert.Equal(t, map[string]any{"sha256": "abc"}, htmlMetadataAttr(`<a href="x" data-core-metadata="sha256=abc">x</a>`))
+	assert.Nil(t, htmlMetadataAttr(map[string]string{"href": "x"}))
+	assert.Equal(t, true, htmlMetadataAttr(map[string]string{"data-core-metadata": "true"}))
+	assert.Equal(t, true, htmlMetadataAttr(map[string]string{"data-dist-info-metadata": "true"}))
+	assert.Equal(t, map[string]any{"sha256": "abc"}, htmlMetadataAttr(map[string]string{"data-core-metadata": "sha256=abc"}))
 }
 
 func TestFileInfo_Metadata(t *testing.T) {

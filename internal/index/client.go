@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log/slog"
 	"net"
@@ -202,7 +201,25 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 	if resp.Request != nil && resp.Request.URL != nil {
 		baseURL = resp.Request.URL.String()
 	}
-	return c.parseHTMLPackageFiles(resp.Body, baseURL)
+	// A base we cannot parse means we cannot resolve anything; fall back to
+	// emitting hrefs verbatim rather than dropping the whole index.
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		slog.WarnContext(ctx, "Cannot parse index URL, leaving package file hrefs unresolved",
+			"error", err, "base_url", config.RedactURL(baseURL))
+		base = nil
+	}
+	files, err := parseSimpleHTML(resp.Body, base)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML page for %s from %s: %w", packageName, index.Redacted(), err)
+	}
+	// Still an authoritative answer, but a page this parser cannot read would
+	// look exactly like this, so say so.
+	if len(files) == 0 {
+		slog.WarnContext(ctx, "HTML index page lists no files",
+			"package", packageName, "index", index.Redacted())
+	}
+	return files, nil
 }
 
 func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
@@ -228,141 +245,4 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
 	}
 	return response.Files, nil
-}
-
-// parseHTMLPackageFiles parses a PEP 503 HTML index page. baseURL is the URL the
-// page was served from; relative and protocol-relative hrefs are resolved against
-// it so that FileInfo.URL is always usable on its own.
-func (c *Client) parseHTMLPackageFiles(body io.Reader, baseURL string) ([]FileInfo, error) {
-	// A base we cannot parse means we cannot resolve anything; fall back to
-	// emitting hrefs verbatim rather than dropping the whole index.
-	base, baseErr := url.Parse(baseURL)
-	if baseErr != nil {
-		slog.Warn("Cannot parse index URL, leaving package file hrefs unresolved",
-			"error", baseErr,
-			"base_url", config.RedactURL(baseURL))
-		base = nil
-	}
-
-	page, err := readCapped(body, maxPackageIndexBytes)
-	if err != nil {
-		return nil, err
-	}
-	files := make([]FileInfo, 0, 50)
-
-	// Simple HTML parsing for package files
-	lines := strings.SplitSeq(string(page), "\n")
-	for line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "<a ") {
-			continue
-		}
-
-		// Extract href
-		hrefStart := strings.Index(line, `href="`)
-		if hrefStart == -1 {
-			continue
-		}
-		hrefStart += 6
-		hrefEnd := strings.Index(line[hrefStart:], `"`)
-		if hrefEnd == -1 {
-			continue
-		}
-		// Attribute values and anchor text arrive HTML-escaped: a PEP 503
-		// index must write "&gt;=3.8", and re-emitting that escape into the
-		// PEP 691 body we serve makes pip raise InvalidSpecifier. Same for
-		// "&amp;" in a query string.
-		href := html.UnescapeString(line[hrefStart : hrefStart+hrefEnd])
-
-		// Resolve the href against the index page URL. ResolveReference
-		// correctly handles absolute, protocol-relative, root-relative and
-		// path-relative hrefs, and carries the #sha256=... fragment through.
-		fileURL := href
-		if base != nil {
-			ref, err := url.Parse(href)
-			if err != nil {
-				slog.Warn("Skipping package file with unparseable href",
-					"error", err,
-					"href", href,
-					"base_url", config.RedactURL(baseURL))
-				continue
-			}
-			fileURL = base.ResolveReference(ref).String()
-		}
-
-		// Extract filename from anchor text
-		textStart := strings.Index(line, ">")
-		textEnd := strings.Index(line, "</a>")
-		if textStart == -1 || textEnd == -1 || textStart >= textEnd {
-			continue
-		}
-		filename := html.UnescapeString(line[textStart+1 : textEnd])
-
-		// Extract data-requires-python if present
-		var requiresPython string
-		if rpStart := strings.Index(line, `data-requires-python="`); rpStart != -1 {
-			rpStart += 22
-			if rpEnd := strings.Index(line[rpStart:], `"`); rpEnd != -1 {
-				requiresPython = html.UnescapeString(line[rpStart : rpStart+rpEnd])
-			}
-		}
-
-		// Extract data-yanked if present
-		var yanked any
-		if yankStart := strings.Index(line, `data-yanked="`); yankStart != -1 {
-			yankStart += 13
-			if yankEnd := strings.Index(line[yankStart:], `"`); yankEnd != -1 {
-				yankedStr := html.UnescapeString(line[yankStart : yankStart+yankEnd])
-				if yankedStr == "" {
-					yanked = true
-				} else {
-					yanked = yankedStr
-				}
-			}
-		}
-
-		// PEP 503 carries the digest in the href fragment as
-		// #sha256=<hex>; lift it into the same hash map shape the JSON
-		// index produces so downstream code needs no format branch.
-		var hashes map[string]string
-		if _, fragment, found := strings.Cut(href, "#"); found {
-			if sum, ok := strings.CutPrefix(fragment, "sha256="); ok && sum != "" {
-				hashes = map[string]string{"sha256": sum}
-			}
-		}
-
-		files = append(files, FileInfo{
-			Name:           filename,
-			URL:            fileURL,
-			Hashes:         hashes,
-			RequiresPython: requiresPython,
-			Yanked:         yanked,
-			CoreMetadata:   htmlMetadataAttr(line),
-		})
-	}
-
-	return files, nil
-}
-
-// htmlMetadataAttr lifts a PEP 658 data-core-metadata (or the older
-// data-dist-info-metadata) attribute into the PEP 691 shape: "true" becomes
-// true, "sha256=<hex>" becomes {"sha256": "<hex>"}, absent stays nil.
-func htmlMetadataAttr(line string) any {
-	for _, attr := range []string{`data-core-metadata="`, `data-dist-info-metadata="`} {
-		start := strings.Index(line, attr)
-		if start == -1 {
-			continue
-		}
-		start += len(attr)
-		end := strings.Index(line[start:], `"`)
-		if end == -1 {
-			continue
-		}
-		value := html.UnescapeString(line[start : start+end])
-		if algo, sum, found := strings.Cut(value, "="); found && sum != "" {
-			return map[string]any{algo: sum}
-		}
-		return true
-	}
-	return nil
 }

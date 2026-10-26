@@ -46,7 +46,8 @@ internal/
                    index.go (simple index routes), admin.go (auth, cross-site, page, rows, prefetch, eviction)
   index/           service.go (Resolve/Invalidate, extras-first, singleflight, root proxy),
                    cache.go (bounded index cache: files + JSON + gzip per entry),
-                   client.go (PyPI client, JSON first, HTML fallback), normalize.go
+                   client.go (PyPI client, JSON first, HTML fallback),
+                   simple.go (PEP 503 HTML parse + render), normalize.go
   download/        service.go (stateless Resolve/Fetch, PEP 658 metadata siblings)
   admin/           admin.go (List/Evict/InFlight), prefetch.go — pure service, no HTTP
   storage/         store.go (read-through Store: flight, spool, tail, ranged S3 reader),
