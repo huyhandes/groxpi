@@ -176,7 +176,8 @@ mode, which has no cache, the table is empty.
 
 Form-encoded, field `package`. Answers `202 Accepted` immediately and downloads on a context detached
 from the request, so a large package cannot be cut off by a reverse-proxy timeout. There is no job ID:
-progress is the files appearing in the table.
+progress is the files appearing in the table. A package whose prefetch is still running is accepted
+again but not queued: one prefetch per package runs at a time.
 
 Prefetch downloads the **newest final release only** — yanked files and pre-releases are excluded,
 versions are compared under PEP 440 ordering, and all files of the winning release (wheels plus sdist)

@@ -42,7 +42,8 @@ func (s *Service) Prefetch(ctx context.Context, pkgs ...string) error {
 // startPrefetch runs one prefetch in the background. Everything that makes a
 // detached goroutine dangerous is handled here rather than in the work itself:
 // it is registered so shutdown waits for it, deduplicated so an impatient
-// operator submitting the same name ten times gets one download, deadlined so it
+// operator submitting the same name ten times gets one goroutine (a duplicate
+// is skipped, not queued, while one runs), deadlined so it
 // cannot outlive the process it is holding open, and its panics are contained —
 // the server's recover middleware only wraps the request goroutine.
 //
@@ -55,11 +56,21 @@ func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 		s.prefetchMu.Unlock()
 		return false
 	}
+	if _, dup := s.running[packageName]; dup {
+		s.prefetchMu.Unlock()
+		return true
+	}
+	s.running[packageName] = struct{}{}
 	s.prefetches.Add(1)
 	s.prefetchMu.Unlock()
 
 	go func() {
 		defer s.prefetches.Done()
+		defer func() {
+			s.prefetchMu.Lock()
+			delete(s.running, packageName)
+			s.prefetchMu.Unlock()
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("Prefetch panicked", "package", packageName, "panic", r)
@@ -69,11 +80,7 @@ func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 
 		ctx, cancel := context.WithTimeout(ctx, prefetchDeadline)
 		defer cancel()
-
-		_, _, _ = s.prefetchSF.Do(packageName, func() (any, error) {
-			s.prefetchPackage(ctx, packageName)
-			return nil, nil
-		})
+		s.prefetchPackage(ctx, packageName)
 	}()
 
 	return true
