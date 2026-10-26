@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/download"
+	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
@@ -82,11 +84,13 @@ type Progress struct {
 // looked up.
 var ErrInvalidKey = errors.New("invalid storage key")
 
-// Key is the storage key of a package file, packages/{pkg}/{file}. An empty
-// file names the package's prefix. Each name must be one path segment: not
-// empty, no '/', '\' or NUL, and no leading '.', so a key never leaves its
-// package directory.
+// Key is the storage key of a package file, packages/{pkg}/{file}, with pkg
+// PEP 503 normalised so every spelling of a name is one key. An empty file
+// names the package's prefix. The normalised pkg and the raw file must each be
+// one path segment: not empty, no '/', '\' or NUL, and no leading '.', so a key
+// never leaves its package directory.
 func Key(pkg, file string) (string, error) {
+	pkg = index.NormalizeName(pkg)
 	if !validSegment(pkg) || (file != "" && !validSegment(file)) {
 		return "", fmt.Errorf("%w: package %q, file %q", ErrInvalidKey, pkg, file)
 	}
@@ -117,6 +121,7 @@ type Store struct {
 	mu         sync.Mutex
 	flights    map[string]*flight
 	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
+	commits    uint64               // bumped at each post-commit unregister, under mu
 	leaders    sync.WaitGroup
 }
 
@@ -139,6 +144,87 @@ func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir
 		s.commit = s.commitHybrid
 	}
 	return s
+}
+
+// New builds the store the configuration's storage mode asks for: the cache
+// (local), the durable store (s3), or the cache in front of it (hybrid). The
+// zero mode is local. An unknown mode is an error rather than a silent local
+// store, which would run without the durable store the operator asked for. A
+// download budget of 0 is redirect mode: misses are never fetched.
+func New(cfg *config.Config, fetcher Fetcher) (*Store, error) {
+	var (
+		cache   *LocalStorage
+		durable *S3Storage
+		err     error
+	)
+	switch cfg.StorageType {
+	case "", "local":
+		cache, err = NewLocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
+	case "s3", "hybrid":
+		durable, err = NewS3Storage(&S3Config{
+			Endpoint:        cfg.S3Endpoint,
+			AccessKeyID:     cfg.S3AccessKeyID,
+			SecretAccessKey: cfg.S3SecretAccessKey,
+			Region:          cfg.S3Region,
+			Bucket:          cfg.S3Bucket,
+			Prefix:          cfg.S3Prefix,
+			UseSSL:          cfg.S3UseSSL,
+			ForcePathStyle:  cfg.S3ForcePathStyle,
+			EnableHTTP2:     cfg.S3EnableHTTP2,
+			ConnectTimeout:  cfg.ConnectTimeout,
+			RequestTimeout:  cfg.DownloadTimeout,
+		})
+		if err == nil && cfg.StorageType == "hybrid" {
+			if cache, err = NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL); err != nil {
+				_ = durable.Close()
+				err = fmt.Errorf("failed to create local cache: %w", err)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown storage type %q: want local, s3 or hybrid", cfg.StorageType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Pure-s3 spools get a directory of their own: the cache dir defaults to
+	// the shared OS temp dir, and the store reaps stale files in its spool dir.
+	spoolDir := filepath.Join(cfg.CacheDir, "spool")
+	if cache == nil {
+		if err := os.MkdirAll(spoolDir, 0750); err != nil {
+			_ = durable.Close()
+			return nil, fmt.Errorf("failed to create spool directory: %w", err)
+		}
+	}
+	s := NewStore(cache, durable, fetcher, spoolDir, cfg.DownloadTimeout <= 0)
+
+	d := s.Describe()
+	attrs := []any{"mode", d.Mode, "cache_dir", d.CacheDir, "cache_size", d.CacheSize, "redirect", s.redirect}
+	if durable != nil {
+		attrs = append(attrs, "endpoint", config.RedactURL(cfg.S3Endpoint), "bucket", cfg.S3Bucket, "prefix", cfg.S3Prefix)
+	}
+	slog.Info("storage configured", attrs...)
+	return s, nil
+}
+
+// Description is what the store reports about itself: the storage mode and
+// the cache behind it. With no cache (s3) the directory is empty and the size 0.
+type Description struct {
+	Mode      string // local, s3 or hybrid
+	CacheDir  string
+	CacheSize int64 // bytes, 0 = unbounded or no cache
+}
+
+// Describe reports the storage mode and the cache this store actually uses.
+func (s *Store) Describe() Description {
+	switch {
+	case s.cache == nil:
+		return Description{Mode: "s3"}
+	case s.durable == nil:
+		return Description{Mode: "local", CacheDir: s.cache.baseDir, CacheSize: s.cache.maxSize}
+	default:
+		return Description{Mode: "hybrid", CacheDir: s.cache.baseDir, CacheSize: s.cache.maxSize}
+	}
 }
 
 // reapSpool removes crash-leftover spool files from dir, which the store owns
@@ -166,30 +252,42 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if file == "" {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
 	}
+	pkg = index.NormalizeName(pkg) // once, so the resolve below sees it too
 	key, err := Key(pkg, file)
 	if err != nil {
 		return nil, err
 	}
-	if f := s.join(key); f != nil {
+	f, seen := s.join(key)
+	if f != nil {
 		return f.open(ctx)
 	}
 
-	obj, promote := s.lookup(ctx, key, file)
-	if obj != nil {
-		return obj, nil
-	}
-	if promote == nil && s.redirect {
-		t, err := s.fetcher.Resolve(ctx, pkg, file)
-		if err != nil {
-			return nil, err
+	// A flight that commits between the lookup and the lock below changes the
+	// commit count; the lookup then runs once more instead of fetching again.
+	var promote *download.File
+	for retried := false; ; retried = true {
+		var obj *Object
+		obj, promote = s.lookup(ctx, key, file)
+		if obj != nil {
+			return obj, nil
 		}
-		return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
+		if promote == nil && s.redirect {
+			t, err := s.fetcher.Resolve(ctx, pkg, file)
+			if err != nil {
+				return nil, err
+			}
+			return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
+		}
+		s.mu.Lock()
+		if retried || s.commits == seen || s.flights[key] != nil {
+			break
+		}
+		s.mu.Unlock()
+		if promote != nil {
+			_ = promote.Body.Close()
+		}
 	}
-
-	// ponytail: a leader committing between lookup and this lock is missed and
-	// the file fetched twice; re-check the backend here if that ever shows up.
-	s.mu.Lock()
-	f := s.flights[key]
+	f = s.flights[key]
 	if f != nil {
 		f.ref()
 		s.mu.Unlock()
@@ -211,19 +309,29 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	return f.open(ctx)
 }
 
-func (s *Store) join(key string) *flight {
+// join refs the flight for key, if any, and returns the commit count seen.
+func (s *Store) join(key string) (*flight, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.flights[key]
 	if f != nil {
 		f.ref()
 	}
-	return f
+	return f, s.commits
 }
 
-func (s *Store) unregister(f *flight) {
+func (s *Store) unregister(f *flight) { s.drop(f, false) }
+
+// unregisterCommitted unregisters a flight whose file is now stored, so an
+// Open that missed it in between looks again.
+func (s *Store) unregisterCommitted(f *flight) { s.drop(f, true) }
+
+func (s *Store) drop(f *flight, committed bool) {
 	s.mu.Lock()
 	delete(s.flights, f.key)
+	if committed {
+		s.commits++
+	}
 	n := len(s.flights)
 	s.mu.Unlock()
 	telemetry.DownloadsInFlight(context.Background(), int64(n))
@@ -439,7 +547,7 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 	} else if s.evicted(f) {
 		_ = s.cache.remove(f.key, written)
 	}
-	s.unregister(f)
+	s.unregisterCommitted(f)
 	f.finish(nil)
 }
 
@@ -470,7 +578,7 @@ func (s *Store) commitHybrid(ctx context.Context, f *flight, sp *os.File, writte
 func (s *Store) commitS3(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
 	f.finish(nil)
 	s.upload(ctx, f, sp, written)
-	s.unregister(f)
+	s.unregisterCommitted(f)
 	_ = os.Remove(sp.Name())
 }
 

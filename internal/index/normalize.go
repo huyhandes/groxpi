@@ -9,8 +9,8 @@ import (
 var nameSeparatorRun = regexp.MustCompile(`[-_.]+`)
 
 // NormalizeName applies the PEP 503 normalisation rule: any run of `-`, `_` or
-// `.` collapses to a single `-`, and the name is lowercased. It must be applied
-// wherever a package name becomes a cache key or an upstream path segment.
+// `.` collapses to a single `-`, and the name is lowercased. Resolve,
+// Invalidate and storage.Key apply it themselves, so callers need not.
 func NormalizeName(name string) string {
 	return strings.ToLower(nameSeparatorRun.ReplaceAllString(name, "-"))
 }

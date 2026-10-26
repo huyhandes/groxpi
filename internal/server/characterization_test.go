@@ -329,7 +329,7 @@ func (e *env) config(t *testing.T, opts ...func(*config.Config)) *config.Config 
 	}
 	if e.mode == "hybrid" {
 		cfg.LocalCacheDir = t.TempDir()
-		cfg.LocalCacheSize = 1 << 30
+		cfg.LocalCacheSize = 1 << 29 // distinct from CacheSize: health and home must report this one
 	}
 	if e.s3 != nil {
 		cfg.S3Endpoint = e.s3.URL
@@ -492,9 +492,11 @@ func TestCharacterization(t *testing.T) {
 // TestCharacterizationS3 runs the download suite against a pure-s3 backend, so
 // S3 hits are held to the same Range and conditional behaviour as local hits.
 func TestCharacterizationS3(t *testing.T) {
-	characterizeDownload(t, func(t *testing.T) *env {
+	newEnv := func(t *testing.T) *env {
 		return &env{mode: "s3", up: newUpstream(t), s3: newFakeS3(t)}
-	})
+	}
+	characterizeDownload(t, newEnv)
+	t.Run("home_and_health", func(t *testing.T) { characterizeHomeHealth(t, newEnv(t), "s3") })
 }
 
 func characterizeIndex(t *testing.T, e *env) {
@@ -1042,8 +1044,20 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 	})
 }
 
+// wantCache is the cache a mode really uses: hybrid's local cache, none in s3.
+func wantCache(cfg *config.Config) (dir string, size int64) {
+	switch cfg.StorageType {
+	case "hybrid":
+		return cfg.LocalCacheDir, cfg.LocalCacheSize
+	case "s3":
+		return "", 0
+	}
+	return cfg.CacheDir, cfg.CacheSize
+}
+
 func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 	t.Run("home", func(t *testing.T) {
+		wantMB := map[string]string{"local": "1024", "hybrid": "512", "s3": "0"}[mode]
 		p := start(t, e.config(t))
 		resp, body := p.get("/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -1051,7 +1065,7 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 		s := string(body)
 		assert.Contains(t, s, "<title>groxpi - PyPI Cache</title>")
 		assert.Contains(t, s, "<li>Index URL: "+e.up.URL+"/</li>")
-		assert.Contains(t, s, "<li>Cache Size: 1024 MB</li>")
+		assert.Contains(t, s, "<li>Cache Size: "+wantMB+" MB</li>")
 		assert.Contains(t, s, "<li>Index TTL: 1m0s</li>")
 		assert.Contains(t, s, `<a href="/health">Health Check</a>`)
 		assert.NotContains(t, s, `href="/admin"`)
@@ -1070,6 +1084,7 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 			c.ExtraIndexURLs = []string{"http://u:p@extra.invalid/simple/"}
 		})
 		p := start(t, cfg)
+		dir, size := wantCache(cfg)
 		resp, body := p.get("/health")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, map[string]string{"Content-Type": "application/json; charset=utf-8"})
@@ -1082,10 +1097,10 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 		assert.Equal(t, "success", got.Status)
 		assert.NotZero(t, got.Timestamp)
 		assert.Equal(t, map[string]any{
-			"cache_dir":         cfg.CacheDir,
+			"cache_dir":         dir,
 			"index_url":         strings.Replace(e.up.URL, "http://", "http://redacted@", 1) + "/",
 			"extra_index_urls":  []any{"http://redacted@extra.invalid/simple/"},
-			"cache_size":        float64(1 << 30),
+			"cache_size":        float64(size),
 			"index_ttl_seconds": float64(60),
 			"storage_type":      mode,
 		}, got.Data)

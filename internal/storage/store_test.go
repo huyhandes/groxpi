@@ -379,6 +379,80 @@ func TestStore_S3UploadsSpoolAndRemovesIt(t *testing.T) {
 	assert.Empty(t, files(t, spool), "the spool is removed after upload")
 }
 
+// TestStore_CommitBetweenLookupAndLeadServesTheCommit: a request whose lookup
+// missed just before another flight for the key committed serves the committed
+// file rather than fetching and uploading it again.
+func TestStore_CommitBetweenLookupAndLeadServesTheCommit(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		objects = map[string][]byte{}
+		puts    atomic.Int64
+		misses  atomic.Int64
+	)
+	held, release := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Count(r.URL.Path, "/") < 2 {
+			return // bucket check
+		}
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			objects[r.URL.Path] = body
+			mu.Unlock()
+			puts.Add(1)
+			return
+		}
+		mu.Lock()
+		body, ok := objects[r.URL.Path]
+		mu.Unlock()
+		if !ok {
+			if misses.Add(1) == 1 { // the first miss is held until the other flight commits
+				close(held)
+				<-release
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := NewS3Storage(&S3Config{Endpoint: srv.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "b", ForcePathStyle: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = remote.Close() })
+	f := &fakeFetcher{body: []byte("committed bytes")}
+	s := NewStore(nil, remote, f, t.TempDir(), false)
+
+	late := make(chan []byte)
+	go func() {
+		obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+		if !assert.NoError(t, err) {
+			late <- nil
+			return
+		}
+		got, err := io.ReadAll(obj)
+		assert.NoError(t, err)
+		_ = obj.Close()
+		late <- got
+	}()
+	<-held // the late request's lookup has missed but not yet led
+
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	require.NoError(t, err)
+	got, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	assert.Equal(t, f.body, got)
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond,
+		"the first flight commits and unregisters")
+
+	close(release)
+	assert.Equal(t, f.body, <-late)
+	require.NoError(t, s.Close())
+	assert.Equal(t, int64(1), f.calls.Load(), "fetched once")
+	assert.Equal(t, int64(1), puts.Load(), "uploaded once")
+}
+
 // TestStore_FetchErrorRedirects: a fetch that fails before its body starts is a
 // fetch_failed redirect to the target the leader resolved.
 func TestStore_FetchErrorRedirects(t *testing.T) {
@@ -505,7 +579,7 @@ func TestStore_OpenRejectsInvalidKey(t *testing.T) {
 		{"pkg", ".."},
 		{"pkg", ""},
 		{"", "pkg-1.0.tar.gz"},
-		{"..", "secret"},
+		{"../..", "secret"}, // a bare ".." normalises to the inert "-"
 		{"a/b", "pkg-1.0.tar.gz"},
 	} {
 		for _, st := range []*Store{s, redirect} {
@@ -943,4 +1017,63 @@ func TestRangedReader_EndAndPastEndIssueNoRequest(t *testing.T) {
 	n, err := r.Read(make([]byte, 4))
 	assert.Zero(t, n)
 	assert.Equal(t, io.EOF, err)
+}
+
+// TestKey_NormalisesThePackage pins c8: the key is built from the normalised
+// package name, which is what the denylist then checks; the file stays raw.
+func TestKey_NormalisesThePackage(t *testing.T) {
+	assert.Equal(t, mustKey(t, "foo-bar", "Foo_Bar-1.0.tar.gz"), mustKey(t, "Foo_Bar", "Foo_Bar-1.0.tar.gz"))
+	assert.Equal(t, "packages/foo-bar/Foo_Bar-1.0.tar.gz", mustKey(t, "Foo.BAR", "Foo_Bar-1.0.tar.gz"))
+	assert.Equal(t, "packages/foo-bar/", mustKey(t, "Foo__Bar", ""))
+
+	// ".." and ".x" normalise to "-" and "-x", which are inert names; what
+	// would still escape the directory is refused.
+	for _, pkg := range []string{"", "a/b", `a\b`, "a\x00b", "Foo/Bar", "A/../B"} {
+		_, err := Key(pkg, "f.tar.gz")
+		require.ErrorIs(t, err, ErrInvalidKey, "pkg=%q", pkg)
+	}
+	for _, file := range []string{"../secret", ".hidden", "a/b"} {
+		_, err := Key("Foo_Bar", file)
+		require.ErrorIs(t, err, ErrInvalidKey, "file=%q", file)
+	}
+}
+
+// TestStore_OpenNormalisesThePackage pins c8: a mixed-case open joins the
+// normalised key and resolves upstream under the normalised name.
+func TestStore_OpenNormalisesThePackage(t *testing.T) {
+	l, err := NewLocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	f := &namedFetcher{fakeFetcher: fakeFetcher{body: []byte("z")}}
+	s := NewStore(l, nil, f, "", false)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	for _, pkg := range []string{"Foo_Bar", "foo-bar"} {
+		obj, err := s.Open(t.Context(), pkg, "Foo_Bar-1.0.tar.gz")
+		require.NoError(t, err, pkg)
+		_, err = io.ReadAll(obj)
+		require.NoError(t, err)
+		require.NoError(t, obj.Close())
+	}
+	assert.Equal(t, int64(1), f.calls.Load(), "both spellings are one key")
+	assert.Equal(t, []string{"foo-bar"}, f.names(), "upstream is resolved under the normalised name")
+}
+
+// namedFetcher records the package names it is asked to resolve.
+type namedFetcher struct {
+	fakeFetcher
+	mu   sync.Mutex
+	pkgs []string
+}
+
+func (f *namedFetcher) Resolve(ctx context.Context, pkg, file string) (download.Target, error) {
+	f.mu.Lock()
+	f.pkgs = append(f.pkgs, pkg)
+	f.mu.Unlock()
+	return f.fakeFetcher.Resolve(ctx, pkg, file)
+}
+
+func (f *namedFetcher) names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.pkgs...)
 }

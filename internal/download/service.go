@@ -23,6 +23,10 @@ import (
 // ErrNotListed reports that the index does not list the requested file.
 var ErrNotListed = errors.New("file not listed by the index")
 
+// errUpstreamStalled ends a download whose body sent no bytes for the idle
+// timeout. It names no URL: the file URL may carry index credentials.
+var errUpstreamStalled = errors.New("upstream download stalled")
+
 // Target is where one package file lives upstream and what the index declared
 // about it.
 type Target struct {
@@ -61,17 +65,27 @@ type Service struct {
 	index  *index.Service
 	client *http.Client
 	ttfb   time.Duration
+	idle   time.Duration
 }
 
 // New builds the fetcher over the index service. GROXPI_DOWNLOAD_TIMEOUT is the
 // time-to-first-byte budget: it bounds only the wait for upstream response
-// headers. Once headers are in, the body runs to completion under the caller's
-// context, because a transfer already streaming must not be cut off by a budget
-// meant for connection setup. At 0 (redirect mode) the store never calls Fetch.
-// Requests go through the index's upstream transport, so the TLS setting and
-// connection pool are shared; the client has no whole-request timeout.
+// headers. GROXPI_DOWNLOAD_IDLE_TIMEOUT then bounds each gap between body
+// bytes, so a slow but steady transfer completes and a stalled one fails. At a
+// download timeout of 0 (redirect mode) the store never calls Fetch. Requests
+// go through the index's upstream transport, so the TLS setting and connection
+// pool are shared; the client has no whole-request timeout.
 func New(cfg *config.Config, idx *index.Service) *Service {
-	return &Service{index: idx, client: &http.Client{Transport: idx.Transport()}, ttfb: cfg.DownloadTimeout}
+	idle := cfg.DownloadIdleTimeout
+	if idle <= 0 { // same rule as config.Load, for configs built without it
+		idle = config.DefaultDownloadIdleTimeout
+	}
+	return &Service{
+		index:  idx,
+		client: &http.Client{Transport: idx.Transport()},
+		ttfb:   cfg.DownloadTimeout,
+		idle:   idle,
+	}
 }
 
 // Resolve finds a package file in the index. A file the index does not list is
@@ -109,19 +123,25 @@ func (s *Service) Resolve(ctx context.Context, packageName, fileName string) (Ta
 
 // Fetch opens the upstream body of a resolved target. Storage resolves once per
 // miss and calls Fetch with that target.
+//
+// One timer guards the request. It is armed with the time-to-first-byte budget
+// while waiting for headers, then re-armed with the idle timeout and reset by
+// every body read that returns bytes; Close stops it. When it fires the request
+// is cancelled with errUpstreamStalled, so a body that stops sending fails
+// instead of holding its flight, and every request tailing it, open forever.
 func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 	slog.InfoContext(ctx, "🚀 Starting upstream download",
 		"file_url", config.RedactURL(t.URL), "file_size", t.Size, "timeout", s.ttfb)
 
-	// A deadline on the request context would outlive the headers and kill the
-	// body read, so the budget is a timer that cancels and is then stopped: it
-	// can only fire while we are still waiting for the response headers.
-	reqCtx, cancel := context.WithCancel(ctx)
-	budget := time.AfterFunc(s.ttfb, cancel)
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	timer := time.AfterFunc(s.ttfb, func() { cancel(errUpstreamStalled) })
+	release := func() {
+		timer.Stop()
+		cancel(nil)
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, t.URL, nil) // #nosec G704 -- url is the file URL advertised by the configured index, not client input
 	if err != nil {
-		budget.Stop()
-		cancel()
+		release()
 		// An unparseable URL comes back as a *url.Error quoting it whole,
 		// credentials included.
 		return nil, fmt.Errorf("failed to create request: %w", config.RedactURLError(err))
@@ -129,9 +149,8 @@ func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
 	resp, err := s.client.Do(req) // #nosec G704 -- see NewRequestWithContext above
-	budget.Stop()
 	if err != nil {
-		cancel()
+		release()
 		// Both the URL we format and the one net/http embeds in its *url.Error
 		// carry whatever credentials the index handed us.
 		return nil, fmt.Errorf("failed to download from %s: %w",
@@ -139,21 +158,40 @@ func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		cancel()
+		release()
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, config.RedactURL(t.URL))
 	}
-	return &File{Target: t, Body: cancelOnClose{resp.Body, cancel}, Length: resp.ContentLength}, nil
+	timer.Reset(s.idle)
+	body := &idleBody{body: resp.Body, ctx: reqCtx, timer: timer, idle: s.idle, release: release}
+	return &File{Target: t, Body: body, Length: resp.ContentLength}, nil
 }
 
-// cancelOnClose releases the request context along with the body.
-type cancelOnClose struct {
-	io.ReadCloser
-	cancel context.CancelFunc
+// idleBody resets the stall timer on every read that returns bytes and
+// releases the request on Close.
+type idleBody struct {
+	body    io.ReadCloser
+	ctx     context.Context
+	timer   *time.Timer
+	idle    time.Duration
+	release func()
 }
 
-func (c cancelOnClose) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.idle)
+	}
+	if err != nil && err != io.EOF && errors.Is(context.Cause(b.ctx), errUpstreamStalled) {
+		// net/http reports the cancellation as a bare "context canceled"; the
+		// cause is what the caller needs, and it names no URL.
+		err = errUpstreamStalled
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	err := b.body.Close()
+	b.release()
 	return err
 }
 

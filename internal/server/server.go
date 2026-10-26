@@ -1,7 +1,7 @@
 // Package server is the transport: it owns the mux, every route and handler, the
-// middleware, the admin templates, the storage backend's construction and the
-// shutdown order. The index, download and admin modules are plain Go services
-// it calls.
+// middleware, the admin templates and the shutdown order; storage.New builds the
+// storage backend. The index, download, storage and admin modules are plain Go
+// services it calls.
 package server
 
 import (
@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"time"
@@ -62,18 +61,14 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, errors.New("admin interface is enabled but GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD are not both set")
 	}
 
-	cache, durable, err := initStorage(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize storage: %w", err)
-	}
-
 	s := &Server{config: cfg}
 	s.index = index.New(cfg)
-	// Pure-s3 spools get a directory of their own: the cache dir defaults to
-	// the shared OS temp dir, and the store reaps stale files in its spool dir.
-	// A download budget of 0 is redirect mode: misses are never fetched.
-	s.store = storage.NewStore(cache, durable, download.New(cfg, s.index), filepath.Join(cfg.CacheDir, "spool"),
-		cfg.DownloadTimeout <= 0)
+	store, err := storage.New(cfg, download.New(cfg, s.index))
+	if err != nil {
+		s.index.Close()
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
+	s.store = store
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleHome)
@@ -253,7 +248,7 @@ func (s *Server) CloseContext(ctx context.Context) error {
 // not fetch is redirected upstream.
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	pkg := index.NormalizeName(r.PathValue("package"))
+	pkg := r.PathValue("package")
 	file := r.PathValue("file")
 
 	obj, err := s.store.Open(ctx, pkg, file)
@@ -349,23 +344,26 @@ func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {
 	</ul>
 	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a>%s</p>
 </body>
-</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
+</html>`, config.RedactURL(s.config.IndexURL), s.store.Describe().CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	// Storage facts come from the store, which knows the cache it really uses:
+	// hybrid's local cache, none in s3.
+	d := s.store.Describe()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":    "success",
 		"timestamp": time.Now().Unix(),
 		"data": map[string]any{
-			"cache_dir": s.config.CacheDir,
+			"cache_dir": d.CacheDir,
 			// Redacted at the call site: an unauthenticated probe must not be able to
 			// read an index's credentials out of this payload.
 			"index_url":         config.RedactURL(s.config.IndexURL),
 			"extra_index_urls":  redactedIndexes(s.config.ExtraIndexURLs),
-			"cache_size":        s.config.CacheSize,
+			"cache_size":        d.CacheSize,
 			"index_ttl_seconds": int(s.config.IndexTTL.Seconds()),
-			"storage_type":      s.config.StorageType,
+			"storage_type":      d.Mode,
 		},
 	})
 }
@@ -378,38 +376,4 @@ func redactedIndexes(urls []string) []string {
 		out = append(out, config.RedactURL(u))
 	}
 	return out
-}
-
-// initStorage builds the cache (local disk), the durable store (S3), or both,
-// as the storage type asks.
-func initStorage(cfg *config.Config) (*storage.LocalStorage, *storage.S3Storage, error) {
-	switch cfg.StorageType {
-	case "hybrid", "s3":
-	default:
-		// Local storage with atime eviction (no TTL for non-hybrid mode).
-		cache, err := storage.NewLocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
-		return cache, nil, err
-	}
-	durable, err := storage.NewS3Storage(&storage.S3Config{
-		Endpoint:        cfg.S3Endpoint,
-		AccessKeyID:     cfg.S3AccessKeyID,
-		SecretAccessKey: cfg.S3SecretAccessKey,
-		Region:          cfg.S3Region,
-		Bucket:          cfg.S3Bucket,
-		Prefix:          cfg.S3Prefix,
-		UseSSL:          cfg.S3UseSSL,
-		ForcePathStyle:  cfg.S3ForcePathStyle,
-		EnableHTTP2:     cfg.S3EnableHTTP2,
-		ConnectTimeout:  cfg.ConnectTimeout,
-		RequestTimeout:  cfg.DownloadTimeout,
-	})
-	if err != nil || cfg.StorageType == "s3" {
-		return nil, durable, err
-	}
-	cache, err := storage.NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
-	if err != nil {
-		_ = durable.Close()
-		return nil, nil, fmt.Errorf("failed to create local cache: %w", err)
-	}
-	return cache, durable, nil
 }
