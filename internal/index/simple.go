@@ -149,8 +149,10 @@ func htmlMetadataAttr(attrs map[string]string) any {
 // RenderSimpleHTML renders a package's PEP 503 page from its file list, every
 // href pointing back at this proxy. Every interpolated value is HTML-escaped.
 // HTML is the uncommon content type, so it is produced on demand rather than
-// stored as a third copy per package.
+// stored as a third copy per package. The page names the package by its
+// normalised name, as the index entry does.
 func RenderSimpleHTML(pkg string, files []FileInfo) []byte {
+	pkg = NormalizeName(pkg)
 	var sb strings.Builder
 	sb.Grow(1024 + len(files)*200)
 

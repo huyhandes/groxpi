@@ -86,7 +86,9 @@ groxpi keeps package files in up to two places, with different jobs:
 `hybrid` is the cache in front of the durable store. There is no backend interface: the `Store` holds a
 concrete local cache and/or a concrete S3 store, and `hybrid` is "cache, then S3" logic in the `Store`.
 
-Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike. The
+Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike.
+`storage.Key`, `index.Resolve` and `index.Invalidate` normalise the name themselves, so callers pass
+it as received; the key's path-segment check runs on the normalised name. The
 package prefix is what makes `DELETE /cache/<package>` a prefix delete rather than a second index.
 Eviction deletes the package from the cache and from the durable store; otherwise the next request
 would restore it from S3. The admin listing shows the cache only.

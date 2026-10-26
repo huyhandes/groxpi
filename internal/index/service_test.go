@@ -212,3 +212,30 @@ func TestResolve_OversizedIndexBodyFailsAndIsNotCached(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an oversized body must not be cached")
 }
+
+// TestResolve_NormalisesTheName pins c8: any spelling of a name is one index
+// entry and one upstream query, and either spelling invalidates it.
+func TestResolve_NormalisesTheName(t *testing.T) {
+	upstream := newFakeIndexServer(t)
+	svc := newTestService(t, &config.Config{
+		IndexURL:        upstream.URL,
+		CacheDir:        t.TempDir(),
+		IndexTTL:        time.Hour,
+		IndexCacheSize:  1 << 20,
+		DownloadTimeout: time.Second,
+		LogLevel:        "ERROR",
+	})
+
+	getIndex(t, svc, "Foo_Bar")
+	getIndex(t, svc, "foo-bar")
+	assert.Equal(t, 1, upstream.hitsFor("foo-bar"), "both spellings share one upstream query")
+	assert.Equal(t, 1, upstream.total, "upstream is only asked for the normalised name")
+
+	svc.Invalidate("Foo.Bar")
+	getIndex(t, svc, "foo-bar")
+	assert.Equal(t, 2, upstream.hitsFor("foo-bar"), "invalidating another spelling clears the entry")
+
+	svc.Invalidate("foo-bar")
+	getIndex(t, svc, "FOO__BAR")
+	assert.Equal(t, 3, upstream.hitsFor("foo-bar"))
+}
