@@ -703,25 +703,8 @@ func TestServer_ErrorHandling(t *testing.T) {
 
 // Singleflight tests for server handlers following TDD principles
 func TestServer_SingleflightListPackages(t *testing.T) {
-	// Mock PyPI server that counts requests
-	requestCount := int64(0)
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&requestCount, 1)
-		// Add delay to ensure concurrent requests hit
-		time.Sleep(20 * time.Millisecond)
-
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"projects": [
-				{"name": "test-package-1"},
-				{"name": "test-package-2"}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	// Delay so the concurrent requests overlap the one upstream fetch.
+	mockPyPI := NewFakePyPI(t).SetDelay(20 * time.Millisecond)
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -752,9 +735,8 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 	wg.Wait()
 
 	// Verify only one HTTP request was made to PyPI due to singleflight
-	finalRequestCount := atomic.LoadInt64(&requestCount)
-	if finalRequestCount != 1 {
-		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", finalRequestCount)
+	if hits := mockPyPI.RootHits(); hits != 1 {
+		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", hits)
 	}
 
 	// Verify all server responses are successful
@@ -785,8 +767,8 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 			continue
 		}
 
-		if len(projects) != 2 {
-			t.Errorf("Request %d: expected 2 projects, got %d", i, len(projects))
+		if len(projects) != 1 {
+			t.Errorf("Request %d: expected the upstream's 1 project, got %d", i, len(projects))
 		}
 
 		// Verify it contains the expected project names
@@ -799,41 +781,19 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 			}
 		}
 
-		if !projectNames["test-package-1"] || !projectNames["test-package-2"] {
-			t.Errorf("Request %d: expected test-package-1 and test-package-2, got %v", i, projectNames)
+		if !projectNames["demo"] {
+			t.Errorf("Request %d: expected the upstream's project demo, got %v", i, projectNames)
 		}
 	}
 }
 
 func TestServer_SingleflightListFiles(t *testing.T) {
 	packageName := "test-package"
-	requestCount := int64(0)
 
-	// Mock PyPI server that counts requests
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&requestCount, 1)
-		// Add delay to ensure concurrent requests hit
-		time.Sleep(20 * time.Millisecond)
-
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"name": "` + packageName + `",
-			"files": [
-				{
-					"filename": "` + packageName + `-1.0.0.tar.gz",
-					"url": "https://files.pythonhosted.org/packages/.../` + packageName + `-1.0.0.tar.gz"
-				},
-				{
-					"filename": "` + packageName + `-1.0.0-py3-none-any.whl",
-					"url": "https://files.pythonhosted.org/packages/.../` + packageName + `-1.0.0-py3-none-any.whl"
-				}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	// Delay so the concurrent requests overlap the one upstream fetch.
+	mockPyPI := NewFakePyPI(t).SetDelay(20*time.Millisecond).
+		Add(packageName, packageName+"-1.0.0.tar.gz", FakeFile{}).
+		Add(packageName, packageName+"-1.0.0-py3-none-any.whl", FakeFile{})
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -864,9 +824,8 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 	wg.Wait()
 
 	// Verify only one HTTP request was made to PyPI due to singleflight
-	finalRequestCount := atomic.LoadInt64(&requestCount)
-	if finalRequestCount != 1 {
-		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", finalRequestCount)
+	if hits := mockPyPI.IndexHits(packageName); hits != 1 {
+		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", hits)
 	}
 
 	// Verify all server responses are successful
@@ -925,18 +884,8 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 }
 
 func TestServer_SingleflightErrorPropagation(t *testing.T) {
-	requestCount := int64(0)
-
-	// Mock PyPI server that returns errors
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&requestCount, 1)
-		// Add delay to ensure concurrent requests hit
-		time.Sleep(20 * time.Millisecond)
-
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("Internal Server Error"))
-	}))
-	defer mockPyPI.Close()
+	// Root listing answers 500, delayed so the concurrent requests overlap.
+	mockPyPI := NewFakePyPI(t).SetDelay(20 * time.Millisecond).Fail("")
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -967,9 +916,8 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 	wg.Wait()
 
 	// Verify only one HTTP request was made to PyPI due to singleflight
-	finalRequestCount := atomic.LoadInt64(&requestCount)
-	if finalRequestCount != 1 {
-		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", finalRequestCount)
+	if hits := mockPyPI.RootHits(); hits != 1 {
+		t.Errorf("Expected exactly 1 HTTP request to PyPI due to singleflight, got %d", hits)
 	}
 
 	// The root index is a byte-level proxy, so the upstream failure is reported
@@ -985,38 +933,18 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 			t.Errorf("Failed to read response body for request %d: %v", i, err)
 			continue
 		}
-		if string(body) != "Internal Server Error" {
+		if string(body) != "boom\n" {
 			t.Errorf("Request %d: expected the upstream body, got %q", i, body)
 		}
 	}
 }
 
 func TestServer_SingleflightDifferentPackages(t *testing.T) {
-	requestCount := int64(0)
-
-	// Mock PyPI server that handles different packages
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&requestCount, 1)
-		time.Sleep(15 * time.Millisecond)
-
-		// Extract package name from URL path
-		packageName := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/"), "/")
-
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"name": "` + packageName + `",
-			"files": [
-				{
-					"filename": "` + packageName + `-1.0.0.tar.gz",
-					"url": "https://files.pythonhosted.org/packages/.../` + packageName + `-1.0.0.tar.gz"
-				}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	packages := []string{"package-a", "package-b", "package-c"}
+	mockPyPI := NewFakePyPI(t).SetDelay(15 * time.Millisecond)
+	for _, pkg := range packages {
+		mockPyPI.Add(pkg, pkg+"-1.0.0.tar.gz", FakeFile{})
+	}
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -1027,7 +955,6 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
-	packages := []string{"package-a", "package-b", "package-c"}
 	var wg sync.WaitGroup
 	responses := make([]*http.Response, len(packages))
 
@@ -1046,10 +973,11 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify separate requests for different packages (should be 3 requests)
-	finalRequestCount := atomic.LoadInt64(&requestCount)
-	if finalRequestCount != int64(len(packages)) {
-		t.Errorf("Expected %d HTTP requests for different packages, got %d", len(packages), finalRequestCount)
+	// Verify separate requests for different packages (one each)
+	for _, pkg := range packages {
+		if hits := mockPyPI.IndexHits(pkg); hits != 1 {
+			t.Errorf("Expected 1 HTTP request for %s, got %d", pkg, hits)
+		}
 	}
 
 	// Verify all results are correct (collect results first to avoid race conditions)
@@ -1105,16 +1033,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 
 // Benchmark tests to measure singleflight performance impact on server handlers
 func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"projects": [{"name": "benchmark-package"}]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	mockPyPI := NewFakePyPI(b)
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -1142,22 +1061,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 }
 
 func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"name": "benchmark-package",
-			"files": [
-				{
-					"filename": "benchmark-package-1.0.0.tar.gz",
-					"url": "https://files.pythonhosted.org/packages/.../benchmark-package-1.0.0.tar.gz"
-				}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	mockPyPI := NewFakePyPI(b).Add("benchmark-package", "benchmark-package-1.0.0.tar.gz", FakeFile{})
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -1188,27 +1092,10 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 func TestServer_URLRewriting(t *testing.T) {
 	packageName := "test-package"
 
-	// Mock PyPI server that returns original PyPI URLs
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		w.WriteHeader(http.StatusOK)
-		response := `{
-			"meta": {"api-version": "1.0"},
-			"name": "` + packageName + `",
-			"files": [
-				{
-					"filename": "test-package-1.0.0.tar.gz",
-					"url": "https://files.pythonhosted.org/packages/a1/b2/c3/test-package-1.0.0.tar.gz"
-				},
-				{
-					"filename": "test-package-1.0.0-py3-none-any.whl",
-					"url": "https://files.pythonhosted.org/packages/d4/e5/f6/test-package-1.0.0-py3-none-any.whl"
-				}
-			]
-		}`
-		_, _ = w.Write([]byte(response))
-	}))
-	defer mockPyPI.Close()
+	// The fake's index lists absolute URLs on its own host.
+	mockPyPI := NewFakePyPI(t).
+		Add(packageName, "test-package-1.0.0.tar.gz", FakeFile{}).
+		Add(packageName, "test-package-1.0.0-py3-none-any.whl", FakeFile{})
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
@@ -1260,9 +1147,9 @@ func TestServer_URLRewriting(t *testing.T) {
 				t.Errorf("Expected URL '%s', got '%s'", expectedURL, url)
 			}
 
-			// Ensure URL does not point to PyPI directly
-			if strings.Contains(url, "files.pythonhosted.org") {
-				t.Errorf("URL should not contain files.pythonhosted.org, got '%s'", url)
+			// Ensure URL does not point to the upstream directly
+			if strings.Contains(url, mockPyPI.URL) {
+				t.Errorf("URL should not contain the upstream %s, got '%s'", mockPyPI.URL, url)
 			}
 		}
 	})
@@ -1297,9 +1184,9 @@ func TestServer_URLRewriting(t *testing.T) {
 			}
 		}
 
-		// Ensure HTML does not contain direct PyPI URLs
-		if strings.Contains(bodyStr, "files.pythonhosted.org") {
-			t.Errorf("HTML should not contain files.pythonhosted.org URLs, got: %s", bodyStr)
+		// Ensure HTML does not contain direct upstream URLs
+		if strings.Contains(bodyStr, mockPyPI.URL) {
+			t.Errorf("HTML should not contain upstream %s URLs, got: %s", mockPyPI.URL, bodyStr)
 		}
 	})
 }

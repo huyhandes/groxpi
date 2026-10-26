@@ -47,14 +47,14 @@ type FakePyPI struct {
 	mu        sync.Mutex
 	pkgs      map[string][]string // package -> listed filenames
 	files     map[string]FakeFile // filename -> file (unlisted siblings included)
-	failing   map[string]bool     // package -> index answers 500
-	rootDelay time.Duration
+	failing   map[string]bool     // package ("" = root) -> answers 500
+	delay     time.Duration
 	rootHits  int
 	indexHits map[string]int
 	fileHits  map[string]int
 }
 
-func NewFakePyPI(t *testing.T) *FakePyPI {
+func NewFakePyPI(t testing.TB) *FakePyPI {
 	t.Helper()
 	u := &FakePyPI{
 		release:   make(chan struct{}),
@@ -86,7 +86,7 @@ func (u *FakePyPI) AddFile(name string, f FakeFile) *FakePyPI {
 	return u
 }
 
-// Fail makes pkg's index answer 500.
+// Fail makes pkg's index answer 500; Fail("") fails the root listing.
 func (u *FakePyPI) Fail(pkg string) *FakePyPI {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -94,11 +94,11 @@ func (u *FakePyPI) Fail(pkg string) *FakePyPI {
 	return u
 }
 
-// SetRootDelay holds every root-listing response for d.
-func (u *FakePyPI) SetRootDelay(d time.Duration) *FakePyPI {
+// SetDelay holds every response (root, index, file) for d before it starts.
+func (u *FakePyPI) SetDelay(d time.Duration) *FakePyPI {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.rootDelay = d
+	u.delay = d
 	return u
 }
 
@@ -137,9 +137,14 @@ func (u *FakePyPI) serve(w http.ResponseWriter, r *http.Request) {
 func (u *FakePyPI) serveRoot(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.rootHits++
-	delay := u.rootDelay
+	delay, failing := u.delay, u.failing[""]
 	u.mu.Unlock()
 	time.Sleep(delay)
+
+	if failing {
+		http.Error(w, "boom", http.StatusInternalServerError)
+		return
+	}
 
 	body, ctype := FakeRootHTML, "text/html"
 	if strings.Contains(r.Header.Get("Accept"), "json") {
@@ -159,11 +164,13 @@ func (u *FakePyPI) serveIndex(w http.ResponseWriter, r *http.Request, pkg string
 	u.indexHits[pkg]++
 	names, ok := u.pkgs[pkg]
 	failing := u.failing[pkg]
+	delay := u.delay
 	listed := make([]FakeFile, len(names))
 	for i, n := range names {
 		listed[i] = u.files[n]
 	}
 	u.mu.Unlock()
+	time.Sleep(delay)
 
 	if failing {
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -207,7 +214,9 @@ func (u *FakePyPI) serveFile(w http.ResponseWriter, r *http.Request, name string
 	u.mu.Lock()
 	u.fileHits[name]++
 	f, ok := u.files[name]
+	delay := u.delay
 	u.mu.Unlock()
+	time.Sleep(delay)
 
 	switch {
 	case !ok:
