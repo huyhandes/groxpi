@@ -6,18 +6,6 @@ that proves it. Delete an entry when it ships.
 
 ## Storage
 
-### Evicting a package can race an in-flight upload
-
-- **Where:** `internal/storage/store.go` — `Store.DeletePrefix` vs `Store.upload` in the
-  hybrid and s3 commits.
-- **What:** in `hybrid` or `s3` mode, an admin evict that runs while a download of the same package is
-  still uploading deletes the S3 objects, then the upload lands and recreates one. The next cache miss
-  promotes it back, so the evict is partly undone.
-- **Fix:** have `DeletePrefix` wait for (or cancel) flights whose key has the prefix before deleting,
-  or record an eviction generation that a finishing upload checks first.
-- **Check:** a store test that gates the fake S3 PUT, evicts mid-upload, releases the gate, and asserts
-  the bucket is empty.
-
 ### A file can be fetched and uploaded twice
 
 - **Where:** `internal/storage/store.go` — `Store.commitHybrid`.
