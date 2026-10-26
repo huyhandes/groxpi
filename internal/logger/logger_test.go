@@ -126,6 +126,25 @@ func TestInit_ConsoleFormat(t *testing.T) {
 	}
 }
 
+// TestConsole_QuotesControlCharacters: a value carrying a newline (a decoded
+// %0A in a request path, say) renders quoted on one line, so it cannot forge a
+// second log record.
+func TestConsole_QuotesControlCharacters(t *testing.T) {
+	var buf bytes.Buffer
+	slog.New(newConsoleHandler(&buf, false)).Info("request",
+		"path", "/simple/x\nINF\x1bforged", "tab", "a\tb", "eq", "a=b", "plain", "ok")
+
+	out := buf.String()
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Fatalf("want one line, got %d: %q", n, out)
+	}
+	for _, want := range []string{`path="/simple/x\nINF\x1bforged"`, `tab="a\tb"`, `eq="a=b"`, ` plain=ok`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("want %s in %q", want, out)
+		}
+	}
+}
+
 func TestInit_LevelFiltering(t *testing.T) {
 	output := captureStdout(t, func() {
 		Init(LogConfig{Level: "WARN", Format: "console", Color: false})

@@ -143,6 +143,19 @@ func TestNew(t *testing.T) {
 	})
 }
 
+// TestNew_S3ResponseHeaderBudgetIsNotTheDownloadBudget: the download budget
+// bounds a package fetch, not how long S3 may take to start answering an
+// upload or delete; the S3 store keeps its own default.
+func TestNew_S3ResponseHeaderBudgetIsNotTheDownloadBudget(t *testing.T) {
+	bucket := newBucketServer(t)
+	cfg := &config.Config{StorageType: "s3", CacheDir: t.TempDir(), DownloadTimeout: 900 * time.Millisecond}
+	s3Settings(cfg, bucket.URL)
+	s, err := New(cfg, &fakeFetcher{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	assert.Equal(t, 5*time.Minute, s.durable.transport.ResponseHeaderTimeout)
+}
+
 func TestNew_HybridLocalCacheFailureClosesDurable(t *testing.T) {
 	bucket := newBucketServer(t)
 	notADir := filepath.Join(t.TempDir(), "file")

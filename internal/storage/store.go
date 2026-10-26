@@ -90,7 +90,11 @@ var ErrInvalidKey = errors.New("invalid storage key")
 // one path segment: not empty, no '/', '\' or NUL, and no leading '.', so a key
 // never leaves its package directory.
 func Key(pkg, file string) (string, error) {
-	pkg = index.NormalizeName(pkg)
+	return key(index.NormalizeName(pkg), file)
+}
+
+// key is Key for an already normalised pkg: it only validates.
+func key(pkg, file string) (string, error) {
 	if !validSegment(pkg) || (file != "" && !validSegment(file)) {
 		return "", fmt.Errorf("%w: package %q, file %q", ErrInvalidKey, pkg, file)
 	}
@@ -121,7 +125,7 @@ type Store struct {
 	mu         sync.Mutex
 	flights    map[string]*flight
 	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
-	commits    uint64               // bumped at each post-commit unregister, under mu
+	commits    [commitSlots]uint64  // per commitSlot, bumped at each post-commit unregister, under mu
 	leaders    sync.WaitGroup
 }
 
@@ -172,7 +176,6 @@ func New(cfg *config.Config, fetcher Fetcher) (*Store, error) {
 			ForcePathStyle:  cfg.S3ForcePathStyle,
 			EnableHTTP2:     cfg.S3EnableHTTP2,
 			ConnectTimeout:  cfg.ConnectTimeout,
-			RequestTimeout:  cfg.DownloadTimeout,
 		})
 		if err == nil && cfg.StorageType == "hybrid" {
 			if cache, err = NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL); err != nil {
@@ -253,7 +256,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
 	}
 	pkg = index.NormalizeName(pkg) // once, so the resolve below sees it too
-	key, err := Key(pkg, file)
+	key, err := key(pkg, file)
 	if err != nil {
 		return nil, err
 	}
@@ -262,8 +265,9 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 		return f.open(ctx)
 	}
 
-	// A flight that commits between the lookup and the lock below changes the
-	// commit count; the lookup then runs once more instead of fetching again.
+	// A flight that commits between the lookup and the lock below changes its
+	// key's commit slot; the lookup then runs once more instead of fetching again.
+	slot := commitSlot(key)
 	var promote *download.File
 	for retried := false; ; retried = true {
 		var obj *Object
@@ -279,7 +283,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 			return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
 		}
 		s.mu.Lock()
-		if retried || s.commits == seen || s.flights[key] != nil {
+		if retried || s.commits[slot] == seen || s.flights[key] != nil {
 			break
 		}
 		s.mu.Unlock()
@@ -309,7 +313,8 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	return f.open(ctx)
 }
 
-// join refs the flight for key, if any, and returns the commit count seen.
+// join refs the flight for key, if any, and returns the commit count seen in
+// key's slot.
 func (s *Store) join(key string) (*flight, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -317,7 +322,20 @@ func (s *Store) join(key string) (*flight, uint64) {
 	if f != nil {
 		f.ref()
 	}
-	return f, s.commits
+	return f, s.commits[commitSlot(key)]
+}
+
+// commitSlot is the slot of s.commits that counts the commits of key: FNV-1a
+// of the key, so a commit only re-checks lookups of keys sharing its slot.
+const commitSlots = 64
+
+func commitSlot(key string) int {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return int(h % commitSlots)
 }
 
 func (s *Store) unregister(f *flight) { s.drop(f, false) }
@@ -330,7 +348,7 @@ func (s *Store) drop(f *flight, committed bool) {
 	s.mu.Lock()
 	delete(s.flights, f.key)
 	if committed {
-		s.commits++
+		s.commits[commitSlot(f.key)]++
 	}
 	n := len(s.flights)
 	s.mu.Unlock()
@@ -819,7 +837,8 @@ func (f *flight) open(ctx context.Context) (*Object, error) {
 // that then fails — not even when upstream sends more than it declared.
 //
 // ponytail: a reader blocked on a stalled upstream is not woken by its own
-// client leaving; it waits for the leader to finish or fail.
+// client leaving; it waits for the leader to finish or fail. An upstream-fetch
+// wait is bounded by GROXPI_DOWNLOAD_IDLE_TIMEOUT, after which the fetch fails.
 type tail struct {
 	f      *flight
 	off    int64

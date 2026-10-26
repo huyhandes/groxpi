@@ -225,7 +225,7 @@ func appendAttr(b *strings.Builder, prefix string, a slog.Attr) {
 	b.WriteString(a.Key)
 	b.WriteByte('=')
 	v := a.Value.String()
-	if strings.ContainsAny(v, " \"") {
+	if strings.ContainsAny(v, " \"=\n\r\t") {
 		v = strconv.Quote(v)
 	}
 	b.WriteString(v)

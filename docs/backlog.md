@@ -90,6 +90,16 @@ that proves it. Delete an entry when it ships.
 
 ## Index
 
+### An upstream index outage answers 404 on file routes
+
+- **Where:** `internal/server/server.go` — `Server.handleFile`, the `default` branch.
+- **What:** any index resolution failure on `/simple/<pkg>/<file>` or `/index/<pkg>/<file>` answers
+  `404 Package not found`, an outage included (`docs/api-endpoints.md` documents it), while the
+  package routes answer `500` for the same failure. pip treats a `404` as final and does not retry.
+- **Fix:** answer `404` only for `index.ErrNotFound`, and map any other index failure on a file route
+  to `502` (or `500`, matching the package routes).
+- **Check:** a server test with a failing upstream index asserting a file route no longer answers `404`.
+
 ### The HTML package page carries no `#sha256=` href fragment
 
 - **Where:** `internal/index/simple.go` — `RenderSimpleHTML`.
