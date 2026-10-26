@@ -277,6 +277,27 @@ func TestDurationEnvAcceptsUnits(t *testing.T) {
 	}
 }
 
+// TestDownloadIdleTimeout pins the stall budget for an upstream file body: 60s
+// by default, and a value at or below zero means the default rather than "never
+// time out", since a body that never times out hangs every request tailing it.
+func TestDownloadIdleTimeout(t *testing.T) {
+	cases := map[string]time.Duration{
+		"":    60 * time.Second,
+		"0":   60 * time.Second,
+		"-5":  60 * time.Second,
+		"2.5": 2500 * time.Millisecond,
+		"90s": 90 * time.Second,
+	}
+	for value, want := range cases {
+		t.Run("value="+value, func(t *testing.T) {
+			t.Setenv("GROXPI_DOWNLOAD_IDLE_TIMEOUT", value)
+			if got := Load().DownloadIdleTimeout; got != want {
+				t.Fatalf("GROXPI_DOWNLOAD_IDLE_TIMEOUT=%q gave %v, want %v", value, got, want)
+			}
+		})
+	}
+}
+
 // TestMalformedEnvIsLoud pins that a value we cannot use is announced. Load
 // cannot fail - a mistyped tuning knob must not stop the proxy - so the warning
 // is the only thing standing between an operator and a setting that was never

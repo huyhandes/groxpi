@@ -134,6 +134,7 @@ the LRU and TTL rules in [`local`](#local), with `GROXPI_LOCAL_CACHE_SIZE` as it
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Time-to-first-byte budget for an upstream package file. |
+| `GROXPI_DOWNLOAD_IDLE_TIMEOUT` | `60` | Longest gap between body bytes of an upstream package file before the download fails. `0` or less means `60`. |
 | `GROXPI_CONNECT_TIMEOUT` | `0` (unset) | Summed with the next into one whole-request timeout for the index client. Also the S3 backend's setup deadline. |
 | `GROXPI_READ_TIMEOUT` | `0` (unset) | Summed with the previous. Neither is a per-phase budget — read the note below before setting either. |
 
@@ -141,6 +142,11 @@ the LRU and TTL rules in [`local`](#local), with `GROXPI_LOCAL_CACHE_SIZE` as it
 arrive, the body streams to completion under the request's own lifetime — a transfer already flowing to
 the client is never cut off by a budget meant for connection setup. If the budget expires first, the
 client is redirected to the upstream URL and nothing is cached.
+
+`GROXPI_DOWNLOAD_IDLE_TIMEOUT` bounds each gap in that stream, not the whole transfer: every chunk of
+body bytes restarts it, so a slow but steady download completes. If upstream sends nothing for that
+long, the download fails, nothing is cached, and the next request for the file starts a fresh download.
+Index requests are not covered by it.
 
 Set it to `0` to disable caching of package files altogether: every download becomes a redirect
 upstream. That is what `redirect.reason=caching_disabled` counts.
