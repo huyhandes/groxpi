@@ -49,7 +49,7 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(r.PathValue("package"))
+	packageName := r.PathValue("package")
 
 	entry, err := s.index.Resolve(r.Context(), packageName)
 	if err != nil {

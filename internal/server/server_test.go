@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -562,6 +564,32 @@ func TestServer_NormalizePackageName(t *testing.T) {
 			}
 		})
 	}
+
+	// A mixed-case file URL is served from the normalised cache key, without
+	// asking upstream.
+	t.Run("mixed-case file URL hits the normalised key", func(t *testing.T) {
+		var hits atomic.Int64
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(up.Close)
+		cfg := routesConfig(t, up.URL)
+		path := filepath.Join(cfg.CacheDir, "packages", "foo-bar", "Foo_Bar-1.0.tar.gz")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, []byte("cached"), 0o600))
+		srv, err := NewServer(cfg)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = srv.Close() })
+
+		resp := do(srv.Router(), httptest.NewRequest("GET", "/simple/Foo_Bar/Foo_Bar-1.0.tar.gz", nil))
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "cached", string(body))
+		assert.Zero(t, hits.Load(), "a cached file is not fetched again")
+	})
 }
 
 func TestServer_HandleCacheEdgeCases(t *testing.T) {

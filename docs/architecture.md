@@ -86,7 +86,9 @@ groxpi keeps package files in up to two places, with different jobs:
 `hybrid` is the cache in front of the durable store. There is no backend interface: the `Store` holds a
 concrete local cache and/or a concrete S3 store, and `hybrid` is "cache, then S3" logic in the `Store`.
 
-Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike. The
+Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike.
+`storage.Key`, `index.Resolve` and `index.Invalidate` normalise the name themselves, so callers pass
+it as received; the key's path-segment check runs on the normalised name. The
 package prefix is what makes `DELETE /cache/<package>` a prefix delete rather than a second index.
 Eviction deletes the package from the cache and from the durable store; otherwise the next request
 would restore it from S3. The admin listing shows the cache only.
@@ -195,9 +197,11 @@ to a response without calling `download` itself:
 - a wrapped `download.ErrNotListed` — `404 File not found`.
 - anything else (the package index could not be resolved) — `404 Package not found`.
 
-The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
-only fire while groxpi is still waiting for upstream response headers. A body already streaming is never
-cut off by it.
+One timer guards each upstream file request. While groxpi waits for response headers it holds the
+time-to-first-byte budget; once headers arrive it is re-armed with `GROXPI_DOWNLOAD_IDLE_TIMEOUT` and
+reset by every body read that returns bytes, then stopped on close. A slow but steady body is never cut
+off; one that sends nothing for the idle timeout fails the flight, nothing is committed, and the next
+request starts a fresh flight.
 
 The leader runs on a context detached from its client's request: it fills the cache for every reader,
 so it finishes even after all of them have left. Shutdown waits for it.

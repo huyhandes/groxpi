@@ -51,6 +51,7 @@ func (s *Service) Prefetch(ctx context.Context, pkgs ...string) error {
 // finished anyway. Taking the lock around the registration is what keeps the Add
 // from racing Close's Wait.
 func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
+	packageName = index.NormalizeName(packageName) // the dedupe key: every spelling is one package
 	s.prefetchMu.Lock()
 	if s.shuttingDown {
 		s.prefetchMu.Unlock()

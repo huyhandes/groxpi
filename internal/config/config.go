@@ -15,6 +15,10 @@ import (
 // GROXPI_EXTRA_INDEX_TTLS is missing or unparseable.
 const defaultExtraIndexTTL = 3 * time.Minute
 
+// DefaultDownloadIdleTimeout is GROXPI_DOWNLOAD_IDLE_TIMEOUT when unset or at
+// or below zero.
+const DefaultDownloadIdleTimeout = 60 * time.Second
+
 // Index is one configured upstream index: where to fetch from, and how long its
 // answers stay cached. The TTL is per index so a fast-moving private index can be
 // refreshed more often than PyPI.
@@ -131,9 +135,10 @@ type Config struct {
 	S3EnableHTTP2 bool // Enable HTTP/2 for better multiplexing
 
 	// Timeout configuration
-	DownloadTimeout time.Duration
-	ConnectTimeout  time.Duration
-	ReadTimeout     time.Duration
+	DownloadTimeout     time.Duration
+	DownloadIdleTimeout time.Duration // longest gap between body bytes of an upstream file
+	ConnectTimeout      time.Duration
+	ReadTimeout         time.Duration
 
 	// Server configuration
 	Port      string
@@ -178,6 +183,7 @@ func Load() *Config {
 		IndexCacheSize:         getIntEnv("GROXPI_INDEX_CACHE_SIZE", 256*1024*1024), // 256MB, provisional
 		CacheDir:               getEnv("GROXPI_CACHE_DIR", ""),
 		DownloadTimeout:        getDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
+		DownloadIdleTimeout:    getDurationEnv("GROXPI_DOWNLOAD_IDLE_TIMEOUT", DefaultDownloadIdleTimeout),
 		Port:                   getEnv("PORT", "5000"),
 		LogLevel:               getEnv("GROXPI_LOGGING_LEVEL", "INFO"),
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
@@ -235,6 +241,12 @@ func Load() *Config {
 		for i := range cfg.ExtraIndexTTLs {
 			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 		}
+	}
+
+	// A stalled body with no idle bound hangs every request tailing it, so zero
+	// is the default, not "never".
+	if cfg.DownloadIdleTimeout <= 0 {
+		cfg.DownloadIdleTimeout = DefaultDownloadIdleTimeout
 	}
 
 	// Set default cache dir if not specified

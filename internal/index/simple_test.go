@@ -158,4 +158,7 @@ func TestRenderSimpleHTML_Pin(t *testing.T) {
 		" data-core-metadata=\"sha256=abc\" data-dist-info-metadata=\"sha256=abc\">demo-1.0.whl</a><br>\n" +
 		"</body>\n</html>"
 	assert.Equal(t, want, string(got))
+
+	assert.Equal(t, string(RenderSimpleHTML("foo-bar", nil)), string(RenderSimpleHTML("Foo_Bar", nil)),
+		"the page names the package by its normalised name")
 }

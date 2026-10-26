@@ -20,14 +20,16 @@ that proves it. Delete an entry when it ships.
 
 ### A file can be fetched and uploaded twice
 
-- **Where:** `internal/storage/store.go` — the `ponytail:` comment in `Store.Open`.
-- **What:** a leader that commits between another request's `lookup` and its lock on the flight map is
-  missed, so that request starts a second download. In `hybrid` and `s3` mode that is also a second
-  S3 upload. A cache commit failure, or the LRU evicting the file before a reader returns, causes the
-  same. The result is correct; the cost is one extra upstream fetch and PUT.
-- **Fix:** re-run `lookup` under the flight-map lock (or right after taking it) before starting a
-  leader.
-- **Check:** a test that forces the interleaving and counts fetcher calls and bucket PUTs (both 1).
+- **Where:** `internal/storage/store.go` — `Store.commitHybrid`.
+- **What:** a request that missed a flight committing just before it leads re-checks once and serves
+  the commit. One window remains in `hybrid` mode: the flight unregisters after the cache rename and
+  before its S3 upload lands, so if the cache commit failed (or the LRU evicted the file) a request in
+  that window misses both tiers and starts a second download and a second S3 upload. The result is
+  correct; the cost is one extra upstream fetch and PUT.
+- **Fix:** when the cache commit fails, keep the flight registered until the upload finishes, as
+  `commitS3` does.
+- **Check:** a hybrid store test that fails the cache commit, gates the fake S3 PUT, opens the file
+  again, and counts fetcher calls and bucket PUTs (both 1).
 
 ### HEAD and conditional requests on pure-s3 hits cost a full GetObject
 

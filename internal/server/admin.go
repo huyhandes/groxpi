@@ -96,7 +96,7 @@ func handleCacheList(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleCachePackage(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(r.PathValue("package"))
+	packageName := r.PathValue("package")
 	if packageName == "" {
 		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Package name required"}`)
 		return
@@ -125,7 +125,7 @@ func writeStatus(w http.ResponseWriter, code int, body string) {
 // handleAdminPrefetch accepts a prefetch and returns immediately; the admin
 // module runs it detached from the request.
 func (s *Server) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
-	packageName := index.NormalizeName(strings.TrimSpace(r.PostFormValue("package")))
+	packageName := strings.TrimSpace(r.PostFormValue("package"))
 	if packageName == "" {
 		http.Error(w, "Package name required", http.StatusBadRequest)
 		return
@@ -138,7 +138,7 @@ func (s *Server) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte("Prefetching " + packageName)) // #nosec G705 -- normalised name in a text/plain body
+	_, _ = w.Write([]byte("Prefetching " + index.NormalizeName(packageName))) // #nosec G705 -- normalised name in a text/plain body
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {

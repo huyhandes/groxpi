@@ -17,6 +17,7 @@ import (
 
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/download"
+	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
@@ -83,11 +84,13 @@ type Progress struct {
 // looked up.
 var ErrInvalidKey = errors.New("invalid storage key")
 
-// Key is the storage key of a package file, packages/{pkg}/{file}. An empty
-// file names the package's prefix. Each name must be one path segment: not
-// empty, no '/', '\' or NUL, and no leading '.', so a key never leaves its
-// package directory.
+// Key is the storage key of a package file, packages/{pkg}/{file}, with pkg
+// PEP 503 normalised so every spelling of a name is one key. An empty file
+// names the package's prefix. The normalised pkg and the raw file must each be
+// one path segment: not empty, no '/', '\' or NUL, and no leading '.', so a key
+// never leaves its package directory.
 func Key(pkg, file string) (string, error) {
+	pkg = index.NormalizeName(pkg)
 	if !validSegment(pkg) || (file != "" && !validSegment(file)) {
 		return "", fmt.Errorf("%w: package %q, file %q", ErrInvalidKey, pkg, file)
 	}
@@ -117,6 +120,7 @@ type Store struct {
 
 	mu      sync.Mutex
 	flights map[string]*flight
+	commits uint64 // bumped at each post-commit unregister, under mu
 	leaders sync.WaitGroup
 }
 
@@ -247,30 +251,42 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if file == "" {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
 	}
+	pkg = index.NormalizeName(pkg) // once, so the resolve below sees it too
 	key, err := Key(pkg, file)
 	if err != nil {
 		return nil, err
 	}
-	if f := s.join(key); f != nil {
+	f, seen := s.join(key)
+	if f != nil {
 		return f.open(ctx)
 	}
 
-	obj, promote := s.lookup(ctx, key, file)
-	if obj != nil {
-		return obj, nil
-	}
-	if promote == nil && s.redirect {
-		t, err := s.fetcher.Resolve(ctx, pkg, file)
-		if err != nil {
-			return nil, err
+	// A flight that commits between the lookup and the lock below changes the
+	// commit count; the lookup then runs once more instead of fetching again.
+	var promote *download.File
+	for retried := false; ; retried = true {
+		var obj *Object
+		obj, promote = s.lookup(ctx, key, file)
+		if obj != nil {
+			return obj, nil
 		}
-		return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
+		if promote == nil && s.redirect {
+			t, err := s.fetcher.Resolve(ctx, pkg, file)
+			if err != nil {
+				return nil, err
+			}
+			return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
+		}
+		s.mu.Lock()
+		if retried || s.commits == seen || s.flights[key] != nil {
+			break
+		}
+		s.mu.Unlock()
+		if promote != nil {
+			_ = promote.Body.Close()
+		}
 	}
-
-	// ponytail: a leader committing between lookup and this lock is missed and
-	// the file fetched twice; re-check the backend here if that ever shows up.
-	s.mu.Lock()
-	f := s.flights[key]
+	f = s.flights[key]
 	if f != nil {
 		f.ref()
 		s.mu.Unlock()
@@ -292,19 +308,29 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	return f.open(ctx)
 }
 
-func (s *Store) join(key string) *flight {
+// join refs the flight for key, if any, and returns the commit count seen.
+func (s *Store) join(key string) (*flight, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.flights[key]
 	if f != nil {
 		f.ref()
 	}
-	return f
+	return f, s.commits
 }
 
-func (s *Store) unregister(f *flight) {
+func (s *Store) unregister(f *flight) { s.drop(f, false) }
+
+// unregisterCommitted unregisters a flight whose file is now stored, so an
+// Open that missed it in between looks again.
+func (s *Store) unregisterCommitted(f *flight) { s.drop(f, true) }
+
+func (s *Store) drop(f *flight, committed bool) {
 	s.mu.Lock()
 	delete(s.flights, f.key)
+	if committed {
+		s.commits++
+	}
 	n := len(s.flights)
 	s.mu.Unlock()
 	telemetry.DownloadsInFlight(context.Background(), int64(n))
@@ -514,7 +540,7 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 		slog.ErrorContext(ctx, "Failed to commit download to cache", "error", err, "key", f.key)
 		_ = os.Remove(sp.Name())
 	}
-	s.unregister(f)
+	s.unregisterCommitted(f)
 	f.finish(nil)
 }
 
@@ -536,7 +562,7 @@ func (s *Store) commitHybrid(ctx context.Context, f *flight, sp *os.File, writte
 func (s *Store) commitS3(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
 	f.finish(nil)
 	s.upload(ctx, f, sp, written)
-	s.unregister(f)
+	s.unregisterCommitted(f)
 	_ = os.Remove(sp.Name())
 }
 
