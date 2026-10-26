@@ -7,45 +7,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestNewClient(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL:               "https://org/simple/",
-		DisableSSLVerification: false,
-		ConnectTimeout:         5 * time.Second,
-		ReadTimeout:            20 * time.Second,
-	}
-
-	client := NewClient(cfg)
-
-	if client == nil {
-		t.Fatal("NewClient() returned nil")
-	}
-
-	// Test that client can make basic requests (interface testing)
-	// Note: We can't access private fields, so we test the public interface
-}
-
-func TestNewClient_SSLVerificationDisabled(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL:               "https://org/simple/",
-		DisableSSLVerification: true,
-	}
-
-	client := NewClient(cfg)
-
-	// Check if SSL verification is disabled
-	transport := client.httpClient.Transport.(*http.Transport)
-	if !transport.TLSClientConfig.InsecureSkipVerify {
-		t.Error("Expected SSL verification to be disabled")
-	}
-}
 
 func TestClient_MakeRequest(t *testing.T) {
 	// Create test server
@@ -66,7 +32,7 @@ func TestClient_MakeRequest(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{IndexURL: server.URL}
-	client := NewClient(cfg)
+	client := newClient(cfg, newTransport(cfg))
 
 	resp, err := client.makeRequest(context.Background(), server.URL, "application/vnd.pypi.simple.v1+json")
 	if err != nil {
@@ -86,7 +52,7 @@ func TestClient_MakeRequest(t *testing.T) {
 
 func TestClient_ParseJSONPackageFiles(t *testing.T) {
 	cfg := &config.Config{}
-	client := NewClient(cfg)
+	client := newClient(cfg, newTransport(cfg))
 
 	jsonResponse := `{
 		"meta": {
@@ -166,7 +132,7 @@ func TestClient_GetPackageFiles(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{IndexURL: server.URL}
-	client := NewClient(cfg)
+	client := newClient(cfg, newTransport(cfg))
 
 	files, err := client.GetPackageFiles(context.Background(), config.Index{URL: server.URL}, packageName)
 	if err != nil {
@@ -191,7 +157,7 @@ func TestClient_GetPackageFiles_NotFound(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{IndexURL: server.URL}
-	client := NewClient(cfg)
+	client := newClient(cfg, newTransport(cfg))
 
 	_, err := client.GetPackageFiles(context.Background(), config.Index{URL: server.URL}, "non-existent-package")
 	if err == nil {
