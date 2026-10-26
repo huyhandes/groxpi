@@ -144,7 +144,10 @@ index lists without a metadata marker, or does not list at all, answers `404`. T
 }
 ```
 
-`timestamp` is Unix seconds. Index URLs are redacted, because this endpoint is unauthenticated and must
+`timestamp` is Unix seconds. `cache_dir` and `cache_size` describe the cache the storage mode really
+uses: `GROXPI_CACHE_DIR`/`GROXPI_CACHE_SIZE` in `local`, `GROXPI_LOCAL_CACHE_DIR`/`GROXPI_LOCAL_CACHE_SIZE`
+in `hybrid`, and `""`/`0` in `s3`, which has no cache. The home page's "Cache Size" follows the same
+rule. Index URLs are redacted, because this endpoint is unauthenticated and must
 not leak an index's credentials.
 
 ## Administration

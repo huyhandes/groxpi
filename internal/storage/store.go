@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/download"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
@@ -138,6 +139,87 @@ func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir
 		s.commit = s.commitHybrid
 	}
 	return s
+}
+
+// New builds the store the configuration's storage mode asks for: the cache
+// (local), the durable store (s3), or the cache in front of it (hybrid). The
+// zero mode is local. An unknown mode is an error rather than a silent local
+// store, which would run without the durable store the operator asked for. A
+// download budget of 0 is redirect mode: misses are never fetched.
+func New(cfg *config.Config, fetcher Fetcher) (*Store, error) {
+	var (
+		cache   *LocalStorage
+		durable *S3Storage
+		err     error
+	)
+	switch cfg.StorageType {
+	case "", "local":
+		cache, err = NewLocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
+	case "s3", "hybrid":
+		durable, err = NewS3Storage(&S3Config{
+			Endpoint:        cfg.S3Endpoint,
+			AccessKeyID:     cfg.S3AccessKeyID,
+			SecretAccessKey: cfg.S3SecretAccessKey,
+			Region:          cfg.S3Region,
+			Bucket:          cfg.S3Bucket,
+			Prefix:          cfg.S3Prefix,
+			UseSSL:          cfg.S3UseSSL,
+			ForcePathStyle:  cfg.S3ForcePathStyle,
+			EnableHTTP2:     cfg.S3EnableHTTP2,
+			ConnectTimeout:  cfg.ConnectTimeout,
+			RequestTimeout:  cfg.DownloadTimeout,
+		})
+		if err == nil && cfg.StorageType == "hybrid" {
+			if cache, err = NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL); err != nil {
+				_ = durable.Close()
+				err = fmt.Errorf("failed to create local cache: %w", err)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown storage type %q: want local, s3 or hybrid", cfg.StorageType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Pure-s3 spools get a directory of their own: the cache dir defaults to
+	// the shared OS temp dir, and the store reaps stale files in its spool dir.
+	spoolDir := filepath.Join(cfg.CacheDir, "spool")
+	if cache == nil {
+		if err := os.MkdirAll(spoolDir, 0750); err != nil {
+			_ = durable.Close()
+			return nil, fmt.Errorf("failed to create spool directory: %w", err)
+		}
+	}
+	s := NewStore(cache, durable, fetcher, spoolDir, cfg.DownloadTimeout <= 0)
+
+	d := s.Describe()
+	attrs := []any{"mode", d.Mode, "cache_dir", d.CacheDir, "cache_size", d.CacheSize, "redirect", s.redirect}
+	if durable != nil {
+		attrs = append(attrs, "endpoint", config.RedactURL(cfg.S3Endpoint), "bucket", cfg.S3Bucket, "prefix", cfg.S3Prefix)
+	}
+	slog.Info("storage configured", attrs...)
+	return s, nil
+}
+
+// Description is what the store reports about itself: the storage mode and
+// the cache behind it. With no cache (s3) the directory is empty and the size 0.
+type Description struct {
+	Mode      string // local, s3 or hybrid
+	CacheDir  string
+	CacheSize int64 // bytes, 0 = unbounded or no cache
+}
+
+// Describe reports the storage mode and the cache this store actually uses.
+func (s *Store) Describe() Description {
+	switch {
+	case s.cache == nil:
+		return Description{Mode: "s3"}
+	case s.durable == nil:
+		return Description{Mode: "local", CacheDir: s.cache.baseDir, CacheSize: s.cache.maxSize}
+	default:
+		return Description{Mode: "hybrid", CacheDir: s.cache.baseDir, CacheSize: s.cache.maxSize}
+	}
 }
 
 // reapSpool removes crash-leftover spool files from dir, which the store owns
