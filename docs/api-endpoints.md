@@ -91,7 +91,9 @@ has cached.
    the first included, reads the same growing spool. `Range` is ignored while a download is in flight.
 3. **Redirect (`302`)** — the client is sent to the upstream URL. This happens when caching is disabled
    (`GROXPI_DOWNLOAD_TIMEOUT=0`) or when the upstream fetch failed or exceeded its time-to-first-byte
-   budget before upstream answered `200`.
+   budget before upstream answered `200`. The `Location` never carries index credentials: user-info is
+   stripped from the upstream URL (and a warning logged with the redacted URL), so a private index in
+   redirect mode hands clients an upstream `401`, not its password.
 4. **`404`** — the package's index could not be resolved, or the index does not list that filename.
    A filename that is not a single path segment (empty, containing `/`, `\` or NUL, or starting with
    `.`, so an encoded `..%2F` too) answers `404 File not found` before anything else: no upstream query,
