@@ -379,6 +379,80 @@ func TestStore_S3UploadsSpoolAndRemovesIt(t *testing.T) {
 	assert.Empty(t, files(t, spool), "the spool is removed after upload")
 }
 
+// TestStore_CommitBetweenLookupAndLeadServesTheCommit: a request whose lookup
+// missed just before another flight for the key committed serves the committed
+// file rather than fetching and uploading it again.
+func TestStore_CommitBetweenLookupAndLeadServesTheCommit(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		objects = map[string][]byte{}
+		puts    atomic.Int64
+		misses  atomic.Int64
+	)
+	held, release := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Count(r.URL.Path, "/") < 2 {
+			return // bucket check
+		}
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			objects[r.URL.Path] = body
+			mu.Unlock()
+			puts.Add(1)
+			return
+		}
+		mu.Lock()
+		body, ok := objects[r.URL.Path]
+		mu.Unlock()
+		if !ok {
+			if misses.Add(1) == 1 { // the first miss is held until the other flight commits
+				close(held)
+				<-release
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := NewS3Storage(&S3Config{Endpoint: srv.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "b", ForcePathStyle: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = remote.Close() })
+	f := &fakeFetcher{body: []byte("committed bytes")}
+	s := NewStore(nil, remote, f, t.TempDir(), false)
+
+	late := make(chan []byte)
+	go func() {
+		obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+		if !assert.NoError(t, err) {
+			late <- nil
+			return
+		}
+		got, err := io.ReadAll(obj)
+		assert.NoError(t, err)
+		_ = obj.Close()
+		late <- got
+	}()
+	<-held // the late request's lookup has missed but not yet led
+
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	require.NoError(t, err)
+	got, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	assert.Equal(t, f.body, got)
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond,
+		"the first flight commits and unregisters")
+
+	close(release)
+	assert.Equal(t, f.body, <-late)
+	require.NoError(t, s.Close())
+	assert.Equal(t, int64(1), f.calls.Load(), "fetched once")
+	assert.Equal(t, int64(1), puts.Load(), "uploaded once")
+}
+
 // TestStore_FetchErrorRedirects: a fetch that fails before its body starts is a
 // fetch_failed redirect to the target the leader resolved.
 func TestStore_FetchErrorRedirects(t *testing.T) {
