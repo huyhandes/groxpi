@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -152,4 +153,36 @@ func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
 
 	getIndex(t, svc, "numpy")
 	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an expired package must be refetched")
+}
+
+// TestResolve_UpstreamFailureIsRedacted pins that index returns already-redacted
+// errors: whether a credentialed index fails at the transport or with an HTTP
+// error, neither its password nor a token-as-username reaches the error text.
+func TestResolve_UpstreamFailureIsRedacted(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failing.Close)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+
+	for _, base := range []string{failing.URL, closed.URL} {
+		for _, user := range []*url.Userinfo{url.UserPassword("deploy", secret), url.User(secret)} {
+			u, err := url.Parse(base)
+			require.NoError(t, err)
+			u.User = user
+			svc := newTestService(t, &config.Config{
+				IndexURL:        u.String(),
+				IndexTTL:        time.Minute,
+				IndexCacheSize:  1 << 20,
+				DownloadTimeout: time.Second,
+				LogLevel:        "ERROR",
+			})
+
+			_, err = svc.Resolve(t.Context(), "numpy")
+			require.Error(t, err, u.Redacted())
+			assert.NotContains(t, err.Error(), secret, u.Redacted())
+		}
+	}
 }

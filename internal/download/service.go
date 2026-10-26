@@ -112,7 +112,9 @@ func (s *Service) Fetch(ctx context.Context, packageName, fileName string) (*Fil
 	if err != nil {
 		budget.Stop()
 		cancel()
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		// An unparseable URL comes back as a *url.Error quoting it whole,
+		// credentials included.
+		return nil, fmt.Errorf("failed to create request: %w", config.RedactURLError(err))
 	}
 	req.Header.Set("User-Agent", "groxpi/1.0.0")
 
