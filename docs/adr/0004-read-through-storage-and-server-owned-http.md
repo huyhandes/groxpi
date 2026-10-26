@@ -98,3 +98,16 @@ blurred them.
   redirected in redirect mode) rather than a `200` cut off mid-body. `Range` and conditional requests
   still go through `http.ServeContent`; a ranged read fetches bounded windows, starting at 1 MiB and
   doubling up to a cap, instead of an open-ended `bytes=<off>-`. S3 hits still carry no `ETag`.
+
+## Amendment — 2026-10-27: redirect mode lives in storage
+
+Decision 2 made redirect mode a server decision built on a per-call no-fetch option to `Open`. That
+left the server, admin and download each re-deriving the mode from `GROXPI_DOWNLOAD_TIMEOUT`.
+
+- **The mode is set once, when the store is built.** `storage.NewStore(..., redirect bool)` takes it
+  and `Store.Open(ctx, pkg, file)` has no fetch flag. A redirect-mode store answers a miss in every
+  tier with `ErrNotFound` and starts no flight; a hybrid durable hit is still promoted into the cache.
+- **Everyone else asks the store.** The server's redirect reason and admin's up-front "caching is
+  disabled" prefetch refusal read `Store.Redirects()`. Download no longer substitutes a 5-minute budget
+  for a zero timeout, because a redirect-mode store never calls `Fetch`.
+- The externally visible behaviour of redirect mode is unchanged.

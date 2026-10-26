@@ -15,7 +15,6 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/storage"
 )
@@ -25,10 +24,9 @@ var ErrShuttingDown = errors.New("shutting down; prefetch not accepted")
 
 // Service is the admin module.
 type Service struct {
-	store   *storage.Store
-	index   *index.Service
-	noCache bool // redirect mode: prefetch has nothing to warm
-	errors  failures
+	store  *storage.Store
+	index  *index.Service
+	errors failures
 
 	// prefetches counts the detached prefetch goroutines so shutdown can wait for
 	// them: one of them may be writing to storage when the signal arrives.
@@ -45,11 +43,10 @@ type Service struct {
 }
 
 // New builds the admin module.
-func New(cfg *config.Config, store *storage.Store, idx *index.Service) *Service {
+func New(store *storage.Store, idx *index.Service) *Service {
 	return &Service{
-		store:   store,
-		index:   idx,
-		noCache: cfg.DownloadTimeout <= 0,
+		store: store,
+		index: idx,
 	}
 }
 

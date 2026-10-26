@@ -74,7 +74,9 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	s.downloads = download.New(cfg, s.index)
 	// Pure-s3 spools get a directory of their own: the cache dir defaults to
 	// the shared OS temp dir, and the store reaps stale files in its spool dir.
-	s.store = storage.NewStore(cache, durable, s.downloads, filepath.Join(cfg.CacheDir, "spool"))
+	// A download budget of 0 is redirect mode: misses are never fetched.
+	s.store = storage.NewStore(cache, durable, s.downloads, filepath.Join(cfg.CacheDir, "spool"),
+		cfg.DownloadTimeout <= 0)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleHome)
@@ -95,7 +97,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			_ = s.store.Close()
 			return nil, err
 		}
-		s.admin = admin.New(cfg, s.store, s.index)
+		s.admin = admin.New(s.store, s.index)
 		s.registerAdmin(mux)
 	}
 
@@ -273,8 +275,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	pkg := index.NormalizeName(r.PathValue("package"))
 	file := r.PathValue("file")
 
-	fetch := s.config.DownloadTimeout > 0
-	obj, err := s.store.Open(ctx, pkg, file, fetch)
+	obj, err := s.store.Open(ctx, pkg, file)
 	if errors.Is(err, storage.ErrInvalidKey) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -290,7 +291,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Package not found", http.StatusNotFound)
 		default:
 			reason := telemetry.RedirectCachingDisabled
-			if fetch {
+			if !s.store.Redirects() {
 				reason = telemetry.RedirectFetchFailed
 				slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
 					"error", config.RedactErrorText(err), "package", pkg, "file", file,
