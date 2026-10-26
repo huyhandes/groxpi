@@ -71,7 +71,7 @@ func main() {
 
 	// Log startup info
 	slog.Info("🚀 Starting groxpi server",
-		"version", "1.0.0",
+		"version", config.Version,
 		"log_level", cfg.LogLevel,
 		"log_format", cfg.LogFormat,
 		"otlp_endpoint", cfg.OTLPEndpoint)
@@ -139,18 +139,4 @@ func shutdown(ctx context.Context, httpServer *http.Server, srv *server.Server) 
 	if err := srv.CloseContext(ctx); err != nil {
 		slog.Error("Failed to close storage backend", "error", err)
 	}
-}
-
-// formatBytes converts bytes to human readable format
-func FormatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

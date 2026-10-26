@@ -21,8 +21,8 @@ func TestClient_MakeRequest(t *testing.T) {
 			t.Errorf("Expected Accept header to be 'application/vnd.pypi.simple.v1+json', got '%s'", r.Header.Get("Accept"))
 		}
 
-		if r.Header.Get("User-Agent") != "groxpi/1.0.0" {
-			t.Errorf("Expected User-Agent to be 'groxpi/1.0.0', got '%s'", r.Header.Get("User-Agent"))
+		if r.Header.Get("User-Agent") != config.UserAgent {
+			t.Errorf("Expected User-Agent %q, got %q", config.UserAgent, r.Header.Get("User-Agent"))
 		}
 
 		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
