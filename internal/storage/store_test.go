@@ -732,8 +732,11 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte // by URL path
 	puts    atomic.Int64
+	putOnce sync.Once
 	failGet bool          // object GETs answer 403 (set before use)
 	gate    chan struct{} // object GETs send half, then wait for it to close (set before use)
+	putGate chan struct{} // PUTs signal putSeen, then wait for it to close (set before use)
+	putSeen chan struct{} // closed by the first gated PUT
 }
 
 // exists reports whether key is a file in the cache.
@@ -754,6 +757,12 @@ func newFakeS3(t *testing.T) (*S3Storage, *fakeS3) {
 		switch r.Method {
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
+			if b.putGate != nil {
+				b.mu.Unlock()
+				b.putOnce.Do(func() { close(b.putSeen) })
+				<-b.putGate
+				b.mu.Lock()
+			}
 			b.objects[r.URL.Path] = body
 			b.puts.Add(1)
 		case http.MethodHead, http.MethodGet:

@@ -8,7 +8,8 @@ that proves it. Delete an entry when it ships.
 
 ### Evicting a package can race an in-flight upload
 
-- **Where:** `internal/storage/store.go` — `Store.DeletePrefix` vs the upload at the end of `Store.fill`.
+- **Where:** `internal/storage/store.go` — `Store.DeletePrefix` vs `Store.upload` in the
+  hybrid and s3 commits.
 - **What:** in `hybrid` or `s3` mode, an admin evict that runs while a download of the same package is
   still uploading deletes the S3 objects, then the upload lands and recreates one. The next cache miss
   promotes it back, so the evict is partly undone.
@@ -78,16 +79,17 @@ that proves it. Delete an entry when it ships.
   no user cache dir.
 - **Check:** a config test asserting the default `CacheDir`.
 
-## Observability
+## Index
 
-### The upstream-fetch metric includes the S3 upload in hybrid mode
+### The HTML package page carries no `#sha256=` href fragment
 
-- **Where:** `internal/storage/store.go` — `Store.lead`, `telemetry.UpstreamFetch`.
-- **What:** `fill` (which ends with the synchronous S3 upload) runs inside the timed region, so the
-  upstream-fetch duration in `hybrid` and `s3` mode includes the PUT.
-- **Fix:** record the duration when the spool is verified, before the commit and upload, and give the
-  upload its own span.
-- **Check:** a test with a slow fake S3 asserting the recorded fetch duration excludes the PUT delay.
+- **Where:** `internal/index/simple.go` — `RenderSimpleHTML`.
+- **What:** PEP 503 lets a link carry its digest as `#sha256=<hex>`; the page groxpi renders links to
+  `/simple/<pkg>/<file>` with no fragment, so an HTML-only client cannot verify the download against
+  the index (the PEP 691 JSON body does carry `hashes`).
+- **Fix:** append `#sha256=` plus the file's `Hashes["sha256"]` to the href when the upstream gave one.
+- **Check:** a `RenderSimpleHTML` case with a hash asserting the fragment, and the round-trip test
+  comparing `Hashes`.
 
 ## Admin and UI
 

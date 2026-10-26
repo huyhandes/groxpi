@@ -113,8 +113,9 @@ type Store struct {
 	cache    *LocalStorage // nil in s3 mode
 	durable  *S3Storage    // nil in local mode
 	fetcher  Fetcher
-	spoolDir string // spool directory when there is no cache
-	redirect bool   // a miss is never fetched; the caller redirects upstream
+	spoolDir string     // spool directory when there is no cache
+	redirect bool       // a miss is never fetched; the caller redirects upstream
+	commit   commitFunc // per mode, chosen once in NewStore
 
 	mu      sync.Mutex
 	flights map[string]*flight
@@ -130,8 +131,14 @@ type Store struct {
 func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
 	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
 		flights: map[string]*flight{}}
-	if cache == nil {
+	switch {
+	case cache == nil:
+		s.commit = s.commitS3
 		reapSpool(spoolDir)
+	case durable == nil:
+		s.commit = s.commitLocal
+	default:
+		s.commit = s.commitHybrid
 	}
 	return s
 }
@@ -240,6 +247,7 @@ func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *downloa
 		}
 		telemetry.CacheMiss(ctx, telemetry.LayerLocal)
 		if !errors.Is(err, ErrNotFound) {
+			// Safe to log raw: a local filesystem error, no index URL in it.
 			slog.ErrorContext(ctx, "Failed to read local cache", "error", err, "key", key)
 		}
 	}
@@ -273,11 +281,13 @@ func (s *Store) lookup(ctx context.Context, key, file string) (*Object, *downloa
 func (s *Store) remoteMiss(ctx context.Context, key string, err error) {
 	telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 	if !errors.Is(err, ErrNotFound) {
+		// Safe to log raw: an object-store error; S3 credentials sign requests
+		// and are never part of the endpoint URL.
 		slog.ErrorContext(ctx, "Failed to read remote cache", "error", err, "key", key)
 	}
 }
 
-// lead runs one flight: fetch (or take the promotion source), spool, verify,
+// lead runs one flight: fetch (or take the promotion source), spool, then
 // commit. It holds one ref on the flight, released last.
 func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 	defer s.leaders.Done()
@@ -285,14 +295,19 @@ func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 
 	if src != nil {
 		defer func() { _ = src.Body.Close() }()
-		if err := s.fill(ctx, f, src, true); err != nil {
+		sp, written, err := s.spool(ctx, f, src, true)
+		if err != nil {
+			// Safe to log raw: a local or object-store error, no index URL in it.
 			slog.ErrorContext(ctx, "Failed to promote a durable-store hit into the cache", "error", err, "key", f.key)
+			return
 		}
+		s.commit(ctx, f, sp, written, true)
 		return
 	}
 
 	// The resolution and fetch run on the request's context, so the index
-	// resolution hangs off the request as it always has; the span covers both.
+	// resolution hangs off the request as it always has. The span is the
+	// flight's: it covers resolution, fetch, spool and commit.
 	// The leader resolves once; joiners take its outcome from the flight.
 	fetchCtx := ctx
 	ctx, span := telemetry.Tracer().Start(ctx, "upstream.fetch")
@@ -305,28 +320,43 @@ func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 		span.RecordError(err)
 		return
 	}
+	var (
+		sp      *os.File
+		written int64
+	)
 	src, err = s.fetcher.Fetch(fetchCtx, t)
 	if err == nil {
 		defer func() { _ = src.Body.Close() }()
-		err = s.fill(ctx, f, src, false)
+		sp, written, err = s.spool(ctx, f, src, false)
 	} else {
 		s.unregister(f)
 		f.finish(newRedirectError(t, telemetry.RedirectFetchFailed, err))
 	}
+	// The fetch ends when the spool is verified (or failed); the commit and any
+	// upload are not upstream time.
 	outcome := telemetry.OutcomeOK
 	if err != nil {
 		outcome = telemetry.OutcomeError
-		span.RecordError(err)
-		slog.ErrorContext(ctx, "Upstream download failed",
-			"error", err, "package", f.pkg, "file", f.file)
 	}
 	telemetry.UpstreamFetch(ctx, time.Since(started), outcome)
+	if err != nil {
+		span.RecordError(err)
+		// Safe to log raw: download redacts its errors at the source.
+		slog.ErrorContext(ctx, "Upstream download failed",
+			"error", err, "package", f.pkg, "file", f.file)
+		return
+	}
+	s.commit(ctx, f, sp, written, false)
 }
 
-// fill copies src into a spool file while hashing, then commits it (rename into
-// the cache, upload to the durable store, or both) or, on any failure, fails
-// every reader and removes the spool.
-func (s *Store) fill(ctx context.Context, f *flight, src *download.File, promote bool) (err error) {
+// spool copies src into a spool file while hashing and verifies it. It knows
+// nothing of storage modes. Readers tail the spool while it grows, the last
+// byte held back until verified. On success it returns the spool, still open
+// under the leader's ref, with the flight still registered and unfinished: the
+// commit owns both. On any failure it unregisters the flight, fails every
+// reader and removes the spool; a spool that cannot be created fails a
+// download with a fetch_failed RedirectError (a promotion with the bare error).
+func (s *Store) spool(ctx context.Context, f *flight, src *download.File, promote bool) (_ *os.File, written int64, err error) {
 	ctx, span := telemetry.Tracer().Start(ctx, "storage.put")
 	defer span.End()
 
@@ -340,13 +370,14 @@ func (s *Store) fill(ctx context.Context, f *flight, src *download.File, promote
 	}
 	if err != nil {
 		err = fmt.Errorf("failed to create spool file: %w", err)
+		span.RecordError(err)
 		s.unregister(f)
 		if promote {
 			f.finish(err)
 		} else {
 			f.finish(newRedirectError(src.Target, telemetry.RedirectFetchFailed, err))
 		}
-		return err
+		return nil, 0, err
 	}
 	total := src.Size
 	if total <= 0 {
@@ -357,7 +388,6 @@ func (s *Store) fill(ctx context.Context, f *flight, src *download.File, promote
 	h := sha256.New()
 	bufp := copyBufPool.Get().(*[]byte)
 	defer copyBufPool.Put(bufp)
-	var written int64
 	for {
 		n, rerr := src.Body.Read(*bufp)
 		if n > 0 {
@@ -383,35 +413,65 @@ func (s *Store) fill(ctx context.Context, f *flight, src *download.File, promote
 		s.unregister(f)
 		f.finish(err)
 		_ = os.Remove(sp.Name())
-		return err
+		return nil, 0, err
 	}
+	return sp, written, nil
+}
 
-	// Commit failures are logged, not reported: every reader already has, or
-	// will have, the verified bytes from the spool. The rename keeps the inode,
-	// and sp stays open under the leader's ref, so the upload below reads the
-	// same bytes whatever the cache does to the path meanwhile.
-	if s.cache != nil {
-		if cerr := s.cache.commit(ctx, sp.Name(), f.key, written); cerr != nil {
-			slog.ErrorContext(ctx, "Failed to commit download to cache", "error", cerr, "key", f.key)
-			_ = os.Remove(sp.Name())
-		}
-		// Unregister before finishing, so the request after EOF is a cache hit.
-		s.unregister(f)
-		f.finish(nil)
-	} else {
-		f.finish(nil)
-	}
-	// A promotion came from the durable store; it is not sent back there.
-	if s.durable != nil && !promote {
-		if uerr := s.durable.Put(ctx, f.key, io.NewSectionReader(sp, 0, written), written, contentType(f.file)); uerr != nil {
-			slog.ErrorContext(ctx, "Failed to upload download to object store", "error", uerr, "key", f.key)
-		}
-	}
-	if s.cache == nil {
-		s.unregister(f)
+// commitFunc makes a verified spool permanent; NewStore picks one from the
+// tiers present. A commit's failures are logged, not reported: every reader
+// already has, or will have, the verified bytes from the spool. The rename
+// keeps the inode and sp stays open under the leader's ref, so an upload reads
+// the same bytes whatever the cache does to the path meanwhile. promote marks
+// a spool filled from the durable store.
+type commitFunc func(ctx context.Context, f *flight, sp *os.File, written int64, promote bool)
+
+// commitLocal renames the spool into the cache, unregisters the flight, then
+// finishes it. Invariant: rename, unregister, finish, in that order, so the
+// request after a reader's EOF is a cache hit rather than a join of a finished
+// flight.
+func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
+	if err := s.cache.commit(ctx, sp.Name(), f.key, written); err != nil {
+		// Safe to log raw: a local filesystem error, no index URL in it.
+		slog.ErrorContext(ctx, "Failed to commit download to cache", "error", err, "key", f.key)
 		_ = os.Remove(sp.Name())
 	}
-	return nil
+	s.unregister(f)
+	f.finish(nil)
+}
+
+// commitHybrid is commitLocal, then the upload to the durable store unless the
+// spool was promoted from there. Invariant: rename, unregister, finish, then
+// Put, so readers never wait on the durable store and a cache commit failure
+// still uploads.
+func (s *Store) commitHybrid(ctx context.Context, f *flight, sp *os.File, written int64, promote bool) {
+	s.commitLocal(ctx, f, sp, written, promote)
+	if !promote {
+		s.upload(ctx, f, sp, written)
+	}
+}
+
+// commitS3 finishes the flight, uploads the spool, unregisters, then removes
+// the spool. Invariant: finish, Put, unregister, remove, in that order, so a
+// request during the upload joins the flight instead of fetching again, and
+// the spool goes only once nothing can read it by path.
+func (s *Store) commitS3(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
+	f.finish(nil)
+	s.upload(ctx, f, sp, written)
+	s.unregister(f)
+	_ = os.Remove(sp.Name())
+}
+
+// upload puts the verified spool into the durable store under its own span.
+func (s *Store) upload(ctx context.Context, f *flight, sp *os.File, written int64) {
+	ctx, span := telemetry.Tracer().Start(ctx, "storage.upload")
+	defer span.End()
+	if err := s.durable.Put(ctx, f.key, io.NewSectionReader(sp, 0, written), written, contentType(f.file)); err != nil {
+		span.RecordError(err)
+		// Safe to log raw: an object-store error; S3 credentials sign requests
+		// and are never part of the endpoint URL.
+		slog.ErrorContext(ctx, "Failed to upload download to object store", "error", err, "key", f.key)
+	}
 }
 
 // verify checks the received bytes against what the index declared: the SHA-256

@@ -23,6 +23,7 @@ internal/
   index/     service.go      Resolve / Invalidate / ProxyRoot: extras-first resolution, singleflight
              cache.go        bounded index cache (LRU by last access + background TTL sweep)
              client.go       upstream index client (JSON first, HTML fallback)
+             simple.go       PEP 503 HTML: parse an upstream page, render this proxy's page
              normalize.go    PEP 503 name normalisation
   download/  service.go      Resolve / Fetch: find a file in the index (PEP 658 included), open it upstream
   admin/     admin.go        List / Evict / InFlight: the cache listing and eviction
@@ -196,9 +197,11 @@ to a response without calling `download` itself:
 - a wrapped `download.ErrNotListed` — `404 File not found`.
 - anything else (the package index could not be resolved) — `404 Package not found`.
 
-The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
-only fire while groxpi is still waiting for upstream response headers. A body already streaming is never
-cut off by it.
+One timer guards each upstream file request. While groxpi waits for response headers it holds the
+time-to-first-byte budget; once headers arrive it is re-armed with `GROXPI_DOWNLOAD_IDLE_TIMEOUT` and
+reset by every body read that returns bytes, then stopped on close. A slow but steady body is never cut
+off; one that sends nothing for the idle timeout fails the flight, nothing is committed, and the next
+request starts a fresh flight.
 
 The leader runs on a context detached from its client's request: it fills the cache for every reader,
 so it finishes even after all of them have left. Shutdown waits for it.
@@ -241,9 +244,13 @@ as long as the collector keeps the series.
 ├─ storage.exists
 ├─ index.resolve
 │  └─ index.query          (one per index consulted)
-└─ upstream.fetch
-   └─ storage.put
+└─ upstream.fetch          (the flight: resolve, fetch, spool, commit)
+   ├─ storage.put          (the spool: copy, hash, verify)
+   └─ storage.upload       (the PUT to the durable store, hybrid and s3)
 ```
+
+`groxpi.upstream.fetch.duration` is recorded when the spool is verified, so it never includes
+`storage.upload`.
 
 ## Embedded assets
 

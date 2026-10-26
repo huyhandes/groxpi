@@ -227,12 +227,11 @@ func TestFileInfo_GetYankedReason(t *testing.T) {
 	}
 }
 
-// TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs verifies that hrefs on a
+// TestParseSimpleHTML_ResolvesRelativeHrefs verifies that hrefs on a
 // PEP 503 HTML index page are resolved against the URL of the index page they came
 // from (relative, same-directory, absolute and protocol-relative forms), and that
 // the #sha256=... fragment survives resolution.
-func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
-	client := &Client{}
+func TestParseSimpleHTML_ResolvesRelativeHrefs(t *testing.T) {
 	const baseURL = "https://org/simple/foo/"
 
 	testCases := []struct {
@@ -274,7 +273,7 @@ func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), baseURL)
+			files, err := parseSimpleHTML(strings.NewReader(tc.html), mustURL(t, baseURL))
 			require.NoError(t, err)
 			require.Len(t, files, 1)
 			assert.Equal(t, tc.expectedURL, files[0].URL)
@@ -282,11 +281,10 @@ func TestClient_ParseHTMLPackageFiles_ResolvesRelativeHrefs(t *testing.T) {
 	}
 }
 
-// TestClient_ParseHTMLPackageFiles_SHA256Fragment verifies the #sha256= fragment is
+// TestParseSimpleHTML_SHA256Fragment verifies the #sha256= fragment is
 // read into the hash map in the same shape the JSON index produces, so downstream
 // code never branches on index format.
-func TestClient_ParseHTMLPackageFiles_SHA256Fragment(t *testing.T) {
-	client := &Client{}
+func TestParseSimpleHTML_SHA256Fragment(t *testing.T) {
 	const sum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	testCases := []struct {
@@ -313,7 +311,7 @@ func TestClient_ParseHTMLPackageFiles_SHA256Fragment(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://org/simple/foo/")
+			files, err := parseSimpleHTML(strings.NewReader(tc.html), mustURL(t, "https://org/simple/foo/"))
 			require.NoError(t, err)
 			require.Len(t, files, 1)
 			assert.Equal(t, tc.expected, files[0].Hashes)
@@ -321,16 +319,15 @@ func TestClient_ParseHTMLPackageFiles_SHA256Fragment(t *testing.T) {
 	}
 }
 
-// TestClient_ParseHTMLPackageFiles_PreservesAttributes ensures resolution did not
+// TestParseSimpleHTML_PreservesAttributes ensures resolution did not
 // disturb the other data pulled off the anchor tag, and that HTML entities are
 // decoded. A PEP 503 index must escape ">" in data-requires-python; carrying the
 // escape through into the PEP 691 body we serve makes pip raise InvalidSpecifier
 // on "&gt;=3.8".
-func TestClient_ParseHTMLPackageFiles_PreservesAttributes(t *testing.T) {
-	client := &Client{}
+func TestParseSimpleHTML_PreservesAttributes(t *testing.T) {
 	html := `<a href="../../packages/ab/cd/foo-1.0.tar.gz?token=a&amp;v=2#sha256=abc123" data-requires-python="&gt;=3.8,&lt;4" data-yanked="broken &amp; unusable">foo-1.0&amp;bar.tar.gz</a>`
 
-	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://org/simple/foo/")
+	files, err := parseSimpleHTML(strings.NewReader(html), mustURL(t, "https://org/simple/foo/"))
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 
@@ -340,26 +337,24 @@ func TestClient_ParseHTMLPackageFiles_PreservesAttributes(t *testing.T) {
 	assert.Equal(t, "broken & unusable", files[0].Yanked)
 }
 
-// TestClient_ParseHTMLPackageFiles_MalformedHref verifies an unparseable href is
+// TestParseSimpleHTML_MalformedHref verifies an unparseable href is
 // skipped rather than aborting the whole index.
-func TestClient_ParseHTMLPackageFiles_MalformedHref(t *testing.T) {
-	client := &Client{}
+func TestParseSimpleHTML_MalformedHref(t *testing.T) {
 	html := `<a href="http://[::1]bad">bad.tar.gz</a>
 <a href="foo-1.0.whl">foo-1.0.whl</a>`
 
-	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "https://org/simple/foo/")
+	files, err := parseSimpleHTML(strings.NewReader(html), mustURL(t, "https://org/simple/foo/"))
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	assert.Equal(t, "https://org/simple/foo/foo-1.0.whl", files[0].URL)
 }
 
-// TestClient_ParseHTMLPackageFiles_UnparseableBase falls back to leaving hrefs as-is
-// rather than dropping every file.
-func TestClient_ParseHTMLPackageFiles_UnparseableBase(t *testing.T) {
-	client := &Client{}
+// TestParseSimpleHTML_UnparseableBase: a nil base (the caller could not parse
+// the index URL) leaves hrefs as-is rather than dropping every file.
+func TestParseSimpleHTML_UnparseableBase(t *testing.T) {
 	html := `<a href="foo-1.0.whl">foo-1.0.whl</a>`
 
-	files, err := client.parseHTMLPackageFiles(strings.NewReader(html), "://not a url")
+	files, err := parseSimpleHTML(strings.NewReader(html), nil)
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	assert.Equal(t, "foo-1.0.whl", files[0].URL)
@@ -389,9 +384,8 @@ func TestClient_ParseJSONPackageFiles_AbsoluteURLsUnchanged(t *testing.T) {
 	assert.Equal(t, map[string]string{"sha256": "abc123"}, files[0].Hashes)
 }
 
-// TestClient_ParseHTMLPackageFiles tests HTML parsing for package files
-func TestClient_ParseHTMLPackageFiles(t *testing.T) {
-	client := &Client{}
+// TestParseSimpleHTML tests HTML parsing for package files
+func TestParseSimpleHTML(t *testing.T) {
 
 	testCases := []struct {
 		name     string
@@ -440,9 +434,9 @@ func TestClient_ParseHTMLPackageFiles(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := client.parseHTMLPackageFiles(strings.NewReader(tc.html), "https://org/simple/numpy/")
+			result, err := parseSimpleHTML(strings.NewReader(tc.html), mustURL(t, "https://org/simple/numpy/"))
 			if err != nil {
-				t.Fatalf("parseHTMLPackageFiles failed: %v", err)
+				t.Fatalf("parseSimpleHTML failed: %v", err)
 			}
 
 			if len(result) != len(tc.expected) {
