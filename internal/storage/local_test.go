@@ -165,16 +165,16 @@ func TestLocalStorage_EvictsOldestByAtime(t *testing.T) {
 	s, err := NewLocalStorage(t.TempDir(), 1000, 0)
 	require.NoError(t, err)
 
-	for _, k := range []string{"a", "b", "c", "d"} {
+	for _, k := range []string{"packages/a", "packages/b", "packages/c", "packages/d"} {
 		putN(t, s, k, 250)
 	}
-	setAtime(t, s, "c", 3*time.Hour)
-	setAtime(t, s, "a", 2*time.Hour)
-	setAtime(t, s, "b", time.Hour)
+	setAtime(t, s, "packages/c", 3*time.Hour)
+	setAtime(t, s, "packages/a", 2*time.Hour)
+	setAtime(t, s, "packages/b", time.Hour)
 
-	putN(t, s, "e", 250) // 1250 > 1000: evict oldest down to 900
+	putN(t, s, "packages/e", 250) // 1250 > 1000: evict oldest down to 900
 
-	assert.ElementsMatch(t, []string{"b", "d", "e"}, keys(s.Snapshot()))
+	assert.ElementsMatch(t, []string{"packages/b", "packages/d", "packages/e"}, keys(s.Snapshot()))
 	assert.Equal(t, int64(750), s.size.Load(), "the counter must match what is left on disk")
 }
 
@@ -183,24 +183,24 @@ func TestLocalStorage_RestartPreservesRecency(t *testing.T) {
 	s, err := NewLocalStorage(dir, 1000, 0)
 	require.NoError(t, err)
 
-	for _, k := range []string{"a", "b", "c"} {
+	for _, k := range []string{"packages/a", "packages/b", "packages/c"} {
 		putN(t, s, k, 250)
 	}
-	setAtime(t, s, "a", 3*time.Hour)
-	setAtime(t, s, "b", 2*time.Hour)
-	setAtime(t, s, "c", time.Hour)
-	err = getClose(s, "a") // a hit makes a the most recent
+	setAtime(t, s, "packages/a", 3*time.Hour)
+	setAtime(t, s, "packages/b", 2*time.Hour)
+	setAtime(t, s, "packages/c", time.Hour)
+	err = getClose(s, "packages/a") // a hit makes a the most recent
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
 	s, err = NewLocalStorage(dir, 1000, 0)
 	require.NoError(t, err)
 	assert.Equal(t, int64(750), s.size.Load(), "the startup walk must seed the size counter")
-	assert.Equal(t, []string{"a", "c", "b"}, keys(s.Snapshot()))
+	assert.Equal(t, []string{"packages/a", "packages/c", "packages/b"}, keys(s.Snapshot()))
 
-	putN(t, s, "d", 250)
-	putN(t, s, "e", 250) // over: b then c go, a survives
-	assert.ElementsMatch(t, []string{"a", "d", "e"}, keys(s.Snapshot()))
+	putN(t, s, "packages/d", 250)
+	putN(t, s, "packages/e", 250) // over: b then c go, a survives
+	assert.ElementsMatch(t, []string{"packages/a", "packages/d", "packages/e"}, keys(s.Snapshot()))
 }
 
 // setMtime sets key's mtime to ago in the past and its atime to now: an old
@@ -218,13 +218,13 @@ func TestLocalStorage_TTLExpiresIdleCacheByWriteTime(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	putN(t, s, "old-but-read", 10)
-	putN(t, s, "fresh", 10)
-	setMtime(t, s, "old-but-read", time.Hour)
+	putN(t, s, "packages/old-but-read", 10)
+	putN(t, s, "packages/fresh", 10)
+	setMtime(t, s, "packages/old-but-read", time.Hour)
 
 	assert.Eventually(t, func() bool {
 		ks := keys(s.Snapshot())
-		return len(ks) == 1 && ks[0] == "fresh"
+		return len(ks) == 1 && ks[0] == "packages/fresh"
 	}, 2*time.Second, 20*time.Millisecond, "a recently read file written past the TTL must expire with no writes")
 	assert.Equal(t, int64(10), s.size.Load())
 
@@ -239,7 +239,9 @@ func TestLocalStorage_TTLExpiresIdleCacheByWriteTime(t *testing.T) {
 // progress) stays, and neither is listed.
 func TestLocalStorage_RemovesStaleTempFiles(t *testing.T) {
 	dir := t.TempDir()
-	stale, fresh := filepath.Join(dir, tmpPrefix+"stale"), filepath.Join(dir, tmpPrefix+"fresh")
+	pkg := filepath.Join(dir, packagesDir, "p")
+	require.NoError(t, os.MkdirAll(pkg, 0o750))
+	stale, fresh := filepath.Join(pkg, tmpPrefix+"stale"), filepath.Join(pkg, tmpPrefix+"fresh")
 	require.NoError(t, os.WriteFile(stale, []byte("x"), 0o600))
 	require.NoError(t, os.WriteFile(fresh, []byte("x"), 0o600))
 	old := time.Now().Add(-2 * touchInterval)
@@ -306,4 +308,38 @@ func getClose(s *LocalStorage, key string) error {
 		err = rc.Close()
 	}
 	return err
+}
+
+// TestLocalStorage_OwnsOnlyPackagesDir pins the cache's walk scope: over a
+// shared directory (the default is os.TempDir()), foreign files and stale temp
+// files outside packages/ are never listed, counted, evicted or reaped.
+func TestLocalStorage_OwnsOnlyPackagesDir(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-2 * touchInterval)
+	foreign := []string{
+		filepath.Join(dir, "other.txt"),
+		filepath.Join(dir, tmpPrefix+"x"),
+		filepath.Join(dir, "sub", "y"),
+		filepath.Join(dir, "sub", tmpPrefix+"z"),
+	}
+	for _, p := range foreign {
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+		require.NoError(t, os.WriteFile(p, []byte("foreign"), 0o600))
+		require.NoError(t, os.Chtimes(p, old, old))
+	}
+	cached := filepath.Join(dir, "packages", "p", "f")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cached), 0o750))
+	require.NoError(t, os.WriteFile(cached, []byte("cached"), 0o600))
+
+	s, err := NewLocalStorage(dir, 100, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"packages/p/f"}, keys(s.Snapshot()))
+	assert.Equal(t, int64(len("cached")), s.size.Load(), "foreign files must not count toward the budget")
+
+	putN(t, s, "packages/p/g", 200) // over budget: evicts only under packages/
+	for _, p := range foreign {
+		assert.FileExists(t, p)
+	}
+	assert.Empty(t, s.Snapshot())
+	assert.Zero(t, s.size.Load())
 }

@@ -45,7 +45,7 @@ body. An unparseable URL is reported as `[unparseable-url]` rather than risk lea
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. |
-| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. |
+| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. groxpi owns only `<dir>/packages` and `<dir>/spool`: the cache scan, eviction and temp cleanup never list, count or delete anything else in the directory. |
 | `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. |
 
 There is one index cache. Per package it holds the parsed file list plus the JSON and gzipped-JSON
