@@ -1,14 +1,11 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,51 +35,9 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 		fileContent[i] = byte(i % 256)
 	}
 
-	// Track download attempts to verify deduplication
-	downloadAttempts := int64(0)
-
-	var mockPyPI *httptest.Server
-	mockPyPI = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/"+packageName+"/" {
-			accept := r.Header.Get("Accept")
-			if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
-				// Return JSON API response
-				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				response := map[string]any{
-					"name": packageName,
-					"files": []map[string]any{
-						{
-							"filename": fileName,
-							"url":      fmt.Sprintf("%s/files/%s", mockPyPI.URL, fileName),
-							"size":     int64(len(fileContent)),
-						},
-					},
-				}
-				jsonData, _ := json.Marshal(response)
-				_, _ = w.Write(jsonData)
-			} else {
-				// Return package index HTML
-				w.Header().Set("Content-Type", "text/html")
-				_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head><title>Links for %s</title></head>
-<body>
-<h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
-</body>
-</html>`, packageName, packageName, fileName, fileName)
-			}
-		} else if strings.Contains(r.URL.Path, "/files/") {
-			// Simulate download with controlled delay
-			atomic.AddInt64(&downloadAttempts, 1)
-			time.Sleep(100 * time.Millisecond) // Simulate download time
-
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileContent)))
-			_, _ = w.Write(fileContent)
-		}
-	}))
-	defer mockPyPI.Close()
+	// The delay simulates download time so the concurrent requests overlap.
+	mockPyPI := NewFakePyPI(t).SetDelay(100*time.Millisecond).
+		Add(packageName, fileName, FakeFile{Body: fileContent, Size: int64(len(fileContent))})
 
 	cfg := &config.Config{
 		IndexURL:        mockPyPI.URL,
@@ -96,8 +51,6 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 
 	// Test concurrent downloads are deduplicated
 	t.Run("concurrent_deduplication", func(t *testing.T) {
-		atomic.StoreInt64(&downloadAttempts, 0)
-
 		numConcurrentRequests := 10
 		var wg sync.WaitGroup
 		results := make([]integrationTestResult, numConcurrentRequests)
@@ -153,8 +106,8 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 		}
 
 		// Verify download deduplication worked
-		attempts := atomic.LoadInt64(&downloadAttempts)
-		assert.Equal(t, int64(1), attempts,
+		attempts := mockPyPI.FileHits(fileName)
+		assert.Equal(t, 1, attempts,
 			"Expected exactly 1 download attempt due to deduplication, got %d", attempts)
 
 		assert.Equal(t, numConcurrentRequests, successCount,
@@ -171,24 +124,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 func TestServer_PackageNameNormalization_Integration(t *testing.T) {
 	const normalized = "zope-interface"
 
-	var mu sync.Mutex
-	var indexPaths []string
-
-	mockPyPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		indexPaths = append(indexPaths, r.URL.Path)
-		mu.Unlock()
-
-		if r.URL.Path != "/"+normalized+"/" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body>
-<a href="/files/zope.interface-5.0.tar.gz">zope.interface-5.0.tar.gz</a>
-</body></html>`)
-	}))
-	defer mockPyPI.Close()
+	mockPyPI := NewFakePyPI(t).Add(normalized, "zope.interface-5.0.tar.gz", FakeFile{})
 
 	cfg := &config.Config{
 		IndexURL:        mockPyPI.URL,
@@ -199,7 +135,8 @@ func TestServer_PackageNameNormalization_Integration(t *testing.T) {
 	}
 	router := New(cfg).Router()
 
-	for _, spelling := range []string{"zope.interface", "zope-interface", "Zope__Interface", "zope---interface"} {
+	spellings := []string{"zope.interface", "zope-interface", "Zope__Interface", "zope---interface"}
+	for _, spelling := range spellings {
 		req := httptest.NewRequest("GET", "/simple/"+spelling+"/", nil)
 		resp := testRequestIntegration(router, req)
 		body, _ := io.ReadAll(resp.Body)
@@ -209,10 +146,13 @@ func TestServer_PackageNameNormalization_Integration(t *testing.T) {
 		assert.Contains(t, string(body), "zope.interface-5.0.tar.gz", "spelling %q should list the file", spelling)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Equal(t, []string{"/" + normalized + "/"}, indexPaths,
+	assert.Equal(t, 1, mockPyPI.IndexHits(normalized),
 		"all spellings must produce exactly one upstream fetch of the normalized name")
+	for _, spelling := range spellings {
+		if spelling != normalized {
+			assert.Zero(t, mockPyPI.IndexHits(spelling), "upstream must never see the spelling %q", spelling)
+		}
+	}
 }
 
 // TestServer_DownloadCoordination_RealWorld tests real-world scenarios
@@ -230,47 +170,9 @@ func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
 		fileContent[i] = byte(i % 256)
 	}
 
-	var mockPyPI *httptest.Server
-	mockPyPI = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/"+packageName+"/" {
-			accept := r.Header.Get("Accept")
-			if strings.Contains(accept, "application/vnd.pypi.simple.v1+json") {
-				// Return JSON API response
-				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				response := map[string]any{
-					"name": packageName,
-					"files": []map[string]any{
-						{
-							"filename": fileName,
-							"url":      fmt.Sprintf("%s/files/%s", mockPyPI.URL, fileName),
-							"size":     int64(len(fileContent)),
-						},
-					},
-				}
-				jsonData, _ := json.Marshal(response)
-				_, _ = w.Write(jsonData)
-			} else {
-				// Return HTML response
-				w.Header().Set("Content-Type", "text/html")
-				_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html>
-<head><title>Links for %s</title></head>
-<body>
-<h1>Links for %s</h1>
-<a href="/files/%s">%s</a>
-</body>
-</html>`, packageName, packageName, fileName, fileName)
-			}
-		} else if strings.Contains(r.URL.Path, "/files/") {
-			// Simulate slow download
-			time.Sleep(200 * time.Millisecond)
-
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileContent)))
-			_, _ = w.Write(fileContent)
-		}
-	}))
-	defer mockPyPI.Close()
+	// The delay simulates a slow download.
+	mockPyPI := NewFakePyPI(t).SetDelay(200*time.Millisecond).
+		Add(packageName, fileName, FakeFile{Body: fileContent, Size: int64(len(fileContent))})
 
 	cfg := &config.Config{
 		IndexURL:        mockPyPI.URL,

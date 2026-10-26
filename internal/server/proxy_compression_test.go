@@ -43,7 +43,7 @@ func getRoot(router http.Handler, accept string) *http.Response {
 // contract: requests spaced in time each reach upstream, a concurrent burst
 // reaches it once.
 func TestRootIndex_NotCachedButCoalesced(t *testing.T) {
-	up := NewFakePyPI(t).SetRootDelay(20 * time.Millisecond)
+	up := NewFakePyPI(t).SetDelay(20 * time.Millisecond)
 	router := newProxyServer(t, up.URL)
 
 	const acceptJSON = "application/vnd.pypi.simple.v1+json"
