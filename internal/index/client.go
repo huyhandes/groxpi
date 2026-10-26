@@ -229,7 +229,7 @@ func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.
 	}
 
 	req.Header.Set("Accept", accept)
-	req.Header.Set("User-Agent", "groxpi/1.0.0")
+	req.Header.Set("User-Agent", config.UserAgent)
 
 	resp, err := c.httpClient.Do(req)
 	return resp, config.RedactURLError(err)

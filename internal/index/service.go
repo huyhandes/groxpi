@@ -279,7 +279,7 @@ func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) 
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", "groxpi/1.0.0")
+		req.Header.Set("User-Agent", config.UserAgent)
 		if accept != "" {
 			req.Header.Set("Accept", accept)
 		}

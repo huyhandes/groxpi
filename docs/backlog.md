@@ -106,11 +106,12 @@ that proves it. Delete an entry when it ships.
 
 ### The landing page reports a hardcoded version
 
-- **Where:** `internal/server/server.go` — `handleHome`.
-- **What:** `/` prints a fixed version string, not the build's.
-- **Fix:** read it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
+- **Where:** `internal/config/config.go` — `Version`, the one constant the startup log, the home
+  page and every upstream User-Agent read.
+- **What:** the constant is fixed in source, not the build's version.
+- **Fix:** set it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
   Dockerfile).
-- **Check:** a test asserting the page carries the build-info version.
+- **Check:** a test asserting the home page and User-Agent carry the build-info version.
 
 ## Test gaps
 

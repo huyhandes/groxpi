@@ -293,7 +293,14 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := io.Copy(dst, obj); err != nil {
 		// The status line is gone; aborting is the only way to tell the client
-		// the body is bad rather than hand it a clean end.
+		// the body is bad rather than hand it a clean end. A cancelled request
+		// context means the client left (net/http cancels it when a write to the
+		// connection fails): ordinary, so it logs below ERROR.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "Client disconnected mid-download, aborting response",
+				"error", config.RedactErrorText(err), "package", pkg, "file", file)
+			panic(http.ErrAbortHandler)
+		}
 		slog.ErrorContext(ctx, "Download failed mid-stream, aborting response",
 			"error", config.RedactErrorText(err), "package", pkg, "file", file)
 		panic(http.ErrAbortHandler)
@@ -340,11 +347,11 @@ func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {
 		<li>Index URL: %s</li>
 		<li>Cache Size: %d MB</li>
 		<li>Index TTL: %s</li>
-		<li>Version: 1.0.0</li>
+		<li>Version: %s</li>
 	</ul>
 	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a>%s</p>
 </body>
-</html>`, config.RedactURL(s.config.IndexURL), s.store.Describe().CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
+</html>`, config.RedactURL(s.config.IndexURL), s.store.Describe().CacheSize/(1024*1024), s.config.IndexTTL.String(), config.Version, adminLink)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
