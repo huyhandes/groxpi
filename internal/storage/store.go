@@ -19,11 +19,40 @@ import (
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
-// Fetcher opens a package file upstream. It is the one cross-module interface
-// storage consumes; download.Service implements it and the tests fake it.
+// Fetcher resolves a package file in the index and opens it upstream. It is the
+// one cross-module interface storage consumes; download.Service implements it
+// and the tests fake it. Resolve fails with a wrapped download.ErrNotListed for
+// a file the index does not list, and with any other error when the index
+// itself could not be resolved.
 type Fetcher interface {
-	Fetch(ctx context.Context, pkg, file string) (*download.File, error)
+	Resolve(ctx context.Context, pkg, file string) (download.Target, error)
+	Fetch(ctx context.Context, t download.Target) (*download.File, error)
 }
+
+// RedirectError is a miss the store will not or could not serve, for a file the
+// index lists: the caller should redirect the client to URL. Reason is
+// telemetry.RedirectCachingDisabled (redirect mode) or
+// telemetry.RedirectFetchFailed (the fetch, or its spool, failed before the
+// body started). URL comes from download.Target.RedirectURL, so it never
+// carries userinfo; Stripped reports that some was removed. URL is empty when
+// the target did not parse. Err is the cause, already redacted.
+type RedirectError struct {
+	URL      string
+	Stripped bool
+	Reason   string
+	Err      error
+}
+
+func newRedirectError(t download.Target, reason string, err error) *RedirectError {
+	u, stripped := t.RedirectURL()
+	return &RedirectError{URL: u, Stripped: stripped, Reason: reason, Err: err}
+}
+
+func (e *RedirectError) Error() string {
+	return fmt.Sprintf("redirect upstream (%s): %v", e.Reason, e.Err)
+}
+
+func (e *RedirectError) Unwrap() error { return e.Err }
 
 // Object is an opened package file. A completed object is seekable (hand it to
 // http.ServeContent); an InFlight one tails a download still being written and
@@ -92,8 +121,9 @@ type Store struct {
 // NewStore builds a store over a cache, a durable store, or both (at least one
 // must be non-nil). spoolDir holds the spool files when there is no cache (pure
 // s3); crash leftovers in it are removed by the same rule the cache's scan
-// applies. With redirect set the store never fetches: a miss in every tier is
-// ErrNotFound, while a durable hit in hybrid mode is still promoted.
+// applies. With redirect set the store never fetches: a miss in every tier is a
+// RedirectError(caching_disabled), while a durable hit in hybrid mode is still
+// promoted.
 func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
 	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
 		flights: map[string]*flight{}}
@@ -118,9 +148,12 @@ func reapSpool(dir string) {
 // is never fetched.
 func (s *Store) Redirects() bool { return s.redirect }
 
-// Open opens a package file. On a miss it fetches upstream, or in redirect mode
-// returns ErrNotFound. A name Key refuses, an empty file included, returns
-// ErrInvalidKey before anything is touched.
+// Open opens a package file. On a miss it resolves the file once and fetches
+// it, or in redirect mode returns a RedirectError(caching_disabled). A miss
+// that is not served is one of: a *RedirectError (errors.As), a wrapped
+// download.ErrNotListed, or an error resolving the package index. A name Key
+// refuses, an empty file included, returns ErrInvalidKey before anything is
+// touched.
 func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if file == "" {
 		return nil, fmt.Errorf("%w: empty file name", ErrInvalidKey)
@@ -138,7 +171,11 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 		return obj, nil
 	}
 	if promote == nil && s.redirect {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
+		t, err := s.fetcher.Resolve(ctx, pkg, file)
+		if err != nil {
+			return nil, err
+		}
+		return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
 	}
 
 	// ponytail: a leader committing between lookup and this lock is missed and
@@ -250,19 +287,27 @@ func (s *Store) lead(ctx context.Context, f *flight, src *download.File) {
 		return
 	}
 
-	// The fetch itself runs on the request's context, so the index resolution
-	// inside it hangs off the request as it always has; the span covers it.
+	// The resolution and fetch run on the request's context, so the index
+	// resolution hangs off the request as it always has; the span covers both.
+	// The leader resolves once; joiners take its outcome from the flight.
 	fetchCtx := ctx
 	ctx, span := telemetry.Tracer().Start(ctx, "upstream.fetch")
 	defer span.End()
 	started := time.Now()
-	src, err := s.fetcher.Fetch(fetchCtx, f.pkg, f.file)
+	t, err := s.fetcher.Resolve(fetchCtx, f.pkg, f.file)
+	if err != nil {
+		s.unregister(f)
+		f.finish(err)
+		span.RecordError(err)
+		return
+	}
+	src, err = s.fetcher.Fetch(fetchCtx, t)
 	if err == nil {
 		defer func() { _ = src.Body.Close() }()
 		err = s.fill(ctx, f, src, false)
 	} else {
 		s.unregister(f)
-		f.finish(err)
+		f.finish(newRedirectError(t, telemetry.RedirectFetchFailed, err))
 	}
 	outcome := telemetry.OutcomeOK
 	if err != nil {
@@ -290,8 +335,13 @@ func (s *Store) fill(ctx context.Context, f *flight, src *download.File, promote
 		sp, err = os.CreateTemp(dir, tmpPrefix+"*")
 	}
 	if err != nil {
+		err = fmt.Errorf("failed to create spool file: %w", err)
 		s.unregister(f)
-		f.finish(fmt.Errorf("failed to create spool file: %w", err))
+		if promote {
+			f.finish(err)
+		} else {
+			f.finish(newRedirectError(src.Target, telemetry.RedirectFetchFailed, err))
+		}
 		return err
 	}
 	total := src.Size

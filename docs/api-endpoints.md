@@ -92,8 +92,9 @@ has cached.
 3. **Redirect (`302`)** — the client is sent to the upstream URL. This happens when caching is disabled
    (`GROXPI_DOWNLOAD_TIMEOUT=0`) or when the upstream fetch failed or exceeded its time-to-first-byte
    budget before upstream answered `200`. The `Location` never carries index credentials: user-info is
-   stripped from the upstream URL (and a warning logged with the redacted URL), so a private index in
-   redirect mode hands clients an upstream `401`, not its password.
+   stripped from the upstream URL (and a warning logged with the stripped URL), so a private index in
+   redirect mode hands clients an upstream `401`, not its password. An upstream URL that does not
+   parse is never handed out: that request answers `502` instead.
 4. **`404`** — the package's index could not be resolved, or the index does not list that filename.
    A filename that is not a single path segment (empty, containing `/`, `\` or NUL, or starting with
    `.`, so an encoded `..%2F` too) answers `404 File not found` before anything else: no upstream query,
@@ -224,7 +225,7 @@ the package back from S3. In pure `s3` mode the objects under the package's pref
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
 | `500` | Index resolution failed for a reason other than absence, or a storage operation failed. |
-| `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap. |
+| `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap; or a file to redirect has an upstream URL that does not parse. |
 | `503` | A prefetch was submitted after shutdown had begun. |
 
 A known path with the wrong method answers `405`, not `404`: `DELETE /simple/` tells you the method is

@@ -475,3 +475,22 @@ func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return body
 }
+
+// TestFileMiss_UnknownPackageResolvesTheIndexOnce: a file request for a package
+// no index lists costs one resolution, one query per configured index, not a
+// second resolution to decide how to answer.
+func TestFileMiss_UnknownPackageResolvesTheIndexOnce(t *testing.T) {
+	extra := newFakeUpstreamIndex(t, "extra", nil)
+	primary := newFakeUpstreamIndex(t, "primary", nil)
+	srv := newMultiIndexServer(t, nil, primary, extra)
+
+	req := httptest.NewRequest(http.MethodGet, "/simple/nonexistent/nonexistent-1.0.tar.gz", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), "Package not found")
+	for _, upstream := range []*fakeUpstreamIndex{extra, primary} {
+		assert.Equal(t, 1, upstream.hitsFor("nonexistent"), "%s queried once", upstream.name)
+	}
+}
