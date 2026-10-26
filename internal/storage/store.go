@@ -118,10 +118,11 @@ type Store struct {
 	redirect bool       // a miss is never fetched; the caller redirects upstream
 	commit   commitFunc // per mode, chosen once in NewStore
 
-	mu      sync.Mutex
-	flights map[string]*flight
-	commits uint64 // bumped at each post-commit unregister, under mu
-	leaders sync.WaitGroup
+	mu         sync.Mutex
+	flights    map[string]*flight
+	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
+	commits    uint64               // bumped at each post-commit unregister, under mu
+	leaders    sync.WaitGroup
 }
 
 // NewStore builds a store over a cache, a durable store, or both (at least one
@@ -132,7 +133,7 @@ type Store struct {
 // promoted.
 func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
 	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
-		flights: map[string]*flight{}}
+		flights: map[string]*flight{}, committing: map[*flight]struct{}{}}
 	switch {
 	case cache == nil:
 		s.commit = s.commitS3
@@ -533,12 +534,18 @@ type commitFunc func(ctx context.Context, f *flight, sp *os.File, written int64,
 // commitLocal renames the spool into the cache, unregisters the flight, then
 // finishes it. Invariant: rename, unregister, finish, in that order, so the
 // request after a reader's EOF is a cache hit rather than a join of a finished
-// flight.
+// flight. An evicted flight is not renamed, and one evicted during the rename
+// is removed again: DeletePrefix marks before it deletes, so either it sees the
+// file or the re-check sees the mark.
 func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
-	if err := s.cache.commit(ctx, sp.Name(), f.key, written); err != nil {
+	if s.evicted(f) {
+		_ = os.Remove(sp.Name())
+	} else if err := s.cache.commit(ctx, sp.Name(), f.key, written); err != nil {
 		// Safe to log raw: a local filesystem error, no index URL in it.
 		slog.ErrorContext(ctx, "Failed to commit download to cache", "error", err, "key", f.key)
 		_ = os.Remove(sp.Name())
+	} else if s.evicted(f) {
+		_ = s.cache.remove(f.key, written)
 	}
 	s.unregisterCommitted(f)
 	f.finish(nil)
@@ -549,10 +556,19 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 // Put, so readers never wait on the durable store and a cache commit failure
 // still uploads.
 func (s *Store) commitHybrid(ctx context.Context, f *flight, sp *os.File, written int64, promote bool) {
-	s.commitLocal(ctx, f, sp, written, promote)
-	if !promote {
-		s.upload(ctx, f, sp, written)
+	if promote {
+		s.commitLocal(ctx, f, sp, written, promote)
+		return
 	}
+	// Still evictable between the unregister and the end of the Put.
+	s.mu.Lock()
+	s.committing[f] = struct{}{}
+	s.mu.Unlock()
+	s.commitLocal(ctx, f, sp, written, promote)
+	s.upload(ctx, f, sp, written)
+	s.mu.Lock()
+	delete(s.committing, f)
+	s.mu.Unlock()
 }
 
 // commitS3 finishes the flight, uploads the spool, unregisters, then removes
@@ -566,8 +582,19 @@ func (s *Store) commitS3(ctx context.Context, f *flight, sp *os.File, written in
 	_ = os.Remove(sp.Name())
 }
 
-// upload puts the verified spool into the durable store under its own span.
+// upload puts the verified spool into the durable store under its own span,
+// unless the flight was evicted. The check and the start of the Put are one
+// step under s.mu, so DeletePrefix either stops the Put or waits for it.
 func (s *Store) upload(ctx context.Context, f *flight, sp *os.File, written int64) {
+	s.mu.Lock()
+	if f.evicted {
+		s.mu.Unlock()
+		return
+	}
+	f.uploaded = make(chan struct{})
+	s.mu.Unlock()
+	defer close(f.uploaded)
+
 	ctx, span := telemetry.Tracer().Start(ctx, "storage.upload")
 	defer span.End()
 	if err := s.durable.Put(ctx, f.key, io.NewSectionReader(sp, 0, written), written, contentType(f.file)); err != nil {
@@ -628,7 +655,35 @@ func (s *Store) Snapshot() []CacheEntry {
 // durable store, and reports how many went from the cache (from the durable
 // store when there is no cache). A durable failure is an error, not
 // best-effort: an object left there is promoted straight back.
+//
+// It first marks every flight under prefix evicted, so its commit stores
+// nothing, and waits (bounded by ctx) for any upload that already started,
+// so the delete runs after it. A flight still spooling is never waited on.
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	var uploads []chan struct{}
+	s.mu.Lock()
+	mark := func(f *flight) {
+		if strings.HasPrefix(f.key, prefix) {
+			f.evicted = true
+			if f.uploaded != nil {
+				uploads = append(uploads, f.uploaded)
+			}
+		}
+	}
+	for _, f := range s.flights {
+		mark(f)
+	}
+	for f := range s.committing {
+		mark(f)
+	}
+	s.mu.Unlock()
+	for _, c := range uploads {
+		select {
+		case <-c:
+		case <-ctx.Done():
+		}
+	}
+
 	var (
 		deleted    int
 		cerr, derr error
@@ -640,6 +695,13 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 		deleted, cerr = s.cache.DeletePrefix(ctx, prefix)
 	}
 	return deleted, errors.Join(cerr, derr)
+}
+
+// evicted reports whether DeletePrefix has marked f.
+func (s *Store) evicted(f *flight) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return f.evicted
 }
 
 // Close waits for detached downloads, their uploads included, then closes both
@@ -663,6 +725,8 @@ type flight struct {
 	started        time.Time
 	ready          chan struct{} // closed once the spool exists or the flight failed
 	requests       int           // guarded by Store.mu
+	evicted        bool          // guarded by Store.mu: DeletePrefix ran; the commit stores nothing
+	uploaded       chan struct{} // guarded by Store.mu: made when the Put starts, closed when it ends
 
 	mu      sync.Mutex
 	cond    *sync.Cond

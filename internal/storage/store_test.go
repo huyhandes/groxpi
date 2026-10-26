@@ -828,6 +828,14 @@ func newFakeS3(t *testing.T) (*S3Storage, *fakeS3) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		switch q := r.URL.Query(); {
+		case q.Get("list-type") == "2":
+			b.list(w, q.Get("prefix"))
+			return
+		case r.Method == http.MethodPost && q.Has("delete"):
+			b.delete(w, r)
+			return
+		}
 		switch r.Method {
 		case http.MethodPut:
 			body, _ := io.ReadAll(r.Body)

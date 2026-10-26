@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// Version is groxpi's version: the startup log, the home page and every
+// upstream User-Agent carry it. It is a constant, not read from build info.
+const Version = "1.0.0"
+
+// UserAgent is the User-Agent header on every upstream request.
+const UserAgent = "groxpi/" + Version
+
 // defaultExtraIndexTTL is the TTL an extra index gets when its position in
 // GROXPI_EXTRA_INDEX_TTLS is missing or unparseable.
 const defaultExtraIndexTTL = 3 * time.Minute
@@ -37,9 +44,9 @@ func (i Index) Redacted() string { return RedactURL(i.URL) }
 // without credentials untouched. An unparseable URL is dropped whole: we cannot
 // tell where its credentials end.
 //
-// It lives here rather than beside the HTTP client because internal/pypi already
-// imports this package, so a helper both sides can reach has to sit on the side
-// without the dependency.
+// It lives here rather than beside an HTTP client because index, download and
+// storage all import this package, so it is the one place every module that
+// names a URL can reach.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -52,10 +59,6 @@ func RedactURL(raw string) string {
 	return u.String()
 }
 
-// RedactURLError strips credentials out of the URL net/http embeds in its
-// transport errors: *url.Error prints the URL it failed on, user-info and all, so
-// returning one unredacted leaks a private index's password into any log or
-// response that records the error.
 // credentialedURLPattern matches the user-info component of an absolute URL: a
 // scheme, then everything up to the "@" that is still inside the authority. The
 // character class cannot cross a "/", so a path containing "@" is not matched.
@@ -76,6 +79,10 @@ func RedactErrorText(err error) string {
 	return credentialedURLPattern.ReplaceAllString(err.Error(), "${1}redacted@")
 }
 
+// RedactURLError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// returning one unredacted leaks a private index's password into any log or
+// response that records the error.
 func RedactURLError(err error) error {
 	var uerr *url.Error
 	if errors.As(err, &uerr) {

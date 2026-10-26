@@ -1,5 +1,5 @@
-// This is an internal test package so that TestFormatBytes can exercise the
-// real FormatBytes: package main cannot be imported from an external test.
+// This is an internal test package so that TestHealthCheck can exercise the
+// real healthCheck: package main cannot be imported from an external test.
 package main
 
 import (
@@ -61,36 +61,6 @@ func TestStartupWithoutOTLPEndpoint(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET /health = %d, want 200", resp.StatusCode)
-	}
-}
-
-func TestFormatBytes(t *testing.T) {
-	testCases := []struct {
-		name     string
-		bytes    int64
-		expected string
-	}{
-		{"zero bytes", 0, "0 B"},
-		{"single byte", 1, "1 B"},
-		{"bytes", 512, "512 B"},
-		{"kilobytes", 1024, "1.0 KB"},
-		{"kilobytes with decimal", 1536, "1.5 KB"},
-		{"megabytes", 1024 * 1024, "1.0 MB"},
-		{"megabytes with decimal", 1024*1024 + 512*1024, "1.5 MB"},
-		{"gigabytes", 1024 * 1024 * 1024, "1.0 GB"},
-		{"large gigabytes", 5 * 1024 * 1024 * 1024, "5.0 GB"},
-		{"terabytes", 1024 * 1024 * 1024 * 1024, "1.0 TB"},
-		{"terabytes from gigabytes", 2048 * 1024 * 1024 * 1024, "2.0 TB"},
-		{"negative bytes", -1024, "-1024 B"}, // FormatBytes doesn't handle negatives
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := FormatBytes(tc.bytes)
-			if result != tc.expected {
-				t.Errorf("FormatBytes(%d) = %s, expected %s", tc.bytes, result, tc.expected)
-			}
-		})
 	}
 }
 

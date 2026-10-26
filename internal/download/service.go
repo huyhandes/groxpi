@@ -146,7 +146,7 @@ func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 		// credentials included.
 		return nil, fmt.Errorf("failed to create request: %w", config.RedactURLError(err))
 	}
-	req.Header.Set("User-Agent", "groxpi/1.0.0")
+	req.Header.Set("User-Agent", config.UserAgent)
 
 	resp, err := s.client.Do(req) // #nosec G704 -- see NewRequestWithContext above
 	if err != nil {

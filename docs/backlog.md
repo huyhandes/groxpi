@@ -6,18 +6,6 @@ that proves it. Delete an entry when it ships.
 
 ## Storage
 
-### Evicting a package can race an in-flight upload
-
-- **Where:** `internal/storage/store.go` — `Store.DeletePrefix` vs `Store.upload` in the
-  hybrid and s3 commits.
-- **What:** in `hybrid` or `s3` mode, an admin evict that runs while a download of the same package is
-  still uploading deletes the S3 objects, then the upload lands and recreates one. The next cache miss
-  promotes it back, so the evict is partly undone.
-- **Fix:** have `DeletePrefix` wait for (or cancel) flights whose key has the prefix before deleting,
-  or record an eviction generation that a finishing upload checks first.
-- **Check:** a store test that gates the fake S3 PUT, evicts mid-upload, releases the gate, and asserts
-  the bucket is empty.
-
 ### A file can be fetched and uploaded twice
 
 - **Where:** `internal/storage/store.go` — `Store.commitHybrid`.
@@ -106,11 +94,12 @@ that proves it. Delete an entry when it ships.
 
 ### The landing page reports a hardcoded version
 
-- **Where:** `internal/server/server.go` — `handleHome`.
-- **What:** `/` prints a fixed version string, not the build's.
-- **Fix:** read it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
+- **Where:** `internal/config/config.go` — `Version`, the one constant the startup log, the home
+  page and every upstream User-Agent read.
+- **What:** the constant is fixed in source, not the build's version.
+- **Fix:** set it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
   Dockerfile).
-- **Check:** a test asserting the page carries the build-info version.
+- **Check:** a test asserting the home page and User-Agent carry the build-info version.
 
 ## Test gaps
 
