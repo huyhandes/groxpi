@@ -173,12 +173,7 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package files for %s from %s: %w", packageName, index.Redacted(), err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			// Log error but don't fail the operation
-			_ = err
-		}
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("%w: %s on %s", ErrNotFound, packageName, index.Redacted())

@@ -453,6 +453,58 @@ func TestStore_CommitBetweenLookupAndLeadServesTheCommit(t *testing.T) {
 	assert.Equal(t, int64(1), puts.Load(), "uploaded once")
 }
 
+// TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup: a commit of an unrelated
+// key between a miss and its lead does not send the miss back to the store.
+func TestStore_CommitOfAnotherKeyDoesNotRepeatTheLookup(t *testing.T) {
+	keyA, err := Key("pkg-a", "a-1.0.tar.gz")
+	require.NoError(t, err)
+	keyB, err := Key("pkg-b", "b-1.0.tar.gz")
+	require.NoError(t, err)
+	require.NotEqual(t, commitSlot(keyA), commitSlot(keyB), "the keys must not share a slot")
+
+	var lookupsA atomic.Int64
+	held, release := make(chan struct{}), make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Count(r.URL.Path, "/") < 2 || r.Method == http.MethodPut {
+			return // bucket check or upload
+		}
+		if strings.Contains(r.URL.Path, "/pkg-a/") && lookupsA.Add(1) == 1 {
+			close(held) // the first miss of A is held until B commits
+			<-release
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := NewS3Storage(&S3Config{Endpoint: srv.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "b", ForcePathStyle: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = remote.Close() })
+	s := NewStore(nil, remote, &fakeFetcher{body: []byte("bytes")}, t.TempDir(), false)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		obj, err := s.Open(t.Context(), "pkg-a", "a-1.0.tar.gz")
+		if assert.NoError(t, err) {
+			_, _ = io.Copy(io.Discard, obj)
+			_ = obj.Close()
+		}
+	}()
+	<-held
+
+	obj, err := s.Open(t.Context(), "pkg-b", "b-1.0.tar.gz")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, obj)
+	_ = obj.Close()
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond,
+		"B commits and unregisters")
+
+	close(release)
+	<-done
+	require.NoError(t, s.Close())
+	assert.Equal(t, int64(1), lookupsA.Load(), "A looked up once")
+}
+
 // TestStore_FetchErrorRedirects: a fetch that fails before its body starts is a
 // fetch_failed redirect to the target the leader resolved.
 func TestStore_FetchErrorRedirects(t *testing.T) {

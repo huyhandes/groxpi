@@ -163,8 +163,7 @@ connection setup, headers *and* body. Neither name means what it says:
 - To allow a long transfer, set both, and set the sum to what the whole request may take.
 
 `GROXPI_CONNECT_TIMEOUT` is reused as the S3 backend's dial, TLS-handshake and credential-load budget
-(default 10 seconds there), and `GROXPI_DOWNLOAD_TIMEOUT` as its response-header budget — so the `0.9`
-default also bounds how long S3 may take to start answering.
+(default 10 seconds there).
 
 ## Server
 

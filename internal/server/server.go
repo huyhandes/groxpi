@@ -37,7 +37,7 @@ type Server struct {
 	store     *storage.Store
 	index     *index.Service
 	admin     *admin.Service     // nil when no credentials are configured
-	templates *template.Template // admin page; nil with admin
+	templates *template.Template // admin page; nil without admin
 	handler   http.Handler
 }
 
@@ -86,6 +86,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	if cfg.AdminConfigured() {
 		s.templates, err = parseAdminTemplates()
 		if err != nil {
+			s.index.Close()
 			_ = s.store.Close()
 			return nil, err
 		}
