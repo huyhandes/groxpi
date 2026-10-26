@@ -96,3 +96,62 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 	assert.NotContains(t, body, secret, "the admin page must not render index credentials")
 	assert.NotContains(t, logs.String(), secret, "credentials must appear nowhere in log output")
 }
+
+// TestRedirectNeverHandsOutIndexCredentials: a file URL resolved against a
+// credentialed index carries the index password, and a 302 to it would hand
+// that password to every client. Both redirect paths (redirect mode and a
+// failed fetch) must point at the same host and path with the user-info
+// stripped, and log a Warn carrying the redacted URL.
+func TestRedirectNeverHandsOutIndexCredentials(t *testing.T) {
+	const (
+		secret   = "sup3rs3cr3tpassw0rd"
+		pkg      = "leaky"
+		fileName = "leaky-1.0-py3-none-any.whl"
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><body>\n" +
+			`<a href="` + fileName + `">` + fileName + "</a>\n" +
+			"</body></html>\n"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	for name, timeout := range map[string]time.Duration{"redirect_mode": 0, "fetch_failed": time.Second} {
+		t.Run(name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			restore := captureLogs(t, logs)
+			defer restore()
+
+			indexURL := credentialedURL(t, upstream.URL+"/simple/", "indexuser:"+secret)
+			cfg := &config.Config{
+				IndexURL:        indexURL,
+				CacheDir:        t.TempDir(),
+				IndexTTL:        time.Hour,
+				IndexCacheSize:  1 << 20,
+				DownloadTimeout: timeout,
+			}
+			srv := New(cfg)
+			t.Cleanup(func() { _ = srv.Close() })
+
+			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+fileName, nil)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusFound, w.Code)
+			location := w.Header().Get("Location")
+			assert.Equal(t, upstream.URL+"/simple/"+pkg+"/"+fileName, location,
+				"the redirect points at the upstream file with no user-info")
+			assert.NotContains(t, w.Body.String(), secret, "the 302 body must not carry index credentials")
+			assert.NotContains(t, w.Body.String(), "indexuser", "the 302 body must carry no user-info")
+
+			out := logs.String()
+			assert.NotContains(t, out, secret)
+			assert.Contains(t, out, `"level":"WARN","msg":"Stripped index credentials from upstream redirect"`)
+			assert.Contains(t, out, config.RedactURL(indexURL+pkg+"/"+fileName), "the Warn carries the redacted URL")
+		})
+	}
+}

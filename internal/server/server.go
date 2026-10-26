@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -249,6 +250,22 @@ func (s *Server) CloseContext(ctx context.Context) error {
 	}
 }
 
+// redirectURL is the Location for an upstream redirect: the file URL with any
+// user-info removed. A file URL resolved against a credentialed index carries
+// the index password, and a 302 would hand it to every client; without it a
+// private index answers the client 401 instead. Logs a Warn, with the redacted
+// URL, when it strips something.
+func redirectURL(ctx context.Context, raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	slog.WarnContext(ctx, "Stripped index credentials from upstream redirect",
+		"file_url", config.RedactURL(raw))
+	u.User = nil
+	return u.String()
+}
+
 // handleFile serves a package file through the read-through store: a cached
 // object goes to http.ServeContent (ranges, conditionals); a download in flight
 // is streamed as it arrives, Range ignored. A miss the store will not or could
@@ -281,7 +298,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 					"file_url", config.RedactURL(target.URL))
 			}
 			telemetry.Redirect(ctx, reason)
-			http.Redirect(w, r, target.URL, http.StatusFound)
+			http.Redirect(w, r, redirectURL(ctx, target.URL), http.StatusFound)
 		}
 		return
 	}
