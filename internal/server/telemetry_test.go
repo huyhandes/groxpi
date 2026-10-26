@@ -159,10 +159,8 @@ func TestTelemetry_RequestSpanTree(t *testing.T) {
 
 	payload := testPayload(64 * 1024)
 	pkg, file := "spantree", "spantree-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
 
@@ -194,10 +192,8 @@ func TestTelemetry_CacheHitAndMissCounters(t *testing.T) {
 
 	payload := testPayload(32 * 1024)
 	pkg, file := "counters", "counters-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	// An explicit index TTL, because an index cache entry stored with a zero TTL
 	// expires the instant it is written and could never report a hit.
@@ -252,10 +248,8 @@ func TestTelemetry_RedirectCounter(t *testing.T) {
 
 	payload := testPayload(32 * 1024)
 	pkg, file := "redirectmetric", "redirectmetric-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			time.Sleep(600 * time.Millisecond)
 			_, _ = w.Write(payload)
 		},
@@ -284,10 +278,8 @@ func TestTelemetry_VerificationFailureCounter(t *testing.T) {
 	advertised := testPayload(32 * 1024)
 	advertised[0] ^= 0xff
 	pkg, file := "badhashmetric", "badhashmetric-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(advertised), indexSize: int64(len(served)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(served) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(advertised), Size: int64(len(served)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(served) },
 	})
 	router, _ := newCorrectnessServer(t, up.URL, 5*time.Second)
 

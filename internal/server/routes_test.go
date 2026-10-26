@@ -124,7 +124,7 @@ var adminPaths = []struct {
 }
 
 func TestAdminAuth_NoCredentials_SurfaceReturns404(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	for _, tc := range adminPaths {
@@ -136,7 +136,7 @@ func TestAdminAuth_NoCredentials_SurfaceReturns404(t *testing.T) {
 }
 
 func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL, withCredentials)
 
 	for _, tc := range adminPaths {
@@ -161,7 +161,7 @@ func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
 }
 
 func TestAdminAuth_EnabledWithoutCredentials_ConstructionFails(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 
 	srv, err := NewServer(routesConfig(t, up.URL, func(cfg *config.Config) { cfg.AdminEnabled = true }))
 	require.Error(t, err, "enabling the admin interface without credentials must fail construction")
@@ -182,7 +182,7 @@ func TestAdminAuth_IndexRoutesStayUnauthenticated(t *testing.T) {
 
 	for name, opts := range configurations {
 		t.Run(name, func(t *testing.T) {
-			up := newCountingUpstream(t, "pkg", file, testPayload(1024))
+			up := newPyPIWith(t, "pkg", file, testPayload(1024))
 			router := newRoutesServer(t, up.URL, opts...)
 
 			for _, path := range []string{
@@ -206,20 +206,20 @@ func TestAdminAuth_IndexRoutesStayUnauthenticated(t *testing.T) {
 // package page: the canonical form ends in a slash, and the bare form is
 // redirected to it rather than answered or 404'd.
 func TestRoutes_TrailingSlashRedirect(t *testing.T) {
-	up := newCountingUpstream(t, "numpy", "numpy-1.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "numpy", "numpy-1.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	resp := do(router, httptest.NewRequest(http.MethodGet, "/simple/numpy", nil))
 	_ = readBody(t, resp)
 	assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
 	assert.Equal(t, "/simple/numpy/", resp.Header.Get("Location"))
-	assert.Zero(t, up.indexHits.Load(), "a redirect must not consult upstream")
+	assert.Zero(t, up.IndexHits("numpy"), "a redirect must not consult upstream")
 }
 
 // TestRoutes_MethodNotAllowed: a known path with the wrong method is a 405 with
 // an Allow header, not a 404.
 func TestRoutes_MethodNotAllowed(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	resp := do(router, httptest.NewRequest(http.MethodPost, "/health", nil))

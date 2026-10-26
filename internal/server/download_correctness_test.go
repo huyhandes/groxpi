@@ -1,9 +1,6 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,71 +17,25 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 )
 
-// upstreamSpec describes the fake index/file server a correctness test needs.
-type upstreamSpec struct {
-	pkg       string
-	file      string
-	sha256    string // advertised in the index hashes; omitted when empty
-	indexSize int64  // advertised size; omitted when <= 0
-	serveFile http.HandlerFunc
-}
-
-type fakeUpstream struct {
-	*httptest.Server
-	fileHits atomic.Int64
-}
-
-// newFakeUpstream stands up a PyPI-shaped index (JSON and HTML) plus a file
-// endpoint whose behaviour the test supplies, counting file requests.
-func newFakeUpstream(t *testing.T, spec upstreamSpec) *fakeUpstream {
-	t.Helper()
-
-	up := &fakeUpstream{}
-	up.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/"+spec.pkg+"/":
-			fileURL := up.URL + "/files/" + spec.file
-			if strings.Contains(r.Header.Get("Accept"), "application/vnd.pypi.simple.v1+json") {
-				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				entry := map[string]any{"filename": spec.file, "url": fileURL}
-				if spec.sha256 != "" {
-					entry["hashes"] = map[string]string{"sha256": spec.sha256}
-				}
-				if spec.indexSize > 0 {
-					entry["size"] = spec.indexSize
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"name":  spec.pkg,
-					"files": []map[string]any{entry},
-				})
-				return
-			}
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprintf(w, `<html><body><a href=%q>%s</a></body></html>`, fileURL, spec.file)
-		case strings.HasPrefix(r.URL.Path, "/files/"):
-			up.fileHits.Add(1)
-			spec.serveFile(w, r)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(up.Close)
-	return up
-}
-
 // newCorrectnessServer builds a router against upstream with an explicit
 // time-to-first-byte budget and a per-test cache directory.
 func newCorrectnessServer(t *testing.T, upstreamURL string, ttfb time.Duration) (http.Handler, string) {
 	t.Helper()
-	cacheDir := t.TempDir()
-	srv := New(&config.Config{
+	srv := newCorrectnessSrv(t, upstreamURL, ttfb)
+	return srv.Router(), srv.config.CacheDir
+}
+
+// newCorrectnessSrv is newCorrectnessServer for a test that needs the server
+// itself, to wait for its downloads.
+func newCorrectnessSrv(t *testing.T, upstreamURL string, ttfb time.Duration) *Server {
+	t.Helper()
+	return New(&config.Config{
 		IndexURL:        upstreamURL,
-		CacheDir:        cacheDir,
+		CacheDir:        t.TempDir(),
 		CacheSize:       1 << 30,
 		DownloadTimeout: ttfb,
 		LogLevel:        "ERROR",
 	})
-	return srv.Router(), cacheDir
 }
 
 // getFile serves one file request in-process. An aborted response (a download
@@ -116,36 +66,36 @@ func cachedPath(cacheDir, pkg, file string) string {
 	return filepath.Join(cacheDir, "packages", pkg, file)
 }
 
-func assertNotCached(t *testing.T, cacheDir, pkg, file string) {
+// assertNotCached waits for srv's downloads to finish, then asserts the file
+// was not stored. A flight renames into the cache before it unregisters, so an
+// empty InFlight means a stored file would already be there.
+func assertNotCached(t *testing.T, srv *Server, pkg, file string) {
 	t.Helper()
-	// Give the storage goroutine a moment to finish failing.
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool { return len(srv.store.InFlight()) == 0 },
+		5*time.Second, 5*time.Millisecond, "the failed download never finished")
 
+	cacheDir := srv.config.CacheDir
 	_, err := os.Stat(cachedPath(cacheDir, pkg, file))
 	assert.True(t, os.IsNotExist(err), "expected no cached object for %s/%s", pkg, file)
 
-	// A failed write must also leave no temporary residue behind.
-	entries, _ := os.ReadDir(filepath.Join(cacheDir, "packages", pkg))
-	for _, e := range entries {
-		assert.False(t, strings.HasPrefix(e.Name(), ".tmp-"), "leftover temp file %s", e.Name())
-	}
+	// A failed write must also leave no temporary residue behind. The spool is
+	// removed just after the flight unregisters, so that removal is waited for.
+	assert.Eventually(t, func() bool {
+		entries, _ := os.ReadDir(filepath.Join(cacheDir, "packages", pkg))
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".tmp-") {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 5*time.Millisecond, "leftover temp file for %s/%s", pkg, file)
 }
 
 func waitCached(t *testing.T, cacheDir, pkg, file string) {
 	t.Helper()
 	path := cachedPath(cacheDir, pkg, file)
-	for range 200 {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("file %s was never cached", path)
-}
-
-func sha256Hex(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	require.Eventually(t, func() bool { _, err := os.Stat(path); return err == nil },
+		2*time.Second, 10*time.Millisecond, "file %s was never cached", path)
 }
 
 func testPayload(n int) []byte {
@@ -162,28 +112,25 @@ func TestDownload_HeaderDelayRedirects_BodyDelayDoesNot(t *testing.T) {
 	payload := testPayload(256 * 1024)
 
 	t.Run("header_delay_redirects", func(t *testing.T) {
-		up := newFakeUpstream(t, upstreamSpec{
-			pkg: "slowhdr", file: "slowhdr-1.0.0.tar.gz",
-			sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-			serveFile: func(w http.ResponseWriter, _ *http.Request) {
+		up := NewFakePyPI(t).Add("slowhdr", "slowhdr-1.0.0.tar.gz", FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
 				time.Sleep(600 * time.Millisecond)
 				_, _ = w.Write(payload)
 			},
 		})
-		router, cacheDir := newCorrectnessServer(t, up.URL, 100*time.Millisecond)
+		srv := newCorrectnessSrv(t, up.URL, 100*time.Millisecond)
+		router := srv.Router()
 
 		resp := getFile(router, "slowhdr", "slowhdr-1.0.0.tar.gz")
 		_ = resp.Body.Close()
 		assert.Equal(t, http.StatusFound, resp.StatusCode)
 		assert.Contains(t, resp.Header.Get("Location"), "/files/")
-		assertNotCached(t, cacheDir, "slowhdr", "slowhdr-1.0.0.tar.gz")
+		assertNotCached(t, srv, "slowhdr", "slowhdr-1.0.0.tar.gz")
 	})
 
 	t.Run("body_delay_streams_and_caches", func(t *testing.T) {
-		up := newFakeUpstream(t, upstreamSpec{
-			pkg: "slowbody", file: "slowbody-1.0.0.tar.gz",
-			sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-			serveFile: func(w http.ResponseWriter, _ *http.Request) {
+		up := NewFakePyPI(t).Add("slowbody", "slowbody-1.0.0.tar.gz", FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(payload[:1024])
@@ -207,10 +154,8 @@ func TestDownload_DefaultConfigurationCaches(t *testing.T) {
 	payload := testPayload(2 * 1024 * 1024)
 	pkg, file := "defaults", "defaults-1.0.0.tar.gz"
 
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(payload[:4096])
@@ -235,7 +180,7 @@ func TestDownload_DefaultConfigurationCaches(t *testing.T) {
 	second := getFile(router, pkg, file)
 	assert.Equal(t, http.StatusOK, second.StatusCode)
 	assert.Equal(t, payload, readBody(t, second))
-	assert.Equal(t, int64(1), up.fileHits.Load(), "second request must be served from cache")
+	assert.Equal(t, 1, up.FileHits(file), "second request must be served from cache")
 }
 
 // TestDownload_ChecksumMismatchIsNotCached covers issue #8's primary case.
@@ -245,22 +190,21 @@ func TestDownload_ChecksumMismatchIsNotCached(t *testing.T) {
 	advertised[0] ^= 0xff
 	pkg, file := "badhash", "badhash-1.0.0.tar.gz"
 
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(advertised), indexSize: int64(len(served)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(advertised), Size: int64(len(served)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write(served)
 		},
 	})
-	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
+	srv := newCorrectnessSrv(t, up.URL, 5*time.Second)
+	router := srv.Router()
 
 	resp := getFile(router, pkg, file)
 	_ = readBody(t, resp)
-	assertNotCached(t, cacheDir, pkg, file)
+	assertNotCached(t, srv, pkg, file)
 
 	resp2 := getFile(router, pkg, file)
 	_ = readBody(t, resp2)
-	assert.Equal(t, int64(2), up.fileHits.Load(), "a rejected file must be refetched")
+	assert.Equal(t, 2, up.FileHits(file), "a rejected file must be refetched")
 }
 
 // TestDownload_TruncatedBodyIsNotCached covers issue #7.
@@ -268,10 +212,8 @@ func TestDownload_TruncatedBodyIsNotCached(t *testing.T) {
 	payload := testPayload(512 * 1024)
 	pkg, file := "truncated", "truncated-1.0.0.tar.gz"
 
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(payload[:4096])
@@ -280,15 +222,16 @@ func TestDownload_TruncatedBodyIsNotCached(t *testing.T) {
 			panic(http.ErrAbortHandler)
 		},
 	})
-	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
+	srv := newCorrectnessSrv(t, up.URL, 5*time.Second)
+	router := srv.Router()
 
 	resp := getFile(router, pkg, file)
 	_ = readBody(t, resp)
-	assertNotCached(t, cacheDir, pkg, file)
+	assertNotCached(t, srv, pkg, file)
 
 	resp2 := getFile(router, pkg, file)
 	_ = readBody(t, resp2)
-	assert.Equal(t, int64(2), up.fileHits.Load(), "a truncated download must be refetched")
+	assert.Equal(t, 2, up.FileHits(file), "a truncated download must be refetched")
 }
 
 // TestDownload_LengthFallbackWithoutHash covers the weaker check used when the
@@ -298,9 +241,8 @@ func TestDownload_LengthFallbackWithoutHash(t *testing.T) {
 
 	t.Run("length_matches_caches", func(t *testing.T) {
 		pkg, file := "lenok", "lenok-1.0.0.tar.gz"
-		up := newFakeUpstream(t, upstreamSpec{
-			pkg: pkg, file: file, indexSize: int64(len(payload)),
-			serveFile: func(w http.ResponseWriter, _ *http.Request) {
+		up := NewFakePyPI(t).Add(pkg, file, FakeFile{Size: int64(len(payload)),
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write(payload)
 			},
 		})
@@ -313,21 +255,21 @@ func TestDownload_LengthFallbackWithoutHash(t *testing.T) {
 
 	t.Run("length_mismatch_refuses", func(t *testing.T) {
 		pkg, file := "lenbad", "lenbad-1.0.0.tar.gz"
-		up := newFakeUpstream(t, upstreamSpec{
-			pkg: pkg, file: file, indexSize: int64(len(payload)) + 4096,
-			serveFile: func(w http.ResponseWriter, _ *http.Request) {
+		up := NewFakePyPI(t).Add(pkg, file, FakeFile{Size: int64(len(payload)) + 4096,
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write(payload)
 			},
 		})
-		router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
+		srv := newCorrectnessSrv(t, up.URL, 5*time.Second)
+		router := srv.Router()
 
 		resp := getFile(router, pkg, file)
 		_ = readBody(t, resp)
-		assertNotCached(t, cacheDir, pkg, file)
+		assertNotCached(t, srv, pkg, file)
 
 		resp2 := getFile(router, pkg, file)
 		_ = readBody(t, resp2)
-		assert.Equal(t, int64(2), up.fileHits.Load())
+		assert.Equal(t, 2, up.FileHits(file))
 	})
 }
 
@@ -337,9 +279,8 @@ func TestDownload_UnverifiableFileIsStillCached(t *testing.T) {
 	payload := testPayload(32 * 1024)
 	pkg, file := "unverified", "unverified-1.0.0.tar.gz"
 
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			// Chunked: no Content-Length either.
 			_, _ = w.Write(payload[:1024])
 			w.(http.Flusher).Flush()
@@ -370,9 +311,8 @@ func (w *readFromRecorder) ReadFrom(src io.Reader) (int64, error) {
 func TestDownload_LocalHitHandsServeContentTheFile(t *testing.T) {
 	payload := testPayload(64 * 1024)
 	pkg, file := "copypath", "copypath-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file, sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
 	readBody(t, getFile(router, pkg, file))

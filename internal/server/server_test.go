@@ -137,7 +137,7 @@ func TestServer_HandleHealth(t *testing.T) {
 }
 
 func TestServer_HandleListPackages_HTML(t *testing.T) {
-	up := newFakeRootIndex(t, 0)
+	up := NewFakePyPI(t)
 	router := newProxyServer(t, up.URL)
 
 	req := httptest.NewRequest("GET", "/index/", nil)
@@ -160,13 +160,13 @@ func TestServer_HandleListPackages_HTML(t *testing.T) {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	if !strings.Contains(string(body), "flask") {
+	if !strings.Contains(string(body), "demo") {
 		t.Error("Response should contain the upstream's package list")
 	}
 }
 
 func TestServer_HandleListPackages_JSON(t *testing.T) {
-	up := newFakeRootIndex(t, 0)
+	up := NewFakePyPI(t)
 	router := newProxyServer(t, up.URL)
 
 	req := httptest.NewRequest("GET", "/index/", nil)
@@ -202,8 +202,8 @@ func TestServer_HandleListPackages_JSON(t *testing.T) {
 	if !ok || len(projects) != 1 {
 		t.Fatalf("Expected the upstream's one project, got %v", response["projects"])
 	}
-	if name := projects[0].(map[string]any)["name"]; name != "flask" {
-		t.Errorf("Expected project 'flask', got %v", name)
+	if name := projects[0].(map[string]any)["name"]; name != "demo" {
+		t.Errorf("Expected project 'demo', got %v", name)
 	}
 }
 
@@ -341,7 +341,7 @@ func TestServer_Handle404(t *testing.T) {
 // Removed problematic tests that access unexported functions
 
 func TestServer_ContentNegotiation(t *testing.T) {
-	up := newFakeRootIndex(t, 0)
+	up := NewFakePyPI(t)
 	router := newProxyServer(t, up.URL)
 
 	t.Run("JSON request returns JSON", func(t *testing.T) {

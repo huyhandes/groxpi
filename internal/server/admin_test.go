@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,67 +19,6 @@ import (
 	"github.com/huyhandes/groxpi/internal/admin"
 	"github.com/huyhandes/groxpi/internal/config"
 )
-
-// adminFakeFile is one file in the fake index's package listing.
-type adminFakeFile struct {
-	name string
-	body []byte
-}
-
-// adminUpstream is the fake-upstream harness for the administrative tests: one
-// package with an arbitrary file list and a count of file requests.
-type adminUpstream struct {
-	*httptest.Server
-	pkg      string
-	files    []adminFakeFile
-	fileHits atomic.Int64
-}
-
-func newAdminUpstream(t *testing.T, pkg string, files ...adminFakeFile) *adminUpstream {
-	t.Helper()
-
-	fake := &adminUpstream{pkg: pkg, files: files}
-	fake.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/"+pkg+"/":
-			entries := make([]map[string]any, 0, len(fake.files))
-			for _, f := range fake.files {
-				entries = append(entries, map[string]any{
-					"filename": f.name,
-					"url":      fake.URL + "/files/" + f.name,
-					"size":     len(f.body),
-					"hashes":   map[string]string{"sha256": sha256Hex(f.body)},
-				})
-			}
-			if strings.Contains(r.Header.Get("Accept"), "application/vnd.pypi.simple.v1+json") {
-				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-				_ = json.NewEncoder(w).Encode(map[string]any{"name": pkg, "files": entries})
-				return
-			}
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = fmt.Fprint(w, "<html><body>")
-			for _, e := range entries {
-				_, _ = fmt.Fprintf(w, `<a href=%q>%s</a>`, e["url"], e["filename"])
-			}
-			_, _ = fmt.Fprint(w, "</body></html>")
-		case strings.HasPrefix(r.URL.Path, "/files/"):
-			fake.fileHits.Add(1)
-			name := strings.TrimPrefix(r.URL.Path, "/files/")
-			for _, f := range fake.files {
-				if f.name == name {
-					w.Header().Set("Content-Length", fmt.Sprintf("%d", len(f.body)))
-					_, _ = w.Write(f.body)
-					return
-				}
-			}
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(fake.Close)
-	return fake
-}
 
 // adminHarness is the full server with credentials configured, plus the admin
 // module it built, so tests can read the same listing the page renders.
@@ -146,7 +83,7 @@ func cachedFileNames(h *adminHarness) []string {
 // parsing, the next/prev links, the poll staying on the rendered page, and the
 // row columns. The paging policy itself is tested in the admin module.
 func TestAdminRows_RenderPageQuery(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	h := newAdminServer(t, up.URL)
 	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin"))), "Nothing cached.")
 
@@ -184,7 +121,7 @@ func TestAdminRows_RenderPageQuery(t *testing.T) {
 // TestPrefetch_ReturnsAccepted: the route hands the name to the admin module and
 // returns at once. What prefetch selects is tested in the admin module.
 func TestPrefetch_ReturnsAccepted(t *testing.T) {
-	up := newAdminUpstream(t, "warmme", adminFakeFile{name: "warmme-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "warmme", "warmme-1.0.0.tar.gz", testPayload(64))
 	srv := newAdminServer(t, up.URL)
 
 	resp := postPrefetch(srv.mux, "warmme", true)
@@ -194,7 +131,7 @@ func TestPrefetch_ReturnsAccepted(t *testing.T) {
 }
 
 func TestPrefetch_RequiresPackageName(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newAdminServer(t, up.URL).mux
 
 	resp := postPrefetch(router, "   ", true)
@@ -209,7 +146,7 @@ func TestPrefetch_RequiresPackageName(t *testing.T) {
 // TestAdminPage_MakesNoExternalAssetRequests pins the air-gap property: every
 // asset the page references is served from this binary.
 func TestAdminPage_MakesNoExternalAssetRequests(t *testing.T) {
-	up := newAdminUpstream(t, "pkg", adminFakeFile{name: "pkg-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newAdminServer(t, up.URL).mux
 
 	body := string(readBody(t, authGet(router, "/admin")))
@@ -243,7 +180,7 @@ func postPrefetchSite(router http.Handler, pkg, site string) *http.Response {
 }
 
 func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
-	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "xsite", "xsite-1.0.0.tar.gz", testPayload(64))
 	srv := newAdminServer(t, up.URL)
 	router := srv.mux
 
@@ -255,12 +192,12 @@ func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
 	}
 
 	// The handler never ran, so it never asked upstream for the package.
-	assert.Zero(t, up.fileHits.Load(), "the refused request must not reach the prefetch handler")
+	assert.Zero(t, up.FileHits("xsite-1.0.0.tar.gz"), "the refused request must not reach the prefetch handler")
 	assert.Empty(t, cachedFileNames(srv))
 }
 
 func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {
-	up := newAdminUpstream(t, "xsite", adminFakeFile{name: "xsite-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "xsite", "xsite-1.0.0.tar.gz", testPayload(64))
 	router := newAdminServer(t, up.URL).mux
 
 	for _, site := range []string{"same-origin", "", "none"} {
@@ -274,7 +211,7 @@ func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {
 // TestAdminCrossSite_CacheDeletionInherits pins that the check lives on the route
 // group: nothing wires it to the eviction routes, yet they are covered.
 func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
-	up := newAdminUpstream(t, "keepme", adminFakeFile{name: "keepme-1.0.0.tar.gz", body: testPayload(2048)})
+	up := newPyPIWith(t, "keepme", "keepme-1.0.0.tar.gz", testPayload(2048))
 	srv := newAdminServer(t, up.URL)
 	router := srv.mux
 
@@ -302,7 +239,7 @@ func TestAdminCrossSite_CacheDeletionInherits(t *testing.T) {
 // TestPrefetch_RefusedAfterShutdownIs503: once the admin module refuses
 // prefetches, the route says so instead of silently dropping the request.
 func TestPrefetch_RefusedAfterShutdownIs503(t *testing.T) {
-	up := newAdminUpstream(t, "latecomer", adminFakeFile{name: "latecomer-1.0.0.tar.gz", body: testPayload(64)})
+	up := newPyPIWith(t, "latecomer", "latecomer-1.0.0.tar.gz", testPayload(64))
 	srv := newAdminServer(t, up.URL)
 
 	srv.svc.Close(context.Background())

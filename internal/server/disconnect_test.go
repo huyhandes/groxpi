@@ -65,9 +65,8 @@ func serveAborting(router http.Handler, w http.ResponseWriter, r *http.Request) 
 func TestDownload_ClientDisconnectIsNotAnError(t *testing.T) {
 	payload := testPayload(64 * 1024)
 	pkg, file := "leaver", "leaver-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
 
@@ -89,10 +88,8 @@ func TestDownload_ClientDisconnectIsNotAnError(t *testing.T) {
 func TestDownload_UpstreamFailureMidBodyIsAnError(t *testing.T) {
 	payload := testPayload(512 * 1024)
 	pkg, file := "breaker", "breaker-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(payload[:4096])
