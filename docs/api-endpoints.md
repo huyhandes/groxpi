@@ -47,7 +47,9 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
   cache, with `Content-Encoding: gzip`. Nothing is compressed on the request path; there is no
   compression middleware.
 - HTML is rendered on demand from the parsed file list, with `data-requires-python` and `data-yanked`
-  attributes preserved and every href rewritten to point back at groxpi.
+  attributes preserved and every href rewritten to point back at groxpi. Every interpolated value
+  (package name, href, file name, requires-python, yanked reason) is HTML-escaped, so `>=3.8` is
+  emitted as `&gt;=3.8`.
 - PEP 658 metadata availability is passed through as the upstream stated it — `true` or a hash map —
   under both the `core-metadata` and `dist-info-metadata` keys in JSON (PEP 714) and both
   `data-core-metadata` and `data-dist-info-metadata` attributes in HTML. Whichever spelling the upstream

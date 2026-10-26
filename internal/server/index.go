@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"html"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -98,41 +99,41 @@ func renderPackageFilesHTML(w http.ResponseWriter, packageName string, files []i
 	sb.WriteString(`<!DOCTYPE html>
 <html>
 <head><title>Links for `)
-	sb.WriteString(packageName)
+	sb.WriteString(html.EscapeString(packageName))
 	sb.WriteString(`</title></head>
 <body>
 	<h1>Links for `)
-	sb.WriteString(packageName)
+	sb.WriteString(html.EscapeString(packageName))
 	sb.WriteString(`</h1>
 `)
 
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
-		sb.WriteString(index.ProxyFileURL(packageName, file.Name))
+		sb.WriteString(html.EscapeString(index.ProxyFileURL(packageName, file.Name)))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {
 			sb.WriteString(` data-requires-python="`)
-			sb.WriteString(file.RequiresPython)
+			sb.WriteString(html.EscapeString(file.RequiresPython))
 			sb.WriteString(`"`)
 		}
 		if file.IsYanked() {
 			sb.WriteString(` data-yanked="`)
 			if reason := file.GetYankedReason(); reason != "" {
-				sb.WriteString(reason)
+				sb.WriteString(html.EscapeString(reason))
 			}
 			sb.WriteString(`"`)
 		}
 		if hashes, ok := file.Metadata(); ok {
 			value := "true"
 			if sum := hashes["sha256"]; sum != "" {
-				value = "sha256=" + sum
+				value = "sha256=" + html.EscapeString(sum)
 			}
 			sb.WriteString(` data-core-metadata="` + value + `" data-dist-info-metadata="` + value + `"`)
 		}
 
 		sb.WriteString(`>`)
-		sb.WriteString(file.Name)
+		sb.WriteString(html.EscapeString(file.Name))
 		sb.WriteString(`</a><br>
 `)
 	}
