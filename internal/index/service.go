@@ -26,20 +26,24 @@ import (
 const JSONContentType = "application/vnd.pypi.simple.v1+json"
 
 // upstream is the one-method view of Client that resolution needs. It is an
-// interface because the tests have a second implementation.
+// interface because the tests have a second implementation (fakeUpstream).
 type upstream interface {
 	GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error)
 }
 
 // Service is the index module. One instance serves every configured index.
 type Service struct {
-	cache    *IndexCache
+	cache    *indexCache
 	upstream upstream
 	sf       singleflight.Group
 
 	// indexes is the resolution order: extra indexes first, primary last. Each
 	// carries its own TTL.
 	indexes []config.Index
+	// missTTL is how long "not found on every index" is remembered: the shortest
+	// TTL in the resolution order, so a package newly published to any index is
+	// hidden no longer than that index's own entries would be stale.
+	missTTL time.Duration
 
 	// The root index is proxied rather than parsed, so it needs an HTTP client of
 	// its own instead of the typed index client.
@@ -56,14 +60,20 @@ type Service struct {
 // nothing scans on the read path.
 func New(cfg *config.Config) *Service {
 	transport := newTransport(cfg)
-	return newService(cfg, NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), newClient(cfg, transport), transport)
+	return newService(cfg, newIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), newClient(cfg, transport), transport)
 }
 
-func newService(cfg *config.Config, cache *IndexCache, up upstream, transport *http.Transport) *Service {
+func newService(cfg *config.Config, cache *indexCache, up upstream, transport *http.Transport) *Service {
+	indexes := cfg.ResolutionOrder()
+	missTTL := indexes[0].TTL
+	for _, index := range indexes[1:] {
+		missTTL = min(missTTL, index.TTL)
+	}
 	return &Service{
 		cache:    cache,
 		upstream: up,
-		indexes:  cfg.ResolutionOrder(),
+		indexes:  indexes,
+		missTTL:  missTTL,
 		rootURL:  strings.TrimSuffix(cfg.IndexURL, "/") + "/",
 		// ponytail: one fixed timeout for the whole proxied response. The root list
 		// is large but a single upstream GET; a byte-rate budget can come later if a
@@ -79,26 +89,31 @@ func newService(cfg *config.Config, cache *IndexCache, up upstream, transport *h
 func (s *Service) Transport() http.RoundTripper { return s.transport }
 
 // Close stops the cache sweeper.
-func (s *Service) Close() { s.cache.Close() }
+func (s *Service) Close() { s.cache.close() }
 
-// Invalidate drops a package's cached entry so the next request goes upstream.
-// Any spelling of the name drops the one normalised entry.
+// Invalidate drops a package's cached entry, a cached miss included, so the
+// next request goes upstream. Any spelling of the name drops the one normalised
+// entry.
 func (s *Service) Invalidate(packageName string) {
-	s.cache.InvalidatePackage(NormalizeName(packageName))
+	s.cache.invalidate(NormalizeName(packageName))
 }
 
 // Resolve returns the cache entry for a package — parsed file list and
 // serialised bodies, produced together — using the index cache and
 // deduplicating concurrent upstream fetches. It is the only path to the upstream
-// package index. A miss on every configured index is ErrNotFound. The name is
-// normalised first, so every spelling shares one entry and one upstream query.
+// package index. A miss on every configured index is ErrNotFound, and is itself
+// cached for the shortest index TTL. The name is normalised first, so every
+// spelling shares one entry and one upstream query.
 func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, error) {
 	packageName = NormalizeName(packageName)
 	ctx, span := telemetry.Tracer().Start(ctx, "index.resolve")
 	defer span.End()
 
-	if entry, found := s.cache.GetPackage(packageName); found {
+	if entry, found := s.cache.get(packageName); found {
 		telemetry.CacheHit(ctx, telemetry.LayerIndex)
+		if entry.missing {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, packageName)
+		}
 		return entry, nil
 	}
 	telemetry.CacheMiss(ctx, telemetry.LayerIndex)
@@ -107,6 +122,13 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 		// The fetch fills the cache for every waiter, so it must not die with
 		// whichever client happened to trigger it.
 		index, files, err := s.queryIndexes(context.WithoutCancel(ctx), packageName)
+		if errors.Is(err, ErrNotFound) {
+			// Every index answered and none has the package. Remembering that is
+			// what stops a CI fleet retrying a typo from querying every upstream
+			// on every request. Errors are not remembered: an unreachable index
+			// says nothing about the package.
+			s.cache.set(packageName, newMissEntry(), s.missTTL)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -114,12 +136,12 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode index for package %q: %w", packageName, err)
 		}
-		entry := NewPackageEntry(files, body)
+		entry := newPackageEntry(files, body)
 		// Never cache an empty index: a transient upstream fault would otherwise
 		// poison this package for the whole TTL. The TTL is the answering index's
 		// own, so a fast-moving private index is not held stale by PyPI's.
 		if len(files) > 0 {
-			s.cache.SetPackage(packageName, entry, index.TTL)
+			s.cache.set(packageName, entry, index.TTL)
 		}
 		return entry, nil
 	})

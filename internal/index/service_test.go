@@ -11,16 +11,21 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/huyhandes/groxpi/internal/config"
 )
 
-// fakeIndexServer is an upstream index that counts how often each package page
-// is fetched.
+// fakeIndexServer is an HTTP upstream index that counts how often each package
+// page is fetched. Only tests of what the real client does on the wire use it;
+// everything else runs on fakeUpstream inside a synctest bubble.
 type fakeIndexServer struct {
 	*httptest.Server
 	mu    sync.Mutex
@@ -53,8 +58,7 @@ func (f *fakeIndexServer) hitsFor(pkg string) int {
 	return f.hits["/"+pkg+"/"]
 }
 
-// newTestService builds the index module over the upstream, with the cache
-// reachable.
+// newTestService builds the index module over a real HTTP upstream.
 func newTestService(t *testing.T, cfg *config.Config) *Service {
 	t.Helper()
 	svc := New(cfg)
@@ -62,97 +66,162 @@ func newTestService(t *testing.T, cfg *config.Config) *Service {
 	return svc
 }
 
-// getIndex resolves a package and returns the JSON body the server writes for
-// it.
-func getIndex(t *testing.T, svc *Service, pkg string) []byte {
-	t.Helper()
-	entry, err := svc.Resolve(context.Background(), pkg)
-	require.NoError(t, err)
-	return entry.JSON
+// primaryOnly is a single-index configuration for the fake upstream.
+func primaryOnly(ttl time.Duration, cacheBytes int64) *config.Config {
+	return &config.Config{IndexURL: primaryURL, IndexTTL: ttl, IndexCacheSize: cacheBytes}
 }
 
-// TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
-// merged entry: the body is marshalled once at fill time and every later request
-// writes the same bytes.
-func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL:        upstream.URL,
-		CacheDir:        t.TempDir(),
-		IndexTTL:        time.Hour,
-		IndexCacheSize:  1 << 20,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+// oneFile is the answer of an index that has pkg with a single sdist.
+func oneFile(pkg string) []FileInfo {
+	return []FileInfo{{Name: pkg + "-1.0.tar.gz", URL: "https://files.test/" + pkg + "-1.0.tar.gz"}}
+}
+
+// TestResolve_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
+// merged entry: the body is marshalled once at fill time and every later
+// request gets the same bytes, with a gzip form that decodes to them.
+func TestResolve_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		first, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		second, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+
+		assert.Equal(t, string(first.JSON), string(second.JSON), "cached responses must be byte-identical")
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "the second request must be served from cache")
+
+		zr, err := gzip.NewReader(bytes.NewReader(second.GZIP))
+		require.NoError(t, err)
+		unzipped, err := io.ReadAll(zr)
+		require.NoError(t, err)
+		assert.Equal(t, string(second.JSON), string(unzipped))
 	})
-
-	first := getIndex(t, svc, "numpy")
-	second := getIndex(t, svc, "numpy")
-
-	assert.Equal(t, string(first), string(second), "cached responses must be byte-identical")
-	assert.Equal(t, 1, upstream.hitsFor("numpy"), "the second request must be served from cache")
-
-	// The compressed representation stored alongside the body must decode to it.
-	entry, ok := svc.cache.GetPackage("numpy")
-	require.True(t, ok, "the package must be cached")
-	assert.Equal(t, string(first), string(entry.JSON))
-	zr, err := gzip.NewReader(bytes.NewReader(entry.GZIP))
-	require.NoError(t, err)
-	unzipped, err := io.ReadAll(zr)
-	require.NoError(t, err)
-	assert.Equal(t, string(entry.JSON), string(unzipped))
 }
 
-// TestIndexCache_ByteBudgetForcesRefetch covers the bound: once the budget is
+// TestResolve_ExpiresAfterTheIndexTTL pins the positive TTL: an entry is served
+// from cache up to its index's TTL and refetched after it.
+func TestResolve_ExpiresAfterTheIndexTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		time.Sleep(time.Hour)
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "an entry is fresh up to its TTL")
+
+		time.Sleep(time.Nanosecond)
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 2, up.queried(primaryURL, "numpy"), "an expired package must be refetched")
+	})
+}
+
+// TestResolve_ByteBudgetForcesRefetch covers the bound: once the budget is
 // exceeded the least recently used package is dropped and has to be refetched.
-func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL: upstream.URL,
-		CacheDir: t.TempDir(),
-		IndexTTL: time.Hour,
-		// Small enough that a couple of one-file indices blow the budget.
-		IndexCacheSize:  400,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+func TestResolve_ByteBudgetForcesRefetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
+		for _, pkg := range packages {
+			up.set(primaryURL, pkg, oneFile(pkg), nil)
+		}
+		// Small enough that a couple of one-file indexes blow the budget.
+		svc := newFakeService(t, primaryOnly(time.Hour, 600), up)
+
+		for _, pkg := range packages {
+			_, err := svc.Resolve(t.Context(), pkg)
+			require.NoError(t, err)
+			time.Sleep(time.Millisecond) // distinguish recency; instant in the bubble
+		}
+
+		_, err := svc.Resolve(t.Context(), packages[0])
+		require.NoError(t, err)
+		assert.Equal(t, 2, up.queried(primaryURL, packages[0]),
+			"the earliest package should have been evicted and refetched")
 	})
-
-	packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
-	for _, pkg := range packages {
-		getIndex(t, svc, pkg)
-		time.Sleep(2 * time.Millisecond) // distinguish recency
-	}
-	assert.LessOrEqual(t, svc.cache.Bytes(), int64(400), "cache must stay inside its budget")
-
-	getIndex(t, svc, packages[0])
-	assert.Equal(t, 2, upstream.hitsFor(packages[0]),
-		"the earliest package should have been evicted and refetched")
 }
 
-// TestIndexCache_SweepExpiresWithoutARequest covers the sweeper: an entry past
-// its TTL is gone before anybody asks for it, and the next request refetches.
-func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL:        upstream.URL,
-		CacheDir:        t.TempDir(),
-		IndexTTL:        20 * time.Millisecond,
-		IndexCacheSize:  1 << 20,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+// TestResolve_NormalisesTheName pins c8: any spelling of a name is one index
+// entry and one upstream query, and either spelling invalidates it.
+func TestResolve_NormalisesTheName(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "foo-bar", oneFile("foo-bar"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		resolve := func(name string) {
+			t.Helper()
+			_, err := svc.Resolve(t.Context(), name)
+			require.NoError(t, err)
+		}
+
+		resolve("Foo_Bar")
+		resolve("foo-bar")
+		assert.Equal(t, 1, up.queried(primaryURL, "foo-bar"), "both spellings share one upstream query")
+		assert.Zero(t, up.queried(primaryURL, "Foo_Bar"), "upstream is only asked for the normalised name")
+
+		svc.Invalidate("Foo.Bar")
+		resolve("foo-bar")
+		assert.Equal(t, 2, up.queried(primaryURL, "foo-bar"), "invalidating another spelling clears the entry")
+
+		svc.Invalidate("foo-bar")
+		resolve("FOO__BAR")
+		assert.Equal(t, 3, up.queried(primaryURL, "foo-bar"))
 	})
+}
 
-	getIndex(t, svc, "numpy")
-	require.Equal(t, 1, svc.cache.Len())
+// The OpenTelemetry global delegates once per process, so the in-memory meter
+// provider is installed once for the index test binary.
+var (
+	testMetricsOnce sync.Once
+	testMetrics     *sdkmetric.ManualReader
+)
 
-	// No requests at all while we wait: only the background sweep can empty this.
-	deadline := time.Now().Add(2 * time.Second)
-	for svc.cache.Len() != 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+// indexCacheHits reads the index-layer cache hit counter.
+func indexCacheHits(t *testing.T) int64 {
+	t.Helper()
+	testMetricsOnce.Do(func() {
+		testMetrics = sdkmetric.NewManualReader()
+		otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(testMetrics)))
+	})
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, testMetrics.Collect(context.Background(), &rm))
+	var hits int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok || m.Name != "groxpi.cache.hits" {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				if layer, _ := dp.Attributes.Value("cache.layer"); layer.AsString() == "index" {
+					hits += dp.Value
+				}
+			}
+		}
 	}
-	require.Zero(t, svc.cache.Len(), "the sweep should have reclaimed the expired entry")
+	return hits
+}
 
-	getIndex(t, svc, "numpy")
-	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an expired package must be refetched")
+// TestResolve_CachedMissCountsAsAnIndexCacheHit pins that negative caching
+// keeps the metric surface: a miss served from cache is an index-layer hit.
+func TestResolve_CachedMissCountsAsAnIndexCacheHit(t *testing.T) {
+	before := indexCacheHits(t)
+	synctest.Test(t, func(t *testing.T) {
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), newFakeUpstream())
+		for range 3 {
+			_, err := svc.Resolve(t.Context(), "ghost")
+			require.ErrorIs(t, err, ErrNotFound)
+		}
+	})
+	assert.Equal(t, int64(2), indexCacheHits(t)-before, "the second and third lookups are served from cache")
 }
 
 // TestResolve_UpstreamFailureIsRedacted pins that index returns already-redacted
@@ -211,31 +280,4 @@ func TestResolve_OversizedIndexBodyFailsAndIsNotCached(t *testing.T) {
 	_, err = svc.Resolve(t.Context(), "numpy")
 	require.NoError(t, err)
 	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an oversized body must not be cached")
-}
-
-// TestResolve_NormalisesTheName pins c8: any spelling of a name is one index
-// entry and one upstream query, and either spelling invalidates it.
-func TestResolve_NormalisesTheName(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL:        upstream.URL,
-		CacheDir:        t.TempDir(),
-		IndexTTL:        time.Hour,
-		IndexCacheSize:  1 << 20,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
-	})
-
-	getIndex(t, svc, "Foo_Bar")
-	getIndex(t, svc, "foo-bar")
-	assert.Equal(t, 1, upstream.hitsFor("foo-bar"), "both spellings share one upstream query")
-	assert.Equal(t, 1, upstream.total, "upstream is only asked for the normalised name")
-
-	svc.Invalidate("Foo.Bar")
-	getIndex(t, svc, "foo-bar")
-	assert.Equal(t, 2, upstream.hitsFor("foo-bar"), "invalidating another spelling clears the entry")
-
-	svc.Invalidate("foo-bar")
-	getIndex(t, svc, "FOO__BAR")
-	assert.Equal(t, 3, upstream.hitsFor("foo-bar"))
 }
