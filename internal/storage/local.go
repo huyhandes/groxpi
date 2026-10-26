@@ -301,7 +301,8 @@ func (l *LocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, er
 
 // buildPath constructs the full filesystem path
 func (l *LocalStorage) buildPath(key string) string {
-	// Join cleans ".." segments, so a key can only ever name a path under baseDir.
+	// Defence in depth: Key already refuses names that leave their segment, and
+	// Clean drops any ".." left, so a key can only name a path inside baseDir.
 	return filepath.Join(l.baseDir, filepath.Clean("/"+key))
 }
 

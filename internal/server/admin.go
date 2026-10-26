@@ -12,6 +12,7 @@ import (
 
 	"github.com/huyhandes/groxpi/internal/admin"
 	"github.com/huyhandes/groxpi/internal/index"
+	"github.com/huyhandes/groxpi/internal/storage"
 	tmpl "github.com/huyhandes/groxpi/templates"
 )
 
@@ -100,7 +101,12 @@ func (s *Server) handleCachePackage(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Package name required"}`)
 		return
 	}
-	if err := s.admin.Evict(r.Context(), packageName); err != nil {
+	err := s.admin.Evict(r.Context(), packageName)
+	if errors.Is(err, storage.ErrInvalidKey) {
+		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Invalid package name"}`)
+		return
+	}
+	if err != nil {
 		slog.ErrorContext(r.Context(), "Failed to delete cached files", "error", err, "package", packageName)
 		writeStatus(w, http.StatusInternalServerError, `{"status":"error","message":"Failed to delete cached files"}`)
 		return
