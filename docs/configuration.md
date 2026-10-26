@@ -16,7 +16,7 @@ Any other value is logged as a warning and the default is kept.
 | `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. |
 | `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. |
 | `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. A missing or unparseable entry falls back to 180. |
-| `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification when talking to an index. |
+| `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification on every upstream call: index pages, the root index and file downloads. |
 
 ### How extra indexes are resolved
 

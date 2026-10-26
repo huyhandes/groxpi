@@ -49,6 +49,10 @@ a one-method interface it defines itself (`storage.Fetcher`), the one interface 
 another through, so its tests run against a fake fetcher. Everywhere else a module is used as the
 concrete type it is: an interface with one implementation is a liability, not a boundary.
 
+One upstream transport, owned by index: `index.New` builds it from config and `download` takes it
+through `(*index.Service).Transport()`, so the per-package index, the root proxy and file downloads
+share one connection pool and one TLS setting.
+
 Routing is the standard library's `http.ServeMux` with method-and-pattern routes (`GET
 /simple/{package}/{$}`). The mux supplies the trailing-slash redirect, the `405` with `Allow`, and the
 matched pattern (`r.Pattern`) that names each request span. JSON is the standard library's
