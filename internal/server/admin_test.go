@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -137,10 +138,56 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 
 	page := string(readBody(t, authGet(h.mux, "/admin?q=needle")))
 	assert.Contains(t, page, `value="needle"`, "the box shows the active filter")
-	assert.Contains(t, page, `hx-get="/admin/rows?page=1&amp;q=needle"`, "the poll keeps the filter")
+	// The poll reads the live filter box instead of a q baked into its URL, so
+	// typing filters without a submit and the box is escaped by htmx itself.
+	assert.Contains(t, page, `hx-get="/admin/rows?page=1"`, "the poll URL carries no hand-built q")
+	assert.Contains(t, page, `hx-include="#filter"`, "the poll sends the filter box")
+	assert.Contains(t, page, `hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter"`,
+		"typing in the box re-polls")
+	assert.Contains(t, page, `<form class="controls" method="get" action="/admin">`, "the no-JS GET form stays")
 
 	paged := string(readBody(t, authGet(h.mux, "/admin/rows?q=p0")))
 	assert.Contains(t, paged, `href="/admin?page=2&amp;q=p0"`, "the pager keeps the filter")
+}
+
+// TestAdminRows_PagerEscapesQuery pins that a filter with URL metacharacters
+// survives the pager link: an unescaped & or # would cut the query short.
+func TestAdminRows_PagerEscapesQuery(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	for i := range admin.PageSize + 1 {
+		path := filepath.Join(h.cacheDir, "packages", fmt.Sprintf("a&b#%03d", i), "a.tar.gz")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+	}
+
+	rows := string(readBody(t, authGet(h.mux, "/admin/rows?q="+url.QueryEscape("a&b#"))))
+	assert.Contains(t, rows, `href="/admin?page=2&amp;q=a%26b%23"`)
+	rows = string(readBody(t, authGet(h.mux, "/admin/rows?page=2&q="+url.QueryEscape("a&b#"))))
+	assert.Contains(t, rows, `href="/admin?page=1&amp;q=a%26b%23"`)
+}
+
+// TestAdminRows_FilterAppliesToDownloads pins that the filter also narrows the
+// "Downloading now" rows: a download in flight for another package is hidden,
+// one for the filtered package stays.
+func TestAdminRows_FilterAppliesToDownloads(t *testing.T) {
+	body := testPayload(65536) // past net/http buffering, so headers flush at the gate
+	up := NewFakePyPI(t).Add("slow-pkg", "slow_pkg-1.0.tar.gz",
+		FakeFile{Body: body, SHA256: Sum(body), Size: int64(len(body)), Gated: true})
+	h := newAdminServer(t, up.URL+"/")
+	hs := httptest.NewServer(h.mux)
+	t.Cleanup(hs.Close)
+
+	// Hold one upstream download open until the test is done.
+	resp, err := hs.Client().Get(hs.URL + "/simple/slow-pkg/slow_pkg-1.0.tar.gz")
+	require.NoError(t, err)
+	t.Cleanup(func() { up.Release(); _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() })
+	require.Eventually(t, func() bool { return len(h.svc.InFlight()) == 1 }, 5*time.Second, time.Millisecond)
+
+	other := string(readBody(t, authGet(h.mux, "/admin/rows?q=other")))
+	assert.NotContains(t, other, `class="inflight"`, "a download for another package is filtered out")
+	match := string(readBody(t, authGet(h.mux, "/admin/rows?q=Slow_Pkg")))
+	assert.Contains(t, match, `class="inflight" data-package="slow-pkg"`, "the filtered package's download stays")
 }
 
 // ---------------------------------------------------------------------------

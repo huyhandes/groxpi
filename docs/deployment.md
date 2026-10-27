@@ -197,7 +197,8 @@ pip install --index-url http://pypi.example.com/simple/ numpy
 # pip.conf / pip.ini
 [global]
 index-url = http://pypi.example.com/simple/
-trusted-host = pypi.example.com   # only if not behind TLS
+# only if not behind TLS
+trusted-host = pypi.example.com
 ```
 
 ```bash

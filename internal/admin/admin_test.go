@@ -568,3 +568,21 @@ func TestEvict_InvalidNameDeletesNothing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), hits.Load(), "the index entry was left intact")
 }
+
+// TestNormalizeQuery pins that a filter is folded the way cached package names
+// are (PEP 503), so typing the name as it appears on PyPI finds the cache row.
+func TestNormalizeQuery(t *testing.T) {
+	cases := map[string]string{
+		"":               "",
+		"  Requests ":    "requests",
+		"typing_ext":     "typing-ext",
+		"Zope.Interface": "zope-interface",
+		"a__-.b":         "a-b",
+		"ext_":           "ext-",
+	}
+	for in, want := range cases {
+		if got := admin.NormalizeQuery(in); got != want {
+			t.Errorf("NormalizeQuery(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

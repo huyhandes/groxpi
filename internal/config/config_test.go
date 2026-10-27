@@ -193,6 +193,23 @@ func TestLoadS3WithoutStaticCredentials(t *testing.T) {
 	}
 }
 
+// TestLoadS3LeavesEmptyEndpointEmpty pins that no endpoint means no endpoint:
+// the AWS SDK then resolves the regional one itself. Forcing s3.amazonaws.com
+// sent every request to us-east-1.
+func TestLoadS3LeavesEmptyEndpointEmpty(t *testing.T) {
+	t.Setenv("GROXPI_S3_BUCKET", "groxpi-cache")
+	t.Setenv("GROXPI_S3_ENDPOINT", "")
+
+	for _, storageType := range []string{"s3", "hybrid"} {
+		t.Run(storageType, func(t *testing.T) {
+			t.Setenv("GROXPI_STORAGE_TYPE", storageType)
+			if got := mustLoad(t).S3Endpoint; got != "" {
+				t.Fatalf("S3Endpoint = %q, want empty", got)
+			}
+		})
+	}
+}
+
 // TestLoadS3RequiresBucket pins that the bucket requirement remains.
 func TestLoadS3RequiresBucket(t *testing.T) {
 	t.Setenv("GROXPI_STORAGE_TYPE", "s3")
@@ -348,6 +365,9 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 		{"GROXPI_DOWNLOAD_TIMEOUT", "Inf", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
 		{"GROXPI_DOWNLOAD_TIMEOUT", "-Inf", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
 		{"GROXPI_DOWNLOAD_TIMEOUT", "1e300", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		// The boundary itself: these seconds times 1e9 round to 2^63, one past
+		// the largest time.Duration.
+		{"GROXPI_DOWNLOAD_TIMEOUT", "9223372036.854775807", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
 		{"GROXPI_INDEX_TTL", "-5m", func(c *Config) any { return c.IndexTTL }, 30 * time.Minute},
 	}
 
