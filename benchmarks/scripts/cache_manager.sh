@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Cache Management Utility Script
-# Clears cache for both groxpi and proxpi using DELETE API
+# Empties the caches of groxpi and proxpi by recreating their containers
 # Usage: ./cache_manager.sh <groxpi_url> <proxpi_url> [operation]
 
 set -euo pipefail
@@ -12,10 +12,14 @@ PROXPI_URL="${2:-}"
 OPERATION="${3:-clear-all}"
 TIMEOUT=30
 
-# Packages the benchmark scenarios install (keep in step with TEST_PACKAGES in
-# wrk_api_test.sh and uv_install_test.sh). groxpi's DELETE /cache/list is a
-# no-op, so a cold run is only cold if each of these is evicted by name.
-read -r -a BENCH_PACKAGES <<< "${BENCH_PACKAGES:-numpy pandas polars pyspark fastapi}"
+# A cold run recreates the proxies from this compose file: the containers and
+# their anonymous cache volumes are removed, then fresh ones are started. Neither
+# proxy's DELETE API empties its cache - groxpi's DELETE /cache/list touches no
+# list, and proxpi's DELETE /cache/<package> drops only the in-memory file list,
+# keeping every downloaded file on disk - so API eviction left "cold" runs warm.
+COMPOSE_FILE="${BENCH_COMPOSE_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)/docker-compose.benchmark.yml}"
+GROXPI_SERVICE=groxpi-bench
+PROXPI_SERVICE=proxpi-bench
 
 # Colors for output
 RED='\033[0;31m'
@@ -35,49 +39,24 @@ show_usage() {
     echo "Usage: $0 <groxpi_url> <proxpi_url> [operation]"
     echo ""
     echo "Parameters:"
-    echo "  groxpi_url  - groxpi server URL (e.g., http://server1:5005)"
-    echo "  proxpi_url  - proxpi server URL (e.g., http://server2:5006)"
+    echo "  groxpi_url  - groxpi server URL (e.g., http://localhost:5005)"
+    echo "  proxpi_url  - proxpi server URL (e.g., http://localhost:5006)"
     echo "  operation   - Operation to perform (default: clear-all)"
     echo ""
     echo "Operations:"
-    echo "  clear-all        - Clear all caches on both servers"
-    echo "                     (groxpi: evicts each of BENCH_PACKAGES by name)"
-    echo "  clear-groxpi     - Clear only groxpi cache"
-    echo "  clear-proxpi     - Clear only proxpi cache"
-    echo "  clear-package    - Clear specific package cache (requires package name)"
-    echo "  verify           - Verify cache clear operations"
+    echo "  clear-all        - Recreate both proxies with empty caches"
+    echo "  clear-groxpi     - Recreate only groxpi ($GROXPI_SERVICE)"
+    echo "  clear-proxpi     - Recreate only proxpi ($PROXPI_SERVICE)"
+    echo "  verify           - Time one index request on each server"
     echo "  test-connection  - Test connection to both servers"
     echo ""
+    echo "Clearing recreates the services of BENCH_COMPOSE_FILE on this host"
+    echo "(default: $COMPOSE_FILE),"
+    echo "so the URLs must point at those containers."
+    echo ""
     echo "Examples:"
-    echo "  $0 http://server1:5005 http://server2:5006"
-    echo "  $0 http://server1:5005 http://server2:5006 clear-all"
-    echo "  $0 http://server1:5005 http://server2:5006 clear-package numpy"
-    echo "  $0 http://server1:5005 http://server2:5006 test-connection"
-}
-
-# curl basic-auth arguments for groxpi's admin routes, constant for the whole
-# run. Without credentials those routes answer 404, which used to be walked past
-# as "nothing was cached" - so a warm cache got benchmarked as a cold one. proxpi
-# has no admin auth and is never given credentials: the call sites pass these
-# arguments only when the target is groxpi. The defaults match
-# docker/docker-compose.benchmark.yml; a groxpi with no credentials configured
-# has no eviction routes at all, so there is no "unauthenticated" mode to fall
-# back to.
-CURL_AUTH=(--user "${GROXPI_ADMIN_USERNAME:-bench}:${GROXPI_ADMIN_PASSWORD:-bench}")
-
-# A refused or missing groxpi cache-clear is fatal: continuing would publish a
-# warm measurement labelled cold.
-fatal_if_groxpi() {
-    local name=$1 http_code=$2 what=$3
-    [[ "$name" == "groxpi" ]] || return 0
-    case $http_code in
-        401|403|404)
-            log_error "groxpi refused $what with HTTP $http_code. Check GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD (default bench/bench) - a 404 means the groxpi under test was started without admin credentials, so it has no eviction routes."
-            log_error "Aborting: the cache was not cleared, so any 'cold' number from this run would be a lie."
-            exit 1
-            ;;
-    esac
-    return 0
+    echo "  $0 http://localhost:5005 http://localhost:5006"
+    echo "  $0 http://localhost:5005 http://localhost:5006 test-connection"
 }
 
 # Function to validate URLs
@@ -116,133 +95,21 @@ test_connection() {
     return 1
 }
 
-# Function to clear cache list (all packages index)
-clear_cache_list() {
-    local url=$1
-    local name=$2
-
-    log_info "Clearing cache list for $name..."
-
-    local response
-    local http_code
-
-    # Perform DELETE request to clear cache list
-    local auth=()
-    if [[ "$name" == "groxpi" ]]; then
-        auth=("${CURL_AUTH[@]+"${CURL_AUTH[@]}"}")
+# Recreate services with empty caches: stop and remove the containers together
+# with their anonymous volumes, then start fresh ones and wait until healthy. Any
+# failure aborts: carrying on would measure whatever is left as a cold cache.
+recreate_services() {
+    log_info "Recreating $* with empty caches..."
+    if docker compose -f "$COMPOSE_FILE" rm -sfv "$@" &&
+       docker compose -f "$COMPOSE_FILE" up -d --wait "$@"; then
+        log_success "$* recreated with empty caches"
+        return 0
     fi
-    if response=$(curl -s --connect-timeout 10 --max-time $TIMEOUT \
-                      "${auth[@]+"${auth[@]}"}" \
-                      -w "HTTP_CODE:%{http_code}" \
-                      -X DELETE "$url/cache/list" 2>&1); then
-
-        http_code=$(echo "$response" | grep -o 'HTTP_CODE:[0-9]*' | cut -d':' -f2)
-        response_body=$(echo "$response" | sed 's/HTTP_CODE:[0-9]*$//')
-        fatal_if_groxpi "$name" "$http_code" "the cache-list clear"
-
-        case $http_code in
-            200|204)
-                log_success "$name cache list cleared successfully"
-                if [ -n "$response_body" ]; then
-                    echo "  Response: $response_body"
-                fi
-                return 0
-                ;;
-            404)
-                log_warning "$name cache list endpoint not found (HTTP $http_code)"
-                return 1
-                ;;
-            405)
-                log_error "$name cache list endpoint does not support DELETE (HTTP $http_code)"
-                return 1
-                ;;
-            *)
-                log_error "$name cache list clear failed (HTTP $http_code)"
-                if [ -n "$response_body" ]; then
-                    echo "  Response: $response_body"
-                fi
-                return 1
-                ;;
-        esac
-    else
-        log_error "$name cache list clear request failed: $response"
-        return 1
-    fi
+    log_error "Recreating $* failed; aborting rather than measure a warm cache as cold."
+    exit 1
 }
 
-# Function to clear specific package cache
-clear_package_cache() {
-    local url=$1
-    local name=$2
-    local package=$3
-
-    log_info "Clearing cache for package '$package' on $name..."
-
-    local response
-    local http_code
-
-    # Perform DELETE request to clear specific package cache
-    local auth=()
-    if [[ "$name" == "groxpi" ]]; then
-        auth=("${CURL_AUTH[@]+"${CURL_AUTH[@]}"}")
-    fi
-    if response=$(curl -s --connect-timeout 10 --max-time $TIMEOUT \
-                      "${auth[@]+"${auth[@]}"}" \
-                      -w "HTTP_CODE:%{http_code}" \
-                      -X DELETE "$url/cache/$package" 2>&1); then
-
-        http_code=$(echo "$response" | grep -o 'HTTP_CODE:[0-9]*' | cut -d':' -f2)
-        response_body=$(echo "$response" | sed 's/HTTP_CODE:[0-9]*$//')
-        fatal_if_groxpi "$name" "$http_code" "the '$package' cache clear"
-
-        case $http_code in
-            200|204)
-                log_success "$name package '$package' cache cleared successfully"
-                if [ -n "$response_body" ]; then
-                    echo "  Response: $response_body"
-                fi
-                return 0
-                ;;
-            404)
-                log_warning "$name package '$package' not found in cache (HTTP $http_code)"
-                return 0  # Not an error - package might not be cached
-                ;;
-            *)
-                log_error "$name package '$package' cache clear failed (HTTP $http_code)"
-                if [ -n "$response_body" ]; then
-                    echo "  Response: $response_body"
-                fi
-                return 1
-                ;;
-        esac
-    else
-        log_error "$name package '$package' cache clear request failed: $response"
-        return 1
-    fi
-}
-
-# Evict every package under test. DELETE /cache/list clears nothing on groxpi
-# (the root index is proxied, not cached), so this is what makes a cold run cold.
-# Any groxpi failure aborts the run: a partial eviction would still be measured
-# as cold.
-clear_test_packages() {
-    local url=$1
-    local name=$2
-    local package
-
-    for package in "${BENCH_PACKAGES[@]}"; do
-        if ! clear_package_cache "$url" "$name" "$package"; then
-            if [[ "$name" == "groxpi" ]]; then
-                log_error "Aborting: groxpi did not evict '$package', so any 'cold' number from this run would be a lie."
-                exit 1
-            fi
-            return 1
-        fi
-    done
-    return 0
-}
-
-# Function to verify cache has been cleared
+# Function to time one index request (a rough check, not a measurement)
 verify_cache_clear() {
     local url=$1
     local name=$2
@@ -328,49 +195,11 @@ main() {
             ;;
 
         clear-groxpi)
-            if ! test_connection "$GROXPI_URL" "groxpi"; then
-                exit 1
-            fi
-            clear_test_packages "$GROXPI_URL" "groxpi"
+            recreate_services "$GROXPI_SERVICE"
             ;;
 
         clear-proxpi)
-            if ! test_connection "$PROXPI_URL" "proxpi"; then
-                exit 1
-            fi
-            clear_cache_list "$PROXPI_URL" "proxpi"
-            ;;
-
-        clear-package)
-            if [ $# -lt 4 ]; then
-                log_error "Package name required for clear-package operation"
-                echo "Usage: $0 <groxpi_url> <proxpi_url> clear-package <package_name>"
-                exit 1
-            fi
-
-            local package_name="$4"
-            log_info "Clearing cache for package: $package_name"
-
-            # Test connections first
-            groxpi_ok=true
-            proxpi_ok=true
-
-            if ! test_connection "$GROXPI_URL" "groxpi"; then
-                groxpi_ok=false
-            fi
-
-            if ! test_connection "$PROXPI_URL" "proxpi"; then
-                proxpi_ok=false
-            fi
-
-            # Clear package cache on both servers
-            if $groxpi_ok; then
-                clear_package_cache "$GROXPI_URL" "groxpi" "$package_name"
-            fi
-
-            if $proxpi_ok; then
-                clear_package_cache "$PROXPI_URL" "proxpi" "$package_name"
-            fi
+            recreate_services "$PROXPI_SERVICE"
             ;;
 
         verify)
@@ -386,56 +215,8 @@ main() {
             ;;
 
         clear-all|*)
-            log_info "Clearing all caches..."
-
-            # Test connections first
-            groxpi_ok=true
-            proxpi_ok=true
-
-            if ! test_connection "$GROXPI_URL" "groxpi"; then
-                groxpi_ok=false
-            fi
-
-            if ! test_connection "$PROXPI_URL" "proxpi"; then
-                proxpi_ok=false
-            fi
-
-            if ! $groxpi_ok && ! $proxpi_ok; then
-                log_error "Both servers are unreachable"
-                exit 1
-            fi
-
-            # Clear caches
-            success=true
-
-            if $groxpi_ok; then
-                # Exits on any failure.
-                clear_test_packages "$GROXPI_URL" "groxpi"
-            fi
-
-            if $proxpi_ok; then
-                if ! clear_cache_list "$PROXPI_URL" "proxpi" ||
-                   ! clear_test_packages "$PROXPI_URL" "proxpi"; then
-                    success=false
-                fi
-            fi
-
-            echo ""
-            if $success; then
-                log_success "All cache operations completed successfully"
-
-                # Optional verification
-                log_info "Performing verification..."
-                if $groxpi_ok; then
-                    verify_cache_clear "$GROXPI_URL" "groxpi"
-                fi
-                if $proxpi_ok; then
-                    verify_cache_clear "$PROXPI_URL" "proxpi"
-                fi
-            else
-                log_error "Some cache operations failed"
-                exit 1
-            fi
+            # No verification request afterwards: it would warm the caches just emptied.
+            recreate_services "$GROXPI_SERVICE" "$PROXPI_SERVICE"
             ;;
     esac
 

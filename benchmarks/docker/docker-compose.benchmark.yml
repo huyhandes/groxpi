@@ -20,13 +20,10 @@ services:
       GROXPI_CACHE_DIR: /cache
       GROXPI_LOGGING_LEVEL: INFO
       GROXPI_STORAGE_TYPE: local
-      # Credentials mount the eviction routes scripts/cache_manager.sh needs for
-      # a cold run; without them DELETE /cache/<package> is 404 and the run
-      # aborts. cache_manager.sh defaults to the same pair.
-      GROXPI_ADMIN_USERNAME: ${GROXPI_ADMIN_USERNAME:-bench}
-      GROXPI_ADMIN_PASSWORD: ${GROXPI_ADMIN_PASSWORD:-bench}
+    # Anonymous cache volumes: scripts/cache_manager.sh empties a cache with
+    # `docker compose rm -sfv`, which removes anonymous volumes but not named ones.
     volumes:
-      - groxpi_bench_cache:/cache
+      - /cache
     healthcheck:
       # scratch image: no shell, no wget. The binary is its own probe.
       test: ["CMD", "/groxpi", "--health-check"]
@@ -34,6 +31,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+      # Probe every second while starting, so a cold run's `up --wait` returns
+      # as soon as the proxy is healthy rather than after the first 30s interval.
+      start_interval: 1s
     labels:
       - "benchmark.service=groxpi"
     networks:
@@ -54,23 +54,20 @@ services:
       PROXPI_CACHE_DIR: /var/cache/proxpi
       PROXPI_LOGGING_LEVEL: INFO
     volumes:
-      - proxpi_bench_cache:/var/cache/proxpi
+      - /var/cache/proxpi
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+      # Probe every second while starting, so a cold run's `up --wait` returns
+      # as soon as the proxy is healthy rather than after the first 30s interval.
+      start_interval: 1s
     labels:
       - "benchmark.service=proxpi"
     networks:
       - benchmark-network
-
-volumes:
-  groxpi_bench_cache:
-    driver: local
-  proxpi_bench_cache:
-    driver: local
 
 networks:
   benchmark-network:

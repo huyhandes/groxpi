@@ -13,6 +13,7 @@ PORT=5099
 PKG=requests
 WHEEL=requests-2.32.3-py3-none-any.whl
 
+mkdir -p "$(dirname "$OUT")"  # results/ is gitignored, so absent in a fresh clone
 go -C "$DIR" build -o "$BIN" ./cmd/groxpi
 GROXPI_CACHE_DIR="$CACHE" PORT=$PORT GROXPI_LOGGING_LEVEL=WARN GROXPI_DOWNLOAD_TIMEOUT=30s \
   "$BIN" >/dev/null 2>&1 &

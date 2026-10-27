@@ -45,7 +45,8 @@ show_usage() {
     echo "  --timestamp TS     Use specific timestamp (default: auto-generated)"
     echo "  --api-only         Run only WRK API benchmarks"
     echo "  --uv-only          Run only UV installation benchmarks"
-    echo "  --no-monitoring    Disable resource monitoring"
+    echo "  --no-monitoring    Disable resource monitoring (it samples the local"
+    echo "                     containers groxpi-bench and proxpi-bench only)"
     echo "  --docker-network N Docker network name (default: benchmark-network)"
     echo "  --results-dir DIR  Results directory (default: ./results)"
     echo "  -h, --help         Show this help message"
@@ -176,7 +177,8 @@ start_resource_monitoring() {
     local monitor_script="$SCRIPT_DIR/scripts/monitor_resources.sh"
     local resource_file="$RESULTS_DIR/resources-${TIMESTAMP}.csv"
 
-    # Extract container names from URLs for docker container monitoring
+    # The containers of docker/docker-compose.benchmark.yml on this host,
+    # whatever the URLs point at
     local groxpi_container="groxpi-bench"
     local proxpi_container="proxpi-bench"
 
@@ -308,7 +310,7 @@ EOF
         # Process the CSV to extract key metrics
         if command -v awk >/dev/null 2>&1; then
             tail -n +2 "$RESULTS_DIR/wrk-summary-${TIMESTAMP}.csv" | \
-            awk -F',' '$4=="load" && $5=="index-warm" {printf "| %s | %s | %s | %s |\n", $3, $5, $7, $8}' >> "$report_file" || true
+            awk -F',' '$4=="load" && $5=="numpy-warm" {printf "| %s | %s | %s | %s |\n", $3, $5, $7, $8}' >> "$report_file" || true
         fi
     else
         echo "No WRK results found." >> "$report_file"
@@ -431,8 +433,8 @@ main() {
     # Validate environment
     validate_environment
 
-    # Start resource monitoring
-    start_resource_monitoring
+    # Start resource monitoring; a monitor that fails to start does not stop the run
+    start_resource_monitoring || true
 
     local tests_failed=false
 
