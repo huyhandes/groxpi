@@ -96,7 +96,8 @@ func (s *Server) Router() http.Handler {
 }
 
 // recoverPanics turns a panicking handler into a 500 instead of a dropped
-// connection, and logs the stack so the panic is not lost with it.
+// connection, and logs the stack so the panic is not lost with it. An abort
+// (traceRequests turns a panic after a write into one) is left to net/http.
 func recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -123,7 +124,7 @@ func recoverPanics(next http.Handler) http.Handler {
 // recoverPanics answers) or, after a write, the status already sent; an
 // http.ErrAbortHandler as aborted with the status already sent, or none if
 // nothing was written (logged as status 0). The panic is then re-raised for
-// recoverPanics and net/http to handle as before.
+// recoverPanics and net/http, a plain one after a write as an abort.
 func traceRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -180,6 +181,14 @@ func traceRequests(next http.Handler) http.Handler {
 			}
 			slog.InfoContext(ctx, "request", args...)
 
+			// A plain panic after a write cannot become a 500: recoverPanics'
+			// http.Error would append its text to the body already sent, and a
+			// chunked one would then end cleanly. Re-raise it as an abort so the
+			// connection is dropped. net/http compares the panic value with ==,
+			// so the wrapped abort is still logged there, with its stack.
+			if panicked && sw.code != 0 {
+				panic(fmt.Errorf("%w: %v", http.ErrAbortHandler, rec))
+			}
 			if rec != nil {
 				panic(rec)
 			}
@@ -302,6 +311,8 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, storage.ErrStorage):
 			// The store logged it, once per flight.
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		case ctx.Err() != nil:
+			// The client left before the store answered: nobody to answer.
 		default:
 			slog.DebugContext(ctx, "Package index unavailable",
 				"error", config.RedactErrorText(err), "package", pkg, "file", file)

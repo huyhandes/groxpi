@@ -158,7 +158,8 @@ answers with `500`: the file exists, so it is not a `404`.
 Byte-level pass-through of the upstream response, nothing decoded and nothing cached. Concurrent
 requests for the same `Accept`/`Accept-Encoding` pair share one upstream fetch via singleflight, and the
 fetch runs on a context detached from whichever client triggered it, bounded by the client's own
-timeout.
+timeout. A client that disconnects stops waiting at once; the fetch carries on for the rest (the
+package index lookup below works the same way).
 
 ### Index resolution — `GET /simple/<package>/`
 
@@ -278,7 +279,9 @@ as long as the collector keeps the series.
 
 The request span carries `http.response.status_code`; a 5xx sets the span's status to error. A
 handler that panics is still recorded under its route with error status `panic`, and still gets
-its access log line: as a 500 if it wrote nothing, otherwise with the status already sent. A handler
+its access log line: as a 500 if it wrote nothing, otherwise with the status already sent, and
+then the connection is dropped (net/http logs the panic and its stack) so a half-sent body never
+reads as complete. A handler
 that aborts with `http.ErrAbortHandler` keeps the status already sent, gets
 `http.request.aborted=true` and error status `aborted`, and its access line carries `aborted=true`;
 if it aborted before writing anything, the span has no status code and the access line logs

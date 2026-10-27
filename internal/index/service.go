@@ -131,7 +131,7 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 	}
 	telemetry.CacheMiss(ctx, telemetry.LayerIndex)
 
-	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
+	result, err := s.shared(ctx, "package-files:"+packageName, func() (any, error) {
 		// The fetch fills the cache for every waiter, so it must not die with
 		// whichever client happened to trigger it.
 		index, files, err := s.queryIndexes(context.WithoutCancel(ctx), packageName)
@@ -167,6 +167,18 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
 	return entry, nil
+}
+
+// shared runs fn once per key for every concurrent caller, and lets each caller
+// stop waiting when its own context ends. fn must run detached from ctx: it
+// carries on for the callers still waiting, and fills the cache for later ones.
+func (s *Service) shared(ctx context.Context, key string, fn func() (any, error)) (any, error) {
+	select {
+	case r := <-s.sf.DoChan(key, fn):
+		return r.Val, r.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // resolutionResult classifies one index's answer for the resolution metric. A
@@ -306,7 +318,7 @@ type RootResponse struct {
 // is served through, not stored — but concurrent callers asking for the same
 // representation still share one upstream fetch.
 func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) (*RootResponse, error) {
-	result, err, _ := s.sf.Do("root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
+	result, err := s.shared(ctx, "root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
 		// The fetch serves every waiter, so it must not die with whichever client
 		// happened to trigger it; the HTTP client's own timeout bounds it.
 		req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, s.rootURL, nil)

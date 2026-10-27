@@ -124,7 +124,9 @@ func readCapped(r io.Reader, limit int64) ([]byte, error) {
 // newTransport builds the one upstream transport every client shares: the
 // per-package index, the root proxy and file downloads. It is where
 // GROXPI_DISABLE_INDEX_SSL_VERIFICATION applies, so the setting reaches all
-// three.
+// three. There is no cap on connections per host: with downloads and index
+// lookups sharing it, a cap would let a burst of large downloads queue the
+// index lookups behind them.
 func newTransport(cfg *config.Config) *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -138,7 +140,6 @@ func newTransport(cfg *config.Config) *http.Transport {
 		},
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   100,
-		MaxConnsPerHost:       100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -394,6 +396,11 @@ func panickingRouter() http.Handler {
 		w.WriteHeader(http.StatusAccepted)
 		panic("boom")
 	})
+	mux.HandleFunc("GET /mid-body-boom/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "partial")
+		_ = http.NewResponseController(w).Flush()
+		panic("boom")
+	})
 	mux.HandleFunc("GET /early-abort/{name}", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
 	return recoverPanics(traceRequests(mux))
 }
@@ -449,13 +456,23 @@ func TestTelemetry_AbortedRequestIsMarked(t *testing.T) {
 
 // TestTelemetry_PanicAfterWriteKeepsSentStatus: a handler that panics after
 // sending its status line cannot turn it into a 500. The span and access line
-// record the status the client actually got; the span is still an error.
+// record the status the client actually got; the span is still an error. The
+// panic reaches net/http as an abort, so the connection is dropped rather than
+// a 500 body appended to the response already under way.
 func TestTelemetry_PanicAfterWriteKeepsSentStatus(t *testing.T) {
 	rec, _ := installTestTelemetry(t)
 	var logs strings.Builder
 	defer captureLogs(t, &logs)()
 
-	panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/late-boom/x", nil))
+	func() {
+		defer func() {
+			err, ok := recover().(error)
+			require.True(t, ok, "the panic must be re-raised as an error")
+			assert.ErrorIs(t, err, http.ErrAbortHandler)
+			assert.Contains(t, err.Error(), "boom", "the original panic value must survive")
+		}()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/late-boom/x", nil))
+	}()
 
 	span := findSpan(rec, "GET /late-boom/{name}")
 	require.NotNil(t, span)
@@ -487,6 +504,29 @@ func TestTelemetry_AbortBeforeWriteClaimsNoStatus(t *testing.T) {
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Contains(t, logs.String(), `"status":0`)
 	assert.Contains(t, logs.String(), `"aborted":true`)
+}
+
+// TestPanicAfterBodyWriteDropsConnection: once part of a body has gone out, a
+// 500 can no longer be sent, and appending "Internal Server Error" to a chunked
+// body would hand the client a clean, complete-looking but wrong response. The
+// connection must be dropped instead, so the client sees a broken body.
+func TestPanicAfterBodyWriteDropsConnection(t *testing.T) {
+	installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	srv := httptest.NewUnstartedServer(panickingRouter())
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Start()
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/mid-body-boom/x")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.Error(t, err, "a body cut short by a panic must not read as complete")
+	assert.Equal(t, "partial", string(body))
 }
 
 // TestTelemetry_ServerErrorSetsSpanStatus: a 5xx response marks the request

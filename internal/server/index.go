@@ -31,6 +31,9 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 
 	root, err := s.index.ProxyRoot(r.Context(), accept, acceptEncoding)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client left: nobody to answer
+		}
 		slog.ErrorContext(r.Context(), "Failed to proxy root index", "error", config.RedactErrorText(err))
 		http.Error(w, "Failed to fetch package list", http.StatusBadGateway)
 		return
@@ -53,6 +56,9 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	entry, err := s.index.Resolve(r.Context(), packageName)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client left: nobody to answer
+		}
 		// A miss means every configured index was consulted and none had it.
 		if errors.Is(err, index.ErrNotFound) {
 			http.Error(w, "Package not found", http.StatusNotFound)
