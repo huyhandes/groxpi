@@ -333,6 +333,34 @@ run_package_tests() {
     fi
 }
 
+# Parse one `wrk --latency` log into CSV fields:
+#   requests_per_sec,avg_latency_ms,p50_latency_ms,p99_latency_ms,duration_seconds,threads,connections
+# wrk prints latencies as us/ms/s and the duration as s/m/h; all are normalised.
+# A field wrk did not print is left empty, which DuckDB reads as NULL.
+parse_wrk_log() {
+    awk '
+        function ms(v) {
+            if (v ~ /us$/) return sprintf("%.3f", substr(v, 1, length(v) - 2) / 1000)
+            if (v ~ /ms$/) return sprintf("%.3f", substr(v, 1, length(v) - 2))
+            if (v ~ /s$/)  return sprintf("%.3f", substr(v, 1, length(v) - 1) * 1000)
+            return ""
+        }
+        function secs(v) {
+            if (v ~ /s$/) return substr(v, 1, length(v) - 1) + 0
+            if (v ~ /m$/) return substr(v, 1, length(v) - 1) * 60
+            if (v ~ /h$/) return substr(v, 1, length(v) - 1) * 3600
+            return ""
+        }
+        $1 == "Running" && $3 == "test" { duration = secs($2) }
+        $2 == "threads" && $3 == "and" && $5 == "connections" { threads = $1; connections = $4 }
+        $1 == "Latency" && avg == "" { avg = ms($2) }
+        $1 == "50%" { p50 = ms($2) }
+        $1 == "99%" { p99 = ms($2) }
+        $1 == "Requests/sec:" { rps = $2 }
+        END { printf "%s,%s,%s,%s,%s,%s,%s\n", rps, avg, p50, p99, duration, threads, connections }
+    ' "$1"
+}
+
 # Function to generate summary CSV with proper DuckDB-friendly format
 generate_summary_csv() {
     local results_dir=$1
@@ -357,16 +385,9 @@ generate_summary_csv() {
             test_datetime="${test_datetime:-$(date '+%Y-%m-%d %H:%M:%S')}"
 
             if [ "$test_type" = "load" ]; then
-                # Extract wrk metrics with better parsing
-                local rps=$(grep "Requests/sec:" "$log_file" | awk '{print $2}' | head -1 | tr -d ',')
-                local avg_latency=$(grep "Latency" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-                local p50_latency=$(grep "50%" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-                local p99_latency=$(grep "99%" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-
-                # Extract additional metrics
-                local duration=$(grep "Duration:" "$log_file" | awk '{print $2}' | head -1 || echo "$WRK_DURATION")
-                local threads=$(grep "threads and" "$log_file" | awk '{print $1}' | head -1 || echo "$WRK_THREADS")
-                local connections=$(grep "connections" "$log_file" | awk '{print $3}' | head -1 || echo "$WRK_CONNECTIONS")
+                local rps avg_latency p50_latency p99_latency duration threads connections
+                IFS=, read -r rps avg_latency p50_latency p99_latency duration threads connections \
+                    < <(parse_wrk_log "$log_file")
 
                 # Get endpoint from log or derive from test name
                 local endpoint
@@ -375,18 +396,10 @@ generate_summary_csv() {
                 elif [[ $test_name == *"numpy"* ]]; then
                     endpoint="simple/numpy/"
                 else
-                    endpoint=$(grep "Running" "$log_file" | awk '{print $NF}' | head -1 | sed "s|^[^/]*/||" || echo "unknown")
+                    endpoint=$(awk '/^Running /{print $NF; exit}' "$log_file" | sed -E 's|^[a-z]+://[^/]*/||')
                 fi
 
-                # Clean up duration (convert to seconds if needed)
-                if [[ $duration == *"s" ]]; then
-                    duration=$(echo "$duration" | sed 's/s$//')
-                elif [[ $duration == *"m" ]]; then
-                    local mins=$(echo "$duration" | sed 's/m$//')
-                    duration=$((mins * 60))
-                fi
-
-                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,${rps:-NULL},${avg_latency:-NULL},${p50_latency:-NULL},${p99_latency:-NULL},NULL,NULL,${duration:-NULL},${threads:-NULL},${connections:-NULL}" >> "$summary_file"
+                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,$rps,$avg_latency,$p50_latency,$p99_latency,,,$duration,$threads,$connections" >> "$summary_file"
 
             elif [ "$test_type" = "single" ]; then
                 # Extract single request metrics
@@ -404,7 +417,7 @@ generate_summary_csv() {
                     endpoint="simple/${pkg}/"
                 fi
 
-                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,NULL,NULL,NULL,NULL,${response_time:-NULL},${http_code:-NULL},NULL,NULL,NULL" >> "$summary_file"
+                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,,,,,$response_time,$http_code,,," >> "$summary_file"
             fi
         fi
     done
@@ -441,7 +454,7 @@ main() {
     fi
 
     # Create results directory
-    local results_dir="$(dirname "$0")/../results"
+    local results_dir="${RESULTS_DIR:-$(dirname "$0")/../results}"
     mkdir -p "$results_dir"
 
     # Run tests based on scenario
@@ -484,5 +497,7 @@ main() {
     log_success "WRK API testing completed successfully"
 }
 
-# Run main function
-main "$@"
+# Run main function (skipped when sourced, so parse_wrk_log can be checked alone)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

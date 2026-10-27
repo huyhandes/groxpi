@@ -618,7 +618,7 @@ main() {
     fi
 
     # Create results directory
-    local results_dir="$(dirname "$0")/../results"
+    local results_dir="${RESULTS_DIR:-$(dirname "$0")/../results}"
     mkdir -p "$results_dir"
 
     # Run tests based on scenario

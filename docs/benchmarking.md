@@ -50,7 +50,10 @@ corresponding flags.
 
 Individual stages can be run directly. `scripts/wrk_api_test.sh` and `scripts/uv_install_test.sh` take
 positional arguments — `<groxpi_url> <proxpi_url> <timestamp> [scenario]` — and print their usage when
-called with none. `scripts/analyze_results_duckdb.sh` has a `--help`.
+called with none. They write to `RESULTS_DIR` from the environment (default `benchmarks/results`);
+`benchmark.sh` exports it from `--results-dir`. `scripts/analyze_results_duckdb.sh [timestamp]
+[results_dir]` reads one run's `resources-`, `wrk-summary-` and `uv-summary-<timestamp>.csv` — the
+latest timestamp when none is given — and has a `--help`.
 
 ## Cache state
 
@@ -60,9 +63,11 @@ A comparison is meaningless unless both proxies start from the same cache state.
 package under test — `BENCH_PACKAGES`, a space-separated list defaulting to the scenarios' packages.
 proxpi gets `DELETE /cache/list` as well. Any failed groxpi eviction aborts the run.
 
-Those routes require admin credentials on groxpi — see [api-endpoints.md](api-endpoints.md). Set
-`GROXPI_ADMIN_USERNAME` and `GROXPI_ADMIN_PASSWORD` in the environment to the credentials of the groxpi
-under test; the script sends them as basic auth. Leave both unset for an unauthenticated local server.
+Those routes exist on groxpi only when admin credentials are configured — see
+[configuration.md](configuration.md#administrative-interface) — so the groxpi under test must have
+them. `docker-compose.benchmark.yml` starts groxpi with `GROXPI_ADMIN_USERNAME` and
+`GROXPI_ADMIN_PASSWORD` both defaulting to `bench`, and the script sends the same variables, with the
+same defaults, as basic auth. Against any other groxpi, export the credentials it was started with.
 If the clear is refused (`401`, `403`, or `404`) the run aborts rather than benchmark a warm cache as a
 cold one. proxpi has no admin auth and is never sent credentials.
 

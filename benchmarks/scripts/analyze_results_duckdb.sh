@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Configuration
 TIMESTAMP="${1:-}"
-RESULTS_DIR="${2:-$(dirname "$0")/../results}"
+RESULTS_DIR="${2:-${RESULTS_DIR:-$(dirname "$0")/../results}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors for output
@@ -32,7 +32,7 @@ show_usage() {
     echo ""
     echo "Parameters:"
     echo "  timestamp   - Specific timestamp to analyze (e.g., 20240101_120000)"
-    echo "  results_dir - Results directory (default: ../results)"
+    echo "  results_dir - Results directory (default: \$RESULTS_DIR, else ../results)"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Analyze latest results"
@@ -57,18 +57,22 @@ check_dependencies() {
     duckdb --version
 }
 
-# Function to find latest CSV files
-find_csv_files() {
-    local pattern_suffix="$1"
-    local files
+# Print the path of one run's CSV, or nothing. The stage scripts name their
+# output <prefix>-YYYYMMDD_HHMMSS.csv, so with no timestamp the latest run is the
+# lexically greatest name for that prefix.
+find_csv_file() {
+    local prefix="$1"
 
     if [ -n "$TIMESTAMP" ]; then
-        files=($(find "$RESULTS_DIR" -name "*${TIMESTAMP}*${pattern_suffix}" -type f 2>/dev/null | sort))
-    else
-        files=($(find "$RESULTS_DIR" -name "*${pattern_suffix}" -type f 2>/dev/null | sort -t'_' -k2 -r))
+        local file="$RESULTS_DIR/${prefix}-${TIMESTAMP}.csv"
+        if [ -f "$file" ]; then echo "$file"; fi
+        return 0
     fi
 
-    echo "${files[@]}"
+    local candidates=("$RESULTS_DIR/${prefix}"-[0-9]*_[0-9]*.csv)
+    if [ -f "${candidates[0]}" ]; then
+        printf '%s\n' "${candidates[@]}" | sort -r | head -n 1
+    fi
 }
 
 # Function to run DuckDB query and format output
@@ -94,14 +98,14 @@ run_query() {
 
 # Function to analyze resource usage
 analyze_resources() {
-    local resource_files=($(find_csv_files "resources*.csv"))
+    local resource_file
+    resource_file=$(find_csv_file "resources")
 
-    if [ ${#resource_files[@]} -eq 0 ]; then
+    if [ -z "$resource_file" ]; then
         log_warning "No resource CSV files found"
         return
     fi
 
-    local resource_file="${resource_files[0]}"
     log_info "Analyzing resource data: $(basename "$resource_file")"
 
     # Resource usage summary
@@ -142,14 +146,14 @@ analyze_resources() {
 
 # Function to analyze API performance
 analyze_api_performance() {
-    local wrk_files=($(find_csv_files "wrk-summary*.csv"))
+    local wrk_file
+    wrk_file=$(find_csv_file "wrk-summary")
 
-    if [ ${#wrk_files[@]} -eq 0 ]; then
+    if [ -z "$wrk_file" ]; then
         log_warning "No WRK summary CSV files found"
         return
     fi
 
-    local wrk_file="${wrk_files[0]}"
     log_info "Analyzing API performance data: $(basename "$wrk_file")"
 
     # Load test performance comparison
@@ -224,14 +228,14 @@ analyze_api_performance() {
 
 # Function to analyze installation performance
 analyze_installation_performance() {
-    local uv_files=($(find_csv_files "uv-summary*.csv"))
+    local uv_file
+    uv_file=$(find_csv_file "uv-summary")
 
-    if [ ${#uv_files[@]} -eq 0 ]; then
+    if [ -z "$uv_file" ]; then
         log_warning "No UV summary CSV files found"
         return
     fi
 
-    local uv_file="${uv_files[0]}"
     log_info "Analyzing installation performance data: $(basename "$uv_file")"
 
     # Installation performance by package and cache mode
@@ -335,9 +339,12 @@ analyze_installation_performance() {
 
 # Function to generate executive summary
 generate_executive_summary() {
-    local wrk_files=($(find_csv_files "wrk-summary*.csv"))
-    local uv_files=($(find_csv_files "uv-summary*.csv"))
-    local resource_files=($(find_csv_files "resources*.csv"))
+    local wrk_file
+    wrk_file=$(find_csv_file "wrk-summary")
+    local uv_file
+    uv_file=$(find_csv_file "uv-summary")
+    local resource_file
+    resource_file=$(find_csv_file "resources")
 
     echo ""
     echo "=========================================="
@@ -345,8 +352,7 @@ generate_executive_summary() {
     echo "=========================================="
     echo ""
 
-    if [ ${#wrk_files[@]} -gt 0 ]; then
-        local wrk_file="${wrk_files[0]}"
+    if [ -n "$wrk_file" ]; then
         echo "📊 API Performance Highlights:"
         duckdb -c "
         WITH perf_summary AS (
@@ -364,19 +370,25 @@ generate_executive_summary() {
         "
 
         duckdb -c "
-        WITH speedup AS (
+        WITH per_scenario AS (
             SELECT
-                ROUND(MAX(requests_per_sec) / MIN(requests_per_sec), 1) as speedup_ratio
+                test_name,
+                endpoint,
+                AVG(requests_per_sec) FILTER (WHERE service = 'groxpi') as groxpi_rps,
+                AVG(requests_per_sec) FILTER (WHERE service = 'proxpi') as proxpi_rps
             FROM read_csv('$wrk_file', header=true)
             WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
+            GROUP BY test_name, endpoint
         )
-        SELECT '⚡ Performance advantage: ' || speedup_ratio || 'x faster' as summary
-        FROM speedup;
+        SELECT '⚡ ' || test_name || ' (' || endpoint || '): groxpi/proxpi RPS ratio ' ||
+               ROUND(groxpi_rps / proxpi_rps, 2) as summary
+        FROM per_scenario
+        WHERE groxpi_rps IS NOT NULL AND proxpi_rps > 0
+        ORDER BY test_name, endpoint;
         "
     fi
 
-    if [ ${#uv_files[@]} -gt 0 ]; then
-        local uv_file="${uv_files[0]}"
+    if [ -n "$uv_file" ]; then
         echo ""
         echo "📦 Installation Performance Highlights:"
         duckdb -c "
@@ -408,8 +420,7 @@ generate_executive_summary() {
         "
     fi
 
-    if [ ${#resource_files[@]} -gt 0 ]; then
-        local resource_file="${resource_files[0]}"
+    if [ -n "$resource_file" ]; then
         echo ""
         echo "💻 Resource Usage Highlights:"
         duckdb -c "

@@ -20,6 +20,11 @@ services:
       GROXPI_CACHE_DIR: /cache
       GROXPI_LOGGING_LEVEL: INFO
       GROXPI_STORAGE_TYPE: local
+      # Credentials mount the eviction routes scripts/cache_manager.sh needs for
+      # a cold run; without them DELETE /cache/<package> is 404 and the run
+      # aborts. cache_manager.sh defaults to the same pair.
+      GROXPI_ADMIN_USERNAME: ${GROXPI_ADMIN_USERNAME:-bench}
+      GROXPI_ADMIN_PASSWORD: ${GROXPI_ADMIN_PASSWORD:-bench}
     volumes:
       - groxpi_bench_cache:/cache
     healthcheck:

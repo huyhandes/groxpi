@@ -59,11 +59,11 @@ show_usage() {
 # run. Without credentials those routes answer 404, which used to be walked past
 # as "nothing was cached" - so a warm cache got benchmarked as a cold one. proxpi
 # has no admin auth and is never given credentials: the call sites pass these
-# arguments only when the target is groxpi.
-CURL_AUTH=()
-if [[ -n "${GROXPI_ADMIN_USERNAME:-}" && -n "${GROXPI_ADMIN_PASSWORD:-}" ]]; then
-    CURL_AUTH=(--user "${GROXPI_ADMIN_USERNAME}:${GROXPI_ADMIN_PASSWORD}")
-fi
+# arguments only when the target is groxpi. The defaults match
+# docker/docker-compose.benchmark.yml; a groxpi with no credentials configured
+# has no eviction routes at all, so there is no "unauthenticated" mode to fall
+# back to.
+CURL_AUTH=(--user "${GROXPI_ADMIN_USERNAME:-bench}:${GROXPI_ADMIN_PASSWORD:-bench}")
 
 # A refused or missing groxpi cache-clear is fatal: continuing would publish a
 # warm measurement labelled cold.
@@ -72,7 +72,7 @@ fatal_if_groxpi() {
     [[ "$name" == "groxpi" ]] || return 0
     case $http_code in
         401|403|404)
-            log_error "groxpi refused $what with HTTP $http_code. Check GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD - admin routes also answer 404 when credentials are required but not supplied."
+            log_error "groxpi refused $what with HTTP $http_code. Check GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD (default bench/bench) - a 404 means the groxpi under test was started without admin credentials, so it has no eviction routes."
             log_error "Aborting: the cache was not cleared, so any 'cold' number from this run would be a lie."
             exit 1
             ;;

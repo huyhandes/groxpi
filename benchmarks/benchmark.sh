@@ -139,8 +139,10 @@ parse_arguments() {
         exit 1
     fi
 
-    # Create results directory
+    # Create results directory; the stage scripts read RESULTS_DIR too, so every
+    # file of a run lands in the one directory.
     mkdir -p "$RESULTS_DIR"
+    export RESULTS_DIR
 }
 
 # Function to validate environment and dependencies
@@ -310,7 +312,7 @@ EOF
         # Process the CSV to extract key metrics
         if command -v awk >/dev/null 2>&1; then
             tail -n +2 "$RESULTS_DIR/wrk-summary-${TIMESTAMP}.csv" | \
-            awk -F',' '$3=="load" && $4=="index-warm" {printf "| %s | %s | %s | %s |\n", $2, $4, $6, $7}' >> "$report_file" || true
+            awk -F',' '$4=="load" && $5=="index-warm" {printf "| %s | %s | %s | %s |\n", $3, $5, $7, $8}' >> "$report_file" || true
         fi
     else
         echo "No WRK results found." >> "$report_file"
@@ -333,10 +335,10 @@ EOF
         if command -v awk >/dev/null 2>&1; then
             local packages=("numpy" "pandas" "polars" "fastapi")
             for pkg in "${packages[@]}"; do
-                local groxpi_cold=$(awk -F',' "\$2==\"groxpi\" && \$3~\"cold\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local groxpi_warm=$(awk -F',' "\$2==\"groxpi\" && \$3~\"warm\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local proxpi_cold=$(awk -F',' "\$2==\"proxpi\" && \$3~\"cold\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local proxpi_warm=$(awk -F',' "\$2==\"proxpi\" && \$3~\"warm\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local groxpi_cold=$(awk -F',' "\$3==\"groxpi\" && \$5==\"cold\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local groxpi_warm=$(awk -F',' "\$3==\"groxpi\" && \$5==\"warm\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local proxpi_cold=$(awk -F',' "\$3==\"proxpi\" && \$5==\"cold\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local proxpi_warm=$(awk -F',' "\$3==\"proxpi\" && \$5==\"warm\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
 
                 if [ -n "$groxpi_cold" ] || [ -n "$proxpi_cold" ]; then
                     echo "| groxpi | $pkg | ${groxpi_cold:-N/A} | ${groxpi_warm:-N/A} |" >> "$report_file"
@@ -359,7 +361,7 @@ EOF
         echo "" >> "$report_file"
         echo "Use the DuckDB analysis script for detailed analysis:" >> "$report_file"
         echo "\`\`\`bash" >> "$report_file"
-        echo "./scripts/analyze_results_duckdb.sh $TIMESTAMP" >> "$report_file"
+        echo "./scripts/analyze_results_duckdb.sh $TIMESTAMP \"$RESULTS_DIR\"" >> "$report_file"
         echo "\`\`\`" >> "$report_file"
     else
         echo "No resource monitoring data available." >> "$report_file"
@@ -382,7 +384,7 @@ EOF
     cat >> "$report_file" << EOF
 
 ### Analysis
-- Run \`./scripts/analyze_results_duckdb.sh $TIMESTAMP\` for detailed DuckDB-powered analysis
+- Run \`./scripts/analyze_results_duckdb.sh $TIMESTAMP "$RESULTS_DIR"\` for detailed DuckDB-powered analysis
 - Summary CSVs can be imported into Excel, Google Sheets, or analyzed with DuckDB/pandas
 
 ## Notes
@@ -488,7 +490,7 @@ main() {
 
     log_info "Next steps:"
     log_info "  1. Review the consolidated report: $RESULTS_DIR/benchmark-report-${TIMESTAMP}.md"
-    log_info "  2. Run detailed analysis: ./scripts/analyze_results_duckdb.sh $TIMESTAMP"
+    log_info "  2. Run detailed analysis: ./scripts/analyze_results_duckdb.sh $TIMESTAMP \"$RESULTS_DIR\""
     log_info "  3. Copy CSV files to your analysis environment if needed"
 }
 
