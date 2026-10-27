@@ -109,8 +109,9 @@ test_server_connection() {
     fi
 }
 
-# Function to clear cache using cache_manager.sh
+# Empty one proxy's cache (groxpi or proxpi) using cache_manager.sh
 clear_cache() {
+    local target=$1
     local cache_manager_script="$(dirname "$0")/cache_manager.sh"
 
     if [ ! -f "$cache_manager_script" ]; then
@@ -118,9 +119,9 @@ clear_cache() {
         return 1
     fi
 
-    log_info "Clearing caches on both servers..."
-    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" clear-all; then
-        log_success "Caches cleared successfully"
+    log_info "Clearing $target cache..."
+    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" "clear-$target"; then
+        log_success "$target cache cleared"
         # Wait a moment for cache clear to take effect
         sleep 3
         return 0
@@ -228,10 +229,14 @@ run_wrk_load_test() {
 single() { run_single_request_test "$@" || FAILURES=$((FAILURES + 1)); }
 load() { run_wrk_load_test "$@" || FAILURES=$((FAILURES + 1)); }
 
-# Clear both caches, then run one measurement. A failed clear is counted and the
+# Empty one proxy's cache (groxpi or proxpi), then run one measurement against it:
+#   cold <target> <measurement> <args...>
+# Only the measured proxy is recreated. A failed clear is counted and the
 # measurement skipped, so a warm number is never recorded as a cold one.
 cold() {
-    if clear_cache; then
+    local target=$1
+    shift
+    if clear_cache "$target"; then
         "$@"
     else
         FAILURES=$((FAILURES + 1))
@@ -252,12 +257,12 @@ run_cold_cache_tests() {
         log_info "Running cold cache single request tests..."
 
         # Test package index
-        cold single "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
-        cold single "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
+        cold groxpi single "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
+        cold proxpi single "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
 
         # Test specific package (numpy)
-        cold single "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
-        cold single "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
+        cold groxpi single "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
+        cold proxpi single "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
     fi
 
     # No cold load run: only its first request would miss, so it would measure a
@@ -318,8 +323,8 @@ run_package_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing package: $package"
 
-            cold single "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
-            cold single "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
+            cold groxpi single "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
+            cold proxpi single "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
 
             echo ""
         done

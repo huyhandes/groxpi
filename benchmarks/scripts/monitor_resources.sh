@@ -70,20 +70,14 @@ to_mb() {
     }'
 }
 
-# Function to get container resource stats
-get_container_stats() {
+# Turn one container's docker stats line into a CSV row; an empty line (container
+# not running, or docker stats failed) gives a row of empty fields.
+stats_row() {
     local container=$1
     local timestamp=$2
+    local stats=$3
 
-    # Check if container is running
-    if ! check_container "$container"; then
-        echo "$timestamp,$container,,,,,,,,"
-        return
-    fi
-
-    # Get container stats (timeout after 5 seconds)
-    local stats
-    if stats=$(with_timeout 5 docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.NetIO}},{{.BlockIO}}" "$container" 2>/dev/null); then
+    if [ -n "$stats" ]; then
         # Parse the stats
         local cpu_perc=$(echo "$stats" | cut -d',' -f1 | sed 's/%//; s/^--$//')
         local mem_usage=$(echo "$stats" | cut -d',' -f2)
@@ -117,6 +111,31 @@ get_container_stats() {
     fi
 }
 
+# Sample both containers with one `docker stats --no-stream` call, so a tick's
+# rows come from one sample and a tick costs one stats call, not two. The real
+# cadence is still INTERVAL plus that call (docker takes a second reading to
+# compute CPU%, about two seconds).
+sample_containers() {
+    local timestamp=$1
+    local running=() container stats=""
+
+    for container in "$GROXPI_CONTAINER" "$PROXPI_CONTAINER"; do
+        if check_container "$container"; then
+            running+=("$container")
+        fi
+    done
+
+    # Get container stats (timeout after 5 seconds)
+    if [ ${#running[@]} -gt 0 ]; then
+        stats=$(with_timeout 5 docker stats --no-stream --format "{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.NetIO}},{{.BlockIO}}" "${running[@]}" 2>/dev/null) || stats=""
+    fi
+
+    # Split the output: each line starts with its container's name
+    for container in "$GROXPI_CONTAINER" "$PROXPI_CONTAINER"; do
+        stats_row "$container" "$timestamp" "$(printf '%s\n' "$stats" | awk -F, -v n="$container" '$1 == n { sub(/^[^,]*,/, ""); print; exit }')"
+    done
+}
+
 # Function to cleanup on exit
 cleanup() {
     echo ""
@@ -142,8 +161,7 @@ while true; do
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
     # Get stats for both containers
-    get_container_stats "$GROXPI_CONTAINER" "$timestamp" >> "$OUTPUT_FILE"
-    get_container_stats "$PROXPI_CONTAINER" "$timestamp" >> "$OUTPUT_FILE"
+    sample_containers "$timestamp" >> "$OUTPUT_FILE"
 
     sleep "$INTERVAL"
 done

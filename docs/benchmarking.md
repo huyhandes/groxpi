@@ -15,7 +15,8 @@ compare against until the suite is re-run.
 - **End-to-end install time** (`scripts/uv_install_test.sh`) — `uv add` of real packages into a fresh
   project and virtualenv through each proxy, in a container.
 
-Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
+Resource use is sampled alongside both (`scripts/monitor_resources.sh`, one `docker stats` call
+for both containers per tick; a tick takes the interval plus that call), and
 `scripts/analyze_results_duckdb.sh` turns the raw output into comparison tables.
 
 ## Prerequisites
@@ -60,14 +61,16 @@ Individual stages can be run directly; they build nothing, so bring the proxies 
 called with none. They write to `RESULTS_DIR` from the environment (default `benchmarks/results`);
 `benchmark.sh` exports it from `--results-dir`. `scripts/analyze_results_duckdb.sh [timestamp]
 [results_dir]` reads one run's `resources-`, `wrk-summary-` and `uv-summary-<timestamp>.csv` — the
-latest timestamp when none is given — and has a `--help`.
+latest timestamp over all three when none is given, so the tables never mix runs — and has a `--help`.
 
 ## Cache state
 
 A comparison is meaningless unless both proxies start from the same cache state.
-`scripts/cache_manager.sh` empties both caches before every cold measurement by recreating the
-containers: `docker compose rm -sfv groxpi-bench proxpi-bench`, then `docker compose up -d --wait`,
-which reuses the image built at the start of the run rather than rebuilding it.
+Before every cold measurement, `scripts/cache_manager.sh` empties the cache of the proxy about to be
+measured, and only that one, by recreating its container: `docker compose rm -sfv groxpi-bench` (or
+`proxpi-bench`), then `docker compose up -d --wait` for the same service, which reuses the image built
+at the start of the run rather than rebuilding it. Recreating both would wipe the other proxy's cache
+before its warm run.
 `docker-compose.benchmark.yml` gives each proxy an anonymous cache volume, which `rm -v` deletes; a named
 volume would survive it. The compose file is `benchmarks/docker/docker-compose.benchmark.yml` unless
 `BENCH_COMPOSE_FILE` names another, and the containers must be on the host running the suite, behind
