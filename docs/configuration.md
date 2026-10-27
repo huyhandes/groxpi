@@ -191,7 +191,7 @@ connection setup, headers *and* body. Neither name means what it says:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. Setting it switches telemetry on; each signal posts to `<base>/v1/traces`, `/v1/metrics`, `/v1/logs`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. Setting it switches telemetry on; each signal posts to `<base>/v1/traces`, `/v1/metrics`, `/v1/logs` (a trailing `/` on the base is trimmed). |
 | `OTEL_SERVICE_NAME` | `groxpi` | Service name on exported telemetry. |
 
 `OTEL_EXPORTER_OTLP_ENDPOINT` is the only switch: while it is empty, telemetry is inert — no

@@ -60,44 +60,50 @@ func TestSetupWithUnreachableEndpoint(t *testing.T) {
 // TestSetupPostsEachSignalToItsOTLPPath pins the documented contract that
 // OTEL_EXPORTER_OTLP_ENDPOINT is a collector base URL: each signal is posted
 // to <base>/v1/traces, /v1/metrics and /v1/logs, as an OTel collector expects.
+// A trailing slash on the base URL must not change the paths: the log exporter
+// joins without cleaning and would post to //v1/logs.
 func TestSetupPostsEachSignalToItsOTLPPath(t *testing.T) {
-	var mu sync.Mutex
-	paths := map[string]bool{}
-	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		paths[r.URL.Path] = true
-		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer collector.Close()
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
+	for _, suffix := range []string{"", "/"} {
+		t.Run("suffix="+suffix, func(t *testing.T) {
+			var mu sync.Mutex
+			paths := map[string]bool{}
+			collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				paths[r.URL.Path] = true
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer collector.Close()
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL+suffix)
 
-	shutdown, err := Setup(context.Background(), true, "groxpi")
-	if err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
+			shutdown, err := Setup(context.Background(), true, "groxpi")
+			if err != nil {
+				t.Fatalf("Setup: %v", err)
+			}
 
-	_, span := Tracer().Start(context.Background(), "request")
-	span.End()
-	counter, err := Meter().Int64Counter("groxpi.test.counter")
-	if err != nil {
-		t.Fatalf("counter: %v", err)
-	}
-	counter.Add(context.Background(), 1)
-	var rec otelapilog.Record
-	rec.SetBody(attribute.StringValue("hello"))
-	otellog.GetLoggerProvider().Logger(ScopeName).Emit(context.Background(), rec)
+			_, span := Tracer().Start(context.Background(), "request")
+			span.End()
+			counter, err := Meter().Int64Counter("groxpi.test.counter")
+			if err != nil {
+				t.Fatalf("counter: %v", err)
+			}
+			counter.Add(context.Background(), 1)
+			var rec otelapilog.Record
+			rec.SetBody(attribute.StringValue("hello"))
+			otellog.GetLoggerProvider().Logger(ScopeName).Emit(context.Background(), rec)
 
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
+			if err := shutdown(context.Background()); err != nil {
+				t.Fatalf("shutdown: %v", err)
+			}
 
-	mu.Lock()
-	defer mu.Unlock()
-	for _, want := range []string{"/v1/traces", "/v1/metrics", "/v1/logs"} {
-		if !paths[want] {
-			t.Errorf("collector never received a POST to %s; got %v", want, paths)
-		}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, want := range []string{"/v1/traces", "/v1/metrics", "/v1/logs"} {
+				if !paths[want] {
+					t.Errorf("collector never received a POST to %s; got %v", want, paths)
+				}
+			}
+		})
 	}
 }
 

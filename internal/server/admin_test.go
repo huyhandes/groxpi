@@ -158,6 +158,27 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 	assert.Contains(t, paged, `href="/admin?page=2&amp;q=p0"`, "the pager keeps the filter")
 }
 
+// TestAdminRows_EvictConfirmsAndReportsFailure pins the Evict button's two
+// guards: the browser asks before deleting, naming the package and both
+// places it is removed from, and a refused or failed DELETE shows its reply in
+// a status line outside the table, which survives the reload that follows.
+func TestAdminRows_EvictConfirmsAndReportsFailure(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	path := filepath.Join(h.cacheDir, "packages", "needle", "needle-1.0.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+
+	rows := string(readBody(t, authGet(h.mux, "/admin/rows")))
+	assert.Contains(t, rows, `hx-confirm="Evict needle? This deletes it from the cache and from the object store, if one is configured."`)
+	assert.Contains(t, rows, `hx-on::after-request="document.getElementById('evict-status').textContent = event.detail.successful ? '' : 'Evict failed: ' + (event.detail.xhr.responseText || event.detail.xhr.status); htmx.trigger(document.body, 'cache-changed')"`)
+
+	page := string(readBody(t, authGet(h.mux, "/admin")))
+	assert.Contains(t, page, `id="evict-status"`)
+	assert.Less(t, strings.Index(page, `id="evict-status"`), strings.Index(page, `id="cache"`),
+		"the status line sits outside the table the reload replaces")
+}
+
 // TestAdminPage_FilterRestartsAtPageOne pins that a new filter on page N starts
 // at page 1 of the matches: the page travels in a hidden input outside the
 // filter form, so a no-JS submit sends only q, while the poll includes it and

@@ -271,10 +271,12 @@ as long as the collector keeps the series.
 ```
 
 The request span carries `http.response.status_code`; a 5xx sets the span's status to error. A
-handler that panics is still recorded under its route, as a 500 with error status, and still gets
-its access log line. A handler that aborts with `http.ErrAbortHandler` keeps the status already
-sent, gets `http.request.aborted=true` and error status `aborted`, and its access line carries
-`aborted=true`.
+handler that panics is still recorded under its route with error status `panic`, and still gets
+its access log line: as a 500 if it wrote nothing, otherwise with the status already sent. A handler
+that aborts with `http.ErrAbortHandler` keeps the status already sent, gets
+`http.request.aborted=true` and error status `aborted`, and its access line carries `aborted=true`;
+if it aborted before writing anything, the span has no status code and the access line logs
+status 0.
 
 `groxpi.upstream.fetch.duration` is recorded when the spool is verified, so it never includes
 `storage.upload`.

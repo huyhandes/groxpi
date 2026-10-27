@@ -390,6 +390,11 @@ func panickingRouter() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		panic(http.ErrAbortHandler)
 	})
+	mux.HandleFunc("GET /late-boom/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		panic("boom")
+	})
+	mux.HandleFunc("GET /early-abort/{name}", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
 	return recoverPanics(traceRequests(mux))
 }
 
@@ -410,7 +415,7 @@ func TestTelemetry_PanickingRequestIsTracedAndLogged(t *testing.T) {
 	require.NotNil(t, span, "the panicking request's span must be named after its route")
 	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusInternalServerError))
 	assert.Equal(t, codes.Error, span.Status().Code)
-	assert.Equal(t, http.StatusText(http.StatusInternalServerError), span.Status().Description)
+	assert.Equal(t, "panic", span.Status().Description)
 
 	assert.Contains(t, logs.String(), `"msg":"request"`)
 	assert.Contains(t, logs.String(), `"status":500`)
@@ -440,6 +445,48 @@ func TestTelemetry_AbortedRequestIsMarked(t *testing.T) {
 
 	assert.Contains(t, logs.String(), `"aborted":true`)
 	assert.Contains(t, logs.String(), `"path":"/abort/x"`)
+}
+
+// TestTelemetry_PanicAfterWriteKeepsSentStatus: a handler that panics after
+// sending its status line cannot turn it into a 500. The span and access line
+// record the status the client actually got; the span is still an error.
+func TestTelemetry_PanicAfterWriteKeepsSentStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/late-boom/x", nil))
+
+	span := findSpan(rec, "GET /late-boom/{name}")
+	require.NotNil(t, span)
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusAccepted))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Equal(t, "panic", span.Status().Description)
+	assert.Contains(t, logs.String(), `"status":202`)
+}
+
+// TestTelemetry_AbortBeforeWriteClaimsNoStatus: an abort before anything was
+// written sent the client no status, so neither the span nor the access line
+// may claim a 200.
+func TestTelemetry_AbortBeforeWriteClaimsNoStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	func() {
+		defer func() { _ = recover() }()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/early-abort/x", nil))
+	}()
+
+	span := findSpan(rec, "GET /early-abort/{name}")
+	require.NotNil(t, span)
+	for _, kv := range span.Attributes() {
+		assert.NotEqual(t, attribute.Key("http.response.status_code"), kv.Key, "no status was sent")
+	}
+	assert.Contains(t, span.Attributes(), attribute.Bool("http.request.aborted", true))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Contains(t, logs.String(), `"status":0`)
+	assert.Contains(t, logs.String(), `"aborted":true`)
 }
 
 // TestTelemetry_ServerErrorSetsSpanStatus: a 5xx response marks the request
