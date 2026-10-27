@@ -119,9 +119,11 @@ func recoverPanics(next http.Handler) http.Handler {
 // nothing about it.
 //
 // The span and the access line are finished in a defer, so a panicking handler
-// is recorded too: a plain panic as a 500 (what recoverPanics answers), an
-// http.ErrAbortHandler as aborted with the status already sent. The panic is
-// then re-raised for recoverPanics and net/http to handle as before.
+// is recorded too: a plain panic as an error span with a 500 (what
+// recoverPanics answers) or, after a write, the status already sent; an
+// http.ErrAbortHandler as aborted with the status already sent, or none if
+// nothing was written (logged as status 0). The panic is then re-raised for
+// recoverPanics and net/http to handle as before.
 func traceRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -133,13 +135,21 @@ func traceRequests(next http.Handler) http.Handler {
 		r = r.WithContext(ctx)
 		defer func() {
 			rec := recover()
+			// status 0 means nothing reached the client: only an abort before
+			// the first write leaves it so. A plain panic with nothing written
+			// is answered 500 by recoverPanics; one after a write keeps the
+			// status already sent.
 			status := sw.status()
-			aborted := false
+			aborted, panicked := false, false
 			if rec != nil {
 				if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 					aborted = true
+					status = sw.code
 				} else {
-					status = http.StatusInternalServerError
+					panicked = true
+					if sw.code == 0 {
+						status = http.StatusInternalServerError
+					}
 				}
 			}
 
@@ -151,8 +161,12 @@ func traceRequests(next http.Handler) http.Handler {
 				route = r.Method + " unmatched"
 			}
 			span.SetName(route)
-			span.SetAttributes(attribute.Int("http.response.status_code", status))
+			if status != 0 {
+				span.SetAttributes(attribute.Int("http.response.status_code", status))
+			}
 			switch {
+			case panicked:
+				span.SetStatus(codes.Error, "panic")
 			case aborted:
 				span.SetAttributes(attribute.Bool("http.request.aborted", true))
 				span.SetStatus(codes.Error, "aborted")

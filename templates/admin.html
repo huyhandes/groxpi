@@ -14,7 +14,7 @@
   tr.file td:first-child { padding-left: 2rem; font-family: ui-monospace, monospace; font-size: .9em; }
   .muted { color: #777; }
   .errors { border: 1px solid #c33; padding: .5rem 1rem; margin: 1rem 0; }
-  .errors li { color: #c33; }
+  .errors li, #evict-status { color: #c33; }
   form, .controls { display: flex; gap: .5rem; margin: .75rem 0; }
   input { padding: .3rem .5rem; }
 </style>
@@ -57,6 +57,10 @@
      hx-trigger="every 3s [!document.hidden]" hx-swap="innerHTML">
 {{template "inflight" .}}
 </div>
+
+<!-- An Evict button asks first (hx-confirm), then writes a failed DELETE's
+     reply here; it sits outside #cache so the reload that follows keeps it. -->
+<p id="evict-status" role="status"></p>
 
 <!-- The package table walks the cache, so it never polls: it reloads on a
      filter change, the Refresh button, an eviction, or a finished download. -->

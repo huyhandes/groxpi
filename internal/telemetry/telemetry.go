@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -66,6 +67,15 @@ func Setup(ctx context.Context, enabled bool, serviceName string) (shutdown func
 	// OTEL_EXPORTER_OTLP_ENDPOINT as a base URL with /v1/<signal> appended, and
 	// OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT used as given, overriding the base.
 	// Passing an endpoint option here would override both.
+	//
+	// The log exporter appends /v1/logs to the base without cleaning it, so a
+	// trailing slash would post logs to //v1/logs. Trim it in the environment
+	// the exporters read.
+	if base := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); strings.HasSuffix(base, "/") {
+		if err := os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", strings.TrimRight(base, "/")); err != nil {
+			return nil, fmt.Errorf("failed to normalise OTEL_EXPORTER_OTLP_ENDPOINT: %w", err)
+		}
+	}
 	traceExp, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)

@@ -197,7 +197,8 @@ a finished download or promotion, an eviction, a size or TTL eviction — so whe
 differs from the current one the reply carries `HX-Trigger: cache-changed`, even for a download that
 started and finished between two polls. A missing or malformed `gen` triggers nothing. The package table,
 `GET /admin/rows`, walks the cache, so it reloads only on that event, a filter change, the Refresh
-button, or an eviction from the page.
+button, or an eviction from the page. The page's Evict button asks for confirmation first, naming the
+package; a refused or failed `DELETE` shows its reply in a status line above the table.
 
 `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
 malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
