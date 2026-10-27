@@ -16,28 +16,29 @@ func TestParseLevel(t *testing.T) {
 	testCases := []struct {
 		input    string
 		expected slog.Level
+		ok       bool
 	}{
-		{"DEBUG", slog.LevelDebug},
-		{"debug", slog.LevelDebug},
-		{"Debug", slog.LevelDebug},
-		{"INFO", slog.LevelInfo},
-		{"info", slog.LevelInfo},
-		{"WARN", slog.LevelWarn},
-		{"WARNING", slog.LevelWarn},
-		{"warn", slog.LevelWarn},
-		{"ERROR", slog.LevelError},
-		{"error", slog.LevelError},
-		{"FATAL", LevelFatal},
-		{"fatal", LevelFatal},
-		{"INVALID", slog.LevelInfo}, // default fallback
-		{"", slog.LevelInfo},        // default fallback
+		{"DEBUG", slog.LevelDebug, true},
+		{"debug", slog.LevelDebug, true},
+		{"Debug", slog.LevelDebug, true},
+		{"INFO", slog.LevelInfo, true},
+		{"info", slog.LevelInfo, true},
+		{"WARN", slog.LevelWarn, true},
+		{"WARNING", slog.LevelWarn, true},
+		{"warn", slog.LevelWarn, true},
+		{"ERROR", slog.LevelError, true},
+		{"error", slog.LevelError, true},
+		{"FATAL", LevelFatal, true},
+		{"fatal", LevelFatal, true},
+		{"INVALID", slog.LevelInfo, false}, // default fallback
+		{"", slog.LevelInfo, true},         // unset is the default, not a mistake
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.input, func(t *testing.T) {
-			result := ParseLevel(tc.input)
-			if result != tc.expected {
-				t.Errorf("parseLevel(%q) = %v, want %v", tc.input, result, tc.expected)
+			result, ok := parseLevel(tc.input)
+			if result != tc.expected || ok != tc.ok {
+				t.Errorf("parseLevel(%q) = %v, %v; want %v, %v", tc.input, result, ok, tc.expected, tc.ok)
 			}
 		})
 	}

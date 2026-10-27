@@ -76,14 +76,9 @@ func warnInvalid(key, value, fallback string) {
 		"default", fallback)
 }
 
-// ParseLevel converts a string level to a slog.Level; anything unknown is INFO.
-func ParseLevel(level string) slog.Level {
-	l, _ := parseLevel(level)
-	return l
-}
-
-// parseLevel is ParseLevel that also reports whether the name was recognised.
-// An empty name is the unset default, not a mistake.
+// parseLevel converts a level name to a slog.Level, reporting whether the name
+// was recognised; anything unknown is INFO. An empty name is the unset default,
+// not a mistake.
 func parseLevel(level string) (slog.Level, bool) {
 	switch strings.ToUpper(level) {
 	case "DEBUG":

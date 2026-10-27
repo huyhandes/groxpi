@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -377,4 +379,86 @@ func TestTelemetry_IndexCacheEvictionIsCounted(t *testing.T) {
 	assert.Greater(t, collect(t, reader).value("groxpi.cache.evictions", indexLayer),
 		before.value("groxpi.cache.evictions", indexLayer),
 		"an over-budget index cache must count its evictions")
+}
+
+// panickingRouter is the production middleware stack over a mux whose handlers
+// panic, the plain way and the http.ErrAbortHandler way.
+func panickingRouter() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /boom/{name}", func(http.ResponseWriter, *http.Request) { panic("boom") })
+	mux.HandleFunc("GET /abort/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		panic(http.ErrAbortHandler)
+	})
+	return recoverPanics(traceRequests(mux))
+}
+
+// TestTelemetry_PanickingRequestIsTracedAndLogged: a handler panic must not
+// erase the request from the trace or the access log. The span is still named
+// after its route and carries a 500 and an error status, the access line is
+// still written, and the panic still reaches recoverPanics, which answers 500.
+func TestTelemetry_PanickingRequestIsTracedAndLogged(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	w := httptest.NewRecorder()
+	panickingRouter().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/boom/x", nil))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+
+	span := findSpan(rec, "GET /boom/{name}")
+	require.NotNil(t, span, "the panicking request's span must be named after its route")
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusInternalServerError))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Equal(t, http.StatusText(http.StatusInternalServerError), span.Status().Description)
+
+	assert.Contains(t, logs.String(), `"msg":"request"`)
+	assert.Contains(t, logs.String(), `"status":500`)
+	assert.Contains(t, logs.String(), `"path":"/boom/x"`)
+}
+
+// TestTelemetry_AbortedRequestIsMarked: http.ErrAbortHandler is net/http's
+// deliberate abort, not a server error. The span and access line say aborted,
+// keep the status already sent, and the abort still reaches net/http.
+func TestTelemetry_AbortedRequestIsMarked(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	func() {
+		defer func() {
+			assert.Equal(t, http.ErrAbortHandler, recover(), "the abort must be re-panicked")
+		}()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/abort/x", nil))
+	}()
+
+	span := findSpan(rec, "GET /abort/{name}")
+	require.NotNil(t, span, "the aborted request's span must be named after its route")
+	assert.Contains(t, span.Attributes(), attribute.Bool("http.request.aborted", true))
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusOK))
+	assert.Equal(t, codes.Error, span.Status().Code)
+
+	assert.Contains(t, logs.String(), `"aborted":true`)
+	assert.Contains(t, logs.String(), `"path":"/abort/x"`)
+}
+
+// TestTelemetry_ServerErrorSetsSpanStatus: a 5xx response marks the request
+// span as an error; a 4xx does not.
+func TestTelemetry_ServerErrorSetsSpanStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /bad", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
+	mux.HandleFunc("GET /missing", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	h := traceRequests(mux)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/bad", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/missing", nil))
+
+	bad := findSpan(rec, "GET /bad")
+	require.NotNil(t, bad)
+	assert.Equal(t, codes.Error, bad.Status().Code)
+	assert.Equal(t, http.StatusText(http.StatusBadGateway), bad.Status().Description)
+
+	missing := findSpan(rec, "GET /missing")
+	require.NotNil(t, missing)
+	assert.Equal(t, codes.Unset, missing.Status().Code)
 }

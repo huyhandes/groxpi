@@ -37,7 +37,7 @@ func TestStartupWithoutOTLPEndpoint(t *testing.T) {
 		t.Fatalf("expected no OTLP endpoint, got %q", cfg.OTLPEndpoint)
 	}
 
-	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint != "", cfg.ServiceName)
 	if err != nil {
 		t.Fatalf("telemetry setup must not fail without a collector: %v", err)
 	}

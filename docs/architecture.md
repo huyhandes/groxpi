@@ -233,7 +233,8 @@ configured — to OpenTelemetry through the `otelslog` bridge, carrying the trac
 the request that produced them. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset, all three signals are inert:
 no providers, no connection attempt, no startup dependency.
 
-All three signals leave over OTLP/HTTP to one endpoint. There is **no** Prometheus scrape endpoint and
+All three signals leave over OTLP/HTTP to the collector that variable names (or to the standard
+per-signal endpoint variables, which override it). There is **no** Prometheus scrape endpoint and
 no `/metrics` route; `monitoring/prometheus.yml` scrapes a collector. See
 [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md).
 
@@ -268,6 +269,12 @@ as long as the collector keeps the series.
    ├─ storage.put          (the spool: copy, hash, verify)
    └─ storage.upload       (the PUT to the durable store, hybrid and s3)
 ```
+
+The request span carries `http.response.status_code`; a 5xx sets the span's status to error. A
+handler that panics is still recorded under its route, as a 500 with error status, and still gets
+its access log line. A handler that aborts with `http.ErrAbortHandler` keeps the status already
+sent, gets `http.request.aborted=true` and error status `aborted`, and its access line carries
+`aborted=true`.
 
 `groxpi.upstream.fetch.duration` is recorded when the spool is verified, so it never includes
 `storage.upload`.
