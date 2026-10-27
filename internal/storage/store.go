@@ -127,6 +127,7 @@ type Store struct {
 	flights    map[string]*flight
 	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
 	commits    [commitSlots]uint64  // per commitSlot, bumped at each post-commit unregister, under mu
+	evictions  uint64               // bumped by each DeletePrefix before it marks, under mu
 	slotSeed   maphash.Seed         // commitSlot's hash seed, fixed for the Store's life
 	leaders    sync.WaitGroup
 }
@@ -262,18 +263,20 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, seen := s.join(key)
+	f, seen, gen := s.join(key)
 	if f != nil {
 		return f.open(ctx)
 	}
 
 	// A flight that commits between the lookup and the lock below changes its
 	// key's commit slot; the lookup then runs once more instead of fetching again.
+	// A DeletePrefix in that gap finds no flight to mark, so a changed eviction
+	// generation also looks again, else a promotion would restore what it deleted.
 	slot := s.commitSlot(key)
 	var promote *download.File
 	for retried := false; ; retried = true {
 		var obj *Object
-		obj, promote = s.lookup(ctx, key, file, !retried) // one miss per Open
+		obj, promote = s.lookup(ctx, key, file, !retried) // one outcome (the first lookup's) per Open
 		if obj != nil {
 			return obj, nil
 		}
@@ -285,9 +288,10 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 			return nil, newRedirectError(t, telemetry.RedirectCachingDisabled, fmt.Errorf("%w: %s", ErrNotFound, key))
 		}
 		s.mu.Lock()
-		if retried || s.commits[slot] == seen || s.flights[key] != nil {
+		if s.flights[key] != nil || (s.evictions == gen && (retried || s.commits[slot] == seen)) {
 			break
 		}
+		gen = s.evictions
 		s.mu.Unlock()
 		if promote != nil {
 			_ = promote.Body.Close()
@@ -316,15 +320,15 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 }
 
 // join refs the flight for key, if any, and returns the commit count seen in
-// key's slot.
-func (s *Store) join(key string) (*flight, uint64) {
+// key's slot and the eviction generation.
+func (s *Store) join(key string) (*flight, uint64, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.flights[key]
 	if f != nil {
 		f.ref()
 	}
-	return f, s.commits[s.commitSlot(key)]
+	return f, s.commits[s.commitSlot(key)], s.evictions
 }
 
 // commitSlot is the slot of s.commits that counts the commits of key: a hash
@@ -355,18 +359,21 @@ func (s *Store) drop(f *flight, committed bool) {
 // lookup finds a stored object. In hybrid mode a cache miss with a durable hit
 // returns the durable body as promote, to be spooled into the cache like a
 // download. A backend failure other than a miss is logged and treated as a miss.
-// Misses are counted only with countMiss, so a retried lookup is not a second.
-func (s *Store) lookup(ctx context.Context, key, file string, countMiss bool) (*Object, *download.File) {
+// Hits and misses are counted only with count, so a retried lookup records
+// nothing on top of the first.
+func (s *Store) lookup(ctx context.Context, key, file string, count bool) (*Object, *download.File) {
 	ctx, span := telemetry.Tracer().Start(ctx, "storage.exists")
 	defer span.End()
 
 	if s.cache != nil {
 		f, info, err := s.cache.Get(ctx, key)
 		if err == nil {
-			telemetry.CacheHit(ctx, telemetry.LayerLocal)
+			if count {
+				telemetry.CacheHit(ctx, telemetry.LayerLocal)
+			}
 			return &Object{ReadSeekCloser: f, Name: file, Size: info.Size, ModTime: info.LastModified, ContentType: contentType(file)}, nil
 		}
-		if countMiss {
+		if count {
 			telemetry.CacheMiss(ctx, telemetry.LayerLocal)
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -384,7 +391,7 @@ func (s *Store) lookup(ctx context.Context, key, file string, countMiss bool) (*
 	// miss here, never a 200 that dies after its headers.
 	rc, info, err := s.durable.Get(rctx, key)
 	if err != nil {
-		if countMiss {
+		if count {
 			telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -394,7 +401,9 @@ func (s *Store) lookup(ctx context.Context, key, file string, countMiss bool) (*
 		}
 		return nil, nil
 	}
-	telemetry.CacheHit(ctx, telemetry.LayerRemote)
+	if count {
+		telemetry.CacheHit(ctx, telemetry.LayerRemote)
+	}
 	if s.cache == nil {
 		// No ETag: a local hit sends none, and S3 hits match it header for header.
 		return &Object{
@@ -559,7 +568,7 @@ type commitFunc func(ctx context.Context, f *flight, sp *os.File, written int64,
 func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
 	if s.evicted(f) {
 		_ = os.Remove(sp.Name())
-	} else if err := s.cache.commit(ctx, sp.Name(), f.key, written); err != nil {
+	} else if err := s.syncCommit(ctx, sp, f.key, written); err != nil {
 		// Safe to log raw: a local filesystem error, no index URL in it.
 		slog.ErrorContext(ctx, "Failed to commit download to cache", "error", err, "key", f.key)
 		_ = os.Remove(sp.Name())
@@ -568,6 +577,16 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 	}
 	s.unregisterCommitted(f)
 	f.finish(nil)
+}
+
+// syncCommit flushes the spool to disk before renaming it into the cache, so a
+// host crash cannot leave a renamed but empty or partial file to be served as a
+// hit.
+func (s *Store) syncCommit(ctx context.Context, sp *os.File, key string, written int64) error {
+	if err := sp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync spool file: %w", err)
+	}
+	return s.cache.commit(ctx, sp.Name(), key, written)
 }
 
 // commitHybrid is commitLocal, then the upload to the durable store unless the
@@ -684,6 +703,7 @@ func (s *Store) Snapshot() []CacheEntry {
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	var uploads []chan struct{}
 	s.mu.Lock()
+	s.evictions++ // an Open between its lookup and its flight looks again
 	mark := func(f *flight) {
 		if strings.HasPrefix(f.key, prefix) {
 			f.evicted = true
