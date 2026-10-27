@@ -135,8 +135,9 @@ type View struct {
 	Packages    []Package // the current page only
 	Errors      []Failure
 	Downloading []Download // filled by the caller from InFlight
-	Size        int64      // across every page
-	Total       int        // packages across every page
+	Size        int64      // across every page of the matches
+	Total       int        // matching packages across every page
+	Query       string     // the normalized filter; empty lists everything
 
 	// Page is 1-based; PrevPage and NextPage are 0 when there is no such page.
 	Page, PrevPage, NextPage int
@@ -178,15 +179,19 @@ type Download struct {
 // List groups one page of the cache snapshot into the page's rows. Storage keys
 // already encode the package and filename in a fixed shape, so grouping is
 // string manipulation and needs no second index.
-func (s *Service) List(_ context.Context, page int) View {
+//
+// A non-empty query keeps only packages whose name contains it (case-folded),
+// and is applied before paging so a match on any page is found.
+func (s *Service) List(_ context.Context, page int, query string) View {
 	now := time.Now()
-	view := View{Errors: s.errors.list(), Page: page}
+	query = NormalizeQuery(query)
+	view := View{Errors: s.errors.list(), Page: page, Query: query}
 
 	// The listing is the cache's own walk; the durable store is never listed.
 	byName := make(map[string]*Package)
 	for _, entry := range s.store.Snapshot() {
 		packageName, fileName, ok := splitPackageKey(entry.Key)
-		if !ok {
+		if !ok || !strings.Contains(packageName, query) {
 			continue
 		}
 
@@ -232,6 +237,10 @@ func (s *Service) List(_ context.Context, page int) View {
 	}
 	return view
 }
+
+// NormalizeQuery is the form a filter is matched in: trimmed and lower-cased,
+// as cached package names are.
+func NormalizeQuery(q string) string { return strings.ToLower(strings.TrimSpace(q)) }
 
 // InFlight lists the downloads running now, for the page's "Downloading now"
 // rows.

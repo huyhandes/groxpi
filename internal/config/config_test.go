@@ -342,6 +342,12 @@ func TestMalformedEnvIsLoud(t *testing.T) {
 		{"GROXPI_INDEX_CACHE_SIZE", "512MB", func(c *Config) any { return c.IndexCacheSize }, int64(256 * 1024 * 1024)},
 		{"GROXPI_CACHE_SIZE", "-1", func(c *Config) any { return c.CacheSize }, int64(5 * 1024 * 1024 * 1024)},
 		{"GROXPI_DOWNLOAD_TIMEOUT", "later", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		// Bare seconds that do not fit a time.Duration are malformed, not a
+		// wrapped or saturated budget.
+		{"GROXPI_DOWNLOAD_TIMEOUT", "NaN", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		{"GROXPI_DOWNLOAD_TIMEOUT", "Inf", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		{"GROXPI_DOWNLOAD_TIMEOUT", "-Inf", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
+		{"GROXPI_DOWNLOAD_TIMEOUT", "1e300", func(c *Config) any { return c.DownloadTimeout }, 900 * time.Millisecond},
 		{"GROXPI_INDEX_TTL", "-5m", func(c *Config) any { return c.IndexTTL }, 30 * time.Minute},
 	}
 

@@ -161,8 +161,12 @@ func (s *Server) renderAdmin(w http.ResponseWriter, r *http.Request, name string
 	if err != nil || page < 1 {
 		page = 1
 	}
-	view := s.admin.List(r.Context(), page)
-	view.Downloading = s.admin.InFlight()
+	view := s.admin.List(r.Context(), page, r.URL.Query().Get("q"))
+	for _, d := range s.admin.InFlight() {
+		if strings.Contains(d.Package, view.Query) {
+			view.Downloading = append(view.Downloading, d)
+		}
+	}
 	if err := s.templates.ExecuteTemplate(&buf, name, view); err != nil {
 		slog.ErrorContext(r.Context(), "Failed to render admin page", "error", err, "template", name)
 		http.Error(w, "Failed to render page", http.StatusInternalServerError)
@@ -179,7 +183,7 @@ func handleAdminAsset(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "asset unavailable", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	_, _ = w.Write(body)
 }

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -61,15 +62,19 @@ func Setup(ctx context.Context, endpoint, serviceName string) (shutdown func(con
 		return nil, fmt.Errorf("failed to build telemetry resource: %w", err)
 	}
 
-	traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(endpoint))
+	// endpoint is the collector base URL (OTEL_EXPORTER_OTLP_ENDPOINT). The
+	// exporters' WithEndpointURL takes the full per-signal URL and posts to its
+	// path as given, so the OTLP/HTTP signal paths are appended here.
+	base := strings.TrimSuffix(endpoint, "/")
+	traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(base+"/v1/traces"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
-	metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(endpoint))
+	metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(base+"/v1/metrics"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP metric exporter: %w", err)
 	}
-	logExp, err := otlploghttp.New(ctx, otlploghttp.WithEndpointURL(endpoint))
+	logExp, err := otlploghttp.New(ctx, otlploghttp.WithEndpointURL(base+"/v1/logs"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP log exporter: %w", err)
 	}

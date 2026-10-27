@@ -66,7 +66,7 @@ func postPrefetch(router http.Handler, pkg string, auth bool) *http.Response {
 // cachedFileNames reads the file names out of the same snapshot the page renders.
 func cachedFileNames(h *adminHarness) []string {
 	var names []string
-	for _, pkg := range h.svc.List(context.Background(), 1).Packages {
+	for _, pkg := range h.svc.List(context.Background(), 1, "").Packages {
 		for _, f := range pkg.Files {
 			names = append(names, f.Name)
 		}
@@ -112,6 +112,35 @@ func TestAdminRows_RenderPageQuery(t *testing.T) {
 	assert.Equal(t, first, string(readBody(t, authGet(h.mux, "/admin/rows?page=bogus"))), "a malformed page is page 1")
 	assert.Equal(t, second, string(readBody(t, authGet(h.mux, "/admin/rows?page=9223372036854775807"))),
 		"a page past the end is the last page, and must not overflow")
+}
+
+// TestAdminRows_FilterQuery pins the HTTP side of the filter: ?q= reaches the
+// listing (so a match past the first page is found), the page keeps it in the
+// box, the poll and the pager links.
+func TestAdminRows_FilterQuery(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	plantFile := func(pkg, file string) {
+		path := filepath.Join(h.cacheDir, "packages", pkg, file)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+	}
+	for i := range 2*admin.PageSize + 1 {
+		plantFile(fmt.Sprintf("p%03d", i), "a.tar.gz")
+	}
+	plantFile("zz-needle", "needle-1.0.tar.gz")
+
+	rows := string(readBody(t, authGet(h.mux, "/admin/rows?q=Needle")))
+	assert.Equal(t, 1, strings.Count(rows, `class="pkg"`))
+	assert.Contains(t, rows, `data-package="zz-needle"`)
+	assert.Contains(t, rows, "1 package(s)")
+
+	page := string(readBody(t, authGet(h.mux, "/admin?q=needle")))
+	assert.Contains(t, page, `value="needle"`, "the box shows the active filter")
+	assert.Contains(t, page, `hx-get="/admin/rows?page=1&amp;q=needle"`, "the poll keeps the filter")
+
+	paged := string(readBody(t, authGet(h.mux, "/admin/rows?q=p0")))
+	assert.Contains(t, paged, `href="/admin?page=2&amp;q=p0"`, "the pager keeps the filter")
 }
 
 // ---------------------------------------------------------------------------

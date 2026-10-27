@@ -199,26 +199,20 @@ func TestFileInfo_IsYanked(t *testing.T) {
 // TestFileInfo_GetYankedReason tests the GetYankedReason method
 func TestFileInfo_GetYankedReason(t *testing.T) {
 	testCases := []struct {
-		name         string
-		yanked       any
-		yankedReason string
-		expected     string
+		name     string
+		yanked   any
+		expected string
 	}{
-		{"reason from YankedReason field", false, "explicit reason", "explicit reason"},
-		{"reason from string yanked", "implicit reason", "", "implicit reason"},
-		{"YankedReason takes precedence", "implicit", "explicit", "explicit"},
-		{"empty reason", false, "", ""},
-		{"nil yanked", nil, "", ""},
-		{"bool true yanked no reason", true, "", ""},
-		{"empty string yanked", "", "", ""},
+		{"reason from string yanked", "implicit reason", "implicit reason"},
+		{"not yanked", false, ""},
+		{"nil yanked", nil, ""},
+		{"bool true yanked no reason", true, ""},
+		{"empty string yanked", "", ""},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			fileInfo := &FileInfo{
-				Yanked:       tc.yanked,
-				YankedReason: tc.yankedReason,
-			}
+			fileInfo := &FileInfo{Yanked: tc.yanked}
 			result := fileInfo.GetYankedReason()
 			if result != tc.expected {
 				t.Errorf("GetYankedReason() = %q, expected %q", result, tc.expected)

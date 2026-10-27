@@ -453,8 +453,7 @@ type wireFile struct {
 	Hashes         map[string]string `json:"hashes"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	URL            string            `json:"url"`
-	Yanked         bool              `json:"yanked,omitempty"`
-	YankedReason   string            `json:"yanked-reason,omitempty"`
+	Yanked         any               `json:"yanked,omitempty"`
 }
 
 type wireFiles struct {

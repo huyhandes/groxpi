@@ -52,9 +52,11 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
   (package name, href, file name, requires-python, yanked reason) is HTML-escaped, so `>=3.8` is
   emitted as `&gt;=3.8`.
 - PEP 658 metadata availability is passed through as the upstream stated it — `true` or a hash map —
-  under both the `core-metadata` and `dist-info-metadata` keys in JSON (PEP 714) and both
-  `data-core-metadata` and `data-dist-info-metadata` attributes in HTML. Whichever spelling the upstream
-  used, both are emitted. A file the upstream does not mark gets no marker.
+  under the `core-metadata` key only in JSON (PEP 714: servers should not emit the old key in JSON) and
+  under both `data-core-metadata` and `data-dist-info-metadata` attributes in HTML. Either upstream
+  spelling is accepted. A file the upstream does not mark gets no marker.
+- In JSON, every file carries `hashes` (an empty object when the upstream declared none), and a yanked
+  file carries `yanked` as the reason string, or `true` when no reason was given (PEP 691).
 
 ## The root index
 
@@ -180,7 +182,9 @@ download in progress — package, file, bytes so far against the declared size, 
 requests are coalesced onto it — and disappears when nothing is in flight. The page polls
 `GET /admin/rows` for updates. Both `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
 malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
-across pages, and the page's poll keeps the page it was rendered for. The listing shows the local cache only, so in pure `s3`
+across pages, and the page's poll keeps the page it was rendered for. Both also accept `?q=` (trimmed,
+case-insensitive substring of the package name), applied to every cached package before paging and to the
+"Downloading now" rows; the page's filter box submits it and the poll and pager links keep it. The listing shows the local cache only, so in pure `s3`
 mode, which has no cache, the table is empty.
 
 ### `POST /admin/prefetch`

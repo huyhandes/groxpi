@@ -343,25 +343,24 @@ func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) 
 	return root, nil
 }
 
-// The wire shapes below are the typed replacement for the maps the index
-// responses used to be built from. Fields are declared in the key order
-// encoding/json emitted for those maps (alphabetical), so response bytes are
-// unchanged.
+// The wire shapes below are the PEP 691 JSON this proxy serves for a package.
 
 type wireMeta struct {
 	APIVersion string `json:"api-version"`
 }
 
 type wireFile struct {
-	Filename       string            `json:"filename"`
-	Hashes         map[string]string `json:"hashes,omitempty"`
+	Filename string `json:"filename"`
+	// PEP 691: hashes MUST be present, even when empty.
+	Hashes         map[string]string `json:"hashes"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	URL            string            `json:"url"`
-	Yanked         bool              `json:"yanked,omitempty"`
-	YankedReason   string            `json:"yanked-reason,omitempty"`
-	// PEP 714: emit under both keys so old and new installers find it.
-	CoreMetadata     any `json:"core-metadata,omitempty"`
-	DistInfoMetadata any `json:"dist-info-metadata,omitempty"`
+	// PEP 691: yanked is true or the non-empty reason string; omitted when
+	// the file is not yanked.
+	Yanked any `json:"yanked,omitempty"`
+	// PEP 714: JSON servers emit core-metadata only ("should not emit the old
+	// keys in JSON"); the HTML page carries both attributes.
+	CoreMetadata any `json:"core-metadata,omitempty"`
 }
 
 type wireFiles struct {
@@ -385,16 +384,20 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 			RequiresPython: file.RequiresPython,
 			URL:            ProxyFileURL(packageName, file.Name),
 		}
+		if wf.Hashes == nil {
+			wf.Hashes = map[string]string{}
+		}
 		if file.IsYanked() {
 			wf.Yanked = true
-			wf.YankedReason = file.GetYankedReason()
+			if reason := file.GetYankedReason(); reason != "" {
+				wf.Yanked = reason
+			}
 		}
 		if hashes, ok := file.Metadata(); ok {
-			var v any = true
+			wf.CoreMetadata = true
 			if len(hashes) > 0 {
-				v = hashes
+				wf.CoreMetadata = hashes
 			}
-			wf.CoreMetadata, wf.DistInfoMetadata = v, v
 		}
 		body.Files = append(body.Files, wf)
 	}

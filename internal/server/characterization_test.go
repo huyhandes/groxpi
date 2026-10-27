@@ -404,9 +404,8 @@ func characterizeIndex(t *testing.T, e *env) {
 		"files": []any{
 			map[string]any{
 				"filename": demoFile, "url": "/simple/demo/" + demoFile,
-				"hashes":             map[string]any{"sha256": sum(demoWheel)}, // upstream "size" is not re-emitted today
-				"core-metadata":      map[string]any{"sha256": sum(demoMeta)},
-				"dist-info-metadata": map[string]any{"sha256": sum(demoMeta)},
+				"hashes":        map[string]any{"sha256": sum(demoWheel)}, // upstream "size" is not re-emitted today
+				"core-metadata": map[string]any{"sha256": sum(demoMeta)},
 			},
 			map[string]any{
 				"filename": oldFile, "url": "/simple/demo/" + oldFile,
@@ -884,7 +883,7 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body = p.admin(http.MethodGet, "/admin/htmx.min.js", nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=86400"})
+		pin(t, resp, map[string]string{"Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "private, max-age=86400"})
 		assert.NotEmpty(t, body)
 	})
 

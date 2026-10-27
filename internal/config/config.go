@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
@@ -346,7 +347,9 @@ func parseDuration(key, value string, defaultValue time.Duration) time.Duration 
 	d, err := time.ParseDuration(value)
 	if err != nil {
 		seconds, floatErr := strconv.ParseFloat(value, 64)
-		if floatErr != nil {
+		// NaN, ±Inf and anything past ~292 years do not fit a time.Duration;
+		// converting them would wrap or be implementation-defined.
+		if floatErr != nil || math.IsNaN(seconds) || math.Abs(seconds) > math.MaxInt64/1e9 {
 			invalidEnv(key, value, defaultValue)
 			return defaultValue
 		}
