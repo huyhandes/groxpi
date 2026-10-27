@@ -104,8 +104,9 @@ package prefix is what makes `DELETE /cache/<package>` a prefix delete rather th
 Eviction deletes the package from the cache and from the durable store; otherwise the next request
 would restore it from S3. An eviction during a download of the same package wins: the flight still
 serves its readers but stores nothing, and an upload already under way is waited for, then deleted.
-A request that looked the file up just before the eviction, and has not yet started its flight, looks
-again, so a hybrid promotion never writes the deleted file back into the cache.
+A request that looked the file up just before the eviction, or while it was still deleting, and has not
+yet started its flight, looks again; a flight started while the eviction runs stores nothing. So a
+hybrid promotion never writes the deleted file back into the cache.
 The admin listing shows the cache only.
 
 Serving a stored file hands the open object to `http.ServeContent`,

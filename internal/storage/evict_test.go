@@ -179,6 +179,53 @@ func TestStore_EvictCancelledMidUploadDeletesNothing(t *testing.T) {
 	}
 }
 
+// TestStore_PromotionDuringEvictIsNotUndone: a hybrid Open that starts while
+// DeletePrefix is still deleting from the bucket finds the object there and
+// promotes it; that promotion commits after the cache delete, yet stores
+// nothing, so the file is in neither tier and the next Open fetches upstream.
+func TestStore_PromotionDuringEvictIsNotUndone(t *testing.T) {
+	f := &fakeFetcher{body: []byte("upstream bytes")}
+	s, l, bucket, _ := evictStore(t, "hybrid", f)
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
+	bucket.seed(key, []byte("evicted bytes"))
+	bucket.delHold, bucket.delHeld = make(chan struct{}), make(chan struct{})
+	bucket.gate = make(chan struct{})
+	releaseDel, releaseGet := sync.OnceFunc(func() { close(bucket.delHold) }), sync.OnceFunc(func() { close(bucket.gate) })
+	t.Cleanup(releaseDel)
+	t.Cleanup(releaseGet)
+
+	done := deletePrefixAsync(s, mustKey(t, "pkg", ""))
+	select {
+	case <-bucket.delHeld: // marked, and still deleting from the bucket
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeletePrefix never reached the bucket delete")
+	}
+	obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz") // a durable hit: promoted
+	require.NoError(t, err)
+	releaseDel()
+	require.NoError(t, <-done)
+
+	releaseGet() // the promotion finishes and commits after the cache delete
+	_, err = io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond, "the promotion committed")
+
+	ok, err := exists(l, key)
+	require.NoError(t, err)
+	assert.False(t, ok, "the promotion did not restore the evicted file to the cache")
+	assert.Nil(t, bucket.object(key), "gone from the bucket")
+
+	obj, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+	require.NoError(t, err)
+	got, err := io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	require.NoError(t, s.Close())
+	assert.Equal(t, "upstream bytes", string(got))
+	assert.Equal(t, int64(1), f.resolves.Load(), "the next Open fetched upstream")
+}
+
 // list answers a ListObjectsV2 under prefix in one page. Caller holds b.mu.
 func (b *fakeS3) list(w http.ResponseWriter, prefix string) {
 	var body strings.Builder
@@ -201,6 +248,12 @@ func (b *fakeS3) delete(w http.ResponseWriter, r *http.Request) {
 	if err := xml.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
+	}
+	if b.delHold != nil {
+		b.mu.Unlock()
+		b.delOnce.Do(func() { close(b.delHeld) })
+		<-b.delHold
+		b.mu.Lock()
 	}
 	for _, o := range req.Objects {
 		delete(b.objects, "/b/"+o.Key)

@@ -904,6 +904,9 @@ type fakeS3 struct {
 	getHold chan struct{} // the first object GET reads the bucket, signals getHeld, then waits for it to close (set before use)
 	getHeld chan struct{}
 	getOnce sync.Once
+	delHold chan struct{} // DeleteObjects signal delHeld, then wait for it to close (set before use)
+	delHeld chan struct{}
+	delOnce sync.Once
 }
 
 // exists reports whether key is a file in the cache.
