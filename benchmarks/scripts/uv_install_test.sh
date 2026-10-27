@@ -546,7 +546,7 @@ generate_summary_csv() {
 
                     # Try to find package size and dependency info with better parsing
                     local size_raw=$(grep -A2 "✓ $package installed successfully" "$log_file" | grep "Installed size:" | awk '{print $3}' | head -1)
-                    local size_mb="NULL"
+                    local size_mb=""
                     if [ -n "$size_raw" ] && [ "$size_raw" != "unknown" ]; then
                         # Convert size to MB
                         if [[ $size_raw == *"GB"* ]] || [[ $size_raw == *"G"* ]]; then
@@ -559,8 +559,7 @@ generate_summary_csv() {
                     fi
 
                     local deps=$(grep -A3 "✓ $package installed successfully" "$log_file" | grep "Dependencies installed:" | awk '{print $3}' | head -1)
-                    deps="${deps:-NULL}"
-                    if [ "$deps" = "unknown" ]; then deps="NULL"; fi
+                    if [ "$deps" = "unknown" ]; then deps=""; fi
 
                     echo "$TIMESTAMP,$test_start,$service,$test_name,$cache_mode,$package,$install_time,TRUE,$size_mb,$deps,$test_type,$test_start,$test_end" >> "$summary_file"
                 fi
@@ -573,7 +572,7 @@ generate_summary_csv() {
 
                     # Parse batch installation size
                     local size_raw=$(grep -A2 "Batch installation completed" "$log_file" | grep "Total installed size:" | awk '{print $4}' | head -1)
-                    local size_mb="NULL"
+                    local size_mb=""
                     if [ -n "$size_raw" ] && [ "$size_raw" != "unknown" ]; then
                         if [[ $size_raw == *"GB"* ]] || [[ $size_raw == *"G"* ]]; then
                             size_mb=$(echo "$size_raw" | sed 's/[^0-9.]//g' | awk '{print $1 * 1024}')
@@ -585,8 +584,7 @@ generate_summary_csv() {
                     fi
 
                     local deps=$(grep -A3 "Batch installation completed" "$log_file" | grep "Total dependencies:" | awk '{print $3}' | head -1)
-                    deps="${deps:-NULL}"
-                    if [ "$deps" = "unknown" ]; then deps="NULL"; fi
+                    if [ "$deps" = "unknown" ]; then deps=""; fi
 
                     # For batch installations, use a combined package name
                     local batch_packages="batch_all"
@@ -606,7 +604,7 @@ generate_summary_csv() {
                     local package="${BASH_REMATCH[1]}"
                     local install_time="${BASH_REMATCH[2]}"
 
-                    echo "$TIMESTAMP,$test_start,$service,$test_name,$cache_mode,$package,$install_time,FALSE,NULL,NULL,$test_type,$test_start,$test_end" >> "$summary_file"
+                    echo "$TIMESTAMP,$test_start,$service,$test_name,$cache_mode,$package,$install_time,FALSE,,,$test_type,$test_start,$test_end" >> "$summary_file"
                 fi
             done < "$log_file"
         fi
