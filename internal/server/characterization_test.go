@@ -956,8 +956,11 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		require.Eventually(t, func() bool {
 			_, rows := p.admin(http.MethodGet, "/admin/rows", nil)
-			return strings.Contains(string(rows), demoFile)
-		}, 5*time.Second, 10*time.Millisecond, "prefetched file appears in the listing")
+			// The rows also list in-flight downloads by name, and hybrid lists
+			// the file while its S3 upload still holds the flight; a GET then
+			// joins the flight. Wait until it is listed and no flight remains.
+			return strings.Contains(string(rows), demoFile) && server.InFlight(p.srv) == 0
+		}, 5*time.Second, 10*time.Millisecond, "prefetched file is cached and no longer in flight")
 
 		resp, body = p.get("/simple/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
