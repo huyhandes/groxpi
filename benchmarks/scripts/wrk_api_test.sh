@@ -211,14 +211,16 @@ run_wrk_load_test() {
            "$url$endpoint" > "$output_file" 2>&1; then
 
         # wrk counts every response as a request, so error replies would pass
-        # for throughput. Any non-2xx/3xx reply fails the measurement, and the
-        # log is renamed out of the summary CSV's glob so its rate is not reported.
+        # for throughput. wrk's "Non-2xx or 3xx responses" counter, despite its
+        # name, counts only status > 399, so any 4xx/5xx reply fails the
+        # measurement, and the log is renamed out of the summary CSV's glob so
+        # its rate is not reported.
         local non_2xx
         non_2xx=$(awk '/Non-2xx or 3xx responses:/ {print $NF; exit}' "$output_file")
         if [ -n "$non_2xx" ]; then
             local failed_file="${output_file%.log}.failed.log"
             mv "$output_file" "$failed_file"
-            log_error "  Load test got $non_2xx non-2xx/3xx responses; see $failed_file"
+            log_error "  Load test got $non_2xx 4xx/5xx responses; see $failed_file"
             return 1
         fi
 

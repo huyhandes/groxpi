@@ -132,6 +132,18 @@ that proves it. Delete an entry when it ships.
   last-modified only; no access time).
 - **Check:** a server test in s3 mode against the fake bucket asserting rows appear.
 
+### Admin Evict can be undone by an in-flight index lookup
+
+- **Where:** `internal/admin/admin.go` — `Service.Evict`; `internal/index/service.go` —
+  `Service.Resolve`, the `cache.set` calls inside the shared lookup.
+- **What:** `Evict` calls `Invalidate`, but a lookup for the same package already running upstream
+  writes its result into the index cache when it returns, after the invalidation. The evicted
+  listing is back until it expires: the cost is at most one index TTL of stale listing.
+- **Fix:** keep a per-key generation in the index cache, bumped by `invalidate`; the lookup reads it
+  before querying and skips the write when it changed.
+- **Check:** a `testing/synctest` test that holds an upstream lookup, evicts the package, releases the
+  lookup, and asserts the next `Resolve` misses the index cache.
+
 ### The landing page reports a hardcoded version
 
 - **Where:** `internal/config/config.go` — `Version`, the one constant the startup log, the home
