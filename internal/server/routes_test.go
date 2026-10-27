@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -115,6 +116,45 @@ func TestFileRoute_EncodedTraversalIsNotFound(t *testing.T) {
 		}
 	}
 	assert.Zero(t, hits.Load(), "an invalid file name never reaches upstream")
+}
+
+// TestFileRoute_ClientGoneIsNotNotFound: a client that left before the store
+// answered gets nothing written; its request is not recorded as a 404.
+func TestFileRoute_ClientGoneIsNotNotFound(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(up.Close)
+	router := newRoutesServer(t, up.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequestWithContext(ctx, "GET", "/index/pkg/pkg-1.0.tar.gz", nil))
+
+	assert.NotEqual(t, http.StatusNotFound, w.Code)
+	assert.Empty(t, w.Body.String(), "nobody is left to answer")
+	assert.Zero(t, hits.Load(), "a gone client starts no fetch")
+}
+
+// TestIndexRoutes_ClientGoneIsNotAnError: a client that leaves while the index
+// lookup it waits on is still upstream gets nothing written, rather than a 5xx
+// (and an ERROR log line) for a fetch that never failed.
+func TestIndexRoutes_ClientGoneIsNotAnError(t *testing.T) {
+	up := NewFakePyPI(t).SetDelay(300 * time.Millisecond)
+	router := newRoutesServer(t, up.URL)
+
+	for _, path := range []string{"/simple/", "/simple/pkg/"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(ctx, "GET", path, nil))
+		cancel()
+
+		assert.Less(t, w.Code, http.StatusInternalServerError, path)
+		assert.Empty(t, w.Body.String(), "%s: nobody is left to answer", path)
+	}
 }
 
 // TestEvictRoute_InvalidNameIsBadRequest pins A1 on eviction: a package name

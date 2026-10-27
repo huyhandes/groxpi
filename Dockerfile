@@ -8,7 +8,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 # Install build dependencies
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache ca-certificates
 
 # Set working directory
 WORKDIR /build

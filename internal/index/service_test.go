@@ -330,3 +330,138 @@ func TestResolve_ExtraTTLIsSweptWhenPrimaryTTLIsZero(t *testing.T) {
 		assert.Zero(t, b)
 	})
 }
+
+// gatedUpstream holds every query until release is closed, ignoring the query's
+// context: the shared fetch runs detached, so nothing should cancel it.
+type gatedUpstream struct {
+	*fakeUpstream
+	release chan struct{}
+}
+
+func (g *gatedUpstream) GetPackageFiles(ctx context.Context, index config.Index, pkg string) ([]FileInfo, error) {
+	<-g.release
+	return g.fakeUpstream.GetPackageFiles(ctx, index, pkg)
+}
+
+// TestResolve_WaiterCanLeaveASharedFetch: a caller waiting on a lookup another
+// caller started returns as soon as its own context ends, while the shared
+// fetch carries on for the callers still waiting and fills the cache.
+func TestResolve_WaiterCanLeaveASharedFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		left := make(chan error, 1)
+		go func() { _, err := svc.Resolve(ctx, "numpy"); left <- err }()
+		stayed := make(chan error, 1)
+		go func() { _, err := svc.Resolve(t.Context(), "numpy"); stayed <- err }()
+		synctest.Wait()
+
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-left:
+			require.ErrorIs(t, err, context.Canceled)
+		default:
+			t.Fatal("a caller whose context ended is still waiting on the shared fetch")
+		}
+
+		close(up.release)
+		require.NoError(t, <-stayed, "the shared fetch must outlive the caller that started it")
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "the shared fetch filled the cache")
+	})
+}
+
+// TestProxyRoot_WaiterCanLeaveASharedFetch: as for Resolve, a caller of the
+// shared root fetch can leave without failing the callers still waiting.
+func TestProxyRoot_WaiterCanLeaveASharedFetch(t *testing.T) {
+	release := make(chan struct{})
+	var hits sync.Mutex
+	n := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Lock()
+		n++
+		hits.Unlock()
+		<-release
+		_, _ = io.WriteString(w, "root")
+	}))
+	t.Cleanup(up.Close)
+	svc := newTestService(t, &config.Config{IndexURL: up.URL, IndexCacheSize: 1 << 20})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	left := make(chan error, 1)
+	go func() { _, err := svc.ProxyRoot(ctx, "", ""); left <- err }()
+	require.Eventually(t, func() bool { hits.Lock(); defer hits.Unlock(); return n == 1 },
+		5*time.Second, time.Millisecond, "the root fetch never started")
+	stayed := make(chan *RootResponse, 1)
+	go func() { resp, _ := svc.ProxyRoot(t.Context(), "", ""); stayed <- resp }()
+
+	cancel()
+	select {
+	case err := <-left:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a caller whose context ended is still waiting on the shared fetch")
+	}
+
+	close(release)
+	resp := <-stayed
+	require.NotNil(t, resp, "the shared fetch must outlive the caller that started it")
+	assert.Equal(t, "root", string(resp.Body))
+}
+
+// panickyUpstream panics on its first query, as a parser bug fed hostile
+// upstream data would, and answers normally afterwards.
+type panickyUpstream struct {
+	*fakeUpstream
+	panicked bool
+}
+
+func (p *panickyUpstream) GetPackageFiles(ctx context.Context, index config.Index, pkg string) ([]FileInfo, error) {
+	p.mu.Lock()
+	first := !p.panicked
+	p.panicked = true
+	p.mu.Unlock()
+	if first {
+		panic("parser bug")
+	}
+	return p.fakeUpstream.GetPackageFiles(ctx, index, pkg)
+}
+
+// TestResolve_PanicInSharedFetchIsAnError: the shared fetch runs on its own
+// goroutine, where an unrecovered panic would kill the process. It must come
+// back to the caller as an error, and the next lookup must work.
+func TestResolve_PanicInSharedFetchIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := &panickyUpstream{fakeUpstream: newFakeUpstream()}
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "parser bug", "the panic value must reach the error")
+		assert.NotErrorIs(t, err, ErrNotFound, "a panic says nothing about the package")
+
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err, "a panic must not poison the next lookup")
+	})
+}
+
+// TestShared_PanicIsAnError covers the rest of the shared fetch (encoding,
+// caching), which runs on singleflight's goroutine rather than a query's.
+func TestShared_PanicIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), newFakeUpstream())
+		_, err := svc.shared(t.Context(), "k", func() (any, error) { panic("encode bug") })
+		require.ErrorIs(t, err, errPanic)
+		assert.Contains(t, err.Error(), "encode bug")
+
+		v, err := svc.shared(t.Context(), "k", func() (any, error) { return 1, nil })
+		require.NoError(t, err)
+		assert.Equal(t, 1, v)
+	})
+}

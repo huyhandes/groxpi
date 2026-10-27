@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -131,7 +132,7 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 	}
 	telemetry.CacheMiss(ctx, telemetry.LayerIndex)
 
-	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
+	result, err := s.shared(ctx, "package-files:"+packageName, func() (any, error) {
 		// The fetch fills the cache for every waiter, so it must not die with
 		// whichever client happened to trigger it.
 		index, files, err := s.queryIndexes(context.WithoutCancel(ctx), packageName)
@@ -167,6 +168,40 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
 	return entry, nil
+}
+
+// shared runs fn once per key for every concurrent caller, and lets each caller
+// stop waiting when its own context ends. fn must run detached from ctx: it
+// carries on for the callers still waiting, and fills the cache for later ones.
+// fn runs on its own goroutine, where a panic would kill the process, so a panic
+// comes back as an error instead.
+func (s *Service) shared(ctx context.Context, key string, fn func() (any, error)) (any, error) {
+	guarded := func() (v any, err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				err = panicError(ctx, rec)
+			}
+		}()
+		return fn()
+	}
+	select {
+	case r := <-s.sf.DoChan(key, guarded):
+		return r.Val, r.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// errPanic marks a lookup that panicked, e.g. a parser bug fed upstream data.
+var errPanic = errors.New("index lookup panicked")
+
+// panicError logs a recovered panic with its stack and turns it into an error,
+// so the caller answers a 5xx instead of the process dying with it.
+func panicError(ctx context.Context, rec any) error {
+	err := fmt.Errorf("%w: %v", errPanic, rec)
+	slog.ErrorContext(ctx, "Index lookup panicked",
+		"error", config.RedactErrorText(err), "stack", string(debug.Stack()))
+	return err
 }
 
 // resolutionResult classifies one index's answer for the resolution metric. A
@@ -235,6 +270,13 @@ func (s *Service) queryConcurrently(ctx context.Context, indexes []config.Index,
 		done[i], cancels[i] = make(chan struct{}), cancel
 		go func(i int, index config.Index) {
 			defer close(done[i])
+			// The upstream answer is parsed here, on a goroutine of its own:
+			// a panic must become this index's error, not kill the process.
+			defer func() {
+				if rec := recover(); rec != nil {
+					answers[i] = indexAnswer{err: panicError(ctx, rec)}
+				}
+			}()
 
 			// One span and one counted outcome per index consulted, so a slow or
 			// unreachable private index is visible without reading the code. The
@@ -306,7 +348,7 @@ type RootResponse struct {
 // is served through, not stored — but concurrent callers asking for the same
 // representation still share one upstream fetch.
 func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) (*RootResponse, error) {
-	result, err, _ := s.sf.Do("root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
+	result, err := s.shared(ctx, "root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
 		// The fetch serves every waiter, so it must not die with whichever client
 		// happened to trigger it; the HTTP client's own timeout bounds it.
 		req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, s.rootURL, nil)
