@@ -22,9 +22,12 @@ import (
 // failure does not.
 var ErrNotFound = errors.New("package not found")
 
+// packageIndexAccept is the Accept header PEP 691 recommends for clients.
+const packageIndexAccept = "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01"
+
 // client fetches index pages from an upstream PyPI-compatible index. Concurrent
-// requests for the same package are coalesced by the package-file service, not
-// here.
+// requests for the same package are merged by Service.Resolve's singleflight,
+// not here.
 type client struct {
 	httpClient *http.Client
 }
@@ -163,8 +166,10 @@ func newClient(cfg *config.Config, transport http.RoundTripper) *client {
 func (c *client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
 	indexURL := strings.TrimSuffix(index.URL, "/") + "/" + packageName + "/"
 
-	// Try JSON first
-	resp, err := c.makeRequest(ctx, indexURL, "application/vnd.pypi.simple.v1+json")
+	// PEP 691's recommended client Accept: JSON preferred, HTML still
+	// acceptable, so a strict HTML-only index answers instead of 406ing. The
+	// response's own Content-Type picks the parser below.
+	resp, err := c.makeRequest(ctx, indexURL, packageIndexAccept)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package files for %s from %s: %w", packageName, index.Redacted(), err)
 	}

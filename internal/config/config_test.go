@@ -353,6 +353,36 @@ func TestExtraIndexTTLs(t *testing.T) {
 	}
 }
 
+// TestExtraIndexURLsArePositional pins that an empty GROXPI_EXTRA_INDEX_URLS
+// item is skipped but still consumes its GROXPI_EXTRA_INDEX_TTLS slot, so every
+// later index keeps the TTL written in its own position.
+func TestExtraIndexURLsArePositional(t *testing.T) {
+	d := defaultExtraIndexTTL
+	cases := []struct {
+		urls, ttls string
+		want       []Index
+	}{
+		{"a,,b", "60,,120", []Index{{URL: "a", TTL: 60 * time.Second}, {URL: "b", TTL: 120 * time.Second}}},
+		{",a", "60,120", []Index{{URL: "a", TTL: 120 * time.Second}}},
+		{"a, ,b", "", []Index{{URL: "a", TTL: d}, {URL: "b", TTL: d}}},
+		{"a,b,", "60,120,180", []Index{{URL: "a", TTL: 60 * time.Second}, {URL: "b", TTL: 120 * time.Second}}},
+		{"a,,b", "60", []Index{{URL: "a", TTL: 60 * time.Second}, {URL: "b", TTL: d}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.urls+"|"+tc.ttls, func(t *testing.T) {
+			t.Setenv("GROXPI_EXTRA_INDEX_URLS", tc.urls)
+			t.Setenv("GROXPI_EXTRA_INDEX_TTLS", tc.ttls)
+			t.Setenv("GROXPI_INDEX_URL", "p")
+			t.Setenv("GROXPI_INDEX_TTL", "1h")
+			got := mustLoad(t).ResolutionOrder()
+			want := append(tc.want, Index{URL: "p", TTL: time.Hour})
+			if !slices.Equal(got, want) {
+				t.Fatalf("URLS=%q TTLS=%q gave %v, want %v", tc.urls, tc.ttls, got, want)
+			}
+		})
+	}
+}
+
 // TestDownloadIdleTimeout pins the stall budget for an upstream file body: 60s
 // by default, and a value at or below zero means the default rather than "never
 // time out", since a body that never times out hangs every request tailing it.

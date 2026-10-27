@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -228,9 +229,20 @@ func Load() (*Config, error) {
 		LocalCacheTTL:  getDurationEnv("GROXPI_LOCAL_CACHE_TTL", 0), // 0 = disabled
 	}
 
-	// Parse extra index URLs
+	// Parse extra index URLs. Like the TTLs below the list is positional: an
+	// empty item is skipped, but it still owns its TTL slot (dropped after the
+	// TTLs are parsed), so "a,,b" with "60,,120" gives b 120.
+	var emptyURLSlots []int
 	if extraURLs := getEnv("GROXPI_EXTRA_INDEX_URLS", ""); extraURLs != "" {
-		cfg.ExtraIndexURLs = splitAndTrim(extraURLs, ",")
+		for i, item := range strings.Split(extraURLs, ",") {
+			if item = strings.TrimSpace(item); item == "" {
+				slog.Warn("Ignoring empty GROXPI_EXTRA_INDEX_URLS item; its GROXPI_EXTRA_INDEX_TTLS slot is skipped too",
+					"variable", "GROXPI_EXTRA_INDEX_URLS", "value", extraURLs, "position", i)
+				emptyURLSlots = append(emptyURLSlots, i)
+				continue
+			}
+			cfg.ExtraIndexURLs = append(cfg.ExtraIndexURLs, item)
+		}
 	}
 
 	// Parse extra index TTLs. Split without dropping empty entries: the list is
@@ -243,6 +255,12 @@ func Load() (*Config, error) {
 			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 			if ttlStr = strings.TrimSpace(ttlStr); ttlStr != "" {
 				cfg.ExtraIndexTTLs[i] = parseDuration("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
+			}
+		}
+		// Drop the slots of skipped URLs, last first so earlier positions hold.
+		for _, slot := range slices.Backward(emptyURLSlots) {
+			if slot < len(cfg.ExtraIndexTTLs) {
+				cfg.ExtraIndexTTLs = slices.Delete(cfg.ExtraIndexTTLs, slot, slot+1)
 			}
 		}
 	} else {
@@ -376,15 +394,4 @@ func getBoolEnv(key string, defaultValue bool) bool {
 		invalidEnv(key, value, defaultValue)
 		return defaultValue
 	}
-}
-
-func splitAndTrim(s, sep string) []string {
-	parts := strings.Split(s, sep)
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }

@@ -183,3 +183,38 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestIndexCache_ZeroTTLStoresNothing pins that a TTL of zero disables caching
+// rather than storing entries that are expired on arrival and never swept.
+func TestIndexCache_ZeroTTLStoresNothing(t *testing.T) {
+	c := newIndexCache(0, 0)
+	defer c.close()
+
+	for i := range 100 {
+		c.set(fmt.Sprintf("p%d", i), testEntry(`{"a":1}`), 0)
+	}
+	if n, b := c.stats(); n != 0 || b != 0 {
+		t.Fatalf("TTL 0 left %d entries, %d bytes; want none", n, b)
+	}
+}
+
+// TestIndexCache_OversizeEntryKeepsTheRest pins that one entry bigger than the
+// whole budget is not stored, instead of evicting everything to make room it
+// can never have.
+func TestIndexCache_OversizeEntryKeepsTheRest(t *testing.T) {
+	one := testEntry(`{"a":1}`)
+	c := newIndexCache(50*one.size, 0)
+	defer c.close()
+
+	for i := range 50 {
+		c.set(fmt.Sprintf("p%d", i), testEntry(`{"a":1}`), time.Minute)
+	}
+	c.set("big", testEntry(`{"a":"`+string(bytes.Repeat([]byte("x"), int(50*one.size)))+`"}`), time.Minute)
+
+	if n, b := c.stats(); n != 50 || b != 50*one.size {
+		t.Fatalf("after an oversize set: %d entries, %d bytes; want 50, %d", n, b, 50*one.size)
+	}
+	if _, ok := c.get("big"); ok {
+		t.Fatal("an entry bigger than the budget must not be stored")
+	}
+}
