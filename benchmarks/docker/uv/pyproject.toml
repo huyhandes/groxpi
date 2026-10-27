@@ -2,7 +2,7 @@
 name = "benchmark-test"
 version = "0.1.0"
 description = "Benchmark testing project for groxpi vs proxpi"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 dependencies = []
 
 # Index under test; uv_install_test.sh substitutes the server URL (scheme included)
