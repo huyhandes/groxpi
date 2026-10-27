@@ -9,13 +9,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration with defaults
-GROXPI_URL=""
-PROXPI_URL=""
+GROXPI_URL="${GROXPI_URL:-}"
+PROXPI_URL="${PROXPI_URL:-}"
 TIMESTAMP=""
 API_ONLY=false
 UV_ONLY=false
 RESOURCE_MONITORING=true
-DOCKER_NETWORK="benchmark-network"
+DOCKER_NETWORK="${DOCKER_NETWORK:-benchmark-network}"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Colors for output
@@ -112,10 +112,6 @@ parse_arguments() {
                 ;;
         esac
     done
-
-    # Use environment variables if not provided via command line
-    GROXPI_URL="${GROXPI_URL:-${GROXPI_URL:-}}"
-    PROXPI_URL="${PROXPI_URL:-${PROXPI_URL:-}}"
 
     # Generate timestamp if not provided
     if [ -z "$TIMESTAMP" ]; then
