@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UV_TYPES="{'installed_size_mb': 'DOUBLE', 'dependency_count': 'BIGINT'}"
 # wrk_api_test.sh leaves the load columns empty on single rows and the single
 # column empty on load rows, so a run with only one kind has all-empty columns.
-WRK_TYPES="{'requests_per_sec': 'DOUBLE', 'avg_latency_ms': 'DOUBLE', 'p50_latency_ms': 'DOUBLE', 'p99_latency_ms': 'DOUBLE', 'response_time_single_sec': 'DOUBLE'}"
+WRK_TYPES="{'requests_per_sec': 'DOUBLE', 'avg_latency_ms': 'DOUBLE', 'p50_latency_ms': 'DOUBLE', 'p99_latency_ms': 'DOUBLE', 'response_time_single_sec': 'DOUBLE', 'http_code': 'INTEGER'}"
 # monitor_resources.sh can leave the readings empty, for the same reason.
 RESOURCE_TYPES="{'cpu_percent': 'DOUBLE', 'memory_used_mb': 'DOUBLE'}"
 
@@ -193,7 +193,7 @@ analyze_api_performance() {
         ROUND(MAX(response_time_single_sec), 4) as max_response_time_sec,
         COUNT(*) as test_runs
     FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
-    WHERE test_type = 'single' AND response_time_single_sec IS NOT NULL
+    WHERE test_type = 'single' AND http_code = 200 AND response_time_single_sec IS NOT NULL
     GROUP BY service, test_name, endpoint
     ORDER BY service, avg_response_time_sec;
     " "Single Request Response Times"

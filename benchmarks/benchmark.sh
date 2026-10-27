@@ -51,7 +51,7 @@ show_usage() {
     echo "  --no-monitoring    Disable resource monitoring (it samples the local"
     echo "                     containers groxpi-bench and proxpi-bench only)"
     echo "  --docker-network N Docker network name (default: benchmark-network)"
-    echo "  --results-dir DIR  Results directory (default: ./results)"
+    echo "  --results-dir DIR  Results directory (default: <script dir>/results)"
     echo "  -h, --help         Show this help message"
     echo ""
     echo "Environment Variables:"

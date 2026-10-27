@@ -169,6 +169,8 @@ run_single_request_test() {
             log_success "  Response time: ${time_total}s (HTTP $http_code)"
         else
             log_warning "  Response time: ${time_total}s (HTTP $http_code)"
+            # Logged for the record, but counted as a failure: a non-200 is not a timing
+            return 1
         fi
     else
         log_error "  Request failed"

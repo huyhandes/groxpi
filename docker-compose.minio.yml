@@ -61,7 +61,6 @@ services:
       # PyPI Configuration
       GROXPI_INDEX_URL: https://pypi.org/simple/
       GROXPI_INDEX_TTL: 1800
-      GROXPI_CACHE_SIZE: 10737418240  # 10GB
       GROXPI_LOGGING_LEVEL: INFO
       
       # S3 Storage Configuration

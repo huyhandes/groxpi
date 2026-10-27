@@ -45,8 +45,10 @@ COPY --from=builder /build/groxpi /groxpi
 # Create cache directory
 VOLUME ["/cache"]
 
-# The one setting whose default differs from config.go: the cache lives on the volume.
+# Settings whose image default differs from config.go: the cache lives on the
+# volume, and container logs are read by collectors, not a terminal.
 ENV GROXPI_CACHE_DIR=/cache
+ENV GROXPI_LOG_COLOR=false
 
 # Expose port
 EXPOSE 5000
