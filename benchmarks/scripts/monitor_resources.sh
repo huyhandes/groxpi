@@ -49,17 +49,24 @@ with_timeout() {
     fi
 }
 
-# Convert a docker size ("12.5MiB", "3.4kB", "0B") to MB; empty if unparseable.
+# Convert a docker size to decimal MB (10^6 bytes); empty if unparseable.
+# docker stats prints memory in binary units ("12.5MiB") and network/block IO
+# in decimal ones ("3.4kB", "1.2MB", "0B"), so each suffix keeps its own base.
 to_mb() {
     awk -v v="$1" 'BEGIN {
         if (!match(v, /^[0-9.]+/)) exit
         n = substr(v, 1, RLENGTH); u = substr(v, RLENGTH + 1)
-        if (u ~ /^[Kk]i?B$/) n /= 1024
-        else if (u ~ /^Gi?B$/) n *= 1024
-        else if (u ~ /^Ti?B$/) n *= 1024 * 1024
-        else if (u == "B") n /= 1024 * 1024
-        else if (u !~ /^Mi?B$/) exit
-        printf "%.3f", n
+        if (u == "B") m = 1
+        else if (u == "kB" || u == "KB") m = 1e3
+        else if (u == "MB") m = 1e6
+        else if (u == "GB") m = 1e9
+        else if (u == "TB") m = 1e12
+        else if (u == "KiB") m = 1024
+        else if (u == "MiB") m = 1024 ^ 2
+        else if (u == "GiB") m = 1024 ^ 3
+        else if (u == "TiB") m = 1024 ^ 4
+        else exit
+        printf "%.3f", n * m / 1e6
     }'
 }
 

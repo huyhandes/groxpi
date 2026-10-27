@@ -17,8 +17,11 @@ TEST_PACKAGES=("numpy" "pandas" "polars" "pyspark" "fastapi")
 
 # Docker configuration
 DOCKER_NETWORK="${DOCKER_NETWORK:-benchmark-network}"
-UV_IMAGE="${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}"
+UV_IMAGE="${UV_IMAGE:-ghcr.io/astral-sh/uv:python3.12-bookworm-slim}"
 DOCKER_TIMEOUT=600  # 10 minutes timeout for large packages
+
+# Failed test runs; any failure makes the script exit nonzero after the summary
+FAILURES=0
 
 # Colors for output
 RED='\033[0;31m'
@@ -54,7 +57,7 @@ show_usage() {
     echo ""
     echo "Environment Variables:"
     echo "  DOCKER_NETWORK - Docker network name (default: benchmark-network)"
-    echo "  UV_IMAGE       - UV container image (default: uv-tester:latest)"
+    echo "  UV_IMAGE       - UV container image (default: ghcr.io/astral-sh/uv:python3.12-bookworm-slim)"
     echo ""
     echo "Examples:"
     echo "  $0 http://server1:5005 http://server2:5006 20240101_120000"
@@ -176,17 +179,8 @@ run_uv_install_test() {
     log_info "UV test: $service_name - $test_name ($cache_mode cache)"
     log_info "  Packages: $packages_list"
 
-    # Prepare docker command
-    local docker_cmd="docker run --rm \
-        --network=$DOCKER_NETWORK \
-        -v $temp_dir:/workspace \
-        -w /workspace \
-        $UV_IMAGE \
-        timeout $DOCKER_TIMEOUT bash -c"
-
-    # Create test script for container
-    local test_script="
-#!/bin/bash
+    # Test script for the container, written to $temp_dir/run.sh
+    local test_script="#!/bin/bash
 set -euo pipefail
 
 echo '=== UV Installation Test - $service_name ($test_name) ==='
@@ -213,7 +207,7 @@ install_package() {
     echo \"Starting installation of \$pkg...\"
     if timeout 300 uv add \$pkg --quiet; then
         local end_time=\$(date +%s.%N)
-        local duration=\$(echo \"\$end_time - \$start_time\" | bc -l)
+        local duration=\$(awk -v s=\"\$start_time\" -v e=\"\$end_time\" 'BEGIN { print e - s }')
 
         printf \"✓ \$pkg installed successfully in %.2fs\\n\" \$duration
 
@@ -230,7 +224,7 @@ install_package() {
         return 0
     else
         local end_time=\$(date +%s.%N)
-        local duration=\$(echo \"\$end_time - \$start_time\" | bc -l)
+        local duration=\$(awk -v s=\"\$start_time\" -v e=\"\$end_time\" 'BEGIN { print e - s }')
 
         printf \"✗ \$pkg installation failed after %.2fs\\n\" \$duration
         return 1
@@ -254,7 +248,7 @@ install_batch() {
     # Install all packages together
     if timeout 600 uv add \$packages --quiet; then
         local end_time=\$(date +%s.%N)
-        local duration=\$(echo \"\$end_time - \$start_time\" | bc -l)
+        local duration=\$(awk -v s=\"\$start_time\" -v e=\"\$end_time\" 'BEGIN { print e - s }')
 
         printf \"✓ Batch installation completed in %.2fs\\n\" \$duration
 
@@ -271,7 +265,7 @@ install_batch() {
         return 0
     else
         local end_time=\$(date +%s.%N)
-        local duration=\$(echo \"\$end_time - \$start_time\" | bc -l)
+        local duration=\$(awk -v s=\"\$start_time\" -v e=\"\$end_time\" 'BEGIN { print e - s }')
 
         printf \"✗ Batch installation failed after %.2fs\\n\" \$duration
         return 1
@@ -312,28 +306,48 @@ echo 'Completion time: '\$(date '+%Y-%m-%d %H:%M:%S')
 echo ''
 "
 
+    printf '%s\n' "$test_script" > "$temp_dir/run.sh"
+
     # Execute the test in container
-    if eval "$docker_cmd '$test_script'" > "$output_file" 2>&1; then
+    local status=0
+    local host_start
+    host_start=$(date +%s)
+    docker run --rm \
+        --network="$DOCKER_NETWORK" \
+        -v "$temp_dir:/workspace" \
+        -w /workspace \
+        "$UV_IMAGE" \
+        timeout "$DOCKER_TIMEOUT" bash /workspace/run.sh > "$output_file" 2>&1 || status=$?
+
+    if [ "$status" -eq 0 ]; then
         log_success "  Test completed successfully"
 
         # Extract timing information
-        local install_times=$(grep "installed successfully in" "$output_file" | awk '{print $5}' | sed 's/s$//')
+        local install_times=$(grep "installed successfully in" "$output_file" | awk '{print $6}' | sed 's/s$//')
         if [ -n "$install_times" ]; then
             log_info "  Installation times: $(echo "$install_times" | paste -sd ',' -)"
         fi
 
-        local batch_time=$(grep "Batch installation completed in" "$output_file" | awk '{print $5}' | sed 's/s$//')
+        local batch_time=$(grep "Batch installation completed in" "$output_file" | awk '{print $6}' | sed 's/s$//')
         if [ -n "$batch_time" ]; then
             log_info "  Batch installation time: ${batch_time}s"
         fi
     else
-        log_error "  Test failed or timed out"
+        log_error "  Test failed or timed out (exit $status); see $output_file"
+        if ! grep -q "^✗ " "$output_file"; then
+            printf '✗ %s installation failed after %ss\n' "$test_name" "$(( $(date +%s) - host_start ))" >> "$output_file"
+        fi
     fi
 
     # Cleanup
     rm -rf "$temp_dir"
 
-    return 0
+    return "$status"
+}
+
+# Run one test; a failure is counted (and recorded in its log) instead of aborting the run
+run_test() {
+    run_uv_install_test "$@" || FAILURES=$((FAILURES + 1))
 }
 
 # Function to run cold cache installation tests
@@ -355,11 +369,11 @@ run_cold_install_tests() {
 
             # Clear cache and test groxpi
             clear_cache
-            run_uv_install_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
+            run_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
 
             # Clear cache and test proxpi
             clear_cache
-            run_uv_install_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
+            run_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
 
             echo ""
         done
@@ -373,10 +387,10 @@ warm_up_cache() {
     log_info "Warming up caches with all test packages..."
 
     # Warm up groxpi cache
-    run_uv_install_test "$GROXPI_URL" "groxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
+    run_test "$GROXPI_URL" "groxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
 
     # Warm up proxpi cache
-    run_uv_install_test "$PROXPI_URL" "proxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
+    run_test "$PROXPI_URL" "proxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
 
     log_success "Cache warmup completed"
 }
@@ -401,8 +415,8 @@ run_warm_install_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing warm installation: $package"
 
-            run_uv_install_test "$GROXPI_URL" "groxpi" "warm-$package" "$package" "$results_dir" "warm"
-            run_uv_install_test "$PROXPI_URL" "proxpi" "warm-$package" "$package" "$results_dir" "warm"
+            run_test "$GROXPI_URL" "groxpi" "warm-$package" "$package" "$results_dir" "warm"
+            run_test "$PROXPI_URL" "proxpi" "warm-$package" "$package" "$results_dir" "warm"
 
             echo ""
         done
@@ -425,22 +439,22 @@ run_batch_install_tests() {
         # Test small package batch (fast packages)
         local small_packages="requests click fastapi"
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
 
         # Test mixed size batch
         local mixed_packages="numpy pandas polars"
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
 
         # Test all packages batch
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
     fi
 }
 
@@ -459,15 +473,15 @@ run_large_package_tests() {
 
         # Test pyspark specifically (it's ~300MB)
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         # Test pyspark with warm cache
         log_info "Testing pyspark with warm cache..."
-        run_uv_install_test "$GROXPI_URL" "groxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
-        run_uv_install_test "$PROXPI_URL" "proxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
+        run_test "$GROXPI_URL" "groxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
+        run_test "$PROXPI_URL" "proxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
     fi
 }
 
@@ -498,16 +512,16 @@ generate_summary_csv() {
             # Determine cache mode and test type
             local cache_mode="unknown"
             local test_type="individual"
-            if [[ $test_name == *"cold"* ]] || [[ $test_name == *"single"* ]]; then
+            if [[ $test_name == *"warmup"* ]]; then
+                cache_mode="warmup"
+                test_type="warmup"
+            elif [[ $test_name == *"cold"* ]] || [[ $test_name == *"single"* ]]; then
                 cache_mode="cold"
             elif [[ $test_name == *"warm"* ]]; then
                 cache_mode="warm"
             elif [[ $test_name == *"batch"* ]]; then
                 test_type="batch"
                 cache_mode="cold"  # Most batch tests are cold
-            elif [[ $test_name == *"warmup"* ]]; then
-                cache_mode="warmup"
-                test_type="warmup"
             fi
 
             # Extract individual package installations
@@ -658,6 +672,11 @@ main() {
     echo "End time: $end_time"
     echo "Results saved to: $results_dir"
     echo "Summary: $results_dir/uv-summary-${TIMESTAMP}.csv"
+
+    if [ "$FAILURES" -gt 0 ]; then
+        log_error "$FAILURES test run(s) failed; see the FALSE rows in the summary"
+        exit 1
+    fi
 
     log_success "UV installation testing completed successfully"
 }

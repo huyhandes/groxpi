@@ -10,8 +10,8 @@ compare against until the suite is re-run.
 
 - **Index API throughput and latency** (`scripts/wrk_api_test.sh`) — `wrk` against the index endpoints,
   cold and warm.
-- **End-to-end install time** (`scripts/uv_install_test.sh`) — `uv pip install` of real packages through
-  each proxy, in a container.
+- **End-to-end install time** (`scripts/uv_install_test.sh`) — `uv add` of real packages into a fresh
+  project and virtualenv through each proxy, in a container.
 
 Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
 `scripts/analyze_results_duckdb.sh` turns the raw output into comparison tables.
