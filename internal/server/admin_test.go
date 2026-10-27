@@ -141,8 +141,13 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 	// its URL, so typing filters without a submit and htmx escapes the box.
 	assert.Contains(t, page, `hx-get="/admin/rows"`, "the poll URL carries no hand-built q or page")
 	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the poll sends the filter box and the page")
-	assert.Contains(t, page, `hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter"`,
-		"typing in the box re-polls")
+	assert.Contains(t, page, `hx-trigger="every 3s [!document.hidden], input changed delay:300ms from:#filter, search from:#filter"`,
+		"typing in the box re-polls; a hidden tab does not")
+	assert.Contains(t, page, `<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch"`,
+		"the prefetch form posts without JavaScript too")
+	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText"`,
+		"the prefetch reply, error or not, is shown")
+	assert.Contains(t, page, `id="prefetch-status"`)
 	assert.Contains(t, page, `<form id="filter-form" class="controls" method="get" action="/admin">`,
 		"the no-JS GET form stays")
 

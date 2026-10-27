@@ -17,9 +17,9 @@ Any other value is logged as a warning and the default is kept.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Primary upstream index. |
-| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. |
+| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. `0` means the answer is not cached: it is re-fetched on every request. |
 | `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. |
-| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). |
+| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). `0` means that index's answer is not cached: it is re-fetched on every request. |
 | `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification on every upstream call: index pages, the root index and file downloads. |
 
 ### How extra indexes are resolved
@@ -50,9 +50,9 @@ body. An unparseable URL is reported as `[unparseable-url]` rather than risk lea
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. |
+| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. `0` = unbounded. |
 | `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. groxpi owns only `<dir>/packages` and `<dir>/spool`: the cache scan, eviction and temp cleanup never list, count or delete anything else in the directory. |
-| `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. |
+| `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. `0` = unbounded (entries still leave by TTL). |
 
 There is one index cache. Per package it holds the parsed file list plus the JSON and gzipped-JSON
 response bodies, and accounts all of them against the byte budget. Entries leave by TTL (a background
@@ -121,7 +121,7 @@ The local cache in front of the S3 durable store. Every `s3` setting applies, pl
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for the cache. |
+| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for the cache. `0` = unbounded. |
 | `GROXPI_LOCAL_CACHE_DIR` | value of `GROXPI_CACHE_DIR` | Where the cache lives. |
 | `GROXPI_LOCAL_CACHE_TTL` | `0` (disabled) | Age at which a cached file is dropped regardless of the byte budget, measured from when the file was written. |
 A download is verified and renamed into the cache first, so readers are served from local disk; the

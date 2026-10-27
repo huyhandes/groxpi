@@ -339,6 +339,20 @@ func TestPrefetch_SelectsNewestFinalRelease(t *testing.T) {
 			want: []string{"pkg-1.0.0.tar.gz"},
 		},
 		{
+			name: "local version labels are one release",
+			files: []fakeFile{
+				{name: "pkg-2.0.0.tar.gz"},
+				{name: "pkg-2.1.0-py3-none-any.whl"},
+				{name: "pkg-2.1.0+cpu-cp311-cp311-linux_x86_64.whl"},
+				{name: "pkg-2.1.0+cu118-cp311-cp311-linux_x86_64.whl"},
+			},
+			want: []string{
+				"pkg-2.1.0+cpu-cp311-cp311-linux_x86_64.whl",
+				"pkg-2.1.0+cu118-cp311-cp311-linux_x86_64.whl",
+				"pkg-2.1.0-py3-none-any.whl",
+			},
+		},
+		{
 			name: "nothing selectable is a recorded failure",
 			files: []fakeFile{
 				{name: "pkg-2.0.0rc1.tar.gz"},
@@ -476,8 +490,8 @@ func TestPrefetch_RefusedAfterShutdown(t *testing.T) {
 }
 
 // TestPrefetch_RedirectModeRefuses: over a store built in redirect mode,
-// prefetch has nothing to warm and records "caching is disabled" instead of
-// fetching.
+// prefetch has nothing to warm and records "caching is disabled" once instead
+// of resolving the index or fetching.
 func TestPrefetch_RedirectModeRefuses(t *testing.T) {
 	up := newUpstream(t, "p", fakeFile{name: "p-1.0.tar.gz"})
 	cache, err := storage.NewLocalStorage(t.TempDir(), 0, 0)
@@ -495,6 +509,7 @@ func TestPrefetch_RedirectModeRefuses(t *testing.T) {
 	require.Len(t, errs, 1)
 	assert.Contains(t, errs[0].Message, "caching is disabled")
 	assert.Zero(t, up.fileHits.Load(), "nothing was fetched")
+	assert.Zero(t, up.indexHits.Load(), "the index was not resolved")
 }
 
 // ---------------------------------------------------------------------------

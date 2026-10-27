@@ -71,11 +71,16 @@ func main() {
 		Color:  cfg.LogColor,
 	})
 
-	// Test debug logging immediately after logger init
-	slog.Debug("🔧 Logger initialized and debug logging is working",
-		"log_level", cfg.LogLevel,
-		"log_format", cfg.LogFormat,
-		"log_color", cfg.LogColor)
+	// fatal is logger.Fatal with the telemetry flushed first, under a short
+	// deadline: os.Exit skips every defer, so without it the record saying why
+	// the process died never reaches the collector.
+	fatal := func(msg string, args ...any) {
+		slog.Log(context.Background(), logger.LevelFatal, msg, args...)
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = shutdownTelemetry(flushCtx)
+		cancelFlush()
+		os.Exit(1)
+	}
 
 	// Log startup info
 	slog.Info("🚀 Starting groxpi server",
@@ -95,7 +100,7 @@ func main() {
 	// Create server
 	srv, err := server.NewServer(cfg)
 	if err != nil {
-		logger.Fatal("Failed to construct server", "error", err)
+		fatal("Failed to construct server", "error", err)
 	}
 	router := srv.Router()
 
@@ -111,7 +116,7 @@ func main() {
 		slog.Info("🌐 HTTP server starting", "address", ":"+cfg.Port)
 
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("Failed to start server", "error", err)
+			fatal("Failed to start server", "error", err)
 		}
 	}()
 
