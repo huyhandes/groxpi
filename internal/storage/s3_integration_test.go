@@ -107,7 +107,11 @@ func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, content, data)
 
-	_, err = storage.DeletePrefix(ctx, key)
+	// Clean up directly against MinIO: DeleteObjects requires a checksum, so
+	// the SDK sends one even under WhenRequired and the strict proxy rejects it.
+	direct := createTestS3Storage(t)
+	defer func() { _ = direct.Close() }()
+	_, err = direct.DeletePrefix(ctx, key)
 	require.NoError(t, err)
 }
 
