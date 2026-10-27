@@ -14,10 +14,10 @@ import (
 )
 
 // TestSetupWithoutEndpointIsInert is the regression guard against instrumentation
-// becoming a startup dependency: with no collector endpoint, Setup installs
+// becoming a startup dependency: with telemetry switched off, Setup installs
 // nothing, cannot fail, and the tracer it hands instrumentation records nothing.
 func TestSetupWithoutEndpointIsInert(t *testing.T) {
-	shutdown, err := Setup(context.Background(), "", "groxpi")
+	shutdown, err := Setup(context.Background(), false, "groxpi")
 	if err != nil {
 		t.Fatalf("Setup with no endpoint must not fail: %v", err)
 	}
@@ -43,7 +43,8 @@ func TestSetupWithoutEndpointIsInert(t *testing.T) {
 // on still returns cleanly: the OTLP/HTTP exporters connect lazily, so a
 // collector that is down can neither block startup nor fail a request.
 func TestSetupWithUnreachableEndpoint(t *testing.T) {
-	shutdown, err := Setup(context.Background(), "http://127.0.0.1:1", "groxpi")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	shutdown, err := Setup(context.Background(), true, "groxpi")
 	if err != nil {
 		t.Fatalf("Setup with an unreachable collector must not fail: %v", err)
 	}
@@ -69,8 +70,9 @@ func TestSetupPostsEachSignalToItsOTLPPath(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer collector.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
 
-	shutdown, err := Setup(context.Background(), collector.URL, "groxpi")
+	shutdown, err := Setup(context.Background(), true, "groxpi")
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -96,5 +98,41 @@ func TestSetupPostsEachSignalToItsOTLPPath(t *testing.T) {
 		if !paths[want] {
 			t.Errorf("collector never received a POST to %s; got %v", want, paths)
 		}
+	}
+}
+
+// TestSetupHonoursPerSignalEndpoints pins that the standard per-signal variables
+// reach the exporters: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is used as given and
+// overrides the base URL for that signal only.
+func TestSetupHonoursPerSignalEndpoints(t *testing.T) {
+	var mu sync.Mutex
+	paths := map[string]bool{}
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths[r.URL.Path] = true
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", collector.URL+"/custom/traces")
+
+	shutdown, err := Setup(context.Background(), true, "groxpi")
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	_, span := Tracer().Start(context.Background(), "request")
+	span.End()
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !paths["/custom/traces"] {
+		t.Errorf("traces did not go to the per-signal endpoint; got %v", paths)
+	}
+	if paths["/v1/traces"] {
+		t.Errorf("traces went to the base endpoint despite the per-signal override; got %v", paths)
 	}
 }

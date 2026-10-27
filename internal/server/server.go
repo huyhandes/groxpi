@@ -19,6 +19,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -116,6 +117,11 @@ func recoverPanics(next http.Handler) http.Handler {
 // continued when the client sent W3C headers. It also writes the access log
 // line. It is instrumentation only: it reads the response status and changes
 // nothing about it.
+//
+// The span and the access line are finished in a defer, so a panicking handler
+// is recorded too: a plain panic as a 500 (what recoverPanics answers), an
+// http.ErrAbortHandler as aborted with the status already sent. The panic is
+// then re-raised for recoverPanics and net/http to handle as before.
 func traceRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -125,20 +131,46 @@ func traceRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
 		r = r.WithContext(ctx)
+		defer func() {
+			rec := recover()
+			status := sw.status()
+			aborted := false
+			if rec != nil {
+				if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+					aborted = true
+				} else {
+					status = http.StatusInternalServerError
+				}
+			}
+
+			// The mux fills in the matched pattern on the request it was handed.
+			// The pattern, not the path: a span name per package name would be a
+			// cardinality explosion in any backend.
+			route := r.Pattern
+			if route == "" {
+				route = r.Method + " unmatched"
+			}
+			span.SetName(route)
+			span.SetAttributes(attribute.Int("http.response.status_code", status))
+			switch {
+			case aborted:
+				span.SetAttributes(attribute.Bool("http.request.aborted", true))
+				span.SetStatus(codes.Error, "aborted")
+			case status >= http.StatusInternalServerError:
+				span.SetStatus(codes.Error, http.StatusText(status))
+			}
+
+			args := []any{"status", status, "latency", time.Since(start), "method", r.Method, "path", r.URL.Path}
+			if aborted {
+				args = append(args, "aborted", true)
+			}
+			slog.InfoContext(ctx, "request", args...)
+
+			if rec != nil {
+				panic(rec)
+			}
+		}()
 		next.ServeHTTP(sw, r)
-
-		// The mux fills in the matched pattern on the request it was handed. The
-		// pattern, not the path: a span name per package name would be a
-		// cardinality explosion in any backend.
-		route := r.Pattern
-		if route == "" {
-			route = r.Method + " unmatched"
-		}
-		span.SetName(route)
-		span.SetAttributes(attribute.Int("http.response.status_code", sw.status()))
-
-		slog.InfoContext(ctx, "request",
-			"status", sw.status(), "latency", time.Since(start), "method", r.Method, "path", r.URL.Path)
 	})
 }
 

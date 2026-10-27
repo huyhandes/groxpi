@@ -57,7 +57,7 @@ func main() {
 	// Install the OpenTelemetry providers before the logger, so that the log
 	// bridge picks up a real provider when one is configured. With no endpoint
 	// configured this installs nothing and cannot fail.
-	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint != "", cfg.ServiceName)
 	if err != nil {
 		// A misconfigured exporter must not stop the proxy from serving.
 		slog.Warn("Telemetry disabled: failed to set up OpenTelemetry", "error", err)
@@ -87,7 +87,7 @@ func main() {
 		"version", config.Version,
 		"log_level", cfg.LogLevel,
 		"log_format", cfg.LogFormat,
-		"otlp_endpoint", cfg.OTLPEndpoint)
+		"otlp_endpoint", config.RedactURL(cfg.OTLPEndpoint))
 
 	// Log configuration
 	slog.Info("📋 Configuration loaded",

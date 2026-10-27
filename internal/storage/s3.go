@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"github.com/huyhandes/groxpi/internal/config"
 )
 
 // S3Config holds S3 storage configuration
@@ -142,7 +144,7 @@ func NewS3Storage(settings *S3Config) (*S3Storage, error) {
 	}
 
 	slog.Info("S3 storage backend initialized",
-		"endpoint", cfg.Endpoint,
+		"endpoint", config.RedactURL(cfg.Endpoint),
 		"bucket", cfg.Bucket,
 		"prefix", cfg.Prefix,
 		"path_style", cfg.ForcePathStyle,

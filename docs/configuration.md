@@ -191,11 +191,15 @@ connection setup, headers *and* body. Neither name means what it says:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. Setting it switches telemetry on; each signal posts to `<base>/v1/traces`, `/v1/metrics`, `/v1/logs`. |
 | `OTEL_SERVICE_NAME` | `groxpi` | Service name on exported telemetry. |
 
-With no endpoint configured, telemetry is inert: no providers installed, no connection attempted,
-instrumentation costs nothing. groxpi serves no Prometheus scrape endpoint — see
+`OTEL_EXPORTER_OTLP_ENDPOINT` is the only switch: while it is empty, telemetry is inert — no
+providers installed, no connection attempted, instrumentation costs nothing — even if a per-signal
+variable is set. Once it is set, the OTLP/HTTP exporters read the rest of the standard variables
+themselves, so `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are honoured: each is used as given (no path appended) and
+overrides the base URL for its signal. groxpi serves no Prometheus scrape endpoint — see
 [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md).
 
 ## Administrative interface
