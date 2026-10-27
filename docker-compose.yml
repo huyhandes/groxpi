@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   groxpi:
     build:
@@ -19,7 +17,7 @@ services:
       - GROXPI_CACHE_SIZE=5368709120 # 5GB
       - GROXPI_INDEX_TTL=1800 # 30 minutes
       - GROXPI_CACHE_DIR=/cache
-      - GROXPI_LOGGING_LEVEL=DEBUG
+      - GROXPI_LOGGING_LEVEL=INFO
 
       # Storage Configuration (default: local)
       - GROXPI_STORAGE_TYPE=local
