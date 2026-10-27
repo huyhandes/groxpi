@@ -68,17 +68,23 @@ func TestIndexCache_MissIsChargedAFixedSize(t *testing.T) {
 // (half an hour away) means live entries get evicted to make room for bytes
 // already known to be worthless.
 func TestIndexCache_MissDropsTheStaleEntry(t *testing.T) {
-	c := newIndexCache(0, 0)
-	defer c.close()
+	synctest.Test(t, func(t *testing.T) {
+		c := newIndexCache(0, 0)
+		defer c.close()
 
-	c.set("k", testEntry(`{"a":1}`), -time.Second)
+		c.set("k", testEntry(`{"a":1}`), time.Minute)
+		if n, _ := c.stats(); n != 1 {
+			t.Fatalf("set stored %d entries; want 1", n)
+		}
+		time.Sleep(time.Minute + time.Second)
 
-	if _, ok := c.get("k"); ok {
-		t.Fatal("an expired entry must not be readable")
-	}
-	if n, b := c.stats(); n != 0 || b != 0 {
-		t.Fatalf("stale entry still charged: %d entries, %d bytes", n, b)
-	}
+		if _, ok := c.get("k"); ok {
+			t.Fatal("an expired entry must not be readable")
+		}
+		if n, b := c.stats(); n != 0 || b != 0 {
+			t.Fatalf("stale entry still charged: %d entries, %d bytes", n, b)
+		}
+	})
 }
 
 func TestIndexCache_ByteBudgetEvictsLeastRecentlyUsed(t *testing.T) {

@@ -193,7 +193,7 @@ func (c *client) GetPackageFiles(ctx context.Context, index config.Index, packag
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		slog.WarnContext(ctx, "Cannot parse index URL, leaving package file URLs unresolved",
-			"error", err, "base_url", config.RedactURL(baseURL))
+			"error", config.RedactErrorText(err), "base_url", config.RedactURL(baseURL))
 		base = nil
 	}
 

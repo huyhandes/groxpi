@@ -51,7 +51,9 @@ valid and is what the Kubernetes manifest below uses.
 docker compose up -d      # see docker-compose.yml
 ```
 
-`docker-compose.minio.yml` brings up MinIO alongside groxpi for exercising the S3 path locally.
+`docker-compose.minio.yml` is meant to bring up MinIO alongside groxpi for exercising the S3 path
+locally, but it is currently broken: the MinIO images it references are no longer publicly pullable.
+See "The MinIO compose files reference images that no longer exist" in [backlog.md](backlog.md).
 
 ## Kubernetes
 

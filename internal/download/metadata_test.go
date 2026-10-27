@@ -34,7 +34,9 @@ func newService(t *testing.T, files map[string][]index.FileInfo, ttfb time.Durat
 	}))
 	t.Cleanup(simple.Close)
 	cfg := &config.Config{IndexURL: simple.URL, IndexTTL: time.Minute, IndexCacheSize: 1 << 20, DownloadTimeout: ttfb}
-	return New(cfg, index.New(cfg))
+	idx := index.New(cfg)
+	t.Cleanup(idx.Close)
+	return New(cfg, idx)
 }
 
 func TestMetadataURL(t *testing.T) {

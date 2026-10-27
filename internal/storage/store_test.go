@@ -338,18 +338,13 @@ func TestStore_S3GetFailureIsAMiss(t *testing.T) {
 func TestStore_HybridDeletePrefixEvictsBothTiers(t *testing.T) {
 	l1, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
-	s := NewStore(l1, nil, &fakeFetcher{body: []byte("cached")}, "", false)
-	obj, err := s.Open(t.Context(), "numpy", "numpy-1.0.tar.gz")
-	require.NoError(t, err)
-	_, _ = io.ReadAll(obj)
-	_ = obj.Close()
-	require.NoError(t, s.Close())
+	put(t, l1, mustKey(t, "numpy", "numpy-1.0.tar.gz"), []byte("cached"))
 
 	bucket := newFakeBucket(t, 10, "packages/numpy/numpy-1.0.tar.gz", "packages/pandas/pandas-1.0.tar.gz")
 	remote, err := NewS3Storage(&S3Config{Endpoint: bucket.URL, AccessKeyID: "test", SecretAccessKey: "test",
 		Bucket: "b", ForcePathStyle: true})
 	require.NoError(t, err)
-	s = NewStore(l1, remote, &fakeFetcher{}, "", false)
+	s := NewStore(l1, remote, &fakeFetcher{}, "", false)
 
 	deleted, err := s.DeletePrefix(context.Background(), mustKey(t, "numpy", ""))
 	require.NoError(t, err)
@@ -618,6 +613,7 @@ func TestStore_NotListedIsNotARedirect(t *testing.T) {
 	f := &fakeFetcher{resolveErr: fmt.Errorf("%w: pkg/pkg-1.0.tar.gz", download.ErrNotListed)}
 	for _, redirect := range []bool{false, true} {
 		s := NewStore(l, nil, f, "", redirect)
+		t.Cleanup(func() { require.NoError(t, s.Close()) })
 		_, err = s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
 		require.ErrorIs(t, err, download.ErrNotListed, "redirect=%v", redirect)
 		var re *RedirectError
@@ -1209,7 +1205,7 @@ func TestStore_EvictDuringPromotionLookupIsNotUndone(t *testing.T) {
 		_ = obj.Close()
 		got <- body
 	}()
-	<-bucket.getHeld // the GET has read the object; Open has not locked yet
+	<-bucket.getHeld // the GET is held before the fake writes anything; Open has not locked yet
 	_, err = s.DeletePrefix(t.Context(), mustKey(t, "pkg", ""))
 	require.NoError(t, err)
 	close(bucket.getHold)

@@ -89,7 +89,7 @@ func simpleFile(attrs map[string]string, text string, base *url.URL) (FileInfo, 
 		ref, err := url.Parse(href)
 		if err != nil {
 			slog.Warn("Skipping package file with unparseable href",
-				"error", err,
+				"error", config.RedactErrorText(err),
 				"href", config.RedactURL(href),
 				"base_url", config.RedactURL(base.String()))
 			return FileInfo{}, false
