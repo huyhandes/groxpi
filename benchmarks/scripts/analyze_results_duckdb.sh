@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # column that is empty in every row would be sniffed as VARCHAR and break AVG
 # and arithmetic, so their types are given rather than detected.
 UV_TYPES="{'installed_size_mb': 'DOUBLE', 'dependency_count': 'BIGINT'}"
+# wrk_api_test.sh leaves the load columns empty on single rows and the single
+# column empty on load rows, so a run with only one kind has all-empty columns.
+WRK_TYPES="{'requests_per_sec': 'DOUBLE', 'avg_latency_ms': 'DOUBLE', 'p50_latency_ms': 'DOUBLE', 'p99_latency_ms': 'DOUBLE', 'response_time_single_sec': 'DOUBLE'}"
+# monitor_resources.sh can leave the readings empty, for the same reason.
+RESOURCE_TYPES="{'cpu_percent': 'DOUBLE', 'memory_used_mb': 'DOUBLE'}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -122,7 +127,7 @@ analyze_resources() {
         ROUND(MAX(memory_used_mb), 1) as max_memory_mb,
         COUNT(*) as data_points,
         DATE_DIFF('minute', MIN(timestamp::timestamp), MAX(timestamp::timestamp)) as duration_minutes
-    FROM read_csv('$resource_file', header=true)
+    FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
     WHERE cpu_percent IS NOT NULL
     GROUP BY container
     ORDER BY container;
@@ -140,7 +145,7 @@ analyze_resources() {
             WHEN memory_used_mb > 1000 THEN 'High Memory'
             ELSE 'Normal'
         END as load_level
-    FROM read_csv('$resource_file', header=true)
+    FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
     WHERE cpu_percent IS NOT NULL
     AND (cpu_percent > 30 OR memory_used_mb > 500)
     ORDER BY timestamp DESC
@@ -171,7 +176,7 @@ analyze_api_performance() {
         ROUND(AVG(avg_latency_ms), 2) as avg_latency_ms,
         ROUND(AVG(p99_latency_ms), 2) as p99_latency_ms,
         COUNT(*) as test_runs
-    FROM read_csv('$wrk_file', header=true)
+    FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
     WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
     GROUP BY service, test_name, endpoint
     ORDER BY service, avg_rps DESC;
@@ -187,7 +192,7 @@ analyze_api_performance() {
         ROUND(MIN(response_time_single_sec), 4) as min_response_time_sec,
         ROUND(MAX(response_time_single_sec), 4) as max_response_time_sec,
         COUNT(*) as test_runs
-    FROM read_csv('$wrk_file', header=true)
+    FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
     WHERE test_type = 'single' AND response_time_single_sec IS NOT NULL
     GROUP BY service, test_name, endpoint
     ORDER BY service, avg_response_time_sec;
@@ -201,7 +206,7 @@ analyze_api_performance() {
             endpoint,
             ROUND(AVG(requests_per_sec), 1) as groxpi_rps,
             ROUND(AVG(avg_latency_ms), 2) as groxpi_latency_ms
-        FROM read_csv('$wrk_file', header=true)
+        FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
         WHERE service = 'groxpi' AND test_type = 'load' AND requests_per_sec IS NOT NULL
         GROUP BY test_name, endpoint
     ),
@@ -211,7 +216,7 @@ analyze_api_performance() {
             endpoint,
             ROUND(AVG(requests_per_sec), 1) as proxpi_rps,
             ROUND(AVG(avg_latency_ms), 2) as proxpi_latency_ms
-        FROM read_csv('$wrk_file', header=true)
+        FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
         WHERE service = 'proxpi' AND test_type = 'load' AND requests_per_sec IS NOT NULL
         GROUP BY test_name, endpoint
     )
@@ -363,7 +368,7 @@ generate_executive_summary() {
             SELECT
                 service,
                 AVG(requests_per_sec) as avg_rps
-            FROM read_csv('$wrk_file', header=true)
+            FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
             WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
             GROUP BY service
         )
@@ -380,7 +385,7 @@ generate_executive_summary() {
                 endpoint,
                 AVG(requests_per_sec) FILTER (WHERE service = 'groxpi') as groxpi_rps,
                 AVG(requests_per_sec) FILTER (WHERE service = 'proxpi') as proxpi_rps
-            FROM read_csv('$wrk_file', header=true)
+            FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
             WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
             GROUP BY test_name, endpoint
         )
@@ -430,7 +435,7 @@ generate_executive_summary() {
         duckdb -c "
         SELECT
             '🔥 ' || container || ' peak CPU: ' || ROUND(MAX(cpu_percent), 1) || '%' as summary
-        FROM read_csv('$resource_file', header=true)
+        FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
         WHERE cpu_percent IS NOT NULL
         GROUP BY container
         ORDER BY MAX(cpu_percent) DESC;
@@ -439,7 +444,7 @@ generate_executive_summary() {
         duckdb -c "
         SELECT
             '🧠 ' || container || ' peak memory: ' || ROUND(MAX(memory_used_mb), 0) || 'MB' as summary
-        FROM read_csv('$resource_file', header=true)
+        FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
         WHERE memory_used_mb IS NOT NULL
         GROUP BY container
         ORDER BY MAX(memory_used_mb) DESC;
@@ -484,7 +489,7 @@ export_markdown_report() {
         echo "\`\`\`sql"
         echo "-- Example: Custom API performance query"
         echo "SELECT service, AVG(requests_per_sec) as avg_rps"
-        echo "FROM read_csv_auto('$RESULTS_DIR/wrk-summary-*.csv')"
+        echo "FROM read_csv('$RESULTS_DIR/wrk-summary-$TIMESTAMP.csv', header=true, types=$WRK_TYPES)"
         echo "WHERE test_type = 'load'"
         echo "GROUP BY service;"
         echo "\`\`\`"
@@ -546,7 +551,7 @@ main() {
     echo ""
 
     log_success "DuckDB analysis completed successfully"
-    log_info "💡 Tip: You can run custom queries with: duckdb -c \"SELECT * FROM read_csv_auto('$RESULTS_DIR/wrk-summary-*.csv') LIMIT 5;\""
+    log_info "💡 Tip: You can run custom queries with: duckdb -c \"SELECT * FROM read_csv('$RESULTS_DIR/wrk-summary-$TIMESTAMP.csv', header=true, types=$WRK_TYPES) LIMIT 5;\""
 }
 
 # Run main function
