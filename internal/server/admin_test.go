@@ -140,7 +140,7 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 	// The poll reads the live filter form instead of a q and page baked into
 	// its URL, so typing filters without a submit and htmx escapes the box.
 	assert.Contains(t, page, `hx-get="/admin/rows"`, "the poll URL carries no hand-built q or page")
-	assert.Contains(t, page, `hx-include="#filter-form"`, "the poll sends the filter box and the page")
+	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the poll sends the filter box and the page")
 	assert.Contains(t, page, `hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter"`,
 		"typing in the box re-polls")
 	assert.Contains(t, page, `<form id="filter-form" class="controls" method="get" action="/admin">`,
@@ -150,9 +150,10 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 	assert.Contains(t, paged, `href="/admin?page=2&amp;q=p0"`, "the pager keeps the filter")
 }
 
-// TestAdminPage_FilterRestartsAtPageOne pins that typing a filter on page N
-// polls page 1 of the matches: the page travels in a hidden input of the filter
-// form, which the box resets to 1 on input, and the pager links still work.
+// TestAdminPage_FilterRestartsAtPageOne pins that a new filter on page N starts
+// at page 1 of the matches: the page travels in a hidden input outside the
+// filter form, so a no-JS submit sends only q, while the poll includes it and
+// typing in the box resets it to 1. The pager links still work.
 func TestAdminPage_FilterRestartsAtPageOne(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	h := newAdminServer(t, up.URL)
@@ -165,8 +166,9 @@ func TestAdminPage_FilterRestartsAtPageOne(t *testing.T) {
 	page := string(readBody(t, authGet(h.mux, "/admin?page=2")))
 	form := page[strings.Index(page, `<form id="filter-form"`):]
 	form = form[:strings.Index(form, "</form>")]
-	assert.Contains(t, form, `<input id="page" name="page" type="hidden" value="2">`,
-		"the page is a field of the filter form")
+	assert.NotContains(t, form, `name="page"`, "a plain GET submit of the filter sends only q")
+	assert.Contains(t, page, `<input id="page" name="page" type="hidden" value="2">`,
+		"the poll's page is on the page, outside the filter form")
 	assert.Contains(t, form, `hx-on:input="document.getElementById('page').value = 1"`,
 		"typing in the box starts again at page 1")
 	assert.Contains(t, page, `href="/admin?page=1"`, "the pager links stay")

@@ -29,20 +29,21 @@
 
 <!-- The filter is a plain GET: the listing is paged on the server, so the
      query has to reach admin.List to search every package, not just the rows
-     on screen. The page travels in the hidden field; with JavaScript, typing
-     resets it to 1, so a new filter starts again at page 1, and the poll below
-     re-runs as the operator types, sending this whole form with it. -->
+     on screen. A plain submit sends only q, so a new filter starts at page 1.
+     The page the poll keeps lives in the hidden field outside the form; with
+     JavaScript, typing resets it to 1, and the poll below re-runs as the
+     operator types, sending the form and that field with it. -->
 <form id="filter-form" class="controls" method="get" action="/admin">
   <input id="filter" name="q" type="search" value="{{.Filter}}" placeholder="Filter packages…" autocomplete="off"
          hx-on:input="document.getElementById('page').value = 1">
-  <input id="page" name="page" type="hidden" value="{{.Page}}">
   <button type="submit">Filter</button>
 </form>
+<input id="page" name="page" type="hidden" value="{{.Page}}">
 
 <!-- The table polls: prefetch has no progress bar, so files appearing here are
      the progress display. The first render is server-side, so the poll only
      needs to pick up changes. -->
-<div id="cache" hx-get="/admin/rows" hx-include="#filter-form"
+<div id="cache" hx-get="/admin/rows" hx-include="#filter-form, #page"
      hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>

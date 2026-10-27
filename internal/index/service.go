@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -404,7 +405,8 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 	return json.Marshal(body)
 }
 
-// proxyFileURL is the path this proxy serves a package file at.
+// proxyFileURL is the path this proxy serves a package file at, each segment
+// percent-encoded so a name with "#" or "?" is not cut short by the client.
 func proxyFileURL(packageName, fileName string) string {
-	return "/simple/" + packageName + "/" + fileName
+	return "/simple/" + url.PathEscape(packageName) + "/" + url.PathEscape(fileName)
 }

@@ -49,7 +49,8 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
   cache, with `Content-Encoding: gzip`. Nothing is compressed on the request path; there is no
   compression middleware.
 - HTML is rendered on demand from the parsed file list, with `data-requires-python` and `data-yanked`
-  attributes preserved and every href rewritten to point back at groxpi. Every interpolated value
+  attributes preserved and every href rewritten to point back at groxpi. File URLs (in HTML and JSON)
+  are percent-encoded per path segment, so a `#` in a file name becomes `%23`. Every interpolated value
   (package name, href, file name, requires-python, yanked reason) is HTML-escaped, so `>=3.8` is
   emitted as `&gt;=3.8`.
 - PEP 658 metadata availability is passed through as the upstream stated it — `true` or a hash map —
@@ -193,7 +194,7 @@ of the package name, trimmed and normalised like a package name (so `Typing_Ext`
 applied to every cached package before paging and to the "Downloading now" rows. The page's filter box
 sends it, with the page, on every poll, re-polling as the operator types and starting again at page 1;
 it shows the filter as typed (trimmed), not its normalised form. Without JavaScript, submitting the box
-reloads the page with it, on the page shown. The pager links keep it. The listing shows the local cache only, so in pure
+reloads the page with it, starting at page 1. The pager links keep it. The listing shows the local cache only, so in pure
 `s3` mode, which has no cache, the table is empty.
 
 ### `POST /admin/prefetch`

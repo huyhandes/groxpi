@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -186,7 +187,7 @@ func (u *FakePyPI) serveIndex(w http.ResponseWriter, r *http.Request, pkg string
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(w, "<html><body>")
 		for _, n := range names {
-			_, _ = fmt.Fprintf(w, `<a href=%q>%s</a>`, u.URL+"/files/"+n, n)
+			_, _ = fmt.Fprintf(w, `<a href=%q>%s</a>`, u.URL+"/files/"+url.PathEscape(n), n)
 		}
 		_, _ = io.WriteString(w, "</body></html>")
 		return
@@ -198,7 +199,7 @@ func (u *FakePyPI) serveIndex(w http.ResponseWriter, r *http.Request, pkg string
 	files := make([]map[string]any, 0, len(names))
 	for i, n := range names {
 		f := listed[i]
-		e := map[string]any{"filename": n, "url": "../files/" + n}
+		e := map[string]any{"filename": n, "url": "../files/" + url.PathEscape(n)}
 		if f.SHA256 != "" {
 			e["hashes"] = map[string]string{"sha256": f.SHA256}
 		}
