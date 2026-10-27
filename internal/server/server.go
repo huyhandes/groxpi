@@ -124,7 +124,8 @@ func recoverPanics(next http.Handler) http.Handler {
 // recoverPanics answers) or, after a write, the status already sent; an
 // http.ErrAbortHandler as aborted with the status already sent, or none if
 // nothing was written (logged as status 0). The panic is then re-raised for
-// recoverPanics and net/http, a plain one after a write as an abort.
+// recoverPanics and net/http, a plain one after a write logged here and
+// re-raised as a bare abort.
 func traceRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -184,10 +185,12 @@ func traceRequests(next http.Handler) http.Handler {
 			// A plain panic after a write cannot become a 500: recoverPanics'
 			// http.Error would append its text to the body already sent, and a
 			// chunked one would then end cleanly. Re-raise it as an abort so the
-			// connection is dropped. net/http compares the panic value with ==,
-			// so the wrapped abort is still logged there, with its stack.
+			// connection is dropped. It is logged here, as recoverPanics would:
+			// the bare sentinel is the one panic net/http does not log, and a
+			// wrapped one would reach the log bridge at INFO.
 			if panicked && sw.code != 0 {
-				panic(fmt.Errorf("%w: %v", http.ErrAbortHandler, rec))
+				slog.ErrorContext(ctx, "Handler panicked", "panic", rec, "stack", string(debug.Stack()))
+				panic(http.ErrAbortHandler)
 			}
 			if rec != nil {
 				panic(rec)

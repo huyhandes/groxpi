@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -17,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -187,27 +191,47 @@ var (
 // indexCacheHits reads the index-layer cache hit counter.
 func indexCacheHits(t *testing.T) int64 {
 	t.Helper()
+	return counterValue(t, "groxpi.cache.hits", "cache.layer", "index")
+}
+
+// counterValue sums an int64 counter's data points whose attribute key equals
+// value.
+func counterValue(t *testing.T, name, key, value string) int64 {
+	t.Helper()
 	testMetricsOnce.Do(func() {
 		testMetrics = sdkmetric.NewManualReader()
 		otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(testMetrics)))
 	})
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, testMetrics.Collect(context.Background(), &rm))
-	var hits int64
+	var total int64
 	for _, scope := range rm.ScopeMetrics {
 		for _, m := range scope.Metrics {
 			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok || m.Name != "groxpi.cache.hits" {
+			if !ok || m.Name != name {
 				continue
 			}
 			for _, dp := range sum.DataPoints {
-				if layer, _ := dp.Attributes.Value("cache.layer"); layer.AsString() == "index" {
-					hits += dp.Value
+				if v, _ := dp.Attributes.Value(attribute.Key(key)); v.AsString() == value {
+					total += dp.Value
 				}
 			}
 		}
 	}
-	return hits
+	return total
+}
+
+// TestResolve_PanickingQueryCountsAsAnError: a query that panics still has an
+// outcome; it is an index error, not a missing data point.
+func TestResolve_PanickingQueryCountsAsAnError(t *testing.T) {
+	before := counterValue(t, "groxpi.index.resolutions", "index.result", "error")
+	synctest.Test(t, func(t *testing.T) {
+		up := &panickyUpstream{fakeUpstream: newFakeUpstream()}
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.Error(t, err)
+	})
+	assert.Equal(t, int64(1), counterValue(t, "groxpi.index.resolutions", "index.result", "error")-before)
 }
 
 // TestResolve_CachedMissCountsAsAnIndexCacheHit pins that negative caching
@@ -464,4 +488,92 @@ func TestShared_PanicIsAnError(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 1, v)
 	})
+}
+
+// captureErrorLines points the default logger at a buffer for the rest of the
+// test and returns a func counting the ERROR lines logged so far.
+func captureErrorLines(t *testing.T) func() int {
+	t.Helper()
+	logs := &lockedBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func() int { return strings.Count(logs.String(), "level=ERROR") }
+}
+
+// lockedBuffer is a bytes.Buffer safe to log into from the shared fetch's
+// goroutine while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// TestResolve_FailureAfterEveryWaiterLeftIsLogged: the shared lookup outlives
+// its callers, so a real upstream failure must be logged where it happens, not
+// by a caller that may already have gone.
+func TestResolve_FailureAfterEveryWaiterLeftIsLogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		errorLines := captureErrorLines(t)
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", nil, errors.New("upstream 503"))
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		left := make(chan error, 1)
+		go func() { _, err := svc.Resolve(ctx, "numpy"); left <- err }()
+		synctest.Wait()
+		cancel()
+		require.ErrorIs(t, <-left, context.Canceled)
+
+		close(up.release)
+		synctest.Wait()
+		assert.Equal(t, 1, errorLines(), "the failure must be logged once with nobody waiting")
+	})
+}
+
+// TestResolve_SharedFailureIsLoggedOnce: waiters on one failing lookup share
+// one failure, so it is one ERROR line, not one per waiter.
+func TestResolve_SharedFailureIsLoggedOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		errorLines := captureErrorLines(t)
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", nil, errors.New("upstream 503"))
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		errs := make(chan error, 2)
+		for range 2 {
+			go func() { _, err := svc.Resolve(t.Context(), "numpy"); errs <- err }()
+		}
+		synctest.Wait()
+		close(up.release)
+		require.Error(t, <-errs)
+		require.Error(t, <-errs)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "both waiters shared one lookup")
+		assert.Equal(t, 1, errorLines(), "one shared failure is one ERROR line")
+	})
+}
+
+// TestProxyRoot_FailureIsLoggedOnce: as for Resolve, a failed root fetch is
+// logged by the shared fetch itself.
+func TestProxyRoot_FailureIsLoggedOnce(t *testing.T) {
+	errorLines := captureErrorLines(t)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	svc := newTestService(t, &config.Config{IndexURL: closed.URL, IndexCacheSize: 1 << 20})
+
+	_, err := svc.ProxyRoot(t.Context(), "", "")
+	require.Error(t, err)
+	assert.Equal(t, 1, errorLines())
 }

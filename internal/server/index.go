@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"log/slog"
 	"net/http"
 	"strings"
 
@@ -34,7 +33,6 @@ func (s *Server) handleListPackages(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return // the client left: nobody to answer
 		}
-		slog.ErrorContext(r.Context(), "Failed to proxy root index", "error", config.RedactErrorText(err))
 		http.Error(w, "Failed to fetch package list", http.StatusBadGateway)
 		return
 	}
@@ -64,8 +62,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Package not found", http.StatusNotFound)
 			return
 		}
-		slog.ErrorContext(r.Context(), "Failed to fetch package files",
-			"error", config.RedactErrorText(err), "package", packageName)
+		// index logged the failure once, for every waiter.
 		http.Error(w, "Error fetching package: "+config.RedactErrorText(err), http.StatusInternalServerError)
 		return
 	}

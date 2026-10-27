@@ -466,10 +466,10 @@ func TestTelemetry_PanicAfterWriteKeepsSentStatus(t *testing.T) {
 
 	func() {
 		defer func() {
-			err, ok := recover().(error)
-			require.True(t, ok, "the panic must be re-raised as an error")
-			assert.ErrorIs(t, err, http.ErrAbortHandler)
-			assert.Contains(t, err.Error(), "boom", "the original panic value must survive")
+			// The bare sentinel: net/http stays quiet on it, so the panic is
+			// logged once, here, at ERROR, not by net/http through the INFO
+			// log bridge.
+			assert.Equal(t, http.ErrAbortHandler, recover(), "the panic must be re-raised as a bare abort")
 		}()
 		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/late-boom/x", nil))
 	}()
@@ -480,6 +480,8 @@ func TestTelemetry_PanicAfterWriteKeepsSentStatus(t *testing.T) {
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Equal(t, "panic", span.Status().Description)
 	assert.Contains(t, logs.String(), `"status":202`)
+	assert.Contains(t, logs.String(), `"level":"ERROR","msg":"Handler panicked","panic":"boom"`)
+	assert.Contains(t, logs.String(), `"stack":"goroutine`)
 }
 
 // TestTelemetry_AbortBeforeWriteClaimsNoStatus: an abort before anything was
