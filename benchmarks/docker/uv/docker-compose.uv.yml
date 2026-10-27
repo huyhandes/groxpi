@@ -3,6 +3,6 @@ version: '3.8'
 
 services:
   uv-test:
-    image: ghcr.io/astral-sh/uv:latest
+    image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
     container_name: uv-test
     restart: unless-stopped
