@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -224,6 +225,58 @@ func TestStore_PromotionDuringEvictIsNotUndone(t *testing.T) {
 	require.NoError(t, s.Close())
 	assert.Equal(t, "upstream bytes", string(got))
 	assert.Equal(t, int64(1), f.resolves.Load(), "the next Open fetched upstream")
+}
+
+// TestStore_LookupSpanningEvictLooksAgain: a hybrid Open whose durable GET
+// reads the object while DeletePrefix is deleting from the bucket, and returns
+// only after DeletePrefix has finished, registers its flight once the prefix
+// is no longer evicting, so nothing marks it. The generation bump after the
+// deletes makes it look again and fetch upstream instead of promoting the
+// deleted bytes back.
+func TestStore_LookupSpanningEvictLooksAgain(t *testing.T) {
+	f := &fakeFetcher{body: []byte("upstream bytes")}
+	s, l, bucket, _ := evictStore(t, "hybrid", f)
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
+	bucket.seed(key, []byte("evicted bytes"))
+	bucket.delHold, bucket.delHeld = make(chan struct{}), make(chan struct{})
+	bucket.getHold, bucket.getHeld = make(chan struct{}), make(chan struct{})
+	releaseDel, releaseGet := sync.OnceFunc(func() { close(bucket.delHold) }), sync.OnceFunc(func() { close(bucket.getHold) })
+	t.Cleanup(releaseDel)
+	t.Cleanup(releaseGet)
+
+	done := deletePrefixAsync(s, mustKey(t, "pkg", ""))
+	select {
+	case <-bucket.delHeld: // the first generation bump is in, the bucket delete waits
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeletePrefix never reached the bucket delete")
+	}
+	got := make(chan []byte, 1)
+	go func() {
+		obj, err := s.Open(context.Background(), "pkg", "pkg-1.0.tar.gz")
+		if err != nil {
+			got <- []byte(err.Error())
+			return
+		}
+		body, _ := io.ReadAll(obj)
+		_ = obj.Close()
+		got <- body
+	}()
+	select {
+	case <-bucket.getHeld: // the GET has read the old object; Open has not locked yet
+	case <-time.After(5 * time.Second):
+		t.Fatal("Open never reached the durable GET")
+	}
+	releaseDel()
+	require.NoError(t, <-done)
+	releaseGet()
+
+	assert.Equal(t, "upstream bytes", string(<-got), "the deleted bytes are not served")
+	require.NoError(t, s.Close())
+	assert.Equal(t, int64(1), f.resolves.Load(), "the Open fetched upstream")
+	cached, err := os.ReadFile(l.buildPath(key))
+	require.NoError(t, err)
+	assert.Equal(t, "upstream bytes", string(cached), "the evicted bytes were not promoted back into the cache")
+	assert.Equal(t, "upstream bytes", string(bucket.object(key)), "the bucket holds the fresh fetch, not the evicted bytes")
 }
 
 // list answers a ListObjectsV2 under prefix in one page. Caller holds b.mu.
