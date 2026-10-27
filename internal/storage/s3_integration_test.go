@@ -14,10 +14,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -87,7 +90,7 @@ func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
 	}))
 	defer strict.Close()
 
-	storage := newIntegrationS3Storage(t, strict.URL)
+	storage := newIntegrationS3Storage(t, strict.URL, "client-test")
 	defer func() { _ = storage.Close() }()
 
 	ctx := context.Background()
@@ -113,6 +116,103 @@ func TestS3WithMinIO_RejectsChecksumTrailers(t *testing.T) {
 	defer func() { _ = direct.Close() }()
 	_, err = direct.DeletePrefix(ctx, key)
 	require.NoError(t, err)
+}
+
+// TestS3WithMinIO_StoreReadsAndDeletes runs the s3-mode Store against a real
+// object store: a hit larger than one ranged-read window, read across a window
+// boundary and whole, and an eviction of more keys than one DeleteObjects batch.
+func TestS3WithMinIO_StoreReadsAndDeletes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping S3 integration test in short mode")
+	}
+
+	endpoint := minioEndpoint(t)
+	prefix := fmt.Sprintf("store-test-%d", time.Now().UnixNano())
+	t.Cleanup(func() { deleteIntegrationPrefix(t, endpoint, prefix) })
+
+	durable := newIntegrationS3Storage(t, endpoint, prefix)
+	store := NewStore(nil, durable, nil, t.TempDir(), false) // serves hits only: no fetcher
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+
+	t.Run("ranged_reads", func(t *testing.T) {
+		content := make([]byte, 3*firstWindow+123)
+		for i := range content {
+			content[i] = byte(i * 7 % 251)
+		}
+		key, err := Key("big", "big-1.0.tar.gz")
+		require.NoError(t, err)
+		require.NoError(t, durable.Put(ctx, key, bytes.NewReader(content), int64(len(content)), "application/gzip"))
+
+		obj, err := store.Open(ctx, "big", "big-1.0.tar.gz")
+		require.NoError(t, err)
+		require.Equal(t, int64(len(content)), obj.Size)
+		// A seek opens a firstWindow-long window at off; reading past its end
+		// carries on into the next window.
+		off := int64(firstWindow / 2)
+		_, err = obj.Seek(off, io.SeekStart)
+		require.NoError(t, err)
+		got := make([]byte, firstWindow+200)
+		_, err = io.ReadFull(obj, got)
+		require.NoError(t, err)
+		assert.True(t, bytes.Equal(content[off:off+int64(len(got))], got), "range across a window boundary differs")
+		require.NoError(t, obj.Close())
+
+		obj, err = store.Open(ctx, "big", "big-1.0.tar.gz")
+		require.NoError(t, err)
+		all, err := io.ReadAll(obj)
+		require.NoError(t, err)
+		assert.True(t, bytes.Equal(content, all), "whole object differs")
+		require.NoError(t, obj.Close())
+	})
+
+	t.Run("delete_prefix_past_one_batch", func(t *testing.T) {
+		const n = deleteBatchSize + 1
+		keys := make(chan string)
+		errs := make(chan error, n)
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				for k := range keys {
+					errs <- durable.Put(ctx, k, strings.NewReader("x"), 1, "text/plain")
+				}
+			})
+		}
+		for i := range n {
+			k, err := Key("many", fmt.Sprintf("many-%04d.whl", i))
+			require.NoError(t, err)
+			keys <- k
+		}
+		close(keys)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+
+		pkgPrefix, err := Key("many", "")
+		require.NoError(t, err)
+		deleted, err := store.DeletePrefix(ctx, pkgPrefix)
+		require.NoError(t, err)
+		assert.Equal(t, n, deleted)
+
+		left, err := durable.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(durable.bucket),
+			Prefix: aws.String(durable.buildKey(pkgPrefix)),
+		})
+		require.NoError(t, err)
+		assert.Empty(t, left.Contents, "objects left under the prefix")
+	})
+}
+
+// deleteIntegrationPrefix removes every object a test stored under prefix.
+func deleteIntegrationPrefix(t *testing.T, endpoint, prefix string) {
+	t.Helper()
+
+	s := newIntegrationS3Storage(t, endpoint, prefix)
+	defer func() { _ = s.Close() }()
+	_, err := s.DeletePrefix(context.Background(), "")
+	assert.NoError(t, err, "failed to delete the objects under %s", prefix)
 }
 
 // sendsChecksum reports whether a request carries the checksum trailer or
@@ -147,8 +247,13 @@ func TestS3WithRealClients(t *testing.T) {
 	groxpiBinary := buildGroxpiBinary(t)
 	testDir := t.TempDir()
 
+	// A prefix of its own per run, removed afterwards: a reused prefix would
+	// serve pip and uv from the last run's objects instead of fetching them.
+	prefix := fmt.Sprintf("client-test-%d", time.Now().UnixNano())
+	t.Cleanup(func() { deleteIntegrationPrefix(t, endpoint, prefix) })
+
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
-	server := startGroxpiServer(t, groxpiBinary, baseURL, endpoint)
+	server := startGroxpiServer(t, groxpiBinary, baseURL, endpoint, prefix)
 	defer server.Stop()
 	server.waitReady(baseURL)
 
@@ -163,7 +268,7 @@ func TestS3WithRealClients(t *testing.T) {
 
 // createTestS3Storage creates an S3 storage instance pointed at MinIO.
 func createTestS3Storage(t *testing.T) *S3Storage {
-	return newIntegrationS3Storage(t, minioEndpoint(t))
+	return newIntegrationS3Storage(t, minioEndpoint(t), "client-test")
 }
 
 // minioEndpoint returns the MinIO endpoint under test, skipping the test when
@@ -184,7 +289,7 @@ func minioEndpoint(t *testing.T) string {
 // newIntegrationS3Storage builds a backend against endpoint. Path-style
 // addressing is on: MinIO cannot resolve virtual-hosted bucket names, so a round
 // trip here is itself the proof that path-style addressing is in use.
-func newIntegrationS3Storage(t *testing.T, endpoint string) *S3Storage {
+func newIntegrationS3Storage(t *testing.T, endpoint, prefix string) *S3Storage {
 	t.Helper()
 
 	storage, err := NewS3Storage(&S3Config{
@@ -193,7 +298,7 @@ func newIntegrationS3Storage(t *testing.T, endpoint string) *S3Storage {
 		SecretAccessKey: getEnvOrDefault("TEST_S3_SECRET_KEY", "minioadmin"),
 		Region:          "us-east-1",
 		Bucket:          getEnvOrDefault("TEST_S3_BUCKET", "groxpi-test"),
-		Prefix:          "client-test",
+		Prefix:          prefix,
 		UseSSL:          false,
 		ForcePathStyle:  true,
 		ConnectTimeout:  30 * time.Second,
@@ -244,7 +349,7 @@ func (gs *groxpiServer) Stop() {
 
 // startGroxpiServer starts groxpi listening on baseURL's port, storing into the
 // MinIO the other integration tests use.
-func startGroxpiServer(t *testing.T, groxpiBinary, baseURL, endpoint string) *groxpiServer {
+func startGroxpiServer(t *testing.T, groxpiBinary, baseURL, endpoint, prefix string) *groxpiServer {
 	t.Helper()
 
 	u, err := url.Parse(baseURL)
@@ -257,7 +362,7 @@ func startGroxpiServer(t *testing.T, groxpiBinary, baseURL, endpoint string) *gr
 		"AWS_ACCESS_KEY_ID="+getEnvOrDefault("TEST_S3_ACCESS_KEY", "minioadmin"),
 		"AWS_SECRET_ACCESS_KEY="+getEnvOrDefault("TEST_S3_SECRET_KEY", "minioadmin"),
 		"GROXPI_S3_BUCKET="+getEnvOrDefault("TEST_S3_BUCKET", "groxpi-test"),
-		"GROXPI_S3_PREFIX=client-test",
+		"GROXPI_S3_PREFIX="+prefix,
 		"GROXPI_S3_USE_SSL=false",
 		"GROXPI_S3_FORCE_PATH_STYLE=true",
 		"GROXPI_CACHE_DIR="+t.TempDir(),

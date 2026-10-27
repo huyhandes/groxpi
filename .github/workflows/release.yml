@@ -11,9 +11,9 @@ on:
         required: true
         type: string
 
+# Read-only by default; only the jobs that publish get write access.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   prepare:
@@ -145,6 +145,9 @@ jobs:
     name: Build Docker Images
     runs-on: ubuntu-latest
     needs: [prepare, test]
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
 
     steps:
     - name: Checkout code
@@ -187,6 +190,8 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [prepare, build-binaries, build-docker]
+    permissions:
+      contents: write # create the tag and the release
 
     steps:
     - name: Checkout code
@@ -247,7 +252,6 @@ jobs:
         files: release-assets/*
         draft: false
         prerelease: false
-        generate_release_notes: true
         make_latest: true
 
     - name: Clean up release branch (optional)
