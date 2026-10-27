@@ -19,7 +19,8 @@ Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
 ## Prerequisites
 
 - `wrk` — `brew install wrk`, or `apt-get install wrk`
-- Docker, for the install tests and for running both proxies
+- Docker, for the install tests and for running both proxies. The benchmark compose file's
+  healthchecks use `start_interval`, which needs Docker Engine 25.0+ and Docker Compose 2.20.2+
 - `duckdb` — `brew install duckdb`, only for the analysis step
 - Both proxies running from `benchmarks/docker/docker-compose.benchmark.yml` on the same host, since
   cold runs recreate those containers (see [Cache state](#cache-state))

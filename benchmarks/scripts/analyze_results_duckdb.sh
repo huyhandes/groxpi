@@ -79,7 +79,6 @@ find_csv_file() {
 run_query() {
     local query="$1"
     local title="$2"
-    local output_file="${3:-}"
 
     echo ""
     echo "=========================================="
@@ -87,13 +86,7 @@ run_query() {
     echo "=========================================="
     echo ""
 
-    if [ -n "$output_file" ]; then
-        echo "Query: $query" > "$output_file"
-        echo "" >> "$output_file"
-        duckdb -c "$query" | tee -a "$output_file"
-    else
-        duckdb -c "$query"
-    fi
+    duckdb -c "$query"
 }
 
 # Function to analyze resource usage
@@ -471,10 +464,7 @@ export_markdown_report() {
         echo ""
         echo "## Raw Data Files"
         echo ""
-        local all_files=($(find "$RESULTS_DIR" -name "*.csv" -type f | sort))
-        for file in "${all_files[@]}"; do
-            echo "- \`$(basename "$file")\`"
-        done
+        find "$RESULTS_DIR" -name "*.csv" -type f -exec basename {} \; | sort | sed 's/.*/- `&`/'
 
         echo ""
         echo "## DuckDB Queries"
