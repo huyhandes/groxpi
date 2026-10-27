@@ -140,6 +140,18 @@ clear_cache() {
     fi
 }
 
+# Map a host-local URL to one the uv container can reach: inside the container localhost is the
+# container itself, so localhost/127.0.0.1 become host.docker.internal (resolved via --add-host
+# in docker run). Any other host is left alone.
+container_url() {
+    local url=$1
+    if [[ $url =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]*@)?(localhost|127\.0\.0\.1)([:/].*)?$ ]]; then
+        printf '%s%shost.docker.internal%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"
+    else
+        printf '%s\n' "$url"
+    fi
+}
+
 # Function to create pyproject.toml from template with dynamic index endpoint
 create_pyproject_config() {
     local server_url=$1
@@ -173,7 +185,8 @@ run_uv_install_test() {
     local temp_dir=$(mktemp -d)
     local config_file="$temp_dir/pyproject.toml"
 
-    # Create configuration
+    # Create configuration; the container needs a URL it can reach
+    server_url=$(container_url "$server_url")
     create_pyproject_config "$server_url" "$service_name" "$config_file"
 
     log_info "UV test: $service_name - $test_name ($cache_mode cache)"
@@ -314,6 +327,7 @@ echo ''
     host_start=$(date +%s)
     docker run --rm \
         --network="$DOCKER_NETWORK" \
+        --add-host=host.docker.internal:host-gateway \
         -v "$temp_dir:/workspace" \
         -w /workspace \
         "$UV_IMAGE" \
