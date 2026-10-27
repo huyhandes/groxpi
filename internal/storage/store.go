@@ -65,7 +65,6 @@ type Object struct {
 	Name        string
 	Size        int64 // -1 when unknown
 	ModTime     time.Time
-	ETag        string // quoted, empty when unknown
 	ContentType string
 	InFlight    bool
 }
@@ -408,7 +407,6 @@ func (s *Store) lookup(ctx context.Context, key, file string, count bool) (*Obje
 		telemetry.CacheHit(ctx, telemetry.LayerRemote)
 	}
 	if s.cache == nil {
-		// No ETag: a local hit sends none, and S3 hits match it header for header.
 		return &Object{
 			ReadSeekCloser: &rangedReader{
 				open: func(off, end int64) (io.ReadCloser, error) { return s.durable.getRange(rctx, key, off, end) },
@@ -519,7 +517,7 @@ func (s *Store) spool(ctx context.Context, f *flight, src *download.File, promot
 	if total <= 0 {
 		total = src.Length
 	}
-	f.start(sp, src.Size, total, quoteETag(src.SHA256))
+	f.start(sp, src.Size, total)
 
 	h := sha256.New()
 	bufp := copyBufPool.Get().(*[]byte)
@@ -571,7 +569,7 @@ type commitFunc func(ctx context.Context, f *flight, sp *os.File, written int64,
 func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written int64, _ bool) {
 	if s.evicted(f) {
 		_ = os.Remove(sp.Name())
-	} else if err := s.syncCommit(ctx, sp, f.key, written); err != nil {
+	} else if err := s.syncCommit(sp, f.key, written); err != nil {
 		// Safe to log raw: a local filesystem error, no index URL in it.
 		slog.ErrorContext(ctx, "Failed to commit download to cache", "error", err, "key", f.key)
 		_ = os.Remove(sp.Name())
@@ -580,6 +578,8 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 	}
 	s.unregisterCommitted(f)
 	f.finish(nil)
+	// After finish, so a size-eviction walk never holds back a reader's last byte.
+	s.cache.maybeEvict(ctx)
 }
 
 // syncCommit flushes the spool to disk before renaming it into the cache, so a
@@ -588,11 +588,11 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 //
 // shortcut: tails release the last byte only after this sync, so on a miss
 // every waiting client pays the flush, not only the commit.
-func (s *Store) syncCommit(ctx context.Context, sp *os.File, key string, written int64) error {
+func (s *Store) syncCommit(sp *os.File, key string, written int64) error {
 	if err := sp.Sync(); err != nil {
 		return fmt.Errorf("failed to sync spool file: %w", err)
 	}
-	return s.cache.commit(ctx, sp.Name(), key, written)
+	return s.cache.commit(sp.Name(), key, written)
 }
 
 // commitHybrid is commitLocal, then the upload to the durable store unless the
@@ -807,16 +807,15 @@ type flight struct {
 	spool   *os.File
 	size    int64 // declared by the index, -1 when unknown
 	total   int64 // expected length for the last-byte holdback, -1 when unknown
-	etag    string
 	written int64
 	done    bool
 	err     error
 	refs    int
 }
 
-func (f *flight) start(sp *os.File, size, total int64, etag string) {
+func (f *flight) start(sp *os.File, size, total int64) {
 	f.mu.Lock()
-	f.spool, f.size, f.total, f.etag = sp, size, total, etag
+	f.spool, f.size, f.total = sp, size, total
 	f.mu.Unlock()
 	close(f.ready)
 }
@@ -870,7 +869,7 @@ func (f *flight) open(ctx context.Context) (*Object, error) {
 	}
 	f.mu.Lock()
 	err, started := f.err, f.spool != nil
-	obj := &Object{ReadSeekCloser: &tail{f: f}, Name: f.file, Size: f.size, ETag: f.etag, ContentType: contentType(f.file), InFlight: true}
+	obj := &Object{ReadSeekCloser: &tail{f: f}, Name: f.file, Size: f.size, ContentType: contentType(f.file), InFlight: true}
 	f.mu.Unlock()
 	if !started {
 		f.release()
@@ -1022,14 +1021,6 @@ func (r *rangedReader) Close() error {
 	err := r.body.Close()
 	r.body = nil
 	return err
-}
-
-// quoteETag quotes the index's bare hex digest as an entity-tag.
-func quoteETag(etag string) string {
-	if etag == "" {
-		return ""
-	}
-	return `"` + etag + `"`
 }
 
 // contentType derives a content type from the distribution filename so the

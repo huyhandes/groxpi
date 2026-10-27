@@ -133,7 +133,8 @@ func put(t testing.TB, s *LocalStorage, key string, data []byte) {
 	require.NoError(t, err)
 	_, err = tmp.Write(data)
 	require.NoError(t, errors.Join(err, tmp.Close()))
-	require.NoError(t, s.commit(context.Background(), tmp.Name(), key, int64(len(data))))
+	require.NoError(t, s.commit(tmp.Name(), key, int64(len(data))))
+	s.maybeEvict(context.Background())
 }
 
 // putN writes n bytes under key.

@@ -233,8 +233,9 @@ func (l *LocalStorage) remove(key string, size int64) error {
 
 // maybeEvict runs an eviction walk when the size counter crosses maxSize.
 //
-// ponytail: runs synchronously on the Put that crosses the limit; move to a
-// background goroutine if that one Put's latency ever matters.
+// ponytail: runs synchronously on the flight goroutine that crosses the limit,
+// after its readers have their last byte; it delays only that flight's hybrid
+// upload. Move it to a goroutine if that ever matters.
 func (l *LocalStorage) maybeEvict(ctx context.Context) {
 	due := func() bool {
 		return l.maxSize > 0 && l.size.Load() > l.maxSize
@@ -343,8 +344,9 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (*os.File, *ObjectIn
 
 // commit renames a finished temp file (in key's directory) into place and
 // accounts for its size. It is the whole of a local write once the spool's
-// bytes are on disk.
-func (l *LocalStorage) commit(ctx context.Context, tmpPath, key string, written int64) error {
+// bytes are on disk. The caller runs maybeEvict afterwards, off the path that
+// releases readers.
+func (l *LocalStorage) commit(tmpPath, key string, written int64) error {
 	path := l.buildPath(key)
 	// An overwrite replaces the old file's bytes rather than adding to them.
 	var replaced int64
@@ -355,7 +357,6 @@ func (l *LocalStorage) commit(ctx context.Context, tmpPath, key string, written 
 		return fmt.Errorf("failed to move file: %w", err)
 	}
 	l.size.Add(written - replaced)
-	l.maybeEvict(ctx)
 	return nil
 }
 

@@ -147,6 +147,10 @@ func (s *Service) Fetch(ctx context.Context, t Target) (*File, error) {
 		return nil, fmt.Errorf("failed to create request: %w", config.RedactURLError(err))
 	}
 	req.Header.Set("User-Agent", config.UserAgent)
+	// Without this net/http asks for gzip and transparently decodes a reply
+	// labelled Content-Encoding: gzip, so a mislabelled .tar.gz would be cached
+	// decompressed and fail its hash. The file is stored byte for byte.
+	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := s.client.Do(req) // #nosec G704 -- see NewRequestWithContext above
 	if err != nil {

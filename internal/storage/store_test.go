@@ -764,7 +764,7 @@ func TestFlight_FailedAfterStartOpensThenFails(t *testing.T) {
 
 	f := &flight{file: "pkg-1.0.tar.gz", size: -1, ready: make(chan struct{}), refs: 1}
 	f.cond = sync.NewCond(&f.mu)
-	f.start(sp, -1, 4, "")
+	f.start(sp, -1, 4)
 	f.advance(4)
 	fail := errors.New("x")
 	f.finish(fail)
@@ -1050,7 +1050,6 @@ func TestStore_S3HitTransfersOnlyTheRange(t *testing.T) {
 		assert.False(t, obj.InFlight)
 		assert.Equal(t, int64(len(body)), obj.Size)
 		assert.Equal(t, mod, obj.ModTime.UTC())
-		assert.Empty(t, obj.ETag, "S3 hits send no ETag, like local hits")
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set("Range", rng)
 		rec := httptest.NewRecorder()

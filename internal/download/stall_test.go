@@ -1,6 +1,8 @@
 package download
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -104,4 +106,28 @@ func TestFetch_DribblingBodyCompletes(t *testing.T) {
 	got, err := io.ReadAll(f.Body)
 	require.NoError(t, err)
 	assert.Equal(t, payload, string(got))
+}
+
+// TestFetch_GzipLabelledBodyIsNotDecoded pins that a package file is fetched
+// byte for byte. An upstream that labels a .tar.gz "Content-Encoding: gzip"
+// must not have net/http transparently decompress it: the cached bytes would
+// differ from the advertised hash.
+func TestFetch_GzipLabelledBodyIsNotDecoded(t *testing.T) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write([]byte("tarball contents"))
+	require.NoError(t, zw.Close())
+	upstream := buf.Bytes()
+
+	dl, tgt := newBodyUpstream(t, time.Minute, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(upstream)
+	})
+
+	f, err := dl.Fetch(t.Context(), tgt)
+	require.NoError(t, err)
+	defer func() { _ = f.Body.Close() }()
+	got, err := io.ReadAll(f.Body)
+	require.NoError(t, err)
+	assert.Equal(t, upstream, got)
 }
