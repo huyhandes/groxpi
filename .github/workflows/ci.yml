@@ -72,7 +72,7 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       uses: codecov/codecov-action@v4
       with:
-        file: ./coverage.out
+        files: ./coverage.out
         flags: unittests
         name: codecov-umbrella
 
@@ -136,7 +136,7 @@ jobs:
         fi
         # A renamed test or a -run pattern that matches nothing passes with zero
         # tests run; require each one by name.
-        for want in '--- PASS: TestS3WithMinIO_RejectsChecksumTrailers' '--- PASS: TestS3WithMinIO '; do
+        for want in '--- PASS: TestS3WithMinIO_RejectsChecksumTrailers' '--- PASS: TestS3WithMinIO_StoreReadsAndDeletes' '--- PASS: TestS3WithMinIO '; do
           if ! grep -qF -- "$want" minio-test.out; then
             echo "missing from MinIO test output: $want" >&2
             exit 1
