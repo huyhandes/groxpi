@@ -74,4 +74,5 @@ volumes:
 
 networks:
   benchmark-network:
+    name: benchmark-network
     driver: bridge
