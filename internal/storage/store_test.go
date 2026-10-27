@@ -901,6 +901,9 @@ type fakeS3 struct {
 	gate    chan struct{} // object GETs send half, then wait for it to close (set before use)
 	putGate chan struct{} // PUTs signal putSeen, then wait for it to close (set before use)
 	putSeen chan struct{} // closed by the first gated PUT
+	getHold chan struct{} // the first object GET reads the bucket, signals getHeld, then waits for it to close (set before use)
+	getHeld chan struct{}
+	getOnce sync.Once
 }
 
 // exists reports whether key is a file in the cache.
@@ -942,6 +945,16 @@ func newFakeS3(t *testing.T) (*S3Storage, *fakeS3) {
 				return // bucket check
 			}
 			body, ok := b.objects[r.URL.Path]
+			if r.Method == http.MethodGet && b.getHold != nil {
+				first := false
+				b.getOnce.Do(func() { first = true })
+				if first {
+					b.mu.Unlock()
+					close(b.getHeld)
+					<-b.getHold
+					b.mu.Lock()
+				}
+			}
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -1166,4 +1179,42 @@ func (f *namedFetcher) names() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.pkgs...)
+}
+
+// TestStore_EvictDuringPromotionLookupIsNotUndone: a DeletePrefix between a
+// hybrid Open's durable GET and its flight registration marks nothing, so the
+// Open must notice the eviction and look again instead of promoting the
+// deleted bytes back into the cache.
+func TestStore_EvictDuringPromotionLookupIsNotUndone(t *testing.T) {
+	l1, err := NewLocalStorage(t.TempDir(), 0, 0)
+	require.NoError(t, err)
+	remote, bucket := newFakeS3(t)
+	key := mustKey(t, "pkg", "pkg-1.0.tar.gz")
+	bucket.seed(key, []byte("evicted bytes"))
+	bucket.getHold, bucket.getHeld = make(chan struct{}), make(chan struct{})
+	f := &fakeFetcher{body: []byte("upstream bytes")}
+	s := NewStore(l1, remote, f, "", false)
+
+	got := make(chan []byte, 1)
+	go func() {
+		obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+		if err != nil {
+			got <- []byte(err.Error())
+			return
+		}
+		body, _ := io.ReadAll(obj)
+		_ = obj.Close()
+		got <- body
+	}()
+	<-bucket.getHeld // the GET has read the object; Open has not locked yet
+	_, err = s.DeletePrefix(t.Context(), mustKey(t, "pkg", ""))
+	require.NoError(t, err)
+	close(bucket.getHold)
+
+	assert.Equal(t, "upstream bytes", string(<-got), "the deleted bytes are not served")
+	require.NoError(t, s.Close())
+	assert.Equal(t, int64(1), f.resolves.Load(), "the Open fetched upstream")
+	cached, err := os.ReadFile(l1.buildPath(key))
+	require.NoError(t, err)
+	assert.Equal(t, "upstream bytes", string(cached), "the evicted bytes were not promoted back")
 }

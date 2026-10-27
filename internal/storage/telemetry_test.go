@@ -177,3 +177,56 @@ func TestStore_RetriedLookupCountsOneMiss(t *testing.T) {
 	assert.Equal(t, int64(2), lookups.Load(), "a was looked up twice")
 	assert.Equal(t, before+2, cacheMisses(t, reader), "one miss per Open: a once, b once")
 }
+
+// cacheHits sums the storage cache-hit counter over every layer.
+func cacheHits(t *testing.T, reader *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	var n int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if s, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == "groxpi.cache.hits" {
+				for _, dp := range s.DataPoints {
+					n += dp.Value
+				}
+			}
+		}
+	}
+	return n
+}
+
+// TestStore_RetriedLookupHitRecordsOneOutcome: an Open that misses, then hits
+// on the commit-slot retry, records its miss only, not a miss and a hit.
+func TestStore_RetriedLookupHitRecordsOneOutcome(t *testing.T) {
+	_, reader := installTestTelemetry(t)
+	remote, bucket := newFakeS3(t)
+	bucket.getHold, bucket.getHeld = make(chan struct{}), make(chan struct{})
+	s := NewStore(nil, remote, &fakeFetcher{body: []byte("bytes")}, t.TempDir(), false)
+
+	hits0, misses0 := cacheHits(t, reader), cacheMisses(t, reader)
+	late := make(chan error, 1)
+	go func() {
+		obj, err := s.Open(t.Context(), "a", "a-1.0.tar.gz")
+		if err == nil {
+			_, err = io.ReadAll(obj)
+			_ = obj.Close()
+		}
+		late <- err
+	}()
+	<-bucket.getHeld // the first Open read a miss and waits
+
+	obj, err := s.Open(t.Context(), "a", "a-1.0.tar.gz")
+	require.NoError(t, err)
+	_, err = io.ReadAll(obj)
+	require.NoError(t, err)
+	_ = obj.Close()
+	require.Eventually(t, func() bool { return len(s.InFlight()) == 0 }, 5*time.Second, time.Millisecond,
+		"the second Open commits, so the first looks again")
+	close(bucket.getHold)
+	require.NoError(t, <-late)
+	require.NoError(t, s.Close())
+
+	assert.Equal(t, misses0+2, cacheMisses(t, reader), "each Open recorded its miss")
+	assert.Equal(t, hits0, cacheHits(t, reader), "the retried hit is not recorded on top of the miss")
+}

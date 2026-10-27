@@ -104,6 +104,8 @@ package prefix is what makes `DELETE /cache/<package>` a prefix delete rather th
 Eviction deletes the package from the cache and from the durable store; otherwise the next request
 would restore it from S3. An eviction during a download of the same package wins: the flight still
 serves its readers but stores nothing, and an upload already under way is waited for, then deleted.
+A request that looked the file up just before the eviction, and has not yet started its flight, looks
+again, so a hybrid promotion never writes the deleted file back into the cache.
 The admin listing shows the cache only.
 
 Serving a stored file hands the open object to `http.ServeContent`,
@@ -190,7 +192,7 @@ is ignored while in flight. Readers are held one byte short of the expected leng
 written, when no length is known) until verification: against the SHA-256 the index declared, and
 against the expected length (the declared size, else the upstream `Content-Length`) when one is known;
 a file with neither is cached unverified with a warning. A verified spool is
-renamed into the cache (`local`, `hybrid`; in `hybrid` the same goroutine then uploads it to S3) or
+synced to disk and renamed into the cache (`local`, `hybrid`; in `hybrid` the same goroutine then uploads it to S3) or
 uploaded and removed (`s3`). A spool that fails verification is deleted and every reader's body read fails, so
 the server aborts each response rather than end it cleanly; only a fetch that fails before upstream
 answers `200` (or whose spool cannot be created) is redirected upstream.
