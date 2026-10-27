@@ -120,8 +120,10 @@ test_server_connection() {
     fi
 }
 
-# Function to clear cache
+# Empty one proxy's cache (groxpi or proxpi). Only the proxy about to run cold is
+# recreated: clearing both would wipe the other's cache before its warm run.
 clear_cache() {
+    local target=$1
     local cache_manager_script="$(dirname "$0")/cache_manager.sh"
 
     if [ ! -f "$cache_manager_script" ]; then
@@ -129,9 +131,9 @@ clear_cache() {
         return 1
     fi
 
-    log_info "Clearing caches on both servers..."
-    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" clear-all; then
-        log_success "Caches cleared successfully"
+    log_info "Clearing $target cache..."
+    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" "clear-$target"; then
+        log_success "$target cache cleared"
         sleep 3  # Wait for cache clear to take effect
         return 0
     else
@@ -204,14 +206,24 @@ echo 'Timestamp: $TIMESTAMP'
 echo 'Test start: '\$(date '+%Y-%m-%d %H:%M:%S')
 echo ''
 
+# uv add writes to pyproject.toml and uv.lock; keep the template so every install
+# starts from it instead of re-resolving the packages added before.
+cp pyproject.toml pyproject.toml.template
+
+# Fresh project: template pyproject.toml, no lock file, empty virtual environment
+reset_project() {
+    cp pyproject.toml.template pyproject.toml
+    rm -f uv.lock
+    rm -rf .venv
+    uv venv --quiet
+}
+
 # Function to install and time a package
 install_package() {
     local pkg=\$1
     echo \"=== Installing \$pkg ===\"
 
-    # Create fresh virtual environment
-    rm -rf .venv
-    uv venv --quiet
+    reset_project
 
     # Record start time
     local start_time=\$(date +%s.%N)
@@ -231,7 +243,7 @@ install_package() {
         fi
 
         # Get dependency count
-        local dep_count=\$(uv pip list --quiet 2>/dev/null | wc -l || echo 'unknown')
+        local dep_count=\$(uv pip list --format=freeze 2>/dev/null | wc -l | tr -d ' ' || echo 'unknown')
         echo \"  Dependencies installed: \$dep_count\"
 
         return 0
@@ -251,9 +263,7 @@ install_batch() {
     echo \"=== Batch Installation ===\"
     echo \"Packages: \$packages\"
 
-    # Create fresh virtual environment
-    rm -rf .venv
-    uv venv --quiet
+    reset_project
 
     # Record start time
     local start_time=\$(date +%s.%N)
@@ -272,7 +282,7 @@ install_batch() {
         fi
 
         # Get dependency count
-        local dep_count=\$(uv pip list --quiet 2>/dev/null | wc -l || echo 'unknown')
+        local dep_count=\$(uv pip list --format=freeze 2>/dev/null | wc -l | tr -d ' ' || echo 'unknown')
         echo \"  Total dependencies: \$dep_count\"
 
         return 0
@@ -286,26 +296,29 @@ install_batch() {
     echo ''
 }
 
-# Parse test type and run appropriate test
+# Parse test type and run appropriate test. A failed install sets rc instead of
+# aborting (set -e), so the packages after it are still installed - a warmup that
+# stopped early would leave them cold for runs labelled warm.
+rc=0
 case '$test_name' in
     *batch*)
         # Batch installation
-        install_batch '$packages_list'
+        install_batch '$packages_list' || rc=1
         ;;
     *individual*)
         # Install packages individually
         for pkg in $packages_list; do
-            install_package \$pkg
+            install_package \$pkg || rc=1
         done
         ;;
     *single*)
         # Single package installation
-        install_package '$packages_list'
+        install_package '$packages_list' || rc=1
         ;;
     *)
         # Default: individual installation
         for pkg in $packages_list; do
-            install_package \$pkg
+            install_package \$pkg || rc=1
         done
         ;;
 esac
@@ -317,6 +330,7 @@ echo 'Test: $test_name'
 echo 'Cache mode: $cache_mode'
 echo 'Completion time: '\$(date '+%Y-%m-%d %H:%M:%S')
 echo ''
+exit \$rc
 "
 
     printf '%s\n' "$test_script" > "$temp_dir/run.sh"
@@ -381,12 +395,12 @@ run_cold_install_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing cold installation: $package"
 
-            # Clear cache and test groxpi
-            clear_cache
+            # Empty groxpi only, then test it
+            clear_cache groxpi
             run_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
 
-            # Clear cache and test proxpi
-            clear_cache
+            # Empty proxpi only, then test it
+            clear_cache proxpi
             run_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
 
             echo ""
@@ -452,22 +466,22 @@ run_batch_install_tests() {
 
         # Test small package batch (fast packages)
         local small_packages="requests click fastapi"
-        clear_cache
+        clear_cache groxpi
         run_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
-        clear_cache
+        clear_cache proxpi
         run_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
 
         # Test mixed size batch
         local mixed_packages="numpy pandas polars"
-        clear_cache
+        clear_cache groxpi
         run_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
-        clear_cache
+        clear_cache proxpi
         run_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
 
         # Test all packages batch
-        clear_cache
+        clear_cache groxpi
         run_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
-        clear_cache
+        clear_cache proxpi
         run_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
     fi
 }
@@ -486,10 +500,10 @@ run_large_package_tests() {
         log_info "Running large package (pyspark) tests..."
 
         # Test pyspark specifically (it's ~300MB)
-        clear_cache
+        clear_cache groxpi
         run_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
-        clear_cache
+        clear_cache proxpi
         run_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         # Test pyspark with warm cache

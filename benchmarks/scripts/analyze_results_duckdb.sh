@@ -62,22 +62,28 @@ check_dependencies() {
     duckdb --version
 }
 
-# Print the path of one run's CSV, or nothing. The stage scripts name their
-# output <prefix>-YYYYMMDD_HHMMSS.csv, so with no timestamp the latest run is the
-# lexically greatest name for that prefix.
+# Print the timestamp of the latest run, or nothing. The stage scripts name their
+# output <prefix>-YYYYMMDD_HHMMSS.csv, so the latest run is the greatest
+# timestamp over every prefix. One timestamp is then used for all three files:
+# picking the newest file per prefix could mix CSVs from different runs.
+latest_timestamp() {
+    local file name
+    for file in "$RESULTS_DIR"/resources-[0-9]*_[0-9]*.csv \
+                "$RESULTS_DIR"/wrk-summary-[0-9]*_[0-9]*.csv \
+                "$RESULTS_DIR"/uv-summary-[0-9]*_[0-9]*.csv; do
+        [ -f "$file" ] || continue
+        name=$(basename "$file" .csv)
+        echo "${name##*-}"
+    done | sort -r | head -n 1
+}
+
+# Print the path of the analysed run's CSV for a prefix, or nothing.
 find_csv_file() {
     local prefix="$1"
+    local file="$RESULTS_DIR/${prefix}-${TIMESTAMP}.csv"
 
-    if [ -n "$TIMESTAMP" ]; then
-        local file="$RESULTS_DIR/${prefix}-${TIMESTAMP}.csv"
-        if [ -f "$file" ]; then echo "$file"; fi
-        return 0
-    fi
-
-    local candidates=("$RESULTS_DIR/${prefix}"-[0-9]*_[0-9]*.csv)
-    if [ -f "${candidates[0]}" ]; then
-        printf '%s\n' "${candidates[@]}" | sort -r | head -n 1
-    fi
+    if [ -n "$TIMESTAMP" ] && [ -f "$file" ]; then echo "$file"; fi
+    return 0
 }
 
 # Function to run DuckDB query and format output
@@ -512,6 +518,13 @@ main() {
     if [ ! -d "$RESULTS_DIR" ]; then
         log_error "Results directory does not exist: $RESULTS_DIR"
         exit 1
+    fi
+
+    if [ -z "$TIMESTAMP" ]; then
+        TIMESTAMP=$(latest_timestamp)
+        if [ -n "$TIMESTAMP" ]; then
+            log_info "Analyzing the latest run: $TIMESTAMP"
+        fi
     fi
 
     # Run analysis
