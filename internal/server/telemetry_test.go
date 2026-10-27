@@ -365,11 +365,13 @@ func TestTelemetry_IndexCacheEvictionIsCounted(t *testing.T) {
 	// A cache with room reports what it holds.
 	roomy := newMultiIndexServer(t, &config.Config{IndexCacheSize: 1 << 20}, primary)
 	require.Equal(t, http.StatusOK, indexStatus(t, roomy, "one"))
-	assert.Greater(t, collect(t, reader).value("groxpi.cache.occupancy", indexLayer), int64(0),
-		"the index cache must report its occupancy in bytes")
+	oneEntry := collect(t, reader).value("groxpi.cache.occupancy", indexLayer)
+	assert.Greater(t, oneEntry, int64(0), "the index cache must report its occupancy in bytes")
 
-	// A cache with a byte budget no entry fits in evicts on every fill.
-	cramped := newMultiIndexServer(t, &config.Config{IndexCacheSize: 8}, primary)
+	// A cache with room for exactly one entry evicts the first to fit the
+	// second. (An entry bigger than the whole budget is not stored at all.)
+	cramped := newMultiIndexServer(t, &config.Config{IndexCacheSize: oneEntry}, primary)
+	require.Equal(t, http.StatusOK, indexStatus(t, cramped, "one"))
 	require.Equal(t, http.StatusOK, indexStatus(t, cramped, "two"))
 
 	assert.Greater(t, collect(t, reader).value("groxpi.cache.evictions", indexLayer),

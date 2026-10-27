@@ -281,3 +281,52 @@ func TestResolve_OversizedIndexBodyFailsAndIsNotCached(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an oversized body must not be cached")
 }
+
+// TestResolve_ZeroTTLCachesNothing pins GROXPI_INDEX_TTL=0 as "do not cache":
+// every resolve goes upstream and nothing piles up in the cache.
+func TestResolve_ZeroTTLCachesNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(0, 1<<20), up)
+
+		for i := range 50 {
+			_, err := svc.Resolve(t.Context(), "numpy")
+			require.NoError(t, err)
+			_, err = svc.Resolve(t.Context(), fmt.Sprintf("ghost-%d", i))
+			require.ErrorIs(t, err, ErrNotFound)
+		}
+		n, b := svc.cache.stats()
+		assert.Zero(t, n, "TTL 0 must store no entries")
+		assert.Zero(t, b)
+		assert.Equal(t, 50, up.queried(primaryURL, "numpy"), "every resolve goes upstream")
+	})
+}
+
+// TestResolve_ExtraTTLIsSweptWhenPrimaryTTLIsZero pins the sweep cadence: it
+// runs at the shortest positive TTL in the resolution order, so an extra index's
+// entries expire without a read even when the primary's TTL is zero.
+func TestResolve_ExtraTTLIsSweptWhenPrimaryTTLIsZero(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(extraURL, "internal", oneFile("internal"), nil)
+		svc := newFakeService(t, &config.Config{
+			IndexURL:       primaryURL,
+			IndexTTL:       0,
+			ExtraIndexURLs: []string{extraURL},
+			ExtraIndexTTLs: []time.Duration{time.Minute},
+			IndexCacheSize: 1 << 20,
+		}, up)
+
+		_, err := svc.Resolve(t.Context(), "internal")
+		require.NoError(t, err)
+		n, _ := svc.cache.stats()
+		require.Equal(t, 1, n, "the extra's positive TTL caches the entry")
+
+		time.Sleep(2*time.Minute + time.Nanosecond)
+		synctest.Wait()
+		n, b := svc.cache.stats()
+		assert.Zero(t, n, "the sweep must drop the expired extra entry without a read")
+		assert.Zero(t, b)
+	})
+}

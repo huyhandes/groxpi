@@ -66,13 +66,15 @@ One cache, one byte budget. Each entry holds, for one package: the parsed file l
 body, and the gzipped JSON response body. All three are accounted against `GROXPI_INDEX_CACHE_SIZE`.
 Entries leave by TTL — a background sweep, so an expired entry's memory is actually reclaimed rather
 than waiting for the next lookup — or by LRU on last access when the budget is exceeded. An entry's
-TTL is that of the index that answered. The sweep runs at the primary `GROXPI_INDEX_TTL` cadence; a
-lookup that finds an expired entry drops it at once.
+TTL is that of the index that answered; an index with a TTL of `0` has nothing stored. The sweep runs
+at the shortest positive TTL in the resolution order (none runs if every TTL is `0`); a lookup that
+finds an expired entry drops it at once. An entry larger than the whole budget is not stored, so it
+cannot empty the cache.
 
 The cache also remembers misses. When every configured index answers "not found" for a package,
 that fact is cached as a small fixed-size entry in the same map and budget, for the shortest TTL in
 the resolution order (`GROXPI_INDEX_TTL` with no extra index, otherwise usually an extra index's
-180-second default). A cached miss answers 404
+180-second default); if that shortest TTL is `0`, misses are not remembered. A cached miss answers 404
 without querying any upstream and counts as a `groxpi.cache.hits` hit on the `index` layer. An
 upstream error and an empty file list are never cached, so a transient fault does not hide a
 package. A package published to an index while its miss is cached stays a 404 until the miss

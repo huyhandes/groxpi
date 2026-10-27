@@ -460,3 +460,27 @@ func TestParseSimpleHTML(t *testing.T) {
 		})
 	}
 }
+
+// TestClient_GetPackageFiles_StrictHTMLIndex pins the Accept header: an index
+// that serves only HTML and 406s any request not offering an HTML type must
+// still resolve, through the HTML parser.
+func TestClient_GetPackageFiles_StrictHTMLIndex(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body><a href="/files/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a></body></html>`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{IndexURL: server.URL}
+	client := newClient(cfg, newTransport(cfg))
+
+	files, err := client.GetPackageFiles(context.Background(), config.Index{URL: server.URL}, "pkg")
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "pkg-1.0.tar.gz", files[0].Name)
+	assert.Equal(t, server.URL+"/files/pkg-1.0.tar.gz", files[0].URL)
+}

@@ -1,7 +1,14 @@
 # Configuration
 
 groxpi is configured entirely through environment variables. Every setting below exists in
-`internal/config/config.go`; nothing else is read.
+`internal/config/config.go`. Besides these, a few standard variables are read by the libraries
+groxpi uses:
+
+- `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (or their lowercase forms) apply to every upstream index
+  and package file request: the shared upstream transport uses Go's `http.ProxyFromEnvironment`.
+  Requests to `localhost` or a loopback address are never proxied.
+- The OpenTelemetry exporters read their own standard `OTEL_*` variables, and the AWS SDK its own
+  `AWS_*` variables (credential chain, profile and so on), beyond the ones listed below.
 
 Every duration setting accepts either a Go duration string — a number with a unit suffix (`ns`, `us`,
 `ms`, `s`, `m`, `h`), combinable as in `1h30m` or `1.5h` — or a bare number of seconds, fractions
@@ -18,7 +25,7 @@ Any other value is logged as a warning and the default is kept.
 |---|---|---|
 | `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Primary upstream index. |
 | `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. `0` means the answer is not cached: it is re-fetched on every request. |
-| `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. |
+| `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. Positional like the TTLs: an empty item is skipped with a warning but still consumes its `GROXPI_EXTRA_INDEX_TTLS` slot (`a,,b` with `60,,120` gives `b` 120). |
 | `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). `0` means that index's answer is not cached: it is re-fetched on every request. |
 | `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification on every upstream call: index pages, the root index and file downloads. |
 
@@ -36,7 +43,7 @@ to the public one.
 
 Each index carries its own TTL, so a fast-moving private index can be refreshed more often than PyPI.
 A package that no index has is remembered as missing for the **shortest** of these TTLs; until then
-it answers `404` without an upstream query. `DELETE /cache/{package}` clears it sooner.
+it answers `404` without an upstream query. If any index's TTL is `0`, misses are not remembered. `DELETE /cache/{package}` clears it sooner.
 
 Credentials may be embedded in an index URL (`https://user:pass@host/simple/`). They are redacted to
 `https://redacted@host/simple/` in every log record, error message, metric attribute and HTTP response
@@ -56,7 +63,9 @@ body. An unparseable URL is reported as `[unparseable-url]` rather than risk lea
 
 There is one index cache. Per package it holds the parsed file list plus the JSON and gzipped-JSON
 response bodies, and accounts all of them against the byte budget. Entries leave by TTL (a background
-sweep) or by LRU when the budget is exceeded. There is no separate response cache.
+sweep at the shortest positive index TTL) or by LRU when the budget is exceeded. An entry larger than the
+whole budget is not cached. With a TTL of `0` nothing from that index is stored. There is no separate
+response cache.
 
 > The 256 MB default is **provisional**. It was chosen without measurement and cannot be tuned honestly
 > until the cache metrics have been observed against real traffic. Watch `groxpi.cache.occupancy` and
@@ -149,13 +158,13 @@ arrive, the body streams to completion under the request's own lifetime — a tr
 the client is never cut off by a budget meant for connection setup. If the budget expires first, the
 client is redirected to the upstream URL and nothing is cached.
 
+Set `GROXPI_DOWNLOAD_TIMEOUT` to `0` to disable caching of package files altogether: every download
+becomes a redirect upstream. That is what `redirect.reason=caching_disabled` counts.
+
 `GROXPI_DOWNLOAD_IDLE_TIMEOUT` bounds each gap in that stream, not the whole transfer: every chunk of
 body bytes restarts it, so a slow but steady download completes. If upstream sends nothing for that
 long, the download fails, nothing is cached, and the next request for the file starts a fresh download.
 Index requests are not covered by it.
-
-Set it to `0` to disable caching of package files altogether: every download becomes a redirect
-upstream. That is what `redirect.reason=caching_disabled` counts.
 
 `GROXPI_CONNECT_TIMEOUT` and `GROXPI_READ_TIMEOUT` apply to the index HTTP client, not to package
 downloads. They are **summed into one `http.Client.Timeout`**, which covers the whole request —

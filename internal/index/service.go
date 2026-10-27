@@ -57,11 +57,23 @@ type Service struct {
 }
 
 // New builds the index module from configuration. Expired entries are swept at
-// the index TTL cadence: an entry outlives its TTL by at most one interval, and
-// nothing scans on the read path.
+// the shortest positive TTL in the resolution order: an entry outlives its TTL
+// by at most one interval, and nothing scans on the read path.
 func New(cfg *config.Config) *Service {
 	transport := newTransport(cfg)
-	return newService(cfg, newIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), newClient(cfg, transport), transport)
+	return newService(cfg, newIndexCache(cfg.IndexCacheSize, sweepInterval(cfg)), newClient(cfg, transport), transport)
+}
+
+// sweepInterval is the shortest positive TTL across every configured index, or
+// 0 (no sweeper) when none is positive: a TTL of 0 caches nothing to sweep.
+func sweepInterval(cfg *config.Config) time.Duration {
+	var every time.Duration
+	for _, index := range cfg.ResolutionOrder() {
+		if index.TTL > 0 && (every == 0 || index.TTL < every) {
+			every = index.TTL
+		}
+	}
+	return every
 }
 
 func newService(cfg *config.Config, cache *indexCache, up upstream, transport *http.Transport) *Service {

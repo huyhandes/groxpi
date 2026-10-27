@@ -59,7 +59,7 @@ func (f *fakeUpstream) queried(index, pkg string) int {
 // (registered here) stops it before the bubble ends.
 func newFakeService(t *testing.T, cfg *config.Config, up upstream) *Service {
 	t.Helper()
-	svc := newService(cfg, newIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), up, newTransport(cfg))
+	svc := newService(cfg, newIndexCache(cfg.IndexCacheSize, sweepInterval(cfg)), up, newTransport(cfg))
 	t.Cleanup(svc.Close)
 	return svc
 }
