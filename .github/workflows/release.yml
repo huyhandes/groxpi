@@ -25,12 +25,23 @@ jobs:
     steps:
     - name: Extract version from branch or input
       id: version
+      env:
+        # Passed through env, never interpolated into the script: an input is
+        # caller-controlled text and ${{ }} would splice it in as shell.
+        EVENT_NAME: ${{ github.event_name }}
+        INPUT_VERSION: ${{ inputs.version }}
       run: |
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          VERSION="${{ github.event.inputs.version }}"
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          VERSION="$INPUT_VERSION"
         else
           # Extract version from branch name (e.g., release-1.2.3 -> 1.2.3)
           VERSION=$(echo "${GITHUB_REF#refs/heads/release-}" | sed 's/^v//')
+        fi
+        # Later jobs splice the version into their scripts, so only a plain
+        # version string may leave this step.
+        if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+          echo "Invalid version: $VERSION" >&2
+          exit 1
         fi
         echo "version=${VERSION}" >> $GITHUB_OUTPUT
         echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
@@ -76,7 +87,6 @@ jobs:
         BINARY_NAME="groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
         go build \
           -ldflags="-s -w -X main.version=${{ needs.prepare.outputs.version }}" \
-          -a -installsuffix cgo \
           -o "${BINARY_NAME}" \
           cmd/groxpi/main.go
 
