@@ -68,6 +68,9 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		writeIndexJSON(w, r, entry)
 		return
 	}
+	// The answer depends on Accept, so a shared cache must key on it; the HTML
+	// body is never compressed, so Accept-Encoding does not matter here.
+	w.Header().Set("Vary", "Accept")
 	w.Header().Set("Content-Type", "text/html")
 	_, _ = w.Write(index.RenderSimpleHTML(packageName, entry.Files)) // #nosec G705 -- every value escaped by RenderSimpleHTML
 }
@@ -77,7 +80,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // request path.
 func writeIndexJSON(w http.ResponseWriter, r *http.Request, entry *index.Entry) {
 	h := w.Header()
-	h.Set("Vary", "Accept-Encoding")
+	h.Set("Vary", "Accept, Accept-Encoding")
 	h.Set("Content-Type", index.JSONContentType)
 	// ponytail: substring match, not a q-value parse. "gzip;q=0" is rare enough
 	// that the parser can wait for a client that actually sends it.

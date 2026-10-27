@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -279,6 +280,29 @@ func TestDurationEnvAcceptsUnits(t *testing.T) {
 			t.Setenv("GROXPI_DOWNLOAD_TIMEOUT", value)
 			if got := mustLoad(t).DownloadTimeout; got != want {
 				t.Fatalf("GROXPI_DOWNLOAD_TIMEOUT=%s gave %v, want %v", value, got, want)
+			}
+		})
+	}
+}
+
+// TestExtraIndexTTLs pins that GROXPI_EXTRA_INDEX_TTLS is positional: an empty
+// or unparseable entry falls back to the default in its own slot instead of
+// shifting later TTLs onto the wrong index, and each entry is read like any
+// other duration (Go units, or bare seconds).
+func TestExtraIndexTTLs(t *testing.T) {
+	d := defaultExtraIndexTTL
+	cases := map[string][]time.Duration{
+		"60,,120":     {60 * time.Second, d, 120 * time.Second},
+		"5m, 90s":     {5 * time.Minute, 90 * time.Second},
+		"30,later,1h": {30 * time.Second, d, time.Hour},
+		"-5,2.5":      {d, 2500 * time.Millisecond},
+		",":           {d, d},
+	}
+	for value, want := range cases {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("GROXPI_EXTRA_INDEX_TTLS", value)
+			if got := mustLoad(t).ExtraIndexTTLs; !slices.Equal(got, want) {
+				t.Fatalf("GROXPI_EXTRA_INDEX_TTLS=%q gave %v, want %v", value, got, want)
 			}
 		})
 	}

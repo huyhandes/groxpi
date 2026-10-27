@@ -232,18 +232,17 @@ func Load() (*Config, error) {
 		cfg.ExtraIndexURLs = splitAndTrim(extraURLs, ",")
 	}
 
-	// Parse extra index TTLs
+	// Parse extra index TTLs. Split without dropping empty entries: the list is
+	// positional, so "60,,120" must leave the second index on the default rather
+	// than hand it the third index's TTL.
 	if extraTTLs := getEnv("GROXPI_EXTRA_INDEX_TTLS", ""); extraTTLs != "" {
-		ttlStrs := splitAndTrim(extraTTLs, ",")
+		ttlStrs := strings.Split(extraTTLs, ",")
 		cfg.ExtraIndexTTLs = make([]time.Duration, len(ttlStrs))
 		for i, ttlStr := range ttlStrs {
-			ttl, err := strconv.Atoi(ttlStr)
-			if err != nil || ttl < 0 {
-				invalidEnv("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
-				cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
-				continue
+			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
+			if ttlStr = strings.TrimSpace(ttlStr); ttlStr != "" {
+				cfg.ExtraIndexTTLs[i] = parseDuration("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
 			}
-			cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
 		}
 	} else {
 		// Default TTL for extra indices
@@ -337,6 +336,13 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 		return defaultValue
 	}
 
+	return parseDuration(key, value, defaultValue)
+}
+
+// parseDuration reads a Go duration ("5m", "90s") or, as proxpi did, a bare
+// number of seconds. A negative or unparseable value is announced and replaced
+// by defaultValue.
+func parseDuration(key, value string, defaultValue time.Duration) time.Duration {
 	d, err := time.ParseDuration(value)
 	if err != nil {
 		seconds, floatErr := strconv.ParseFloat(value, 64)

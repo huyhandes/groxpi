@@ -317,6 +317,9 @@ func TestLocalStorage_SizeAccounting(t *testing.T) {
 // reads that package's directory, not the whole cache. An unreadable sibling
 // would fail a whole-cache walk; a missing prefix directory deletes nothing.
 func TestLocalStorage_DeletePrefixWalksOnlyItsDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-0 directory, so the unreadable sibling is not unreadable")
+	}
 	s, err := NewLocalStorage(t.TempDir(), 0, 0)
 	require.NoError(t, err)
 	putN(t, s, "packages/a/1", 10)

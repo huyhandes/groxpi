@@ -76,7 +76,7 @@ func TestClient_ParseJSONPackageFiles(t *testing.T) {
 	}`
 
 	reader := strings.NewReader(jsonResponse)
-	files, err := client.parseJSONPackageFiles(reader)
+	files, err := client.parseJSONPackageFiles(reader, nil)
 	if err != nil {
 		t.Fatalf("parseJSONPackageFiles failed: %v", err)
 	}
@@ -360,28 +360,38 @@ func TestParseSimpleHTML_UnparseableBase(t *testing.T) {
 	assert.Equal(t, "foo-1.0.whl", files[0].URL)
 }
 
-// TestClient_ParseJSONPackageFiles_AbsoluteURLsUnchanged documents that the PEP 691
-// JSON path is unaffected: PEP 691 requires absolute URLs, and the values are taken
-// verbatim from the payload.
-func TestClient_ParseJSONPackageFiles_AbsoluteURLsUnchanged(t *testing.T) {
-	client := &Client{}
-	jsonResponse := `{
-		"meta": {"api-version": "1.0"},
-		"name": "foo",
-		"files": [
-			{
-				"filename": "foo-1.0.tar.gz",
-				"url": "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz",
-				"hashes": {"sha256": "abc123"}
-			}
-		]
-	}`
+// TestClient_GetPackageFiles_ResolvesJSONURLs verifies PEP 691 file URLs, which
+// may be relative, are resolved against the URL the JSON page was served from,
+// exactly as hrefs are on the HTML path, and keep their #sha256= fragment.
+func TestClient_GetPackageFiles_ResolvesJSONURLs(t *testing.T) {
+	testCases := []struct {
+		name string
+		url  string
+		want string // with "{base}" standing for the upstream server URL
+	}{
+		{"absolute URL unchanged", "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz", "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz"},
+		{"parent-relative URL", "../../packages/x.whl", "{base}/packages/x.whl"},
+		{"same-directory URL", "x.whl", "{base}/simple/foo/x.whl"},
+		{"root-relative URL keeps fragment", "/packages/x.whl#sha256=abc123", "{base}/packages/x.whl#sha256=abc123"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+				_, _ = w.Write([]byte(`{"meta":{"api-version":"1.0"},"name":"foo","files":[` +
+					`{"filename":"x.whl","url":"` + tc.url + `","hashes":{"sha256":"abc123"}}]}`))
+			}))
+			defer upstream.Close()
 
-	files, err := client.parseJSONPackageFiles(strings.NewReader(jsonResponse))
-	require.NoError(t, err)
-	require.Len(t, files, 1)
-	assert.Equal(t, "https://files.pythonhosted.org/packages/ab/cd/foo-1.0.tar.gz", files[0].URL)
-	assert.Equal(t, map[string]string{"sha256": "abc123"}, files[0].Hashes)
+			cfg := &config.Config{}
+			client := newClient(cfg, newTransport(cfg))
+			files, err := client.GetPackageFiles(context.Background(), config.Index{URL: upstream.URL + "/simple"}, "foo")
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			assert.Equal(t, strings.ReplaceAll(tc.want, "{base}", upstream.URL), files[0].URL)
+			assert.Equal(t, map[string]string{"sha256": "abc123"}, files[0].Hashes)
+		})
+	}
 }
 
 // TestParseSimpleHTML tests HTML parsing for package files

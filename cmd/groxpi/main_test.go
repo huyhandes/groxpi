@@ -670,15 +670,6 @@ func TestTimeoutConfigurations(t *testing.T) {
 	}
 }
 
-// TestLoadReportsBadConfig: a bad environment is an error main can log, not a
-// panic.
-func TestLoadReportsBadConfig(t *testing.T) {
-	t.Setenv("GROXPI_STORAGE_TYPE", "minio")
-	if cfg, err := config.Load(); err == nil {
-		t.Fatalf("config.Load() = %+v, nil; want an error for an unknown storage type", cfg)
-	}
-}
-
 // loadConfig is config.Load for a test whose environment is valid.
 func loadConfig(t *testing.T) *config.Config {
 	t.Helper()

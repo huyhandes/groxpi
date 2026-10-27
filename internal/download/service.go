@@ -208,11 +208,12 @@ const metadataSuffix = ".metadata"
 
 // metadataURL is the PEP 658 location of a distribution's metadata file: the
 // file URL with ".metadata" appended to its path, dropping any #sha256= fragment
-// a PEP 503 index carried on the href.
+// a PEP 503 index carried on the href. A URL that does not parse is suffixed
+// as it stands; the fetch then fails upstream like any other bad URL.
 func metadataURL(fileURL string) string {
 	u, err := url.Parse(fileURL)
 	if err != nil {
-		return strings.TrimSuffix(fileURL, "#") + metadataSuffix
+		return fileURL + metadataSuffix
 	}
 	u.Fragment = ""
 	u.Path += metadataSuffix
