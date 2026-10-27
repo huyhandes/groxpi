@@ -413,3 +413,55 @@ func TestProxyRoot_WaiterCanLeaveASharedFetch(t *testing.T) {
 	require.NotNil(t, resp, "the shared fetch must outlive the caller that started it")
 	assert.Equal(t, "root", string(resp.Body))
 }
+
+// panickyUpstream panics on its first query, as a parser bug fed hostile
+// upstream data would, and answers normally afterwards.
+type panickyUpstream struct {
+	*fakeUpstream
+	panicked bool
+}
+
+func (p *panickyUpstream) GetPackageFiles(ctx context.Context, index config.Index, pkg string) ([]FileInfo, error) {
+	p.mu.Lock()
+	first := !p.panicked
+	p.panicked = true
+	p.mu.Unlock()
+	if first {
+		panic("parser bug")
+	}
+	return p.fakeUpstream.GetPackageFiles(ctx, index, pkg)
+}
+
+// TestResolve_PanicInSharedFetchIsAnError: the shared fetch runs on its own
+// goroutine, where an unrecovered panic would kill the process. It must come
+// back to the caller as an error, and the next lookup must work.
+func TestResolve_PanicInSharedFetchIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := &panickyUpstream{fakeUpstream: newFakeUpstream()}
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "parser bug", "the panic value must reach the error")
+		assert.NotErrorIs(t, err, ErrNotFound, "a panic says nothing about the package")
+
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err, "a panic must not poison the next lookup")
+	})
+}
+
+// TestShared_PanicIsAnError covers the rest of the shared fetch (encoding,
+// caching), which runs on singleflight's goroutine rather than a query's.
+func TestShared_PanicIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), newFakeUpstream())
+		_, err := svc.shared(t.Context(), "k", func() (any, error) { panic("encode bug") })
+		require.ErrorIs(t, err, errPanic)
+		assert.Contains(t, err.Error(), "encode bug")
+
+		v, err := svc.shared(t.Context(), "k", func() (any, error) { return 1, nil })
+		require.NoError(t, err)
+		assert.Equal(t, 1, v)
+	})
+}

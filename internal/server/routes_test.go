@@ -139,6 +139,24 @@ func TestFileRoute_ClientGoneIsNotNotFound(t *testing.T) {
 	assert.Zero(t, hits.Load(), "a gone client starts no fetch")
 }
 
+// TestIndexRoutes_ClientGoneIsNotAnError: a client that leaves while the index
+// lookup it waits on is still upstream gets nothing written, rather than a 5xx
+// (and an ERROR log line) for a fetch that never failed.
+func TestIndexRoutes_ClientGoneIsNotAnError(t *testing.T) {
+	up := NewFakePyPI(t).SetDelay(300 * time.Millisecond)
+	router := newRoutesServer(t, up.URL)
+
+	for _, path := range []string{"/simple/", "/simple/pkg/"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(ctx, "GET", path, nil))
+		cancel()
+
+		assert.Less(t, w.Code, http.StatusInternalServerError, path)
+		assert.Empty(t, w.Body.String(), "%s: nobody is left to answer", path)
+	}
+}
+
 // TestEvictRoute_InvalidNameIsBadRequest pins A1 on eviction: a package name
 // that is not one path segment is refused with 400 in the JSON error shape.
 func TestEvictRoute_InvalidNameIsBadRequest(t *testing.T) {
