@@ -2,8 +2,10 @@ package server
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -43,21 +45,34 @@ func withCredentials(cfg *config.Config) {
 	cfg.AdminPassword = adminPass
 }
 
-// newTestServer builds a server from cfg and fails the test if that errors.
-// Closing it stays the caller's business, as it was with the old New.
+// newTestServer builds a server from cfg, fails the test if that errors, and
+// closes it when the test ends (Close is idempotent, so an explicit Close in the
+// test is harmless). Every index it is pointed at must be on loopback: a test
+// that reaches the real network is slow, flaky and fails offline.
 func newTestServer(tb testing.TB, cfg *config.Config) *Server {
 	tb.Helper()
+	for _, raw := range append([]string{cfg.IndexURL}, cfg.ExtraIndexURLs...) {
+		requireLoopback(tb, raw)
+	}
 	srv, err := NewServer(cfg)
 	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = srv.Close() })
 	return srv
+}
+
+// requireLoopback fails the test unless raw is a URL whose host is a loopback
+// address.
+func requireLoopback(tb testing.TB, raw string) {
+	tb.Helper()
+	u, err := url.Parse(raw)
+	require.NoError(tb, err, "index URL %q", raw)
+	ip := net.ParseIP(u.Hostname())
+	require.True(tb, ip != nil && ip.IsLoopback(), "test index URL %q is not on loopback", raw)
 }
 
 func newRoutesServer(t *testing.T, upstreamURL string, opts ...func(*config.Config)) http.Handler {
 	t.Helper()
-	srv, err := NewServer(routesConfig(t, upstreamURL, opts...))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Close() })
-	return srv.Router()
+	return newTestServer(t, routesConfig(t, upstreamURL, opts...)).Router()
 }
 
 func do(router http.Handler, req *http.Request) *http.Response {

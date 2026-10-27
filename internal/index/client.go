@@ -22,10 +22,10 @@ import (
 // failure does not.
 var ErrNotFound = errors.New("package not found")
 
-// Client fetches index pages from an upstream PyPI-compatible index. Concurrent
+// client fetches index pages from an upstream PyPI-compatible index. Concurrent
 // requests for the same package are coalesced by the package-file service, not
 // here.
-type Client struct {
+type client struct {
 	httpClient *http.Client
 }
 
@@ -90,7 +90,7 @@ func (f *FileInfo) GetYankedReason() string {
 	return ""
 }
 
-type PyPISimpleResponse struct {
+type pypiSimpleResponse struct {
 	Meta struct {
 		APIVersion string `json:"api-version"`
 	} `json:"meta"`
@@ -144,7 +144,7 @@ func newTransport(cfg *config.Config) *http.Transport {
 }
 
 // newClient builds the per-package index client over the shared transport.
-func newClient(cfg *config.Config, transport http.RoundTripper) *Client {
+func newClient(cfg *config.Config, transport http.RoundTripper) *client {
 	httpClient := &http.Client{Transport: transport, Timeout: 60 * time.Second}
 
 	// http.Client.Timeout is one budget for the whole request - connect, headers
@@ -154,13 +154,13 @@ func newClient(cfg *config.Config, transport http.RoundTripper) *Client {
 	if budget := cfg.ConnectTimeout + cfg.ReadTimeout; budget > 0 {
 		httpClient.Timeout = budget
 	}
-	return &Client{httpClient: httpClient}
+	return &client{httpClient: httpClient}
 }
 
 // GetPackageFiles fetches one package's file list from one index. The index is a
 // parameter rather than client state because resolution asks several of them for
 // the same package; the client itself is stateless about which.
-func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
+func (c *client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
 	indexURL := strings.TrimSuffix(index.URL, "/") + "/" + packageName + "/"
 
 	// Try JSON first
@@ -212,7 +212,7 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 	return files, nil
 }
 
-func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
+func (c *client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
 		return nil, config.RedactURLError(err)
@@ -225,12 +225,12 @@ func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.
 	return resp, config.RedactURLError(err)
 }
 
-func (c *Client) parseJSONPackageFiles(body io.Reader, base *url.URL) ([]FileInfo, error) {
+func (c *client) parseJSONPackageFiles(body io.Reader, base *url.URL) ([]FileInfo, error) {
 	buf, err := readCapped(body, maxPackageIndexBytes)
 	if err != nil {
 		return nil, err
 	}
-	var response PyPISimpleResponse
+	var response pypiSimpleResponse
 	if err := json.Unmarshal(buf, &response); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
 	}

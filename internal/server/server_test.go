@@ -20,6 +20,10 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 )
 
+// deadIndexURL is a loopback index nothing listens on, for tests that never
+// ask upstream.
+const deadIndexURL = "http://127.0.0.1:1/simple/"
+
 // testRequest performs an HTTP request against the router and returns the response
 func testRequest(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
@@ -29,9 +33,9 @@ func testRequest(router http.Handler, req *http.Request) *http.Response {
 
 func TestNew(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:  "https://pypi.org/simple/",
+		IndexURL:  deadIndexURL,
 		CacheSize: 1024 * 1024 * 1024, // 1GB
-		CacheDir:  "/tmp/test-cache",
+		CacheDir:  t.TempDir(),
 		IndexTTL:  30 * time.Minute,
 		LogLevel:  "INFO",
 	}
@@ -53,9 +57,9 @@ func TestNew(t *testing.T) {
 
 func TestServer_HandleHome(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:  "https://pypi.org/simple/",
+		IndexURL:  deadIndexURL,
 		CacheSize: 1024 * 1024 * 1024,
-		CacheDir:  "/tmp/test-cache",
+		CacheDir:  t.TempDir(),
 		IndexTTL:  30 * time.Minute,
 		LogLevel:  "INFO",
 	}
@@ -93,8 +97,8 @@ func TestServer_HandleHome(t *testing.T) {
 
 func TestServer_HandleHealth(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL: deadIndexURL,
+		CacheDir: t.TempDir(),
 	}
 
 	srv := newTestServer(t, cfg)
@@ -212,7 +216,7 @@ func TestServer_HandleListFiles(t *testing.T) {
 	defer upstream.Close()
 	cfg := &config.Config{
 		IndexURL: upstream.URL + "/simple/",
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		LogLevel: "INFO",
 	}
 
@@ -230,9 +234,10 @@ func TestServer_HandleListFiles(t *testing.T) {
 }
 
 func TestServer_HandleDownloadFile(t *testing.T) {
+	up := NewFakePyPI(t)
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL: up.URL,
+		CacheDir: t.TempDir(),
 		LogLevel: "INFO",
 	}
 
@@ -243,16 +248,17 @@ func TestServer_HandleDownloadFile(t *testing.T) {
 	resp := testRequest(router, req)
 	defer func() { _ = resp.Body.Close() }()
 
-	// Should return 404 since file is not cached
+	// The upstream does not know the package, so the file is not found.
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("Expected status 404, got %d", resp.StatusCode)
 	}
+	assert.Equal(t, 1, up.IndexHits("numpy"), "the file is looked up in the package index")
 }
 
 func TestServer_HandleCacheList(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:      "https://pypi.org/simple/",
-		CacheDir:      "/tmp/test-cache",
+		IndexURL:      deadIndexURL,
+		CacheDir:      t.TempDir(),
 		AdminUsername: adminUser,
 		AdminPassword: adminPass,
 	}
@@ -291,8 +297,8 @@ func TestServer_HandleCacheList(t *testing.T) {
 
 func TestServer_HandleCachePackage(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:      "https://pypi.org/simple/",
-		CacheDir:      "/tmp/test-cache",
+		IndexURL:      deadIndexURL,
+		CacheDir:      t.TempDir(),
 		AdminUsername: adminUser,
 		AdminPassword: adminPass,
 	}
@@ -322,8 +328,8 @@ func TestServer_HandleCachePackage(t *testing.T) {
 
 func TestServer_Handle404(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL: deadIndexURL,
+		CacheDir: t.TempDir(),
 	}
 
 	srv := newTestServer(t, cfg)
@@ -376,7 +382,7 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 	t.Run("Invalid storage type", func(t *testing.T) {
 		cfg := &config.Config{
 			StorageType: "invalid",
-			CacheDir:    "/tmp/test-cache",
+			CacheDir:    t.TempDir(),
 		}
 
 		// A typo must not silently run local storage without the durable store.
@@ -387,8 +393,9 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 
 	t.Run("Local storage configuration", func(t *testing.T) {
 		cfg := &config.Config{
+			IndexURL:    deadIndexURL,
 			StorageType: "local",
-			CacheDir:    "/tmp/test-cache",
+			CacheDir:    t.TempDir(),
 		}
 
 		srv := newTestServer(t, cfg)
@@ -407,10 +414,11 @@ func TestServer_InitStorage_EdgeCases(t *testing.T) {
 }
 
 func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
+	up := NewFakePyPI(t)
 	cfg := &config.Config{
-		IndexURL:        "https://pypi.org/simple/",
-		CacheDir:        "/tmp/test-cache",
-		DownloadTimeout: 1.0,
+		IndexURL:        up.URL,
+		CacheDir:        t.TempDir(),
+		DownloadTimeout: 5 * time.Second, // fetch mode; the fake answers at once
 	}
 
 	srv := newTestServer(t, cfg)
@@ -431,21 +439,22 @@ func TestServer_HandleDownloadFile_EdgeCases(t *testing.T) {
 		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
-		// The mux cleans the path and redirects to the cleaned form; nothing
-		// under the cache directory must be reachable either way.
-		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusTemporaryRedirect {
-			t.Errorf("Expected 404 or redirect for path traversal, got %d", resp.StatusCode)
+		// The mux cleans the path and redirects to the cleaned form, which
+		// is outside every route; nothing under the cache directory is read.
+		if resp.StatusCode != http.StatusTemporaryRedirect {
+			t.Errorf("Expected 307 for path traversal, got %d", resp.StatusCode)
 		}
-		if loc := resp.Header.Get("Location"); strings.Contains(loc, "..") {
-			t.Errorf("redirect must not preserve traversal: %q", loc)
+		if loc := resp.Header.Get("Location"); loc != "/etc/passwd" {
+			t.Errorf("redirect must go to the cleaned path, got %q", loc)
 		}
 	})
 }
 
 func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
+	up := NewFakePyPI(t).Add("test-package-123", "test_package_123-1.0.tar.gz", FakeFile{})
 	cfg := &config.Config{
-		IndexURL: "https://pypi.org/simple/",
-		CacheDir: "/tmp/test-cache",
+		IndexURL: up.URL,
+		CacheDir: t.TempDir(),
 		IndexTTL: 5 * time.Minute,
 	}
 
@@ -459,10 +468,11 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
-		// Should handle special characters in package names
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-			t.Errorf("Expected status 200 or 404, got %d", resp.StatusCode)
+		// The name is normalised before it is asked for upstream.
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected status 200, got %d", resp.StatusCode)
 		}
+		assert.Equal(t, 1, up.IndexHits("test-package-123"))
 	})
 
 	t.Run("Empty package name", func(t *testing.T) {
@@ -470,9 +480,12 @@ func TestServer_HandleListFiles_EdgeCases(t *testing.T) {
 		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
-		// Should handle empty package names gracefully
-		if resp.StatusCode == http.StatusInternalServerError {
-			t.Error("Server should handle empty package names without internal error")
+		// The mux cleans the empty segment away and redirects to the root.
+		if resp.StatusCode != http.StatusTemporaryRedirect {
+			t.Errorf("Expected status 307, got %d", resp.StatusCode)
+		}
+		if loc := resp.Header.Get("Location"); loc != "/index/" {
+			t.Errorf("Expected redirect to /index/, got %q", loc)
 		}
 	})
 }
@@ -492,7 +505,7 @@ func TestServer_WantsJSON(t *testing.T) {
 	defer upstream.Close()
 	cfg := &config.Config{
 		IndexURL: upstream.URL + "/simple/",
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: time.Hour,
 	}
 
@@ -547,20 +560,27 @@ func TestServer_NormalizePackageName(t *testing.T) {
 		{"", ""},
 	}
 
-	cfg := &config.Config{IndexURL: "https://pypi.org/simple/", CacheDir: "/tmp/test"}
+	up := NewFakePyPI(t)
+	for _, tt := range tests {
+		if tt.expected != "" {
+			up.Add(tt.expected, tt.expected+"-1.0.tar.gz", FakeFile{})
+		}
+	}
+	cfg := &config.Config{IndexURL: up.URL, CacheDir: t.TempDir(), IndexTTL: time.Hour}
 	srv := newTestServer(t, cfg)
 	router := srv.Router()
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			// Test through HTTP request to cover the normalization
+			// The upstream only lists the normalised name, so a 200 proves the
+			// request was normalised; "" is the root listing.
 			req := httptest.NewRequest("GET", "/index/"+tt.input, nil)
 			resp := testRequest(router, req)
 			_ = resp.Body.Close()
 
-			// Should handle normalization without errors
-			if resp.StatusCode == http.StatusInternalServerError {
-				t.Errorf("Package name '%s' caused internal server error", tt.input)
+			assert.Equal(t, http.StatusOK, resp.StatusCode, "package %q", tt.input)
+			if tt.expected != "" {
+				assert.Equal(t, 1, up.IndexHits(tt.expected), "package %q", tt.input)
 			}
 		})
 	}
@@ -594,8 +614,8 @@ func TestServer_NormalizePackageName(t *testing.T) {
 
 func TestServer_HandleCacheEdgeCases(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:      "https://pypi.org/simple/",
-		CacheDir:      "/tmp/test-cache",
+		IndexURL:      deadIndexURL,
+		CacheDir:      t.TempDir(),
 		AdminUsername: adminUser,
 		AdminPassword: adminPass,
 	}
@@ -633,8 +653,8 @@ func TestServer_HandleCacheEdgeCases(t *testing.T) {
 
 func TestServer_HealthEndpointDetails(t *testing.T) {
 	cfg := &config.Config{
-		IndexURL:    "https://pypi.org/simple/",
-		CacheDir:    "/tmp/test-cache",
+		IndexURL:    deadIndexURL,
+		CacheDir:    t.TempDir(),
 		CacheSize:   1024 * 1024 * 1024,
 		IndexTTL:    30 * time.Minute,
 		StorageType: "local",
@@ -670,9 +690,12 @@ func TestServer_HealthEndpointDetails(t *testing.T) {
 }
 
 func TestServer_ErrorHandling(t *testing.T) {
+	// A closed server: its loopback port refuses every connection.
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
 	cfg := &config.Config{
-		IndexURL: "http://invalid-url-that-does-not-exist.local",
-		CacheDir: "/tmp/test-cache",
+		IndexURL: closed.URL,
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Second,
 	}
 
@@ -686,17 +709,8 @@ func TestServer_ErrorHandling(t *testing.T) {
 		resp := testRequest(router, req)
 		defer func() { _ = resp.Body.Close() }()
 
-		// Should handle network errors gracefully without crashing
-		if resp.StatusCode == http.StatusInternalServerError {
-			body, _ := io.ReadAll(resp.Body)
-			t.Logf("Network error response body: %s", body)
-		}
-
-		// Accept various status codes (200 with empty list, 503, etc.)
-		if resp.StatusCode >= 200 && resp.StatusCode < 600 {
-			// Any valid HTTP status is acceptable for error handling
-		} else {
-			t.Errorf("Invalid status code for network error: %d", resp.StatusCode)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("Expected status 502 for an unreachable upstream, got %d", resp.StatusCode)
 		}
 	})
 }
@@ -708,7 +722,7 @@ func TestServer_SingleflightListPackages(t *testing.T) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Hour, // Long TTL to avoid cache expiry during test
 	}
 
@@ -797,7 +811,7 @@ func TestServer_SingleflightListFiles(t *testing.T) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Hour, // Long TTL to avoid cache expiry during test
 	}
 
@@ -889,7 +903,7 @@ func TestServer_SingleflightErrorPropagation(t *testing.T) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Hour,
 	}
 
@@ -948,7 +962,7 @@ func TestServer_SingleflightDifferentPackages(t *testing.T) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Hour,
 	}
 
@@ -1037,7 +1051,7 @@ func BenchmarkServer_HandleListPackages_WithSingleflight(b *testing.B) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/bench-cache",
+		CacheDir: b.TempDir(),
 		IndexTTL: 1 * time.Second, // Short TTL for benchmarking
 	}
 
@@ -1065,7 +1079,7 @@ func BenchmarkServer_HandleListFiles_WithSingleflight(b *testing.B) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/bench-cache",
+		CacheDir: b.TempDir(),
 		IndexTTL: 1 * time.Second, // Short TTL for benchmarking
 	}
 
@@ -1099,7 +1113,7 @@ func TestServer_URLRewriting(t *testing.T) {
 
 	cfg := &config.Config{
 		IndexURL: mockPyPI.URL,
-		CacheDir: "/tmp/test-cache",
+		CacheDir: t.TempDir(),
 		IndexTTL: 1 * time.Hour,
 	}
 

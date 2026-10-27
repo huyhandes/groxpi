@@ -191,8 +191,9 @@ malformed means 1): packages are listed in name order, 50 per page, with a packa
 across pages, and the page's poll keeps the page it was rendered for. Both also accept `?q=`, a substring
 of the package name, trimmed and normalised like a package name (so `Typing_Ext` matches `typing-ext`),
 applied to every cached package before paging and to the "Downloading now" rows. The page's filter box
-sends it with every poll, re-polling as the operator types; without JavaScript, submitting the box
-reloads the page with it. The pager links keep it. The listing shows the local cache only, so in pure
+sends it, with the page, on every poll, re-polling as the operator types and starting again at page 1;
+it shows the filter as typed (trimmed), not its normalised form. Without JavaScript, submitting the box
+reloads the page with it, on the page shown. The pager links keep it. The listing shows the local cache only, so in pure
 `s3` mode, which has no cache, the table is empty.
 
 ### `POST /admin/prefetch`
