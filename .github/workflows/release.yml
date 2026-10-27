@@ -48,10 +48,31 @@ jobs:
         echo "Extracted version: ${VERSION}"
         echo "Tag: v${VERSION}"
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Run go vet
+      run: go vet ./...
+
+    - name: Run tests
+      run: go test -short -race ./...
+
   build-binaries:
     name: Build Binaries
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, test]
     strategy:
       matrix:
         include:
@@ -86,7 +107,7 @@ jobs:
       run: |
         BINARY_NAME="groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
         go build \
-          -ldflags="-s -w -X main.version=${{ needs.prepare.outputs.version }}" \
+          -ldflags="-s -w" \
           -o "${BINARY_NAME}" \
           cmd/groxpi/main.go
 
@@ -108,7 +129,7 @@ jobs:
   build-docker:
     name: Build Docker Images
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, test]
 
     steps:
     - name: Checkout code
@@ -144,8 +165,6 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        build-args: |
-          VERSION=${{ needs.prepare.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
@@ -206,6 +225,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ needs.prepare.outputs.tag }}
+        # Tag the commit that was tested and built, not the default branch.
+        target_commitish: ${{ github.sha }}
         name: "Groxpi ${{ needs.prepare.outputs.tag }}"
         body_path: release_notes.md
         files: release-assets/*

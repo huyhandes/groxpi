@@ -106,7 +106,7 @@ Both are covered in [docs/configuration.md](docs/configuration.md) and
 go build -o groxpi ./cmd/groxpi
 go test ./...            # full suite
 go test -short ./...     # skips tests needing a live S3
-gofmt -l . && go vet ./... && golangci-lint run
+gofmt -s -l . && go vet ./... && golangci-lint run
 ```
 
 ## Documentation

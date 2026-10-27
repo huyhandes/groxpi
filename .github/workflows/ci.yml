@@ -76,6 +76,52 @@ jobs:
         flags: unittests
         name: codecov-umbrella
 
+  minio:
+    name: MinIO Integration
+    runs-on: ubuntu-latest
+    env:
+      TEST_S3_ENDPOINT: localhost:9000
+      TEST_S3_ACCESS_KEY: minioadmin
+      TEST_S3_SECRET_KEY: minioadmin
+      TEST_S3_BUCKET: groxpi-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26.x'
+        cache: true
+
+    # Not a service container: those cannot pass the image its `server` command.
+    - name: Start MinIO and create the bucket
+      run: |
+        docker run -d --name minio -p 9000:9000 \
+          -e MINIO_ROOT_USER="$TEST_S3_ACCESS_KEY" \
+          -e MINIO_ROOT_PASSWORD="$TEST_S3_SECRET_KEY" \
+          --health-cmd "mc ready local" --health-interval 2s --health-retries 30 \
+          minio/minio:latest server /data
+        for _ in $(seq 1 60); do
+          [ "$(docker inspect -f '{{.State.Health.Status}}' minio)" = healthy ] && break
+          sleep 1
+        done
+        [ "$(docker inspect -f '{{.State.Health.Status}}' minio)" = healthy ] || { docker logs minio; exit 1; }
+        docker exec minio mc alias set local http://localhost:9000 "$TEST_S3_ACCESS_KEY" "$TEST_S3_SECRET_KEY"
+        docker exec minio mc mb -p "local/$TEST_S3_BUCKET"
+
+    - name: Run MinIO tests
+      # TestS3WithRealClients is excluded: it needs pip/uv and real PyPI. The
+      # tests skip when MinIO is unreachable, so a skip fails this job.
+      shell: bash
+      run: |
+        go test -race -run 'MinIO' -v ./internal/storage/... | tee minio-test.out
+        if grep -q -- '--- SKIP' minio-test.out; then
+          echo "MinIO tests skipped: MinIO was not reachable" >&2
+          exit 1
+        fi
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest
