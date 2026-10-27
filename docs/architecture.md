@@ -130,6 +130,12 @@ with a `200` that is cut off mid-body. `Range` and conditional requests still go
 `http.ServeContent`; a ranged read fetches bounded windows, starting at 1 MiB and doubling up to a cap,
 rather than an open-ended `bytes=<off>-`. An S3 hit carries no `ETag`.
 
+Every S3 `GetObject` waits at most 30 seconds for its response headers, SDK retries included, and a
+lookup also stops waiting when its client leaves. A lookup that runs out of time is a miss, so a
+stalled S3 falls back to upstream instead of holding the request; the body read after the headers
+has no such deadline. A body read that fails mid-stream (a hit or a promotion) is reopened once as
+a ranged GET at the same offset; a second failure in a row fails the read.
+
 ### `hybrid`
 
 The write path of a download: spool under the cache directory, verify (SHA-256 and length), rename

@@ -281,6 +281,9 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 		if obj != nil {
 			return obj, nil
 		}
+		if promote == nil && ctx.Err() != nil {
+			return nil, ctx.Err() // the client left during the lookup: nothing to fetch for
+		}
 		if promote == nil && s.redirect {
 			t, err := s.fetcher.Resolve(ctx, pkg, file)
 			if err != nil {
@@ -388,16 +391,18 @@ func (s *Store) lookup(ctx context.Context, key, file string, count bool) (*Obje
 		return nil, nil
 	}
 	// Detached: a promotion outlives this request, and a hit is closed by the
-	// server when the response is done.
+	// server when the response is done. The lookup GET is per request, so its
+	// header wait ends with the client (and at s3GetHeaderTimeout); its body
+	// and the windows opened later do not.
 	rctx := context.WithoutCancel(ctx)
 	// The GET is the existence check: a hit whose body cannot be opened is a
 	// miss here, never a 200 that dies after its headers.
-	rc, info, err := s.durable.Get(rctx, key)
+	rc, info, err := s.durable.Get(ctx, key)
 	if err != nil {
 		if count {
 			telemetry.CacheMiss(ctx, telemetry.LayerRemote)
 		}
-		if !errors.Is(err, ErrNotFound) {
+		if !errors.Is(err, ErrNotFound) && ctx.Err() == nil {
 			// Safe to log raw: an object-store error; S3 credentials sign requests
 			// and are never part of the endpoint URL.
 			slog.ErrorContext(ctx, "Failed to read remote cache", "error", err, "key", key)
@@ -407,16 +412,17 @@ func (s *Store) lookup(ctx context.Context, key, file string, count bool) (*Obje
 	if count {
 		telemetry.CacheHit(ctx, telemetry.LayerRemote)
 	}
+	// A ranged reader for a promotion too, so a dropped body resumes.
+	body := &rangedReader{
+		open: func(off, end int64) (io.ReadCloser, error) { return s.durable.getRange(rctx, key, off, end) },
+		size: info.Size, body: rc,
+	}
 	if s.cache == nil {
-		return &Object{
-			ReadSeekCloser: &rangedReader{
-				open: func(off, end int64) (io.ReadCloser, error) { return s.durable.getRange(rctx, key, off, end) },
-				size: info.Size, body: rc,
-			},
+		return &Object{ReadSeekCloser: body,
 			Name: file, Size: info.Size, ModTime: info.LastModified, ContentType: contentType(file),
 		}, nil
 	}
-	return nil, &download.File{Target: download.Target{Size: info.Size}, Body: rc, Length: info.Size}
+	return nil, &download.File{Target: download.Target{Size: info.Size}, Body: body, Length: info.Size}
 }
 
 // lead runs one flight: fetch (or take the promotion source), spool, then
@@ -970,7 +976,9 @@ const (
 // records the offset; a Read anywhere else than the open body's position
 // closes it and opens a bounded window from there, and a window read to its end
 // opens the next, twice as large. A size probe fetches nothing, so
-// http.ServeContent handles single and multi-range requests.
+// http.ServeContent handles single and multi-range requests. A body read that
+// fails is reopened once at the same offset; failing again with no byte read
+// in between returns the error.
 type rangedReader struct {
 	open      func(off, end int64) (io.ReadCloser, error) // end inclusive
 	size, off int64
@@ -987,7 +995,7 @@ func (r *rangedReader) Read(p []byte) (int, error) {
 		_ = r.Close()
 		r.window = 0
 	}
-	for opened := false; ; {
+	for opened, retried := false, false; ; {
 		if r.body == nil {
 			r.window = min(max(2*r.window, firstWindow), maxWindow)
 			b, err := r.open(r.off, min(r.off+r.window, r.size)-1)
@@ -1008,6 +1016,18 @@ func (r *rangedReader) Read(p []byte) (int, error) {
 				return 0, io.ErrUnexpectedEOF // a fresh window with nothing in it
 			}
 			continue // this body is done; the next window carries on
+		}
+		if err != nil && err != io.EOF {
+			// A dropped connection: reopen once at r.off. With bytes in hand
+			// they are returned first and the next Read reopens.
+			_ = r.Close()
+			if n > 0 {
+				return n, nil
+			}
+			if !retried {
+				retried = true
+				continue
+			}
 		}
 		return n, err
 	}
