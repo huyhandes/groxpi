@@ -24,9 +24,10 @@
 
 <!-- Without JavaScript the form posts and the browser shows the plain-text
      reply. With htmx the reply, accepted or refused, goes into the status span:
-     htmx 2 swaps no error response by default, so after-request writes it. -->
+     htmx 2 swaps no error response by default, so after-request writes it. A
+     failure with no body (a dropped connection) shows its status instead. -->
 <form method="post" action="/admin/prefetch" hx-post="/admin/prefetch" hx-swap="none"
-      hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText">
+      hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText || 'Prefetch failed: ' + event.detail.xhr.status">
   <input name="package" placeholder="package name" required autocomplete="off">
   <button type="submit">Prefetch newest release</button>
   <span id="prefetch-status" class="muted" role="status"></span>
