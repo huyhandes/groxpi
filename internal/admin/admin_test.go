@@ -144,7 +144,7 @@ func plant(t *testing.T, dir, pkg, file string, body []byte) string {
 func (h *harness) cachedFiles(t *testing.T) []string {
 	t.Helper()
 	names := []string{}
-	for _, pkg := range h.svc.List(t.Context(), 1).Packages {
+	for _, pkg := range h.svc.List(t.Context(), 1, "").Packages {
 		for _, f := range pkg.Files {
 			names = append(names, f.Name)
 		}
@@ -160,7 +160,7 @@ func (h *harness) cachedFiles(t *testing.T) []string {
 func TestList_Empty(t *testing.T) {
 	h := newHarness(t, newUpstream(t, "p").URL, t.TempDir())
 
-	view := h.svc.List(t.Context(), 1)
+	view := h.svc.List(t.Context(), 1, "")
 	assert.Empty(t, view.Packages)
 	assert.Zero(t, view.Total)
 	assert.Zero(t, view.Size)
@@ -179,7 +179,7 @@ func TestList_Paginates(t *testing.T) {
 	}
 	h := newHarness(t, newUpstream(t, "p").URL, dir)
 
-	first := h.svc.List(t.Context(), 1)
+	first := h.svc.List(t.Context(), 1, "")
 	require.Len(t, first.Packages, admin.PageSize)
 	assert.Equal(t, "p000", first.Packages[0].Name)
 	assert.Equal(t, admin.PageSize+1, first.Total)
@@ -188,14 +188,36 @@ func TestList_Paginates(t *testing.T) {
 	assert.Zero(t, first.PrevPage)
 	assert.Equal(t, 2, first.NextPage)
 
-	second := h.svc.List(t.Context(), 2)
+	second := h.svc.List(t.Context(), 2, "")
 	require.Len(t, second.Packages, 1)
 	assert.Equal(t, "p050", second.Packages[0].Name)
 	assert.Len(t, second.Packages[0].Files, 2, "a package's files stay on one page")
 	assert.Equal(t, 1, second.PrevPage)
 	assert.Zero(t, second.NextPage)
 
-	assert.Equal(t, second, h.svc.List(t.Context(), int(^uint(0)>>1)), "a page past the end is the last page")
+	assert.Equal(t, second, h.svc.List(t.Context(), int(^uint(0)>>1), ""), "a page past the end is the last page")
+}
+
+// TestList_FiltersBeforePaging: the filter searches every cached package, not
+// just the page on screen, and the totals describe the matches.
+func TestList_FiltersBeforePaging(t *testing.T) {
+	dir := t.TempDir()
+	for i := range admin.PageSize + 1 {
+		plant(t, dir, fmt.Sprintf("p%03d", i), "a.whl", []byte("x"))
+	}
+	plant(t, dir, "zz-needle", "needle-1.0.tar.gz", []byte("xyz"))
+	h := newHarness(t, newUpstream(t, "p").URL, dir)
+
+	view := h.svc.List(t.Context(), 1, "  NEEDLE ")
+	require.Len(t, view.Packages, 1, "a match past the first page must be found from page 1")
+	assert.Equal(t, "zz-needle", view.Packages[0].Name)
+	assert.Equal(t, 1, view.Total)
+	assert.Equal(t, int64(3), view.Size)
+	assert.Zero(t, view.NextPage)
+	assert.Equal(t, "needle", view.Query)
+
+	assert.Empty(t, h.svc.List(t.Context(), 1, "absent").Packages)
+	assert.Equal(t, admin.PageSize+2, h.svc.List(t.Context(), 1, "").Total, "an empty filter lists everything")
 }
 
 func TestList_SizeAndAge(t *testing.T) {
@@ -206,7 +228,7 @@ func TestList_SizeAndAge(t *testing.T) {
 	require.NoError(t, h.svc.Prefetch(t.Context(), "listme"))
 	h.svc.Close(t.Context())
 
-	view := h.svc.List(t.Context(), 1)
+	view := h.svc.List(t.Context(), 1, "")
 	require.Len(t, view.Packages, 1)
 	pkg := view.Packages[0]
 	assert.Equal(t, "listme", pkg.Name)
@@ -228,13 +250,13 @@ func TestList_LastAccessedTracksServes(t *testing.T) {
 	up := newUpstream(t, "hitme", fakeFile{name: "hitme-1.0.0.tar.gz"})
 	h := newHarness(t, up.URL, dir)
 
-	require.Equal(t, "2d", h.svc.List(t.Context(), 1).Packages[0].Accessed)
+	require.Equal(t, "2d", h.svc.List(t.Context(), 1, "").Packages[0].Accessed)
 
 	obj, err := h.store.Open(t.Context(), "hitme", "hitme-1.0.0.tar.gz")
 	require.NoError(t, err)
 	require.NoError(t, obj.Close())
 
-	view := h.svc.List(t.Context(), 1)
+	view := h.svc.List(t.Context(), 1, "")
 	require.Len(t, view.Packages, 1)
 	assert.Equal(t, "0s", view.Packages[0].Accessed, "a serve must refresh the package's last access")
 	assert.Equal(t, "0s", view.Packages[0].Files[0].Accessed)
@@ -335,7 +357,7 @@ func TestPrefetch_SelectsNewestFinalRelease(t *testing.T) {
 			h.svc.Close(t.Context())
 
 			assert.Equal(t, tt.want, h.cachedFiles(t))
-			errs := h.svc.List(t.Context(), 1).Errors
+			errs := h.svc.List(t.Context(), 1, "").Errors
 			if tt.failure == "" {
 				assert.Empty(t, errs)
 				return
@@ -355,7 +377,7 @@ func TestPrefetch_UpstreamFailureLeavesNoFilesAndIsSurfaced(t *testing.T) {
 	require.NoError(t, h.svc.Prefetch(t.Context(), "broken"))
 	h.svc.Close(t.Context())
 
-	errs := h.svc.List(t.Context(), 1).Errors
+	errs := h.svc.List(t.Context(), 1, "").Errors
 	require.Len(t, errs, 1)
 	assert.Equal(t, "broken", errs[0].Package)
 	assert.Contains(t, errs[0].Message, "broken-1.0.0.tar.gz")
@@ -370,7 +392,7 @@ func TestPrefetch_UnknownPackageIsSurfaced(t *testing.T) {
 	require.NoError(t, h.svc.Prefetch(t.Context(), "nosuchpackage"))
 	h.svc.Close(t.Context())
 
-	errs := h.svc.List(t.Context(), 1).Errors
+	errs := h.svc.List(t.Context(), 1, "").Errors
 	require.Len(t, errs, 1)
 	assert.Equal(t, "nosuchpackage", errs[0].Package)
 	assert.Contains(t, errs[0].Message, "not found on any configured index")
@@ -410,7 +432,7 @@ func TestPrefetch_DuplicatesRunOnce(t *testing.T) {
 	h.svc.Close(t.Context())
 
 	assert.Equal(t, int64(2), up.fileHits.Load(), "one run per prefetch window, not one per submission")
-	assert.Len(t, h.svc.List(t.Context(), 1).Errors, 2)
+	assert.Len(t, h.svc.List(t.Context(), 1, "").Errors, 2)
 }
 
 // TestClose_DrainsRunningPrefetch pins the ordering the drain exists for:
@@ -469,7 +491,7 @@ func TestPrefetch_RedirectModeRefuses(t *testing.T) {
 	require.NoError(t, svc.Prefetch(t.Context(), "p"))
 	svc.Close(t.Context())
 
-	errs := svc.List(t.Context(), 1).Errors
+	errs := svc.List(t.Context(), 1, "").Errors
 	require.Len(t, errs, 1)
 	assert.Contains(t, errs[0].Message, "caching is disabled")
 	assert.Zero(t, up.fileHits.Load(), "nothing was fetched")

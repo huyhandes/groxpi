@@ -141,6 +141,30 @@ that proves it. Delete an entry when it ships.
   Dockerfile).
 - **Check:** a test asserting the home page and User-Agent carry the build-info version.
 
+## Container and release
+
+### The container runs as root
+
+- **Where:** `Dockerfile` — the final `scratch` stage sets no `USER`.
+- **What:** groxpi runs as uid 0 inside the container. Nothing it does needs root: it listens on an
+  unprivileged port and writes only under `/cache`.
+- **Fix:** `USER 65532:65532` in the final stage, with `/cache` created and owned by that uid in the
+  build stage and copied in (`COPY --chown`), since `scratch` has no shell to `chown` with. Existing
+  deployments whose `/cache` volume was written by root need a one-off `chown -R 65532:65532` on the
+  volume when they upgrade, or the new process cannot write to its cache; say so in the release notes.
+- **Check:** `docker run --rm <image> --health-check` succeeds and `docker inspect` reports
+  `Config.User` as `65532:65532`; a compose run against a fresh volume caches a file.
+
+### Two workflows push the `latest` image tag
+
+- **Where:** `.github/workflows/docker.yml` (`type=raw,value=latest` on the default branch) and
+  `.github/workflows/release.yml` (`type=raw,value=latest` on every release).
+- **What:** `latest` means "newest main build" or "newest release" depending on which workflow ran
+  last, so a user pulling `latest` cannot tell which they got.
+- **Fix:** pick one owner. Releases owning `latest` (main pushes only `main` / `sha-` tags) gives users
+  a stable meaning; drop the tag from the other workflow.
+- **Check:** `git grep -n 'value=latest' .github/workflows` returns exactly one line.
+
 ## Test gaps
 
 - A cache commit failure in `hybrid` still uploads the verified spool to S3.

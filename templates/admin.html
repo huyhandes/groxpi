@@ -27,31 +27,19 @@
   <button type="submit">Prefetch newest release</button>
 </form>
 
-<div class="controls">
-  <input id="filter" type="search" placeholder="Filter packages…" autocomplete="off">
-</div>
+<!-- The filter is a plain GET: the listing is paged on the server, so the
+     query has to reach admin.List to search every package, not just the rows
+     on screen. Submitting starts again at page 1. -->
+<form class="controls" method="get" action="/admin">
+  <input id="filter" name="q" type="search" value="{{.Query}}" placeholder="Filter packages…" autocomplete="off">
+  <button type="submit">Filter</button>
+</form>
 
 <!-- The table polls: prefetch has no progress bar, so files appearing here are
      the progress display. The first render is server-side, so the poll only
      needs to pick up changes. -->
-<div id="cache" hx-get="/admin/rows?page={{.Page}}" hx-trigger="every 3s" hx-swap="innerHTML">
+<div id="cache" hx-get="/admin/rows?page={{.Page}}{{if .Query}}&amp;q={{.Query}}{{end}}" hx-trigger="every 3s" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>
-
-<script>
-  // Client-side filter: the row count is in the hundreds, so narrowing them is a
-  // hidden attribute rather than a server round trip. Re-applied after every
-  // poll, because the swap replaces the rows the filter was hiding.
-  function applyFilter() {
-    var box = document.getElementById('filter');
-    var q = box ? box.value.trim().toLowerCase() : '';
-    var rows = document.querySelectorAll('#cache tr[data-package]');
-    for (var i = 0; i < rows.length; i++) {
-      rows[i].hidden = q !== '' && rows[i].dataset.package.indexOf(q) === -1;
-    }
-  }
-  document.getElementById('filter').addEventListener('input', applyFilter);
-  document.body.addEventListener('htmx:afterSwap', applyFilter);
-</script>
 </body>
 </html>

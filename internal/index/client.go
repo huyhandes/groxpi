@@ -35,8 +35,7 @@ type FileInfo struct {
 	Hashes         map[string]string `json:"hashes,omitempty"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	Size           int64             `json:"size,omitempty"`
-	Yanked         any               `json:"yanked,omitempty"` // Can be bool or string
-	YankedReason   string            `json:"yanked-reason,omitempty"`
+	Yanked         any               `json:"yanked,omitempty"` // PEP 691: bool, or the reason string
 	// PEP 658/714: true or a hash map when <url>.metadata exists upstream.
 	// Both spellings are accepted; CoreMetadata wins when both are present.
 	CoreMetadata     any `json:"core-metadata,omitempty"`
@@ -85,9 +84,6 @@ func (f *FileInfo) IsYanked() bool {
 
 // GetYankedReason returns the yanked reason if available
 func (f *FileInfo) GetYankedReason() string {
-	if f.YankedReason != "" {
-		return f.YankedReason
-	}
 	if s, ok := f.Yanked.(string); ok && s != "" {
 		return s
 	}
@@ -243,7 +239,7 @@ func (c *Client) parseJSONPackageFiles(body io.Reader, base *url.URL) ([]FileInf
 	}
 	for i := range response.Files {
 		// A URL that does not parse stays verbatim: the file is still listed and
-		// its download fails with a redacted error, as it did before resolution.
+		// a download of it fails with a redacted error.
 		if ref, err := url.Parse(response.Files[i].URL); err == nil {
 			response.Files[i].URL = base.ResolveReference(ref).String()
 		}
