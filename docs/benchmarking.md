@@ -21,7 +21,8 @@ Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
 - `wrk` — `brew install wrk`, or `apt-get install wrk`
 - Docker, for the install tests and for running both proxies
 - `duckdb` — `brew install duckdb`, only for the analysis step
-- Two running servers to point at: groxpi and proxpi
+- Both proxies running from `benchmarks/docker/docker-compose.benchmark.yml` on the same host, since
+  cold runs recreate those containers (see [Cache state](#cache-state))
 
 ## Running it
 
@@ -39,7 +40,7 @@ Both URLs are required. Options:
 |---|---|
 | `--api-only` | Run only the `wrk` API benchmarks. |
 | `--uv-only` | Run only the install benchmarks. |
-| `--no-monitoring` | Skip resource sampling. |
+| `--no-monitoring` | Skip resource sampling. Sampling reads `docker stats` for the local containers `groxpi-bench` and `proxpi-bench`, whatever the URLs point at. |
 | `--timestamp TS` | Reuse a specific run timestamp instead of generating one. |
 | `--docker-network N` | Docker network the containers share. |
 | `--results-dir DIR` | Where results are written (default `benchmarks/results`). |
@@ -58,18 +59,20 @@ latest timestamp when none is given — and has a `--help`.
 ## Cache state
 
 A comparison is meaningless unless both proxies start from the same cache state.
-`scripts/cache_manager.sh` clears them between runs. On groxpi `DELETE /cache/list` invalidates no list
-(the root index is proxied, not cached; it evicts only a package named `list`), so the script issues `DELETE /cache/<package>` for every
-package under test — `BENCH_PACKAGES`, a space-separated list defaulting to the scenarios' packages.
-proxpi gets `DELETE /cache/list` as well. Any failed groxpi eviction aborts the run.
+`scripts/cache_manager.sh` empties both caches before every cold measurement by recreating the
+containers: `docker compose rm -sfv groxpi-bench proxpi-bench`, then `docker compose up -d --wait`.
+`docker-compose.benchmark.yml` gives each proxy an anonymous cache volume, which `rm -v` deletes; a named
+volume would survive it. The compose file is `benchmarks/docker/docker-compose.benchmark.yml` unless
+`BENCH_COMPOSE_FILE` names another, and the containers must be on the host running the suite, behind
+the URLs it is given. If recreating them fails, `wrk_api_test.sh` skips that cold measurement and
+exits non-zero, and `uv_install_test.sh` stops, rather than record a warm cache as a cold one.
 
-Those routes exist on groxpi only when admin credentials are configured — see
-[configuration.md](configuration.md#administrative-interface) — so the groxpi under test must have
-them. `docker-compose.benchmark.yml` starts groxpi with `GROXPI_ADMIN_USERNAME` and
-`GROXPI_ADMIN_PASSWORD` both defaulting to `bench`, and the script sends the same variables, with the
-same defaults, as basic auth. Against any other groxpi, export the credentials it was started with.
-If the clear is refused (`401`, `403`, or `404`) the run aborts rather than benchmark a warm cache as a
-cold one. proxpi has no admin auth and is never sent credentials.
+Neither proxy's HTTP eviction empties its cache, which is why the suite does not use it. groxpi's
+`DELETE /cache/list` invalidates nothing, because the root index is proxied and not cached. proxpi's
+`DELETE /cache/<package>` drops only the in-memory file list and keeps every downloaded file on disk.
+
+The `wrk` load runs hit `/simple/numpy/`, not `/simple/`. groxpi passes the root index through to the
+upstream uncached, so a `/simple/` load run would measure pypi.org.
 
 ## Go microbenchmarks
 

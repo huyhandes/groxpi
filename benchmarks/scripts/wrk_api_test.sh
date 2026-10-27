@@ -21,6 +21,9 @@ WRK_TIMEOUT="30s"
 # Test packages - vary in size and complexity
 TEST_PACKAGES=("numpy" "pandas" "polars" "pyspark" "fastapi")
 
+# Failed measurements, counted instead of aborting so the summary CSV is still written
+FAILURES=0
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,7 +50,7 @@ show_usage() {
     echo "Test Scenarios:"
     echo "  all           - Run all test scenarios"
     echo "  cold-single   - Cold cache single request timing"
-    echo "  cold-load     - Cold cache load testing"
+    echo "  cold-load     - Cold cache load testing (/simple/numpy/)"
     echo "  warm-load     - Warm cache load testing"
     echo "  package-tests - Individual package testing"
     echo ""
@@ -146,7 +149,7 @@ run_single_request_test() {
     # Make single request
     local response
     local http_code
-    if response=$(curl -s -w "HTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}" --max-time 30 "$url$endpoint" 2>&1); then
+    if response=$(curl -s -o /dev/null -w "HTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}" --max-time 30 "$url$endpoint" 2>&1); then
         local end_time=$(date +%s.%N)
 
         # Extract metrics
@@ -217,6 +220,20 @@ run_wrk_load_test() {
     fi
 }
 
+# Run one measurement; a failure is counted instead of aborting the suite
+single() { run_single_request_test "$@" || FAILURES=$((FAILURES + 1)); }
+load() { run_wrk_load_test "$@" || FAILURES=$((FAILURES + 1)); }
+
+# Clear both caches, then run one measurement. A failed clear is counted and the
+# measurement skipped, so a warm number is never recorded as a cold one.
+cold() {
+    if clear_cache; then
+        "$@"
+    else
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 # Function to run cold cache tests
 run_cold_cache_tests() {
     local results_dir=$1
@@ -227,36 +244,25 @@ run_cold_cache_tests() {
     echo "=========================================="
     echo ""
 
-    # Clear caches
-    if ! clear_cache; then
-        log_error "Failed to clear caches, skipping cold cache tests"
-        return 1
-    fi
-
     if [ "$TEST_SCENARIO" = "cold-single" ] || [ "$TEST_SCENARIO" = "all" ]; then
         log_info "Running cold cache single request tests..."
 
         # Test package index
-        run_single_request_test "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
-        clear_cache  # Clear again for fair comparison
-        run_single_request_test "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
+        cold single "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
+        cold single "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
 
         # Test specific package (numpy)
-        clear_cache
-        run_single_request_test "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
-        clear_cache
-        run_single_request_test "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
+        cold single "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
+        cold single "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
     fi
 
+    # No /simple/ load run: groxpi passes the root index through uncached, so it
+    # would measure pypi.org rather than either proxy.
     if [ "$TEST_SCENARIO" = "cold-load" ] || [ "$TEST_SCENARIO" = "all" ]; then
         log_info "Running cold cache load tests..."
 
-        # Test package index under load
-        clear_cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
-
-        clear_cache
-        run_wrk_load_test "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
+        cold load "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
+        cold load "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
     fi
 }
 
@@ -266,9 +272,6 @@ warm_up_cache() {
     local service=$2
 
     log_info "Warming up cache for $service..."
-
-    # Make requests to package index and specific packages
-    curl -s "$url/simple/" >/dev/null 2>&1 || true
 
     for package in "${TEST_PACKAGES[@]}"; do
         curl -s "$url/simple/$package/" >/dev/null 2>&1 || true
@@ -295,13 +298,9 @@ run_warm_cache_tests() {
 
         log_info "Running warm cache load tests..."
 
-        # Test package index with warm cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/" "groxpi" "index-warm" "$results_dir"
-        run_wrk_load_test "$PROXPI_URL" "/simple/" "proxpi" "index-warm" "$results_dir"
-
-        # Test specific package with warm cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-warm" "$results_dir"
-        run_wrk_load_test "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-warm" "$results_dir"
+        # Test specific package with warm cache (no /simple/: see run_cold_cache_tests)
+        load "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-warm" "$results_dir"
+        load "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-warm" "$results_dir"
     fi
 }
 
@@ -320,13 +319,8 @@ run_package_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing package: $package"
 
-            # Clear and test groxpi
-            clear_cache
-            run_single_request_test "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
-
-            # Clear and test proxpi
-            clear_cache
-            run_single_request_test "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
+            cold single "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
+            cold single "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
 
             echo ""
         done
@@ -493,6 +487,11 @@ main() {
     echo "End time: $end_time"
     echo "Results saved to: $results_dir"
     echo "Summary: $results_dir/wrk-summary-${TIMESTAMP}.csv"
+
+    if [ "$FAILURES" -gt 0 ]; then
+        log_error "$FAILURES measurement(s) or cache clear(s) failed; see the logs above"
+        exit 1
+    fi
 
     log_success "WRK API testing completed successfully"
 }
