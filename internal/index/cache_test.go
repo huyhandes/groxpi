@@ -198,6 +198,23 @@ func TestIndexCache_ZeroTTLStoresNothing(t *testing.T) {
 	}
 }
 
+// TestIndexCache_ZeroTTLDropsTheOlderEntry pins that refilling a package with
+// TTL 0 removes what was cached before, rather than leaving the old entry to be
+// served until it expires.
+func TestIndexCache_ZeroTTLDropsTheOlderEntry(t *testing.T) {
+	c := newIndexCache(0, 0)
+	defer c.close()
+
+	c.set("k", testEntry(`{"a":1}`), time.Minute)
+	c.set("k", testEntry(`{"a":2}`), 0)
+	if _, ok := c.get("k"); ok {
+		t.Fatal("TTL 0 left the older entry in place")
+	}
+	if n, b := c.stats(); n != 0 || b != 0 {
+		t.Fatalf("TTL 0 left %d entries, %d bytes; want none", n, b)
+	}
+}
+
 // TestIndexCache_OversizeEntryKeepsTheRest pins that one entry bigger than the
 // whole budget is not stored, instead of evicting everything to make room it
 // can never have.

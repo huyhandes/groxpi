@@ -158,11 +158,13 @@ func (c *indexCache) get(pkg string) (*Entry, bool) {
 
 // set stores a package's entry for ttl, evicting to stay inside the budget. A
 // ttl of zero means "do not cache": the entry would be expired on arrival, and
-// with no positive TTL there is no sweeper to reclaim it. An entry bigger than
+// with no positive TTL there is no sweeper to reclaim it. Any older entry is
+// still dropped, so it is not served on until it expires. An entry bigger than
 // the whole budget is not stored either, since evicting everything else would
 // still not make room for it.
 func (c *indexCache) set(pkg string, entry *Entry, ttl time.Duration) {
 	if ttl <= 0 {
+		c.invalidate(pkg)
 		return
 	}
 	now := time.Now()

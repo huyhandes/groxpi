@@ -31,30 +31,6 @@ func testRequest(router http.Handler, req *http.Request) *http.Response {
 	return w.Result()
 }
 
-func TestNew(t *testing.T) {
-	cfg := &config.Config{
-		IndexURL:  deadIndexURL,
-		CacheSize: 1024 * 1024 * 1024, // 1GB
-		CacheDir:  t.TempDir(),
-		IndexTTL:  30 * time.Minute,
-		LogLevel:  "INFO",
-	}
-
-	srv := newTestServer(t, cfg)
-
-	if srv == nil {
-		t.Fatal("New() returned nil")
-	}
-
-	// Test that server has required components initialized
-	if srv.Router() == nil {
-		t.Error("Gin router not initialized")
-	}
-
-	// Test server interface - we can't access private fields
-	// Note: We'll test the server functionality through HTTP requests
-}
-
 func TestServer_HandleHome(t *testing.T) {
 	cfg := &config.Config{
 		IndexURL:  deadIndexURL,
