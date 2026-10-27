@@ -179,6 +179,15 @@ run_single_request_test() {
     fi
 }
 
+# Print wrk's socket error counts if any is non-zero, else nothing.
+wrk_socket_errors() {
+    awk '/Socket errors:/ {
+        line = $0; sub(/^[ \t]*Socket errors: /, "", line); gsub(",", "")
+        if ($4 + $6 + $8 + $10 > 0) print line
+        exit
+    }' "$1"
+}
+
 # Function to run wrk load test
 run_wrk_load_test() {
     local url=$1
@@ -210,6 +219,18 @@ run_wrk_load_test() {
             local failed_file="${output_file%.log}.failed.log"
             mv "$output_file" "$failed_file"
             log_error "  Load test got $non_2xx non-2xx/3xx responses; see $failed_file"
+            return 1
+        fi
+
+        # wrk prints "Socket errors: connect N, read N, write N, timeout N" when
+        # one is non-zero; errored and timed-out requests are not in the rate,
+        # so any non-zero count fails the measurement the same way.
+        local socket_errors
+        socket_errors=$(wrk_socket_errors "$output_file")
+        if [ -n "$socket_errors" ]; then
+            local failed_file="${output_file%.log}.failed.log"
+            mv "$output_file" "$failed_file"
+            log_error "  Load test had socket errors ($socket_errors); see $failed_file"
             return 1
         fi
 

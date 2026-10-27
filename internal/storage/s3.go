@@ -121,7 +121,8 @@ func NewS3Storage(settings *S3Config) (*S3Storage, error) {
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
-	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
+	staticCreds := cfg.AccessKeyID != "" && cfg.SecretAccessKey != ""
+	if staticCreds {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
 		))
@@ -156,7 +157,7 @@ func NewS3Storage(settings *S3Config) (*S3Storage, error) {
 		"bucket", cfg.Bucket,
 		"prefix", cfg.Prefix,
 		"path_style", cfg.ForcePathStyle,
-		"static_credentials", cfg.AccessKeyID != "")
+		"static_credentials", staticCreds)
 
 	return &S3Storage{
 		client:    client,
