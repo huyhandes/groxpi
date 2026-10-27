@@ -100,7 +100,7 @@ func (c *Config) ResolutionOrder() []Index {
 	indexes := make([]Index, 0, len(c.ExtraIndexURLs)+1)
 	for i, extra := range c.ExtraIndexURLs {
 		ttl := defaultExtraIndexTTL
-		if i < len(c.ExtraIndexTTLs) && c.ExtraIndexTTLs[i] > 0 {
+		if i < len(c.ExtraIndexTTLs) {
 			ttl = c.ExtraIndexTTLs[i]
 		}
 		indexes = append(indexes, Index{URL: extra, TTL: ttl})
@@ -298,9 +298,10 @@ func getEnv(key, defaultValue string) string {
 }
 
 // invalidEnv reports a setting that could not be used and names the value taken
-// instead. Load has no error return - a mistyped cache size must not stop the
-// proxy from starting - so the substitution has to be visible in the log, or an
-// operator who wrote "512MB" never learns their tuning was ignored.
+// instead. Load fails only on a setting the proxy cannot run without - a
+// mistyped cache size must not stop the proxy from starting - so the
+// substitution has to be visible in the log, or an operator who wrote "512MB"
+// never learns their tuning was ignored.
 func invalidEnv(key, value string, fallback any) {
 	slog.Warn("Ignoring malformed environment variable, using default instead",
 		"variable", key,

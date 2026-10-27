@@ -198,6 +198,29 @@ func TestInit_LevelFiltering(t *testing.T) {
 	}
 }
 
+// TestInit_WarnsOnUnknownValue: a mistyped level or format still starts the
+// proxy on the default, but says so, the way config announces any other
+// malformed setting — or an operator who wrote "verbose" never learns why debug
+// lines are missing.
+func TestInit_WarnsOnUnknownValue(t *testing.T) {
+	output := captureStdout(t, func() {
+		Init(LogConfig{Level: "verbose", Format: "xml"})
+	})
+	for _, want := range []string{"variable=GROXPI_LOGGING_LEVEL value=verbose", "variable=GROXPI_LOG_FORMAT value=xml"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("expected a warning containing %q, got %q", want, output)
+		}
+	}
+
+	quiet := captureStdout(t, func() {
+		Init(LogConfig{Level: "warning", Format: "JSON"})
+		Init(LogConfig{Level: "", Format: ""})
+	})
+	if quiet != "" {
+		t.Errorf("known or empty values must not warn, got %q", quiet)
+	}
+}
+
 func TestInit_DefaultFormat(t *testing.T) {
 	// An empty format falls back to console.
 	Init(LogConfig{Level: "INFO", Format: "", Color: false})

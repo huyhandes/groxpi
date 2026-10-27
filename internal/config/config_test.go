@@ -256,6 +256,33 @@ func TestResolutionOrder(t *testing.T) {
 	}
 }
 
+// TestResolutionOrder_ExtraTTLs pins how a configured extra TTL reaches the
+// resolution order: a zero is kept as zero, meaning the same as on the primary,
+// rather than silently becoming the default; only a missing slot gets it.
+func TestResolutionOrder_ExtraTTLs(t *testing.T) {
+	cases := []struct {
+		name string
+		ttls []time.Duration
+		want time.Duration
+	}{
+		{"configured", []time.Duration{time.Minute}, time.Minute},
+		{"zero kept", []time.Duration{0}, 0},
+		{"missing slot", nil, defaultExtraIndexTTL},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				IndexURL:       "https://pypi.org/simple/",
+				ExtraIndexURLs: []string{"https://private.example.com/simple/"},
+				ExtraIndexTTLs: tc.ttls,
+			}
+			if got := cfg.ResolutionOrder()[0].TTL; got != tc.want {
+				t.Fatalf("extra TTL %v resolved to %v, want %v", tc.ttls, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolutionOrder_PrimaryOnly(t *testing.T) {
 	cfg := &Config{IndexURL: "https://pypi.org/simple/", IndexTTL: time.Hour}
 	got := cfg.ResolutionOrder()
@@ -314,6 +341,7 @@ func TestExtraIndexTTLs(t *testing.T) {
 		"30,later,1h": {30 * time.Second, d, time.Hour},
 		"-5,2.5":      {d, 2500 * time.Millisecond},
 		",":           {d, d},
+		"0,60":        {0, 60 * time.Second},
 	}
 	for value, want := range cases {
 		t.Run(value, func(t *testing.T) {

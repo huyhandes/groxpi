@@ -242,8 +242,6 @@ func TestRoutes_TrailingSlashRedirect(t *testing.T) {
 	assert.Zero(t, up.IndexHits("numpy"), "a redirect must not consult upstream")
 }
 
-// TestRoutes_MethodNotAllowed: a known path with the wrong method is a 405 with
-// an Allow header, not a 404.
 // TestIndex_FileHrefIsPercentEncoded pins that a file name with a URL
 // metacharacter is escaped in both index forms, and that the escaped href
 // downloads the file rather than a truncated name.
@@ -271,6 +269,8 @@ func TestIndex_FileHrefIsPercentEncoded(t *testing.T) {
 	assert.Equal(t, payload, got)
 }
 
+// TestRoutes_MethodNotAllowed: a known path with the wrong method is a 405 with
+// an Allow header, not a 404.
 func TestRoutes_MethodNotAllowed(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)

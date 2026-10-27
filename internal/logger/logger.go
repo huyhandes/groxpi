@@ -34,12 +34,15 @@ type LogConfig struct {
 }
 
 // Init installs the configured logger as the slog default, which is what the
-// package-level slog calls throughout the codebase use.
+// package-level slog calls throughout the codebase use. An unknown level or
+// format falls back to the default and is announced once the logger is up, the
+// way config announces any other malformed setting.
 func Init(cfg LogConfig) {
-	level := ParseLevel(cfg.Level)
+	level, levelOK := parseLevel(cfg.Level)
 
 	var sink slog.Handler
-	switch strings.ToLower(cfg.Format) {
+	format := strings.ToLower(cfg.Format)
+	switch format {
 	case "json":
 		// JSON format for log collectors
 		sink = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -55,23 +58,46 @@ func Init(cfg LogConfig) {
 		level:    level,
 		handlers: []slog.Handler{sink, otelslog.NewHandler(telemetry.ScopeName)},
 	}))
+
+	if !levelOK {
+		warnInvalid("GROXPI_LOGGING_LEVEL", cfg.Level, "INFO")
+	}
+	if format != "" && format != "json" && format != "console" {
+		warnInvalid("GROXPI_LOG_FORMAT", cfg.Format, "console")
+	}
 }
 
-// ParseLevel converts a string level to a slog.Level.
+// warnInvalid matches config's malformed-variable warning, so both read the
+// same in the log.
+func warnInvalid(key, value, fallback string) {
+	slog.Warn("Ignoring malformed environment variable, using default instead",
+		"variable", key,
+		"value", value,
+		"default", fallback)
+}
+
+// ParseLevel converts a string level to a slog.Level; anything unknown is INFO.
 func ParseLevel(level string) slog.Level {
+	l, _ := parseLevel(level)
+	return l
+}
+
+// parseLevel is ParseLevel that also reports whether the name was recognised.
+// An empty name is the unset default, not a mistake.
+func parseLevel(level string) (slog.Level, bool) {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
-		return slog.LevelDebug
-	case "INFO":
-		return slog.LevelInfo
+		return slog.LevelDebug, true
+	case "INFO", "":
+		return slog.LevelInfo, true
 	case "WARN", "WARNING":
-		return slog.LevelWarn
+		return slog.LevelWarn, true
 	case "ERROR":
-		return slog.LevelError
+		return slog.LevelError, true
 	case "FATAL":
-		return LevelFatal
+		return LevelFatal, true
 	default:
-		return slog.LevelInfo
+		return slog.LevelInfo, false
 	}
 }
 

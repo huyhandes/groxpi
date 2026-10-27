@@ -92,6 +92,13 @@ func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 // recent-errors area as well as logged: an operator watching an empty table must
 // not have to read the server log to learn why it is empty.
 func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
+	// In redirect mode nothing is cached, so there is nothing to warm: one
+	// failure for the package, not one per file after a wasted index lookup.
+	if s.store.Redirects() {
+		s.errors.record(packageName, "caching is disabled (download timeout is 0)")
+		return
+	}
+
 	entry, err := s.index.Resolve(ctx, packageName)
 	if err != nil {
 		if errors.Is(err, index.ErrNotFound) {
@@ -126,9 +133,6 @@ func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
 // warm caches one file with no client attached: open it through the store and
 // drain it. A hit is already cached; a miss drains the whole download path.
 func (s *Service) warm(ctx context.Context, packageName, fileName string) error {
-	if s.store.Redirects() {
-		return errors.New("caching is disabled (download timeout is 0)")
-	}
 	obj, err := s.store.Open(ctx, packageName, fileName)
 	if err != nil {
 		return err
@@ -167,6 +171,10 @@ func newestReleaseFiles(files []index.FileInfo) []index.FileInfo {
 		if !ok {
 			continue
 		}
+		// The local label ("+cpu", "+cu118") names a build of the release, not a
+		// different release: without dropping it, PEP 440 orders the builds and
+		// only one of 2.1.0, 2.1.0+cpu and 2.1.0+cu118 would be warmed.
+		raw, _, _ = strings.Cut(raw, "+")
 		parsed, err := pep440.Parse(raw)
 		if err != nil {
 			slog.Debug("Skipping file with unparseable version", "file", file.Name, "version", raw)
