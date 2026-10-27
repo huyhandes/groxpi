@@ -216,7 +216,7 @@ jobs:
 
     - name: Build binary
       run: |
-        go build -ldflags="-s -w" -o groxpi cmd/groxpi/main.go
+        go build -trimpath -ldflags="-s -w" -o groxpi ./cmd/groxpi
         ls -la groxpi
         echo "Binary built successfully"
 

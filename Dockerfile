@@ -24,9 +24,10 @@ COPY . .
 
 # Build the application with optimizations for target architecture
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -trimpath \
     -ldflags='-w -s' \
     -o groxpi \
-    cmd/groxpi/main.go
+    ./cmd/groxpi
 
 # Stage 2: Runtime stage
 FROM scratch

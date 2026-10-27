@@ -157,7 +157,7 @@ that proves it. Delete an entry when it ships.
 
 ### Two workflows push the `latest` image tag
 
-- **Where:** `.github/workflows/docker.yml` (`type=raw,value=latest` on the default branch) and
+- **Where:** `.github/workflows/docker.yml` (`type=raw,value=latest` on every main build that passed CI) and
   `.github/workflows/release.yml` (`type=raw,value=latest` on every release).
 - **What:** `latest` means "newest main build" or "newest release" depending on which workflow ran
   last, so a user pulling `latest` cannot tell which they got.

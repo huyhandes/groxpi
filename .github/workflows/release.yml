@@ -66,6 +66,20 @@ jobs:
     - name: Run go vet
       run: go vet ./...
 
+    - name: Install staticcheck
+      run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+
+    - name: Run staticcheck
+      run: staticcheck ./...
+
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v8
+      with:
+        # Pinned to the same v2 release as ci.yml; "latest" can resolve to a
+        # line that refuses a go1.26 target.
+        version: v2.12.2
+        args: --timeout=10m
+
     - name: Run tests
       run: go test -short -race ./...
 
@@ -107,9 +121,10 @@ jobs:
       run: |
         BINARY_NAME="groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
         go build \
+          -trimpath \
           -ldflags="-s -w" \
           -o "${BINARY_NAME}" \
-          cmd/groxpi/main.go
+          ./cmd/groxpi
 
         # Generate checksum
         shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
