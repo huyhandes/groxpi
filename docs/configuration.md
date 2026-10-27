@@ -160,9 +160,11 @@ client is redirected to the upstream URL and nothing is cached.
 
 Set `GROXPI_DOWNLOAD_TIMEOUT` to `0` to stop fetching package files from upstream. A file
 already stored is still served: a cache hit, or in `s3` mode a durable-store hit, streams as usual, and
-in `hybrid` mode a durable-store hit is still promoted into the local cache. Only a file found in
-neither is redirected upstream, and upstream is never fetched from. That redirect is what
-`redirect.reason=caching_disabled` counts. Admin prefetch is refused in this mode.
+in `hybrid` mode a durable-store hit is still promoted into the local cache. A file found in neither
+is redirected upstream if the package index lists it, and 404 if it does not; the index may still be
+fetched to build the redirect URL, but the file itself is never fetched. That redirect is what
+`redirect.reason=caching_disabled` counts. Admin prefetch is still accepted (202) but warms nothing:
+it is reported as a failure in the admin page's recent errors.
 
 `GROXPI_DOWNLOAD_IDLE_TIMEOUT` bounds each gap in that stream, not the whole transfer: every chunk of
 body bytes restarts it, so a slow but steady download completes. If upstream sends nothing for that

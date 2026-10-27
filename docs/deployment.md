@@ -9,16 +9,16 @@ GROXPI_CACHE_DIR=/var/cache/groxpi ./groxpi
 
 groxpi listens on `PORT` (default `5000`) on all interfaces. It shuts down gracefully on `SIGINT` and
 `SIGTERM`: in-flight requests drain, admin prefetches are refused and the running ones are waited for,
-the index cache sweeper stops, and storage waits for running downloads — in `hybrid` mode including the
-S3 upload each one finishes with.
+the index cache sweeper stops, and storage waits for running downloads — in `hybrid` and `s3` modes
+including the S3 upload each one finishes with.
 
 ### Shutdown budget
 
 Those steps share **one 5-second budget**, plus up to 5 seconds after it to flush telemetry. A step that
 overruns is reported and stepped over rather than waited out: an unreachable object store or a wedged
 upstream index would otherwise hold the process open until the runtime killed it, which loses more than
-giving up does. What is lost by giving up is a cache entry the next request re-fetches, or an S3
-upload whose file is still in the local cache.
+giving up does. What is lost by giving up is a cache entry the next request re-fetches, or, in
+`hybrid` mode, an S3 upload whose file is still in the local cache.
 
 Allow at least 15 seconds of stop grace so the process exits on its own rather than being killed
 mid-flush. Docker's default is 10 seconds, so set `stop_grace_period: 30s` on the service in Compose;

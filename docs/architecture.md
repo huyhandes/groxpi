@@ -277,6 +277,10 @@ as long as the collector keeps the series.
    └─ storage.upload       (the PUT to the durable store, hybrid and s3)
 ```
 
+A `hybrid` promotion (cache miss, durable-store hit) has no `index.resolve` and no `upstream.fetch`:
+its `storage.put` sits directly under the request span, after `storage.exists`, and no
+`storage.upload` follows.
+
 The request span carries `http.response.status_code`; a 5xx sets the span's status to error. A
 handler that panics is still recorded under its route with error status `panic`, and still gets
 its access log line: as a 500 if it wrote nothing, otherwise with the status already sent, and

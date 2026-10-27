@@ -24,13 +24,14 @@ warm() {
 }
 
 # wrk counts every reply as a request, so error replies and socket errors
-# would pass for throughput; either fails the run.
+# would pass for throughput; either fails the run. Despite its name, wrk's
+# "Non-2xx or 3xx responses" counter counts only status > 399 (4xx and 5xx).
 run_wrk() {
   local out
   out=$(wrk -t4 -c64 -d10s --latency "$@") || { echo "$out"; echo "FAILED: wrk exited non-zero"; return 1; }
   echo "$out"
   if grep -q 'Non-2xx or 3xx responses:' <<<"$out"; then
-    echo "FAILED: non-2xx/3xx responses"
+    echo "FAILED: 4xx/5xx responses"
     return 1
   fi
   # "Socket errors: connect N, read N, write N, timeout N"
@@ -40,6 +41,8 @@ run_wrk() {
   fi
 }
 
+# Set before anything can fail, so an early exit still removes the temp dirs.
+trap '[ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; rm -rf "$CACHE" "$(dirname "$BIN")"' EXIT
 mkdir -p "$(dirname "$OUT")"  # results/ is gitignored, so absent in a fresh clone
 go -C "$DIR" build -o "$BIN" ./cmd/groxpi
 # Something already answering on the port would be measured instead of this build.
@@ -47,7 +50,6 @@ go -C "$DIR" build -o "$BIN" ./cmd/groxpi
 GROXPI_CACHE_DIR="$CACHE" PORT=$PORT GROXPI_LOGGING_LEVEL=WARN GROXPI_DOWNLOAD_TIMEOUT=30s \
   "$BIN" >/dev/null 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; rm -rf "$CACHE" "$(dirname "$BIN")"' EXIT
 up=
 for _ in $(seq 50); do curl -sf "http://localhost:$PORT/health" >/dev/null && up=1 && break; sleep 0.1; done
 [ -n "$up" ] || fail "groxpi did not become healthy on port $PORT"
