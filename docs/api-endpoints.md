@@ -42,7 +42,8 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
 - `?format=` wins outright over `Accept`. Any value containing `json` selects JSON.
 - Otherwise the `Accept` header selects JSON only when it contains **both** `application/vnd.pypi.simple`
   and `json`.
-- JSON responses carry `Content-Type: application/vnd.pypi.simple.v1+json` and `Vary: Accept-Encoding`.
+- JSON responses carry `Content-Type: application/vnd.pypi.simple.v1+json` and
+  `Vary: Accept, Accept-Encoding`; HTML responses carry `Vary: Accept`.
 - A client sending `Accept-Encoding: gzip` gets the gzipped body stored alongside the entry in the index
   cache, with `Content-Encoding: gzip`. Nothing is compressed on the request path; there is no
   compression middleware.

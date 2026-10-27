@@ -41,6 +41,7 @@ func TestMetadataURL(t *testing.T) {
 	assert.Equal(t, "https://h/f/x.whl.metadata", metadataURL("https://h/f/x.whl"))
 	assert.Equal(t, "https://h/f/x.whl.metadata", metadataURL("https://h/f/x.whl#sha256=abc"))
 	assert.Equal(t, "https://h/f/x.whl.metadata?t=1", metadataURL("https://h/f/x.whl?t=1#sha256=abc"))
+	assert.Equal(t, "https://h/f/%zz.metadata", metadataURL("https://h/f/%zz"), "unparseable URL is suffixed as is")
 }
 
 // TestResolve pins resolution: listed files, PEP 658 siblings only when

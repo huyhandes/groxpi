@@ -67,9 +67,6 @@ func (e *Entry) finish() {
 	e.size = int64(2*len(e.JSON) + len(e.GZIP))
 }
 
-// Size is the entry's charge against the cache byte budget.
-func (e *Entry) Size() int64 { return e.size }
-
 // indexCache maps a normalised package name to its Entry, bounded by a total
 // byte budget with least-recently-used eviction, and swept for expired entries
 // on a timer so staleness is reclaimed without waiting for a read.

@@ -457,13 +457,13 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_html_default", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": "text/html", "Vary": absent, "Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Content-Type": "text/html", "Vary": "Accept", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
 	t.Run("package_json_by_accept", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept", jsonAccept)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgJSON, decodeJSON(t, body))
 	})
 	t.Run("package_json_by_format_query", func(t *testing.T) {
@@ -479,13 +479,13 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_json_gzip", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept", jsonAccept, "Accept-Encoding", "gzip")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Encoding": "gzip"})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Encoding": "gzip"})
 		assert.Equal(t, wantPkgJSON, decodeJSON(t, gunzip(t, body)))
 	})
 	t.Run("package_html_ignores_gzip", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept-Encoding", "gzip")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Vary": "Accept", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
 	t.Run("package_index_alias", func(t *testing.T) {
@@ -517,7 +517,7 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_head", func(t *testing.T) {
 		resp, body := p.do(http.MethodHead, "/simple/demo/", nil, "Accept", jsonAccept)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Length": present})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Length": present})
 		assert.Empty(t, body)
 	})
 	t.Run("post_is_405", func(t *testing.T) {

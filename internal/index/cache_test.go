@@ -41,7 +41,7 @@ func TestEntry_GzipDecodesToJSON(t *testing.T) {
 	if string(got) != body {
 		t.Fatalf("gzip form decodes to %q, want %q", got, body)
 	}
-	if e.Size() <= 0 {
+	if e.size <= 0 {
 		t.Fatal("entry size must be positive")
 	}
 }
@@ -84,7 +84,7 @@ func TestIndexCache_MissDropsTheStaleEntry(t *testing.T) {
 func TestIndexCache_ByteBudgetEvictsLeastRecentlyUsed(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		one := testEntry(`{"a":1}`)
-		c := newIndexCache(2*one.Size(), 0)
+		c := newIndexCache(2*one.size, 0)
 		defer c.close()
 
 		// The sleeps are instant on the bubble's clock; they only keep the
@@ -107,8 +107,8 @@ func TestIndexCache_ByteBudgetEvictsLeastRecentlyUsed(t *testing.T) {
 		if _, ok := c.get("a"); !ok {
 			t.Fatal("a was touched and should have survived")
 		}
-		if _, b := c.stats(); b > 2*one.Size() {
-			t.Fatalf("cache holds %d bytes, over the %d budget", b, 2*one.Size())
+		if _, b := c.stats(); b > 2*one.size {
+			t.Fatalf("cache holds %d bytes, over the %d budget", b, 2*one.size)
 		}
 	})
 }
@@ -121,8 +121,8 @@ func TestIndexCache_ReplacingAKeyDoesNotDoubleCount(t *testing.T) {
 	for range 5 {
 		c.set("k", testEntry(`{"a":1}`), time.Minute)
 	}
-	if n, b := c.stats(); n != 1 || b != entry.Size() {
-		t.Fatalf("%d entries, %d bytes; want 1, %d", n, b, entry.Size())
+	if n, b := c.stats(); n != 1 || b != entry.size {
+		t.Fatalf("%d entries, %d bytes; want 1, %d", n, b, entry.size)
 	}
 }
 
@@ -151,7 +151,7 @@ func BenchmarkIndexCache_SetOverBudget(b *testing.B) {
 
 	for _, resident := range []int{100, 10000} {
 		b.Run(fmt.Sprintf("resident=%d", resident), func(b *testing.B) {
-			c := newIndexCache(int64(resident)*one.Size(), 0)
+			c := newIndexCache(int64(resident)*one.size, 0)
 			defer c.close()
 
 			for i := range resident {

@@ -37,7 +37,8 @@ type FakeFile struct {
 }
 
 // FakePyPI is a PyPI-shaped upstream: a root listing, per-package indexes (JSON
-// when asked for, HTML otherwise), files, and request counters for each.
+// with relative file URLs when asked for, HTML with absolute ones otherwise),
+// files, and request counters for each.
 type FakePyPI struct {
 	*httptest.Server
 
@@ -191,10 +192,13 @@ func (u *FakePyPI) serveIndex(w http.ResponseWriter, r *http.Request, pkg string
 		return
 	}
 
+	// JSON file URLs are relative (PEP 691 allows it; the HTML page above uses
+	// absolute ones), so every download through the JSON index proves they are
+	// resolved against the page URL.
 	files := make([]map[string]any, 0, len(names))
 	for i, n := range names {
 		f := listed[i]
-		e := map[string]any{"filename": n, "url": u.URL + "/files/" + n}
+		e := map[string]any{"filename": n, "url": "../files/" + n}
 		if f.SHA256 != "" {
 			e["hashes"] = map[string]string{"sha256": f.SHA256}
 		}

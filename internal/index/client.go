@@ -35,7 +35,6 @@ type FileInfo struct {
 	Hashes         map[string]string `json:"hashes,omitempty"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	Size           int64             `json:"size,omitempty"`
-	UploadTime     string            `json:"upload-time,omitempty"`
 	Yanked         any               `json:"yanked,omitempty"` // Can be bool or string
 	YankedReason   string            `json:"yanked-reason,omitempty"`
 	// PEP 658/714: true or a hash map when <url>.metadata exists upstream.
@@ -183,27 +182,27 @@ func (c *Client) GetPackageFiles(ctx context.Context, index config.Index, packag
 		return nil, fmt.Errorf("HTTP %d from %s for package %s", resp.StatusCode, index.Redacted(), packageName)
 	}
 
-	// Check if response is JSON
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "json") {
-		// PEP 691 requires absolute URLs in the JSON payload, so no resolution is needed.
-		return c.parseJSONPackageFiles(resp.Body)
-	}
-
-	// Fall back to HTML parsing. Resolve hrefs against the URL actually served
-	// (which may differ from indexURL after a redirect).
+	// Both formats may carry relative file URLs (PEP 691 says JSON URLs resolve
+	// "as if it were HTML"), so both resolve against the URL actually served,
+	// which may differ from indexURL after a redirect.
 	baseURL := indexURL
 	if resp.Request != nil && resp.Request.URL != nil {
 		baseURL = resp.Request.URL.String()
 	}
 	// A base we cannot parse means we cannot resolve anything; fall back to
-	// emitting hrefs verbatim rather than dropping the whole index.
+	// emitting URLs verbatim rather than dropping the whole index.
 	base, err := url.Parse(baseURL)
 	if err != nil {
-		slog.WarnContext(ctx, "Cannot parse index URL, leaving package file hrefs unresolved",
+		slog.WarnContext(ctx, "Cannot parse index URL, leaving package file URLs unresolved",
 			"error", err, "base_url", config.RedactURL(baseURL))
 		base = nil
 	}
+
+	if strings.Contains(resp.Header.Get("Content-Type"), "json") {
+		return c.parseJSONPackageFiles(resp.Body, base)
+	}
+
+	// Fall back to HTML parsing.
 	files, err := parseSimpleHTML(resp.Body, base)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse HTML page for %s from %s: %w", packageName, index.Redacted(), err)
@@ -230,7 +229,7 @@ func (c *Client) makeRequest(ctx context.Context, target, accept string) (*http.
 	return resp, config.RedactURLError(err)
 }
 
-func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
+func (c *Client) parseJSONPackageFiles(body io.Reader, base *url.URL) ([]FileInfo, error) {
 	buf, err := readCapped(body, maxPackageIndexBytes)
 	if err != nil {
 		return nil, err
@@ -238,6 +237,16 @@ func (c *Client) parseJSONPackageFiles(body io.Reader) ([]FileInfo, error) {
 	var response PyPISimpleResponse
 	if err := json.Unmarshal(buf, &response); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+	if base == nil {
+		return response.Files, nil
+	}
+	for i := range response.Files {
+		// A URL that does not parse stays verbatim: the file is still listed and
+		// its download fails with a redacted error, as it did before resolution.
+		if ref, err := url.Parse(response.Files[i].URL); err == nil {
+			response.Files[i].URL = base.ResolveReference(ref).String()
+		}
 	}
 	return response.Files, nil
 }
