@@ -127,7 +127,8 @@ type Store struct {
 	flights    map[string]*flight
 	committing map[*flight]struct{} // hybrid flights unregistered but not yet uploaded
 	commits    [commitSlots]uint64  // per commitSlot, bumped at each post-commit unregister, under mu
-	evictions  uint64               // bumped by each DeletePrefix before it marks, under mu
+	evictions  uint64               // bumped by each DeletePrefix before it marks and after it deletes, under mu
+	evicting   map[string]int       // prefixes a DeletePrefix is running for, refcounted, under mu
 	slotSeed   maphash.Seed         // commitSlot's hash seed, fixed for the Store's life
 	leaders    sync.WaitGroup
 }
@@ -140,7 +141,7 @@ type Store struct {
 // promoted.
 func NewStore(cache *LocalStorage, durable *S3Storage, fetcher Fetcher, spoolDir string, redirect bool) *Store {
 	s := &Store{cache: cache, durable: durable, fetcher: fetcher, spoolDir: spoolDir, redirect: redirect,
-		flights: map[string]*flight{}, committing: map[*flight]struct{}{}, slotSeed: maphash.MakeSeed()}
+		flights: map[string]*flight{}, committing: map[*flight]struct{}{}, evicting: map[string]int{}, slotSeed: maphash.MakeSeed()}
 	switch {
 	case cache == nil:
 		s.commit = s.commitS3
@@ -272,6 +273,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	// key's commit slot; the lookup then runs once more instead of fetching again.
 	// A DeletePrefix in that gap finds no flight to mark, so a changed eviction
 	// generation also looks again, else a promotion would restore what it deleted.
+	// A flight registered while a DeletePrefix of its key runs starts evicted.
 	slot := s.commitSlot(key)
 	var promote *download.File
 	for retried := false; ; retried = true {
@@ -308,6 +310,7 @@ func (s *Store) Open(ctx context.Context, pkg, file string) (*Object, error) {
 	}
 	f = &flight{key: key, pkg: pkg, file: file, size: -1, started: time.Now(), ready: make(chan struct{}), refs: 2, requests: 1}
 	f.cond = sync.NewCond(&f.mu)
+	f.evicted = s.evictingKey(key)
 	s.flights[key] = f
 	telemetry.DownloadsInFlight(ctx, int64(len(s.flights)))
 	s.leaders.Add(1)
@@ -582,6 +585,9 @@ func (s *Store) commitLocal(ctx context.Context, f *flight, sp *os.File, written
 // syncCommit flushes the spool to disk before renaming it into the cache, so a
 // host crash cannot leave a renamed but empty or partial file to be served as a
 // hit.
+//
+// shortcut: tails release the last byte only after this sync, so on a miss
+// every waiting client pays the flush, not only the commit.
 func (s *Store) syncCommit(ctx context.Context, sp *os.File, key string, written int64) error {
 	if err := sp.Sync(); err != nil {
 		return fmt.Errorf("failed to sync spool file: %w", err)
@@ -700,9 +706,23 @@ func (s *Store) Snapshot() []CacheEntry {
 // on. If ctx ends first, DeletePrefix returns its error and deletes nothing:
 // it never deletes while a Put may still land. A flight still spooling is
 // never waited on.
+//
+// While it runs, a flight registered under prefix starts evicted (a promotion
+// from a durable store not yet deleted stores nothing), and once both deletes
+// are done the eviction generation changes again, so an Open whose lookup
+// overlapped them looks again.
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	var uploads []chan struct{}
 	s.mu.Lock()
+	s.evicting[prefix]++
+	defer func() {
+		s.mu.Lock()
+		if s.evicting[prefix]--; s.evicting[prefix] == 0 {
+			delete(s.evicting, prefix)
+		}
+		s.evictions++
+		s.mu.Unlock()
+	}()
 	s.evictions++ // an Open between its lookup and its flight looks again
 	mark := func(f *flight) {
 		if strings.HasPrefix(f.key, prefix) {
@@ -738,6 +758,17 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 		deleted, cerr = s.cache.DeletePrefix(ctx, prefix)
 	}
 	return deleted, errors.Join(cerr, derr)
+}
+
+// evictingKey reports whether a DeletePrefix covering key is running. Caller
+// holds s.mu.
+func (s *Store) evictingKey(key string) bool {
+	for p := range s.evicting {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // evicted reports whether DeletePrefix has marked f.
