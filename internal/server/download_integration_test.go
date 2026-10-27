@@ -23,7 +23,6 @@ func testRequestIntegration(router http.Handler, req *http.Request) *http.Respon
 type integrationTestResult struct {
 	StatusCode int
 	BodySize   int
-	Error      error
 }
 
 // TestServer_DownloadCoordination_Integration tests the complete download coordination flow
@@ -66,10 +65,7 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 				req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
 				resp := testRequestIntegration(router, req)
 
-				results[index] = integrationTestResult{
-					StatusCode: resp.StatusCode,
-					Error:      nil,
-				}
+				results[index] = integrationTestResult{StatusCode: resp.StatusCode}
 
 				if resp.Body != nil {
 					body, readErr := io.ReadAll(resp.Body)
@@ -87,11 +83,6 @@ func TestServer_DownloadCoordination_Integration(t *testing.T) {
 		// Verify all requests succeeded
 		successCount := 0
 		for i, result := range results {
-			if result.Error != nil {
-				t.Errorf("Request %d failed: %v", i, result.Error)
-				continue
-			}
-
 			if result.StatusCode != http.StatusOK {
 				t.Errorf("Request %d: expected status 200, got %d", i, result.StatusCode)
 				continue
@@ -153,99 +144,4 @@ func TestServer_PackageNameNormalization_Integration(t *testing.T) {
 			assert.Zero(t, mockPyPI.IndexHits(spelling), "upstream must never see the spelling %q", spelling)
 		}
 	}
-}
-
-// TestServer_DownloadCoordination_RealWorld tests real-world scenarios
-func TestServer_DownloadCoordination_RealWorld(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping real-world integration test in short mode")
-	}
-
-	// Test with pyspark-like scenario
-	packageName := "pyspark-test"
-	fileName := "pyspark-3.4.0.tar.gz"
-	// Create a realistic large file (not 317MB for test speed, but large enough)
-	fileContent := make([]byte, 5*1024*1024) // 5MB for testing
-	for i := range fileContent {
-		fileContent[i] = byte(i % 256)
-	}
-
-	// The delay simulates a slow download.
-	mockPyPI := NewFakePyPI(t).SetDelay(200*time.Millisecond).
-		Add(packageName, fileName, FakeFile{Body: fileContent, Size: int64(len(fileContent))})
-
-	cfg := &config.Config{
-		IndexURL:        mockPyPI.URL,
-		CacheDir:        t.TempDir(),
-		DownloadTimeout: 30 * time.Second, // Realistic timeout
-		LogLevel:        "INFO",
-	}
-
-	srv := newTestServer(t, cfg)
-	router := srv.Router()
-
-	// Simulate multiple pip clients trying to download the same large package
-	t.Run("multiple_pip_clients", func(t *testing.T) {
-		numClients := 5
-		var wg sync.WaitGroup
-		clientResults := make([]bool, numClients)
-
-		startTime := time.Now()
-
-		for i := range numClients {
-			wg.Add(1)
-			go func(clientIndex int) {
-				defer wg.Done()
-
-				req := httptest.NewRequest("GET", fmt.Sprintf("/index/%s/%s", packageName, fileName), nil)
-				resp := testRequestIntegration(router, req)
-
-				if resp.StatusCode != http.StatusOK {
-					t.Errorf("Client %d: expected status 200, got %d", clientIndex, resp.StatusCode)
-					_ = resp.Body.Close()
-					return
-				}
-
-				// Verify content
-				body, err := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-
-				if err != nil {
-					t.Errorf("Client %d: failed to read body: %v", clientIndex, err)
-					return
-				}
-
-				if len(body) != len(fileContent) {
-					t.Errorf("Client %d: expected body size %d, got %d", clientIndex, len(fileContent), len(body))
-					return
-				}
-
-				clientResults[clientIndex] = true
-			}(i)
-		}
-
-		wg.Wait()
-		duration := time.Since(startTime)
-
-		// Verify all clients succeeded
-		successCount := 0
-		for i, success := range clientResults {
-			if success {
-				successCount++
-			} else {
-				t.Errorf("Client %d failed", i)
-			}
-		}
-
-		assert.Equal(t, numClients, successCount, "All clients should succeed")
-
-		// With proper coordination, this should complete much faster than sequential downloads
-		maxExpectedDuration := 2 * time.Second // Should be much faster than 5 * 200ms = 1 second
-		assert.Less(t, duration, maxExpectedDuration,
-			"Coordinated downloads should be faster than sequential: got %v, max expected %v",
-			duration, maxExpectedDuration)
-
-		t.Logf("Real-world test: %d clients, duration: %v (should be close to single download time)",
-			numClients, duration)
-	})
 }

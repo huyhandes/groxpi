@@ -237,7 +237,7 @@ func Load() (*Config, error) {
 		for i, item := range strings.Split(extraURLs, ",") {
 			if item = strings.TrimSpace(item); item == "" {
 				slog.Warn("Ignoring empty GROXPI_EXTRA_INDEX_URLS item; its GROXPI_EXTRA_INDEX_TTLS slot is skipped too",
-					"variable", "GROXPI_EXTRA_INDEX_URLS", "value", extraURLs, "position", i)
+					"variable", "GROXPI_EXTRA_INDEX_URLS", "position", i)
 				emptyURLSlots = append(emptyURLSlots, i)
 				continue
 			}

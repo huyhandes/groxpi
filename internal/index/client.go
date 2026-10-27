@@ -166,10 +166,8 @@ func newClient(cfg *config.Config, transport http.RoundTripper) *client {
 func (c *client) GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error) {
 	indexURL := strings.TrimSuffix(index.URL, "/") + "/" + packageName + "/"
 
-	// PEP 691's recommended client Accept: JSON preferred, HTML still
-	// acceptable, so a strict HTML-only index answers instead of 406ing. The
-	// response's own Content-Type picks the parser below.
-	resp, err := c.makeRequest(ctx, indexURL, packageIndexAccept)
+	// The response's own Content-Type picks the parser below.
+	resp, err := c.makeRequest(ctx, indexURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch package files for %s from %s: %w", packageName, index.Redacted(), err)
 	}
@@ -217,13 +215,15 @@ func (c *client) GetPackageFiles(ctx context.Context, index config.Index, packag
 	return files, nil
 }
 
-func (c *client) makeRequest(ctx context.Context, target, accept string) (*http.Response, error) {
+func (c *client) makeRequest(ctx context.Context, target string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if err != nil {
 		return nil, config.RedactURLError(err)
 	}
 
-	req.Header.Set("Accept", accept)
+	// PEP 691's recommended client Accept: JSON preferred, HTML still
+	// acceptable, so a strict HTML-only index answers instead of 406ing.
+	req.Header.Set("Accept", packageIndexAccept)
 	req.Header.Set("User-Agent", config.UserAgent)
 
 	resp, err := c.httpClient.Do(req)

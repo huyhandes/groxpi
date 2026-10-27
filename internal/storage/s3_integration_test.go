@@ -133,32 +133,28 @@ func TestS3WithRealClients(t *testing.T) {
 		t.Skip("Skipping S3 client integration test in short mode")
 	}
 
-	// Only run in CI where MinIO service is available
+	// Opt-in: besides the MinIO named by TEST_S3_ENDPOINT this needs python3,
+	// uv and network access to PyPI, which the MinIO-only tests do not.
 	if os.Getenv("TEST_S3_ENDPOINT") == "" {
 		t.Skip("Skipping S3 client integration test: TEST_S3_ENDPOINT not set")
 	}
+	endpoint := minioEndpoint(t)
 
-	// Check if groxpi binary exists or build it
 	groxpiBinary := buildGroxpiBinary(t)
-
-	// Create test directory
 	testDir := t.TempDir()
 
-	// Start groxpi server with S3 backend
-	server := startGroxpiServer(t, groxpiBinary)
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
+	server := startGroxpiServer(t, groxpiBinary, baseURL, endpoint)
 	defer server.Stop()
-
-	// Wait for server to be ready
-	waitForServer(t, "http://127.0.0.1:5000")
+	server.waitReady(baseURL)
 
 	t.Run("pip_install", func(t *testing.T) {
-		testPipInstall(t, testDir)
+		testPipInstall(t, testDir, baseURL)
 	})
 
 	t.Run("uv_add", func(t *testing.T) {
-		testUVAdd(t, testDir)
+		testUVAdd(t, testDir, baseURL)
 	})
-
 }
 
 // createTestS3Storage creates an S3 storage instance pointed at MinIO.
@@ -203,78 +199,110 @@ func newIntegrationS3Storage(t *testing.T, endpoint string) *S3Storage {
 	return storage
 }
 
-// buildGroxpiBinary builds the groxpi binary if it doesn't exist
+// buildGroxpiBinary builds the current source into a temporary directory, so
+// the test never runs a stale binary left in the repository.
 func buildGroxpiBinary(t *testing.T) string {
-	groxpiBinary := filepath.Join("..", "..", "groxpi")
-	absGroxpiBinary, err := filepath.Abs(groxpiBinary)
-	require.NoError(t, err)
+	t.Helper()
 
-	if _, err := os.Stat(absGroxpiBinary); os.IsNotExist(err) {
-		t.Log("Building groxpi binary for testing...")
-		cmd := exec.Command("go", "build", "-o", absGroxpiBinary,
-			filepath.Join("..", "..", "cmd", "groxpi", "main.go"))
-		require.NoError(t, cmd.Run(), "Failed to build groxpi binary")
-	}
+	binary := filepath.Join(t.TempDir(), "groxpi")
+	cmd := exec.Command("go", "build", "-o", binary, "github.com/huyhandes/groxpi/cmd/groxpi")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to build groxpi binary: %s", output)
 
-	return absGroxpiBinary
+	return binary
 }
 
-// groxpiServer represents a running groxpi server process
+// freePort asks the kernel for a port nothing is listening on.
+func freePort(t *testing.T) int {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return port
+}
+
+// groxpiServer is a running groxpi child process. exited closes when the
+// process ends, so a crash at startup fails the test at once instead of after
+// the whole readiness wait.
 type groxpiServer struct {
-	cmd *exec.Cmd
-	t   *testing.T
+	t      *testing.T
+	cmd    *exec.Cmd
+	output *bytes.Buffer
+	exited chan struct{}
 }
 
 func (gs *groxpiServer) Stop() {
-	if gs.cmd != nil && gs.cmd.Process != nil {
-		gs.t.Log("Stopping groxpi server...")
-		_ = gs.cmd.Process.Kill()
-		_ = gs.cmd.Wait()
-	}
+	_ = gs.cmd.Process.Kill()
+	<-gs.exited
 }
 
-// startGroxpiServer starts groxpi with S3 backend configuration
-func startGroxpiServer(t *testing.T, groxpiBinary string) *groxpiServer {
+// startGroxpiServer starts groxpi listening on baseURL's port, storing into the
+// MinIO the other integration tests use.
+func startGroxpiServer(t *testing.T, groxpiBinary, baseURL, endpoint string) *groxpiServer {
+	t.Helper()
+
+	u, err := url.Parse(baseURL)
+	require.NoError(t, err)
+
 	cmd := exec.Command(groxpiBinary)
 	cmd.Env = append(os.Environ(),
 		"GROXPI_STORAGE_TYPE=s3",
-		"AWS_ENDPOINT_URL=http://127.0.0.1:9000",
-		"AWS_ACCESS_KEY_ID=minioadmin",
-		"AWS_SECRET_ACCESS_KEY=minioadmin",
-		"GROXPI_S3_BUCKET=groxpi-test",
+		"AWS_ENDPOINT_URL=http://"+endpoint,
+		"AWS_ACCESS_KEY_ID="+getEnvOrDefault("TEST_S3_ACCESS_KEY", "minioadmin"),
+		"AWS_SECRET_ACCESS_KEY="+getEnvOrDefault("TEST_S3_SECRET_KEY", "minioadmin"),
+		"GROXPI_S3_BUCKET="+getEnvOrDefault("TEST_S3_BUCKET", "groxpi-test"),
 		"GROXPI_S3_PREFIX=client-test",
 		"GROXPI_S3_USE_SSL=false",
 		"GROXPI_S3_FORCE_PATH_STYLE=true",
+		"GROXPI_CACHE_DIR="+t.TempDir(),
 		"GROXPI_LOGGING_LEVEL=INFO",
-		"PORT=5000",
+		"PORT="+u.Port(),
 	)
+	output := &bytes.Buffer{}
+	cmd.Stdout = output
+	cmd.Stderr = output
 
-	err := cmd.Start()
-	require.NoError(t, err, "Failed to start groxpi server")
+	require.NoError(t, cmd.Start(), "Failed to start groxpi server")
 
-	return &groxpiServer{cmd: cmd, t: t}
+	gs := &groxpiServer{t: t, cmd: cmd, output: output, exited: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(gs.exited)
+	}()
+	return gs
 }
 
-// waitForServer waits for the server to be ready
-func waitForServer(t *testing.T, url string) {
-	client := &http.Client{Timeout: 5 * time.Second}
+// waitReady polls /health until the server answers, failing at once if the
+// process exits first.
+func (gs *groxpiServer) waitReady(baseURL string) {
+	gs.t.Helper()
 
-	for range 30 {
-		if resp, err := client.Get(url + "/health"); err == nil {
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.After(30 * time.Second)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		if resp, err := client.Get(baseURL + "/health"); err == nil {
 			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
-				t.Log("Groxpi server is ready")
+			if resp.StatusCode == http.StatusOK {
 				return
 			}
 		}
-		time.Sleep(1 * time.Second)
+		select {
+		case <-gs.exited:
+			gs.t.Fatalf("groxpi exited before becoming ready: %v\n%s", gs.cmd.ProcessState, gs.output)
+		case <-deadline:
+			gs.t.Fatal("groxpi did not become ready within 30 seconds")
+		case <-tick.C:
+		}
 	}
-
-	t.Fatal("Groxpi server did not become ready within 30 seconds")
 }
 
 // testPipInstall tests pip package installation through groxpi
-func testPipInstall(t *testing.T, testDir string) {
+func testPipInstall(t *testing.T, testDir, baseURL string) {
 	venvDir := filepath.Join(testDir, "pip-venv")
 
 	// Create virtual environment
@@ -289,7 +317,7 @@ func testPipInstall(t *testing.T, testDir string) {
 	}
 
 	cmd = exec.Command(pipBin, "install", "requests==2.28.0",
-		"--index-url", "http://127.0.0.1:5000/simple/", "--trusted-host", "127.0.0.1")
+		"--index-url", baseURL+"/simple/", "--trusted-host", "127.0.0.1")
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to install requests with pip: %s", string(output))
 
@@ -297,7 +325,7 @@ func testPipInstall(t *testing.T, testDir string) {
 }
 
 // testUVAdd tests uv package installation through groxpi
-func testUVAdd(t *testing.T, testDir string) {
+func testUVAdd(t *testing.T, testDir, baseURL string) {
 	// Check if uv is available
 	if _, err := exec.LookPath("uv"); err != nil {
 		t.Skip("uv not available, skipping uv test")
@@ -312,7 +340,7 @@ func testUVAdd(t *testing.T, testDir string) {
 	require.NoError(t, cmd.Run(), "Failed to initialize uv project")
 
 	// Add package using uv with groxpi index
-	cmd = exec.Command("uv", "add", "click", "--default-index", "http://127.0.0.1:5000/simple/")
+	cmd = exec.Command("uv", "add", "click", "--default-index", baseURL+"/simple/")
 	cmd.Dir = projectDir
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Failed to add click with uv: %s", string(output))

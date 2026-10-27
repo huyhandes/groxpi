@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -14,9 +13,9 @@ import (
 )
 
 func TestLoad(t *testing.T) {
-	// Save original environment
-	originalEnv := make(map[string]string)
-	envVars := []string{
+	// Blank every variable the subtests read so a developer's shell cannot
+	// leak in; t.Setenv restores the originals afterwards.
+	for _, env := range []string{
 		"GROXPI_INDEX_URL",
 		"GROXPI_INDEX_TTL",
 		"GROXPI_CACHE_SIZE",
@@ -29,23 +28,9 @@ func TestLoad(t *testing.T) {
 		"GROXPI_EXTRA_INDEX_TTLS",
 		"GROXPI_CONNECT_TIMEOUT",
 		"GROXPI_READ_TIMEOUT",
+	} {
+		t.Setenv(env, "")
 	}
-
-	for _, env := range envVars {
-		originalEnv[env] = os.Getenv(env)
-		_ = os.Unsetenv(env)
-	}
-
-	// Restore environment after test
-	defer func() {
-		for _, env := range envVars {
-			if val, ok := originalEnv[env]; ok && val != "" {
-				_ = os.Setenv(env, val)
-			} else {
-				_ = os.Unsetenv(env)
-			}
-		}
-	}()
 
 	t.Run("default values", func(t *testing.T) {
 		cfg := mustLoad(t)
@@ -80,14 +65,14 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("custom environment variables", func(t *testing.T) {
-		_ = os.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
-		_ = os.Setenv("GROXPI_INDEX_TTL", "600")
-		_ = os.Setenv("GROXPI_CACHE_SIZE", "1073741824") // 1GB
-		_ = os.Setenv("GROXPI_CACHE_DIR", "/custom/cache")
-		_ = os.Setenv("GROXPI_DOWNLOAD_TIMEOUT", "2.5")
-		_ = os.Setenv("PORT", "8080")
-		_ = os.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
-		_ = os.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
+		t.Setenv("GROXPI_INDEX_URL", "https://test.pypi.org/simple/")
+		t.Setenv("GROXPI_INDEX_TTL", "600")
+		t.Setenv("GROXPI_CACHE_SIZE", "1073741824") // 1GB
+		t.Setenv("GROXPI_CACHE_DIR", "/custom/cache")
+		t.Setenv("GROXPI_DOWNLOAD_TIMEOUT", "2.5")
+		t.Setenv("PORT", "8080")
+		t.Setenv("GROXPI_LOGGING_LEVEL", "DEBUG")
+		t.Setenv("GROXPI_DISABLE_INDEX_SSL_VERIFICATION", "1")
 
 		cfg := mustLoad(t)
 
@@ -125,8 +110,8 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("extra indices configuration", func(t *testing.T) {
-		_ = os.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://extra1.example.com,https://extra2.example.com")
-		_ = os.Setenv("GROXPI_EXTRA_INDEX_TTLS", "120,240")
+		t.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://extra1.example.com,https://extra2.example.com")
+		t.Setenv("GROXPI_EXTRA_INDEX_TTLS", "120,240")
 
 		cfg := mustLoad(t)
 
@@ -154,8 +139,8 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("timeout configuration", func(t *testing.T) {
-		_ = os.Setenv("GROXPI_CONNECT_TIMEOUT", "5.0")
-		_ = os.Setenv("GROXPI_READ_TIMEOUT", "30.0")
+		t.Setenv("GROXPI_CONNECT_TIMEOUT", "5.0")
+		t.Setenv("GROXPI_READ_TIMEOUT", "30.0")
 
 		cfg := mustLoad(t)
 
@@ -380,6 +365,20 @@ func TestExtraIndexURLsArePositional(t *testing.T) {
 				t.Fatalf("URLS=%q TTLS=%q gave %v, want %v", tc.urls, tc.ttls, got, want)
 			}
 		})
+	}
+}
+
+// TestEmptyExtraIndexItemWarningHidesCredentials pins that the warning for an
+// empty GROXPI_EXTRA_INDEX_URLS item names its position, not the raw list: the
+// list carries the other indexes' credentials.
+func TestEmptyExtraIndexItemWarningHidesCredentials(t *testing.T) {
+	t.Setenv("GROXPI_EXTRA_INDEX_URLS", "https://u:secret@h/simple/,,https://x/")
+	logs := captureLogs(t, func() { mustLoad(t) })
+	if !strings.Contains(logs, "position=1") {
+		t.Fatalf("expected the empty item's position in the warning, got %q", logs)
+	}
+	if strings.Contains(logs, "secret") {
+		t.Fatalf("warning leaked a credential: %q", logs)
 	}
 }
 

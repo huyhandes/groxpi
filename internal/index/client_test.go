@@ -17,8 +17,8 @@ func TestClient_MakeRequest(t *testing.T) {
 	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify request headers
-		if r.Header.Get("Accept") != "application/vnd.pypi.simple.v1+json" {
-			t.Errorf("Expected Accept header to be 'application/vnd.pypi.simple.v1+json', got '%s'", r.Header.Get("Accept"))
+		if r.Header.Get("Accept") != packageIndexAccept {
+			t.Errorf("Expected Accept header %q, got %q", packageIndexAccept, r.Header.Get("Accept"))
 		}
 
 		if r.Header.Get("User-Agent") != config.UserAgent {
@@ -34,7 +34,7 @@ func TestClient_MakeRequest(t *testing.T) {
 	cfg := &config.Config{IndexURL: server.URL}
 	client := newClient(cfg, newTransport(cfg))
 
-	resp, err := client.makeRequest(context.Background(), server.URL, "application/vnd.pypi.simple.v1+json")
+	resp, err := client.makeRequest(context.Background(), server.URL)
 	if err != nil {
 		t.Fatalf("makeRequest failed: %v", err)
 	}
