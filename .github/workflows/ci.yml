@@ -134,6 +134,14 @@ jobs:
           echo "MinIO tests skipped: MinIO was not reachable" >&2
           exit 1
         fi
+        # A renamed test or a -run pattern that matches nothing passes with zero
+        # tests run; require each one by name.
+        for want in '--- PASS: TestS3WithMinIO_RejectsChecksumTrailers' '--- PASS: TestS3WithMinIO '; do
+          if ! grep -qF -- "$want" minio-test.out; then
+            echo "missing from MinIO test output: $want" >&2
+            exit 1
+          fi
+        done
 
   security:
     name: Security Scan

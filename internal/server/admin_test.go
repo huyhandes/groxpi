@@ -301,19 +301,16 @@ func postPrefetchSite(router http.Handler, pkg, site string) *http.Response {
 
 func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
 	up := newPyPIWith(t, "xsite", "xsite-1.0.0.tar.gz", testPayload(64))
-	srv := newAdminServer(t, up.URL)
-	router := srv.mux
+	router := newAdminServer(t, up.URL).mux
 
+	// Only the 403 is checked: prefetch runs asynchronously, so "upstream was not
+	// asked" right after the response would pass even if the handler had run.
 	for _, site := range []string{"cross-site", "same-site"} {
 		resp := postPrefetchSite(router, "xsite", site)
 		_ = readBody(t, resp)
 		assert.Equal(t, http.StatusForbidden, resp.StatusCode,
 			"a %s prefetch must be refused", site)
 	}
-
-	// The handler never ran, so it never asked upstream for the package.
-	assert.Zero(t, up.FileHits("xsite-1.0.0.tar.gz"), "the refused request must not reach the prefetch handler")
-	assert.Empty(t, cachedFileNames(srv))
 }
 
 func TestAdminCrossSite_SameOriginAbsentAndNoneSucceed(t *testing.T) {

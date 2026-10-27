@@ -2,6 +2,7 @@ package index
 
 import (
 	"bytes"
+	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
@@ -161,4 +162,21 @@ func TestRenderSimpleHTML_Pin(t *testing.T) {
 
 	assert.Equal(t, string(RenderSimpleHTML("foo-bar", nil)), string(RenderSimpleHTML("Foo_Bar", nil)),
 		"the page names the package by its normalised name")
+}
+
+// TestParseSimpleHTML_UnparseableHrefLogsNoCredentials: url.Parse quotes the
+// whole href in its error, so logging the raw error would leak the user-info the
+// redacted href field beside it hides.
+func TestParseSimpleHTML_UnparseableHrefLogsNoCredentials(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	files, err := parseSimpleHTML(strings.NewReader(`<a href="https://u:secret@h/%zz">bad</a>`),
+		mustURL(t, "https://org/simple/foo/"))
+	require.NoError(t, err)
+	assert.Empty(t, files)
+	assert.Contains(t, logs.String(), "unparseable href")
+	assert.NotContains(t, logs.String(), "secret")
 }
