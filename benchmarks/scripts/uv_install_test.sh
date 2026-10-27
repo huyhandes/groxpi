@@ -378,6 +378,20 @@ run_test() {
     run_uv_install_test "$@" || FAILURES=$((FAILURES + 1))
 }
 
+# Empty one proxy's cache (groxpi or proxpi), then run one test against it:
+#   cold <target> <test> <args...>
+# A failed clear is counted and the test skipped, so a warm run is never
+# recorded as a cold one.
+cold() {
+    local target=$1
+    shift
+    if clear_cache "$target"; then
+        "$@"
+    else
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 # Function to run cold cache installation tests
 run_cold_install_tests() {
     local results_dir=$1
@@ -396,12 +410,10 @@ run_cold_install_tests() {
             log_info "Testing cold installation: $package"
 
             # Empty groxpi only, then test it
-            clear_cache groxpi
-            run_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
+            cold groxpi run_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
 
             # Empty proxpi only, then test it
-            clear_cache proxpi
-            run_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
+            cold proxpi run_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
 
             echo ""
         done
@@ -466,23 +478,17 @@ run_batch_install_tests() {
 
         # Test small package batch (fast packages)
         local small_packages="requests click fastapi"
-        clear_cache groxpi
-        run_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
-        clear_cache proxpi
-        run_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        cold groxpi run_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        cold proxpi run_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
 
         # Test mixed size batch
         local mixed_packages="numpy pandas polars"
-        clear_cache groxpi
-        run_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
-        clear_cache proxpi
-        run_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        cold groxpi run_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        cold proxpi run_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
 
         # Test all packages batch
-        clear_cache groxpi
-        run_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
-        clear_cache proxpi
-        run_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        cold groxpi run_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        cold proxpi run_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
     fi
 }
 
@@ -500,11 +506,9 @@ run_large_package_tests() {
         log_info "Running large package (pyspark) tests..."
 
         # Test pyspark specifically (it's ~300MB)
-        clear_cache groxpi
-        run_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        cold groxpi run_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
-        clear_cache proxpi
-        run_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        cold proxpi run_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         # Test pyspark with warm cache
         log_info "Testing pyspark with warm cache..."
@@ -700,7 +704,7 @@ main() {
     echo "Summary: $results_dir/uv-summary-${TIMESTAMP}.csv"
 
     if [ "$FAILURES" -gt 0 ]; then
-        log_error "$FAILURES test run(s) failed; see the FALSE rows in the summary"
+        log_error "$FAILURES test run(s) failed or were skipped; see the log and the FALSE rows in the summary"
         exit 1
     fi
 

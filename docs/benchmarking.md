@@ -74,8 +74,9 @@ before its warm run.
 `docker-compose.benchmark.yml` gives each proxy an anonymous cache volume, which `rm -v` deletes; a named
 volume would survive it. The compose file is `benchmarks/docker/docker-compose.benchmark.yml` unless
 `BENCH_COMPOSE_FILE` names another, and the containers must be on the host running the suite, behind
-the URLs it is given. If recreating them fails, `wrk_api_test.sh` skips that cold measurement and
-exits non-zero, and `uv_install_test.sh` stops, rather than record a warm cache as a cold one.
+the URLs it is given. If recreating them fails, `wrk_api_test.sh` and `uv_install_test.sh` skip that
+cold measurement, carry on with the rest, and exit non-zero, rather than record a warm cache as a cold
+one.
 
 Neither proxy's HTTP eviction empties its cache, which is why the suite does not use it. groxpi's
 `DELETE /cache/list` invalidates nothing, because the root index is proxied and not cached. proxpi's
