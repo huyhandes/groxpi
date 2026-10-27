@@ -198,7 +198,7 @@ func TestLoadS3WithoutStaticCredentials(t *testing.T) {
 // sent every request to us-east-1.
 func TestLoadS3LeavesEmptyEndpointEmpty(t *testing.T) {
 	t.Setenv("GROXPI_S3_BUCKET", "groxpi-cache")
-	t.Setenv("GROXPI_S3_ENDPOINT", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
 
 	for _, storageType := range []string{"s3", "hybrid"} {
 		t.Run(storageType, func(t *testing.T) {

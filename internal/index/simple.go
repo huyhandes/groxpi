@@ -169,7 +169,7 @@ func RenderSimpleHTML(pkg string, files []FileInfo) []byte {
 
 	for _, file := range files {
 		sb.WriteString(`	<a href="`)
-		sb.WriteString(html.EscapeString(ProxyFileURL(pkg, file.Name)))
+		sb.WriteString(html.EscapeString(proxyFileURL(pkg, file.Name)))
 		sb.WriteString(`"`)
 
 		if file.RequiresPython != "" {

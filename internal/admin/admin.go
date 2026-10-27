@@ -138,6 +138,7 @@ type View struct {
 	Size        int64      // across every page of the matches
 	Total       int        // matching packages across every page
 	Query       string     // the normalized filter; empty lists everything
+	Filter      string     // the filter as typed, trimmed: what the box shows
 
 	// Page is 1-based; PrevPage and NextPage are 0 when there is no such page.
 	Page, PrevPage, NextPage int
@@ -184,8 +185,9 @@ type Download struct {
 // and is applied before paging so a match on any page is found.
 func (s *Service) List(_ context.Context, page int, query string) View {
 	now := time.Now()
-	query = NormalizeQuery(query)
-	view := View{Errors: s.errors.list(), Page: page, Query: query}
+	filter := strings.TrimSpace(query)
+	query = NormalizeQuery(filter)
+	view := View{Errors: s.errors.list(), Page: page, Query: query, Filter: filter}
 
 	// The listing is the cache's own walk; the durable store is never listed.
 	byName := make(map[string]*Package)

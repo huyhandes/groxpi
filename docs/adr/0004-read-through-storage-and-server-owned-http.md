@@ -54,7 +54,8 @@ scan re-adds files in directory-walk order.
    `InFlight`. The server renders its page.
 
 Dependencies point one way: `server → admin → storage → download → index`, with `server` also calling
-`storage` and `index` directly.
+`storage` and `index` directly, `admin` also calling `index`, and `storage` also calling `index`
+(`NormalizeName`) and `config` (`New`).
 
 ## Constraints
 

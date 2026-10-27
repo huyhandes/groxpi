@@ -57,7 +57,7 @@
   </tbody>
 </table>
 <p class="muted">{{.Total}} package(s), {{bytes .Size}} cached.
-{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}{{if .Query}}&amp;q={{.Query | urlquery}}{{end}}">&larr; prev</a>{{end}}
+{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">&larr; prev</a>{{end}}
 {{if or .PrevPage .NextPage}}page {{.Page}}{{end}}
-{{if .NextPage}}<a href="/admin?page={{.NextPage}}{{if .Query}}&amp;q={{.Query | urlquery}}{{end}}">next &rarr;</a>{{end}}</p>
+{{if .NextPage}}<a href="/admin?page={{.NextPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">next &rarr;</a>{{end}}</p>
 {{end}}

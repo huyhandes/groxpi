@@ -42,9 +42,7 @@ func newAdminServer(t *testing.T, upstreamURL string) *adminHarness {
 		AdminUsername:   adminUser,
 		AdminPassword:   adminPass,
 	}
-	srv, err := NewServer(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Close() })
+	srv := newTestServer(t, cfg)
 	return &adminHarness{svc: srv.admin, mux: srv.Router(), cacheDir: cfg.CacheDir}
 }
 
@@ -108,7 +106,8 @@ func TestAdminRows_RenderPageQuery(t *testing.T) {
 	assert.Contains(t, second, `href="/admin?page=1"`)
 	assert.NotContains(t, second, "next")
 
-	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin?page=2"))), `hx-get="/admin/rows?page=2"`,
+	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin?page=2"))),
+		`<input id="page" name="page" type="hidden" value="2">`,
 		"the poll must keep the page the operator navigated to")
 	assert.Equal(t, first, string(readBody(t, authGet(h.mux, "/admin/rows?page=bogus"))), "a malformed page is page 1")
 	assert.Equal(t, second, string(readBody(t, authGet(h.mux, "/admin/rows?page=9223372036854775807"))),
@@ -138,16 +137,54 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 
 	page := string(readBody(t, authGet(h.mux, "/admin?q=needle")))
 	assert.Contains(t, page, `value="needle"`, "the box shows the active filter")
-	// The poll reads the live filter box instead of a q baked into its URL, so
-	// typing filters without a submit and the box is escaped by htmx itself.
-	assert.Contains(t, page, `hx-get="/admin/rows?page=1"`, "the poll URL carries no hand-built q")
-	assert.Contains(t, page, `hx-include="#filter"`, "the poll sends the filter box")
+	// The poll reads the live filter form instead of a q and page baked into
+	// its URL, so typing filters without a submit and htmx escapes the box.
+	assert.Contains(t, page, `hx-get="/admin/rows"`, "the poll URL carries no hand-built q or page")
+	assert.Contains(t, page, `hx-include="#filter-form"`, "the poll sends the filter box and the page")
 	assert.Contains(t, page, `hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter"`,
 		"typing in the box re-polls")
-	assert.Contains(t, page, `<form class="controls" method="get" action="/admin">`, "the no-JS GET form stays")
+	assert.Contains(t, page, `<form id="filter-form" class="controls" method="get" action="/admin">`,
+		"the no-JS GET form stays")
 
 	paged := string(readBody(t, authGet(h.mux, "/admin/rows?q=p0")))
 	assert.Contains(t, paged, `href="/admin?page=2&amp;q=p0"`, "the pager keeps the filter")
+}
+
+// TestAdminPage_FilterRestartsAtPageOne pins that typing a filter on page N
+// polls page 1 of the matches: the page travels in a hidden input of the filter
+// form, which the box resets to 1 on input, and the pager links still work.
+func TestAdminPage_FilterRestartsAtPageOne(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	for i := range 2*admin.PageSize + 1 {
+		path := filepath.Join(h.cacheDir, "packages", fmt.Sprintf("p%03d", i), "a.tar.gz")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+	}
+
+	page := string(readBody(t, authGet(h.mux, "/admin?page=2")))
+	form := page[strings.Index(page, `<form id="filter-form"`):]
+	form = form[:strings.Index(form, "</form>")]
+	assert.Contains(t, form, `<input id="page" name="page" type="hidden" value="2">`,
+		"the page is a field of the filter form")
+	assert.Contains(t, form, `hx-on:input="document.getElementById('page').value = 1"`,
+		"typing in the box starts again at page 1")
+	assert.Contains(t, page, `href="/admin?page=1"`, "the pager links stay")
+	assert.Contains(t, page, `href="/admin?page=3"`, "the pager links stay")
+}
+
+// TestAdminPage_FilterBoxShowsRawQuery pins that the box shows what the
+// operator typed (trimmed), while the listing filters on the normalised form.
+func TestAdminPage_FilterBoxShowsRawQuery(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	path := filepath.Join(h.cacheDir, "packages", "zz-needle", "needle-1.0.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+
+	page := string(readBody(t, authGet(h.mux, "/admin?q="+url.QueryEscape("  ZZ_Needle "))))
+	assert.Contains(t, page, `value="ZZ_Needle"`, "the box keeps the operator's spelling")
+	assert.Contains(t, page, `data-package="zz-needle"`, "the filter matches the normalised form")
 }
 
 // TestAdminRows_PagerEscapesQuery pins that a filter with URL metacharacters

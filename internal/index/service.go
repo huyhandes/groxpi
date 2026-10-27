@@ -25,7 +25,7 @@ import (
 // JSONContentType is the PEP 691 media type of every index body served as JSON.
 const JSONContentType = "application/vnd.pypi.simple.v1+json"
 
-// upstream is the one-method view of Client that resolution needs. It is an
+// upstream is the one-method view of client that resolution needs. It is an
 // interface because the tests have a second implementation (fakeUpstream).
 type upstream interface {
 	GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error)
@@ -382,7 +382,7 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 			Filename:       file.Name,
 			Hashes:         file.Hashes,
 			RequiresPython: file.RequiresPython,
-			URL:            ProxyFileURL(packageName, file.Name),
+			URL:            proxyFileURL(packageName, file.Name),
 		}
 		if wf.Hashes == nil {
 			wf.Hashes = map[string]string{}
@@ -404,7 +404,7 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 	return json.Marshal(body)
 }
 
-// ProxyFileURL is the path this proxy serves a package file at.
-func ProxyFileURL(packageName, fileName string) string {
+// proxyFileURL is the path this proxy serves a package file at.
+func proxyFileURL(packageName, fileName string) string {
 	return "/simple/" + packageName + "/" + fileName
 }
