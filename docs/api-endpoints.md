@@ -15,10 +15,11 @@ Every route groxpi registers, and nothing else.
 | `GET` | `/index/<package>/<file>` | — | Alias of `/simple/<package>/<file>`. |
 | `GET` | `/health` | — | Liveness and configuration echo. |
 | `GET` | `/admin` | basic | Cache administration page. |
-| `GET` | `/admin/rows` | basic | HTML fragment the page polls. |
+| `GET` | `/admin/rows` | basic | HTML fragment: the package table. |
+| `GET` | `/admin/inflight` | basic | HTML fragment the page polls: downloads in flight and recent failures. |
 | `GET` | `/admin/htmx.min.js` | basic | Embedded interaction library. |
 | `POST` | `/admin/prefetch` | basic | Warm the cache for one package. |
-| `DELETE` | `/cache/list` | basic | No-op, kept for Python-proxpi compatibility. |
+| `DELETE` | `/cache/list` | basic | Python-proxpi's list invalidation; evicts a package named `list`. |
 | `DELETE` | `/cache/<package>` | basic | Evict one package's index entry and cached files. |
 
 Point pip at `/simple/` (or `/index/`, which exists only for compatibility with the Python
@@ -186,14 +187,22 @@ token, session or cookie is involved.
 An HTML page listing what the local cache holds: packages, their files, sizes, ages and last-accessed times, plus
 the 20 most recent prefetch failures. Above the table, a "Downloading now" section lists every upstream
 download in progress — package, file, bytes so far against the declared size, age, and how many client
-requests are coalesced onto it — and disappears when nothing is in flight. The page polls
-`GET /admin/rows` for updates. Both `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
+requests are coalesced onto it — and disappears when nothing is in flight.
+
+Only the in-flight section polls: every 3s while the tab is visible the page fetches
+`GET /admin/inflight`, which renders the downloads and failures from memory and never walks the cache.
+The page sends `?shown=N`, the number of download rows it is showing; when fewer are in flight now, a
+download has finished and the reply carries `HX-Trigger: cache-changed`. The package table,
+`GET /admin/rows`, walks the cache, so it reloads only on that event, a filter change, the Refresh
+button, or an eviction from the page.
+
+`/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
 malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
-across pages, and the page's poll keeps the page it was rendered for. Both also accept `?q=`, a substring
+across pages, and the table keeps the page it was rendered for. All three also accept `?q=`, a substring
 of the package name, trimmed and normalised like a package name (so `Typing_Ext` matches `typing-ext`),
 applied to every cached package before paging and to the "Downloading now" rows. The page's filter box
-sends it, with the page, on every poll, re-polling as the operator types and starting again at page 1;
-it shows the filter as typed (trimmed), not its normalised form. Without JavaScript, submitting the box
+sends it, with the page, on every reload and poll, reloading the table as the operator types and starting
+again at page 1; it shows the filter as typed (trimmed), not its normalised form. Without JavaScript, submitting the box
 reloads the page with it, starting at page 1. The pager links keep it. The listing shows the local cache only, so in pure
 `s3` mode, which has no cache, the table is empty.
 
@@ -216,8 +225,11 @@ until it is killed. See [deployment](deployment.md) for the budget and how to si
 
 ### `DELETE /cache/list`
 
-Answers `{"status":"success","data":null}` and does nothing. The root index is proxied rather than
-cached, so there is no cached list to invalidate. The route exists so Python-proxpi clients keep working.
+Python proxpi's "invalidate the package list". The root index is proxied rather than cached, so there
+is no list to invalidate; the route is the package route below for a package named `list`, so it evicts
+that package's index entry and cached files (if any) and answers as that route does —
+`{"status":"success","data":null}` when nothing is cached. Python-proxpi clients keep working, and a
+package called `list` can still be evicted.
 
 ### `DELETE /cache/<package>`
 

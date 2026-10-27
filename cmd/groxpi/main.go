@@ -108,7 +108,8 @@ func main() {
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second, // slowloris guard; bodies are streamed so no ReadTimeout
+		ReadHeaderTimeout: 10 * time.Second,  // slowloris guard; bodies are streamed so no ReadTimeout
+		IdleTimeout:       120 * time.Second, // reap idle keep-alive connections
 	}
 
 	// Start server in goroutine

@@ -83,10 +83,10 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 	srv.Router().ServeHTTP(w, req)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	// The prefetch is detached: poll the page until its failure has landed.
+	// The prefetch is detached: poll the page's poll until its failure has landed.
 	var body string
 	require.Eventually(t, func() bool {
-		rows := httptest.NewRequest(http.MethodGet, "/admin/rows", nil)
+		rows := httptest.NewRequest(http.MethodGet, "/admin/inflight", nil)
 		rows.SetBasicAuth(cfg.AdminUsername, cfg.AdminPassword)
 		rowsRec := httptest.NewRecorder()
 		srv.Router().ServeHTTP(rowsRec, rows)

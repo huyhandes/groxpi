@@ -264,6 +264,24 @@ func TestList_LastAccessedTracksServes(t *testing.T) {
 	assert.Zero(t, up.fileHits.Load(), "the serve was a cache hit")
 }
 
+// TestList_PackageAgeIsOldestFile: a package's age is its oldest file's, not
+// that of whichever file was accessed last.
+func TestList_PackageAgeIsOldestFile(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := plant(t, dir, "mixed", "mixed-1.0.0.tar.gz", []byte("old"))
+	old := time.Now().Add(-5 * 24 * time.Hour)
+	require.NoError(t, os.Chtimes(oldPath, old, old))
+	newPath := plant(t, dir, "mixed", "mixed-2.0.0.tar.gz", []byte("new"))
+	recent := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(newPath, time.Now(), recent))
+	h := newHarness(t, "http://127.0.0.1:1/", dir)
+
+	view := h.svc.List(t.Context(), 1, "")
+	require.Len(t, view.Packages, 1)
+	assert.Equal(t, "5d", view.Packages[0].Age, "the package is as old as its oldest file")
+	assert.Equal(t, "0s", view.Packages[0].Accessed, "the last access is the newest file's")
+}
+
 // TestInFlight_ShowsRunningDownload: a download that has started but not
 // finished is listed with its package, file and requester count, and is gone
 // once it lands in the cache.

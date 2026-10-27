@@ -18,7 +18,7 @@ internal/
                              serves GET /simple/{package}/{file} (and its /index/ alias);
                              wraps the mux in panic recovery and request tracing; shutdown
              index.go        GET /simple/, GET /simple/{package}/ and the /index/ aliases
-             admin.go        basic auth, cross-site check, admin templates, page, rows, prefetch,
+             admin.go        basic auth, cross-site check, admin templates, page, rows, inflight, prefetch,
                              cache eviction routes
   index/     service.go      Resolve / Invalidate / ProxyRoot: extras-first resolution, singleflight
              cache.go        bounded index cache (LRU by last access + background TTL sweep)
@@ -26,7 +26,7 @@ internal/
              simple.go       PEP 503 HTML: parse an upstream page, render this proxy's page
              normalize.go    PEP 503 name normalisation
   download/  service.go      Resolve / Fetch: find a file in the index (PEP 658 included), open it upstream
-  admin/     admin.go        List / Evict / InFlight: the cache listing and eviction
+  admin/     admin.go        List / Evict / InFlight / Failures: the cache listing and eviction
              prefetch.go     Prefetch and newest-release selection, built on storage.Open
   storage/   store.go        read-through Open: coalesced, verified, spooled downloads; the cache
                              and/or the durable store; InFlight

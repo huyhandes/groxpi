@@ -45,12 +45,15 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 
 	mux.Handle("GET /admin", guard(s.handleAdminPage))
 	mux.Handle("GET /admin/rows", guard(s.handleAdminRows))
+	mux.Handle("GET /admin/inflight", guard(s.handleAdminInflight))
 	mux.Handle("GET /admin/htmx.min.js", guard(handleAdminAsset))
 	mux.Handle("POST /admin/prefetch", guard(s.handleAdminPrefetch))
 
 	// Eviction is the pre-existing cache route: the page's Evict button issues the
-	// same DELETE an operator can curl.
-	mux.Handle("DELETE /cache/list", guard(handleCacheList))
+	// same DELETE an operator can curl. Python proxpi's DELETE /cache/list
+	// (invalidate the root list) needs no route of its own: the root index is
+	// proxied, so there is nothing to invalidate, and the package route evicts a
+	// package named "list" instead of shadowing it.
 	mux.Handle("DELETE /cache/{package}", guard(s.handleCachePackage))
 }
 
@@ -86,13 +89,6 @@ func rejectCrossSite(next http.Handler) http.Handler {
 			http.Error(w, "Forbidden: cross-site request", http.StatusForbidden)
 		}
 	})
-}
-
-// handleCacheList is a no-op kept for API compatibility with the Python
-// implementation: the root index is proxied, so there is no cached list to
-// invalidate.
-func handleCacheList(w http.ResponseWriter, _ *http.Request) {
-	writeStatus(w, http.StatusOK, `{"status":"success","data":null}`)
 }
 
 func (s *Server) handleCachePackage(w http.ResponseWriter, r *http.Request) {
@@ -139,31 +135,57 @@ func (s *Server) handleAdminPrefetch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
-	s.renderAdmin(w, r, "admin.html")
+	view := s.listView(r)
+	view.Downloading = s.inFlight(view.Query)
+	s.render(w, r, "admin.html", view)
 }
 
-// handleAdminRows serves the fragment the table polls for. It is the progress
-// display for prefetch: files appear here as they land.
+// handleAdminRows serves the package table fragment. It walks the cache, so the
+// page reloads it on a filter change, a refresh, or a finished download, never
+// on a timer.
 func (s *Server) handleAdminRows(w http.ResponseWriter, r *http.Request) {
-	s.renderAdmin(w, r, "rows")
+	s.render(w, r, "rows", s.listView(r))
 }
 
-func (s *Server) renderAdmin(w http.ResponseWriter, r *http.Request, name string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Rendered into a buffer first so a template failure can still be a 500
-	// instead of a half page with a 200 already committed.
-	var buf strings.Builder
+// handleAdminInflight serves the fragment the page polls: in-flight downloads
+// and recent failures, both in memory, so the poll never walks the cache. The
+// page sends how many download rows it is showing; fewer now means one finished
+// and landed, so the response tells the page to reload the package table.
+func (s *Server) handleAdminInflight(w http.ResponseWriter, r *http.Request) {
+	view := admin.View{Errors: s.admin.Failures(), Query: admin.NormalizeQuery(r.URL.Query().Get("q"))}
+	view.Downloading = s.inFlight(view.Query)
+	if shown, err := strconv.Atoi(r.URL.Query().Get("shown")); err == nil && shown > len(view.Downloading) {
+		w.Header().Set("HX-Trigger", "cache-changed")
+	}
+	s.render(w, r, "inflight", view)
+}
+
+// inFlight is the downloads running now whose package matches the filter.
+func (s *Server) inFlight(query string) []admin.Download {
+	var out []admin.Download
+	for _, d := range s.admin.InFlight() {
+		if strings.Contains(d.Package, query) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// listView is the requested page of the cache listing.
+func (s *Server) listView(r *http.Request) admin.View {
 	// A missing or malformed page is the first page, not an error.
 	page, err := strconv.Atoi(r.URL.Query().Get("page"))
 	if err != nil || page < 1 {
 		page = 1
 	}
-	view := s.admin.List(r.Context(), page, r.URL.Query().Get("q"))
-	for _, d := range s.admin.InFlight() {
-		if strings.Contains(d.Package, view.Query) {
-			view.Downloading = append(view.Downloading, d)
-		}
-	}
+	return s.admin.List(r.Context(), page, r.URL.Query().Get("q"))
+}
+
+func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, view admin.View) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Rendered into a buffer first so a template failure can still be a 500
+	// instead of a half page with a 200 already committed.
+	var buf strings.Builder
 	if err := s.templates.ExecuteTemplate(&buf, name, view); err != nil {
 		slog.ErrorContext(r.Context(), "Failed to render admin page", "error", err, "template", name)
 		http.Error(w, "Failed to render page", http.StatusInternalServerError)
