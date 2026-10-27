@@ -45,5 +45,5 @@ func TestPackageHTML_EscapesUpstreamValues(t *testing.T) {
 	assert.NotContains(t, body, "<b>")
 	assert.Contains(t, body, `data-requires-python="&gt;=3.8`+escaped+`"`)
 	assert.Contains(t, body, `data-yanked="`+escaped+`"`)
-	assert.Contains(t, body, `<a href="/simple/evil/evil-&lt;b&gt;&amp;1.0.tar.gz" data-requires-python="&gt;=3.8">evil-&lt;b&gt;&amp;1.0.tar.gz</a>`)
+	assert.Contains(t, body, `<a href="/simple/evil/evil-%3Cb%3E&amp;1.0.tar.gz" data-requires-python="&gt;=3.8">evil-&lt;b&gt;&amp;1.0.tar.gz</a>`)
 }

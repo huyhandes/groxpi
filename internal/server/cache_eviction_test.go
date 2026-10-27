@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
 )
@@ -19,7 +18,7 @@ import (
 func newEvictionServer(t *testing.T, upstreamURL string) (http.Handler, string) {
 	t.Helper()
 	cacheDir := t.TempDir()
-	srv, err := NewServer(&config.Config{
+	srv := newTestServer(t, &config.Config{
 		IndexURL:        upstreamURL,
 		IndexTTL:        time.Minute,
 		IndexCacheSize:  1 << 20,
@@ -30,8 +29,6 @@ func newEvictionServer(t *testing.T, upstreamURL string) (http.Handler, string) 
 		AdminUsername:   adminUser,
 		AdminPassword:   adminPass,
 	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Close() })
 	return srv.Router(), cacheDir
 }
 

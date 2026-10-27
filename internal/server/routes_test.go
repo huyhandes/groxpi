@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -61,7 +62,8 @@ func newTestServer(tb testing.TB, cfg *config.Config) *Server {
 }
 
 // requireLoopback fails the test unless raw is a URL whose host is a loopback
-// address.
+// address. It accepts IP literals only (httptest URLs), so "localhost" fails on
+// purpose: a name is resolved, and resolution can leave the host.
 func requireLoopback(tb testing.TB, raw string) {
 	tb.Helper()
 	u, err := url.Parse(raw)
@@ -95,9 +97,7 @@ func TestFileRoute_EncodedTraversalIsNotFound(t *testing.T) {
 	for _, timeout := range []time.Duration{5 * time.Second, 0} {
 		cfg := routesConfig(t, up.URL, func(c *config.Config) { c.DownloadTimeout = timeout })
 		require.NoError(t, os.WriteFile(filepath.Join(cfg.CacheDir, "secret"), []byte("planted"), 0o600))
-		srv, err := NewServer(cfg)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = srv.Close() })
+		srv := newTestServer(t, cfg)
 
 		for _, path := range []string{
 			"/index/pkg/..%2F..%2Fsecret",
@@ -187,7 +187,9 @@ func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
 func TestAdminAuth_EnabledWithoutCredentials_ConstructionFails(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 
-	srv, err := NewServer(routesConfig(t, up.URL, func(cfg *config.Config) { cfg.AdminEnabled = true }))
+	cfg := routesConfig(t, up.URL, func(cfg *config.Config) { cfg.AdminEnabled = true })
+	requireLoopback(t, cfg.IndexURL)
+	srv, err := NewServer(cfg)
 	require.Error(t, err, "enabling the admin interface without credentials must fail construction")
 	assert.Nil(t, srv, "a server that cannot be trusted must not be produced")
 }
@@ -242,6 +244,33 @@ func TestRoutes_TrailingSlashRedirect(t *testing.T) {
 
 // TestRoutes_MethodNotAllowed: a known path with the wrong method is a 405 with
 // an Allow header, not a 404.
+// TestIndex_FileHrefIsPercentEncoded pins that a file name with a URL
+// metacharacter is escaped in both index forms, and that the escaped href
+// downloads the file rather than a truncated name.
+func TestIndex_FileHrefIsPercentEncoded(t *testing.T) {
+	const file = "a#b-1.0-py3-none-any.whl"
+	payload := testPayload(64)
+	up := NewFakePyPI(t).Add("hashy", file, FakeFile{Body: payload})
+	router := newRoutesServer(t, up.URL)
+	const want = "/simple/hashy/a%23b-1.0-py3-none-any.whl"
+
+	for _, accept := range []string{"text/html", "application/vnd.pypi.simple.v1+json"} {
+		req := httptest.NewRequest(http.MethodGet, "/simple/hashy/", nil)
+		req.Header.Set("Accept", accept)
+		resp := do(router, req)
+		body := string(readBody(t, resp))
+		require.Equal(t, http.StatusOK, resp.StatusCode, accept)
+		href := regexp.MustCompile(`(?:href="|"url":\s*")([^"]+)"`).FindStringSubmatch(body)
+		require.NotNil(t, href, "%s index lists the file: %s", accept, body)
+		assert.Equal(t, want, href[1], accept)
+	}
+
+	resp := do(router, httptest.NewRequest(http.MethodGet, want, nil))
+	got := readBody(t, resp)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, payload, got)
+}
+
 func TestRoutes_MethodNotAllowed(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)

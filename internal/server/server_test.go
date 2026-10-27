@@ -381,11 +381,13 @@ func TestServer_ContentNegotiation(t *testing.T) {
 func TestServer_InitStorage_EdgeCases(t *testing.T) {
 	t.Run("Invalid storage type", func(t *testing.T) {
 		cfg := &config.Config{
+			IndexURL:    deadIndexURL,
 			StorageType: "invalid",
 			CacheDir:    t.TempDir(),
 		}
 
 		// A typo must not silently run local storage without the durable store.
+		requireLoopback(t, cfg.IndexURL)
 		srv, err := NewServer(cfg)
 		require.Error(t, err)
 		assert.Nil(t, srv)
@@ -598,9 +600,7 @@ func TestServer_NormalizePackageName(t *testing.T) {
 		path := filepath.Join(cfg.CacheDir, "packages", "foo-bar", "Foo_Bar-1.0.tar.gz")
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
 		require.NoError(t, os.WriteFile(path, []byte("cached"), 0o600))
-		srv, err := NewServer(cfg)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = srv.Close() })
+		srv := newTestServer(t, cfg)
 
 		resp := do(srv.Router(), httptest.NewRequest("GET", "/simple/Foo_Bar/Foo_Bar-1.0.tar.gz", nil))
 		body, err := io.ReadAll(resp.Body)
