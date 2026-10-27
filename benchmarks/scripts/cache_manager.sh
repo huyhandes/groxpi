@@ -12,6 +12,11 @@ PROXPI_URL="${2:-}"
 OPERATION="${3:-clear-all}"
 TIMEOUT=30
 
+# Packages the benchmark scenarios install (keep in step with TEST_PACKAGES in
+# wrk_api_test.sh and uv_install_test.sh). groxpi's DELETE /cache/list is a
+# no-op, so a cold run is only cold if each of these is evicted by name.
+read -r -a BENCH_PACKAGES <<< "${BENCH_PACKAGES:-numpy pandas polars pyspark fastapi}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -36,6 +41,7 @@ show_usage() {
     echo ""
     echo "Operations:"
     echo "  clear-all        - Clear all caches on both servers"
+    echo "                     (groxpi: evicts each of BENCH_PACKAGES by name)"
     echo "  clear-groxpi     - Clear only groxpi cache"
     echo "  clear-proxpi     - Clear only proxpi cache"
     echo "  clear-package    - Clear specific package cache (requires package name)"
@@ -215,6 +221,27 @@ clear_package_cache() {
     fi
 }
 
+# Evict every package under test. DELETE /cache/list clears nothing on groxpi
+# (the root index is proxied, not cached), so this is what makes a cold run cold.
+# Any groxpi failure aborts the run: a partial eviction would still be measured
+# as cold.
+clear_test_packages() {
+    local url=$1
+    local name=$2
+    local package
+
+    for package in "${BENCH_PACKAGES[@]}"; do
+        if ! clear_package_cache "$url" "$name" "$package"; then
+            if [[ "$name" == "groxpi" ]]; then
+                log_error "Aborting: groxpi did not evict '$package', so any 'cold' number from this run would be a lie."
+                exit 1
+            fi
+            return 1
+        fi
+    done
+    return 0
+}
+
 # Function to verify cache has been cleared
 verify_cache_clear() {
     local url=$1
@@ -304,7 +331,7 @@ main() {
             if ! test_connection "$GROXPI_URL" "groxpi"; then
                 exit 1
             fi
-            clear_cache_list "$GROXPI_URL" "groxpi"
+            clear_test_packages "$GROXPI_URL" "groxpi"
             ;;
 
         clear-proxpi)
@@ -382,13 +409,13 @@ main() {
             success=true
 
             if $groxpi_ok; then
-                if ! clear_cache_list "$GROXPI_URL" "groxpi"; then
-                    success=false
-                fi
+                # Exits on any failure.
+                clear_test_packages "$GROXPI_URL" "groxpi"
             fi
 
             if $proxpi_ok; then
-                if ! clear_cache_list "$PROXPI_URL" "proxpi"; then
+                if ! clear_cache_list "$PROXPI_URL" "proxpi" ||
+                   ! clear_test_packages "$PROXPI_URL" "proxpi"; then
                     success=false
                 fi
             fi

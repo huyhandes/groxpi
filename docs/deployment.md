@@ -26,7 +26,7 @@ Kubernetes defaults to 30 seconds, which is already enough.
 
 ## Docker
 
-The image is built from `scratch` and contains the binary, CA certificates and timezone data. Nothing
+The image is built from `scratch` and contains the binary and CA certificates. Nothing
 else — no shell, no `curl`, no `wget`, no templates (the admin page's assets are embedded in the
 binary).
 
