@@ -87,7 +87,7 @@ from it, so retention there is set with bucket lifecycle rules. See
 The cache only. Files live under `GROXPI_CACHE_DIR`, bounded by `GROXPI_CACHE_SIZE`. The filesystem is the LRU index:
 a cache hit sets the file's atime explicitly (at most once an hour per file, so a `noatime` mount still
 works; mtime is untouched because it is `Last-Modified`). A write that takes the cache past its budget
-walks the directory and deletes the least recently accessed files until it is at 90% of the budget.
+walks the directory, once the clients streaming that write have their last byte, and deletes the least recently accessed files until it is at 90% of the budget.
 Recency lives on disk, so it survives a restart. A walk at startup seeds the size counter, and every
 walk re-counts the cache size and removes temp files left behind by a crashed write (untouched for
 more than an hour).

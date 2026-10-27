@@ -123,9 +123,9 @@ not cached. The spool is discarded, and every client streaming it has
 its response aborted before the last byte, so no client sees a complete body that failed verification.
 
 Response headers on a download in flight are `Content-Type` (derived from the filename extension), plus
-`Content-Length` and `ETag` (the SHA-256, quoted) when the index supplied them. A cache hit carries
-`Content-Type`, `Content-Length` and `Last-Modified`; a `hybrid` S3 hit streams like a download in
-flight, with `Content-Length` from S3. No S3 hit carries an `ETag`.
+`Content-Length` when the size is known. A cache hit carries `Content-Type`, `Content-Length` and
+`Last-Modified`; a `hybrid` S3 hit streams like a download in flight, with `Content-Length` from S3.
+No package file response carries an `ETag`.
 
 Package files are never compressed by groxpi — they are already-compressed archives.
 

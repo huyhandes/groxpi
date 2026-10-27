@@ -335,9 +335,9 @@ func pin(t *testing.T, resp *http.Response, want map[string]string) {
 func q(s string) string { return `"` + s + `"` }
 
 // Header sets per serve branch, as sent today (#52 unifies them later).
-func streamedMissHeaders(ctype, etag string, length int) map[string]string {
+func streamedMissHeaders(ctype string, length int) map[string]string {
 	h := map[string]string{
-		"Content-Type": ctype, "ETag": etag,
+		"Content-Type": ctype, "ETag": absent,
 		"Accept-Ranges": absent, "Last-Modified": absent,
 		"Content-Disposition": absent, "Cache-Control": absent,
 	}
@@ -542,7 +542,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.get(demoPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders(gzipType, len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
 
 		resp, body = p.get(demoPath)
@@ -561,7 +561,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		p := start(t, e.config(t))
 		resp, body := p.get("/simple/demo/" + oldFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoOld)), 0))
+		pin(t, resp, streamedMissHeaders(gzipType, 0))
 		pin(t, resp, map[string]string{"Content-Length": absent})
 		assert.Equal(t, []string{"chunked"}, resp.TransferEncoding)
 		assert.Equal(t, demoOld, body)
@@ -573,7 +573,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.do(http.MethodHead, demoPath, nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders(gzipType, len(demoWheel)))
 		assert.Empty(t, body)
 
 		resp, body = p.do(http.MethodHead, demoPath, nil)
@@ -637,7 +637,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		require.NoError(t, err)
 		defer func() { _ = leader.Body.Close() }()
 		assert.Equal(t, http.StatusOK, leader.StatusCode)
-		pin(t, leader, streamedMissHeaders(gzipType, q(sum(slowBody)), len(slowBody)))
+		pin(t, leader, streamedMissHeaders(gzipType, len(slowBody)))
 		head := make([]byte, len(slowBody)/2)
 		_, err = io.ReadFull(leader.Body, head)
 		require.NoError(t, err)
@@ -740,7 +740,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.get(metaPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(textType, q(sum(demoMeta)), 0))
+		pin(t, resp, streamedMissHeaders(textType, 0))
 		assert.Equal(t, demoMeta, body)
 
 		resp, body = p.get(metaPath)
@@ -930,7 +930,7 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body = p.get("/simple/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders("application/gzip", q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders("application/gzip", len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
 		assert.Equal(t, 2, e.up.FileHits(demoFile), "evicted file is fetched upstream again")
 

@@ -267,9 +267,6 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", obj.ContentType)
-	if obj.ETag != "" {
-		h.Set("ETag", obj.ETag)
-	}
 	if !obj.InFlight {
 		// The bare ReadSeekCloser, not obj: on a local hit it is the *os.File the
 		// stdlib's copy path looks for, which the Object wrapper would hide.
