@@ -20,6 +20,9 @@ DOCKER_NETWORK="${DOCKER_NETWORK:-benchmark-network}"
 UV_IMAGE="${UV_IMAGE:-ghcr.io/astral-sh/uv:python3.12-bookworm-slim}"
 DOCKER_TIMEOUT=600  # 10 minutes timeout for large packages
 
+# Failed test runs; any failure makes the script exit nonzero after the summary
+FAILURES=0
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -307,6 +310,8 @@ echo ''
 
     # Execute the test in container
     local status=0
+    local host_start
+    host_start=$(date +%s)
     docker run --rm \
         --network="$DOCKER_NETWORK" \
         -v "$temp_dir:/workspace" \
@@ -329,12 +334,20 @@ echo ''
         fi
     else
         log_error "  Test failed or timed out (exit $status); see $output_file"
+        if ! grep -q "^✗ " "$output_file"; then
+            printf '✗ %s installation failed after %ss\n' "$test_name" "$(( $(date +%s) - host_start ))" >> "$output_file"
+        fi
     fi
 
     # Cleanup
     rm -rf "$temp_dir"
 
     return "$status"
+}
+
+# Run one test; a failure is counted (and recorded in its log) instead of aborting the run
+run_test() {
+    run_uv_install_test "$@" || FAILURES=$((FAILURES + 1))
 }
 
 # Function to run cold cache installation tests
@@ -356,11 +369,11 @@ run_cold_install_tests() {
 
             # Clear cache and test groxpi
             clear_cache
-            run_uv_install_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
+            run_test "$GROXPI_URL" "groxpi" "single-$package" "$package" "$results_dir" "cold"
 
             # Clear cache and test proxpi
             clear_cache
-            run_uv_install_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
+            run_test "$PROXPI_URL" "proxpi" "single-$package" "$package" "$results_dir" "cold"
 
             echo ""
         done
@@ -374,10 +387,10 @@ warm_up_cache() {
     log_info "Warming up caches with all test packages..."
 
     # Warm up groxpi cache
-    run_uv_install_test "$GROXPI_URL" "groxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
+    run_test "$GROXPI_URL" "groxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
 
     # Warm up proxpi cache
-    run_uv_install_test "$PROXPI_URL" "proxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
+    run_test "$PROXPI_URL" "proxpi" "warmup" "${TEST_PACKAGES[*]}" "$results_dir" "warmup"
 
     log_success "Cache warmup completed"
 }
@@ -402,8 +415,8 @@ run_warm_install_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing warm installation: $package"
 
-            run_uv_install_test "$GROXPI_URL" "groxpi" "warm-$package" "$package" "$results_dir" "warm"
-            run_uv_install_test "$PROXPI_URL" "proxpi" "warm-$package" "$package" "$results_dir" "warm"
+            run_test "$GROXPI_URL" "groxpi" "warm-$package" "$package" "$results_dir" "warm"
+            run_test "$PROXPI_URL" "proxpi" "warm-$package" "$package" "$results_dir" "warm"
 
             echo ""
         done
@@ -426,22 +439,22 @@ run_batch_install_tests() {
         # Test small package batch (fast packages)
         local small_packages="requests click fastapi"
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-small" "$small_packages" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-small" "$small_packages" "$results_dir" "cold"
 
         # Test mixed size batch
         local mixed_packages="numpy pandas polars"
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-mixed" "$mixed_packages" "$results_dir" "cold"
 
         # Test all packages batch
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "batch-all" "${TEST_PACKAGES[*]}" "$results_dir" "cold"
     fi
 }
 
@@ -460,15 +473,15 @@ run_large_package_tests() {
 
         # Test pyspark specifically (it's ~300MB)
         clear_cache
-        run_uv_install_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        run_test "$GROXPI_URL" "groxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         clear_cache
-        run_uv_install_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
+        run_test "$PROXPI_URL" "proxpi" "large-pyspark-cold" "pyspark" "$results_dir" "cold"
 
         # Test pyspark with warm cache
         log_info "Testing pyspark with warm cache..."
-        run_uv_install_test "$GROXPI_URL" "groxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
-        run_uv_install_test "$PROXPI_URL" "proxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
+        run_test "$GROXPI_URL" "groxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
+        run_test "$PROXPI_URL" "proxpi" "large-pyspark-warm" "pyspark" "$results_dir" "warm"
     fi
 }
 
@@ -659,6 +672,11 @@ main() {
     echo "End time: $end_time"
     echo "Results saved to: $results_dir"
     echo "Summary: $results_dir/uv-summary-${TIMESTAMP}.csv"
+
+    if [ "$FAILURES" -gt 0 ]; then
+        log_error "$FAILURES test run(s) failed; see the FALSE rows in the summary"
+        exit 1
+    fi
 
     log_success "UV installation testing completed successfully"
 }
