@@ -8,8 +8,10 @@ compare against until the suite is re-run.
 
 `benchmarks/` compares groxpi against the Python proxpi implementation on two things:
 
-- **Index API throughput and latency** (`scripts/wrk_api_test.sh`) — `wrk` against the index endpoints,
-  cold and warm.
+- **Index API throughput and latency** (`scripts/wrk_api_test.sh`) — single requests against an empty
+  cache, and a `wrk` load run against a warm one. There is no cold load run: only its first request
+  would miss. A load run that gets any non-2xx/3xx reply counts as failed, and its rate is left out of
+  the summary.
 - **End-to-end install time** (`scripts/uv_install_test.sh`) — `uv add` of real packages into a fresh
   project and virtualenv through each proxy, in a container.
 
@@ -27,7 +29,10 @@ Resource use is sampled alongside both (`scripts/monitor_resources.sh`), and
 
 ## Running it
 
-Bring the two proxies up (`benchmarks/docker/docker-compose.benchmark.yml` does this), then:
+`benchmark.sh` starts by running `docker compose up -d --build --wait` on the benchmark compose file, so
+groxpi is built from the current checkout as `groxpi:bench` (its own tag, apart from the
+`groxpi:latest` of the other compose files) and both proxies are running before anything is measured.
+Run it from the checkout you want to measure:
 
 ```bash
 ./benchmarks/benchmark.sh \
@@ -48,10 +53,10 @@ Both URLs are required. Options:
 | `-h`, `--help` | Usage. |
 
 `GROXPI_URL`, `PROXPI_URL` and `DOCKER_NETWORK` are read from the environment as defaults for the
-corresponding flags.
+corresponding flags; `BENCH_COMPOSE_FILE` names the compose file (see [Cache state](#cache-state)).
 
-Individual stages can be run directly. `scripts/wrk_api_test.sh` and `scripts/uv_install_test.sh` take
-positional arguments — `<groxpi_url> <proxpi_url> <timestamp> [scenario]` — and print their usage when
+Individual stages can be run directly; they build nothing, so bring the proxies up first.
+`scripts/wrk_api_test.sh` and `scripts/uv_install_test.sh` take positional arguments — `<groxpi_url> <proxpi_url> <timestamp> [scenario]` — and print their usage when
 called with none. They write to `RESULTS_DIR` from the environment (default `benchmarks/results`);
 `benchmark.sh` exports it from `--results-dir`. `scripts/analyze_results_duckdb.sh [timestamp]
 [results_dir]` reads one run's `resources-`, `wrk-summary-` and `uv-summary-<timestamp>.csv` — the
@@ -61,7 +66,8 @@ latest timestamp when none is given — and has a `--help`.
 
 A comparison is meaningless unless both proxies start from the same cache state.
 `scripts/cache_manager.sh` empties both caches before every cold measurement by recreating the
-containers: `docker compose rm -sfv groxpi-bench proxpi-bench`, then `docker compose up -d --wait`.
+containers: `docker compose rm -sfv groxpi-bench proxpi-bench`, then `docker compose up -d --wait`,
+which reuses the image built at the start of the run rather than rebuilding it.
 `docker-compose.benchmark.yml` gives each proxy an anonymous cache volume, which `rm -v` deletes; a named
 volume would survive it. The compose file is `benchmarks/docker/docker-compose.benchmark.yml` unless
 `BENCH_COMPOSE_FILE` names another, and the containers must be on the host running the suite, behind

@@ -50,7 +50,6 @@ show_usage() {
     echo "Test Scenarios:"
     echo "  all           - Run all test scenarios"
     echo "  cold-single   - Cold cache single request timing"
-    echo "  cold-load     - Cold cache load testing (/simple/numpy/)"
     echo "  warm-load     - Warm cache load testing"
     echo "  package-tests - Individual package testing"
     echo ""
@@ -143,19 +142,13 @@ run_single_request_test() {
 
     log_info "Single request test: $service - $test_name ($endpoint)"
 
-    # Record start time
-    local start_time=$(date +%s.%N)
-
-    # Make single request
+    # Make single request; curl times it, so no clock arithmetic here
     local response
     local http_code
     if response=$(curl -s -o /dev/null -w "HTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}" --max-time 30 "$url$endpoint" 2>&1); then
-        local end_time=$(date +%s.%N)
-
         # Extract metrics
         http_code=$(echo "$response" | grep -o 'HTTP_CODE:[0-9]*' | cut -d':' -f2)
         time_total=$(echo "$response" | grep -o 'TIME_TOTAL:[0-9.]*' | cut -d':' -f2)
-        duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
 
         # Write results
         {
@@ -168,7 +161,6 @@ run_single_request_test() {
             echo "Results:"
             echo "  HTTP Code: $http_code"
             echo "  Response Time: ${time_total}s"
-            echo "  Total Duration: ${duration}s"
             echo ""
         } > "$output_file"
 
@@ -205,6 +197,18 @@ run_wrk_load_test() {
            --timeout $WRK_TIMEOUT \
            --latency \
            "$url$endpoint" > "$output_file" 2>&1; then
+
+        # wrk counts every response as a request, so error replies would pass
+        # for throughput. Any non-2xx/3xx reply fails the measurement, and the
+        # log is renamed out of the summary CSV's glob so its rate is not reported.
+        local non_2xx
+        non_2xx=$(awk '/Non-2xx or 3xx responses:/ {print $NF; exit}' "$output_file")
+        if [ -n "$non_2xx" ]; then
+            local failed_file="${output_file%.log}.failed.log"
+            mv "$output_file" "$failed_file"
+            log_error "  Load test got $non_2xx non-2xx/3xx responses; see $failed_file"
+            return 1
+        fi
 
         # Extract key metrics
         local rps=$(grep "Requests/sec:" "$output_file" | awk '{print $2}' | head -1)
@@ -256,14 +260,8 @@ run_cold_cache_tests() {
         cold single "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
     fi
 
-    # No /simple/ load run: groxpi passes the root index through uncached, so it
-    # would measure pypi.org rather than either proxy.
-    if [ "$TEST_SCENARIO" = "cold-load" ] || [ "$TEST_SCENARIO" = "all" ]; then
-        log_info "Running cold cache load tests..."
-
-        cold load "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
-        cold load "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
-    fi
+    # No cold load run: only its first request would miss, so it would measure a
+    # warm cache under a cold name. cold-single covers the cold request.
 }
 
 # Function to warm up cache
@@ -298,7 +296,8 @@ run_warm_cache_tests() {
 
         log_info "Running warm cache load tests..."
 
-        # Test specific package with warm cache (no /simple/: see run_cold_cache_tests)
+        # Test specific package with warm cache. No /simple/ load run: groxpi
+        # passes the root index through uncached, so it would measure pypi.org.
         load "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-warm" "$results_dir"
         load "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-warm" "$results_dir"
     fi
@@ -454,9 +453,6 @@ main() {
     # Run tests based on scenario
     case "$TEST_SCENARIO" in
         cold-single)
-            run_cold_cache_tests "$results_dir"
-            ;;
-        cold-load)
             run_cold_cache_tests "$results_dir"
             ;;
         warm-load)

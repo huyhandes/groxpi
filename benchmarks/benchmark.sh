@@ -17,6 +17,9 @@ UV_ONLY=false
 RESOURCE_MONITORING=true
 DOCKER_NETWORK="${DOCKER_NETWORK:-benchmark-network}"
 RESULTS_DIR="$SCRIPT_DIR/results"
+# The compose file whose containers the suite measures (also read by
+# scripts/cache_manager.sh, which recreates them for every cold run)
+COMPOSE_FILE="${BENCH_COMPOSE_FILE:-$SCRIPT_DIR/docker/docker-compose.benchmark.yml}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,6 +58,8 @@ show_usage() {
     echo "  GROXPI_URL         Alternative way to specify groxpi URL"
     echo "  PROXPI_URL         Alternative way to specify proxpi URL"
     echo "  DOCKER_NETWORK     Docker network name"
+    echo "  BENCH_COMPOSE_FILE Compose file of the benchmarked containers"
+    echo "                     (default: docker/docker-compose.benchmark.yml)"
     echo ""
     echo "Examples:"
     echo "  $0 --groxpi-url http://server1:5005 --proxpi-url http://server2:5006"
@@ -140,6 +145,18 @@ parse_arguments() {
     # file of a run lands in the one directory.
     mkdir -p "$RESULTS_DIR"
     export RESULTS_DIR
+}
+
+# Build groxpi-bench from this checkout once per suite run, and recreate any
+# container whose image changed, so the run measures the current code rather
+# than whichever image was built last. Cold runs recreate without rebuilding.
+build_services() {
+    log_info "Building groxpi-bench and starting the benchmark services..."
+    if ! docker compose -f "$COMPOSE_FILE" up -d --build --wait groxpi-bench proxpi-bench; then
+        log_error "Building or starting the benchmark services failed ($COMPOSE_FILE)"
+        exit 1
+    fi
+    log_success "Benchmark services built and healthy"
 }
 
 # Function to validate environment and dependencies
@@ -303,7 +320,7 @@ EOF
         echo "" >> "$report_file"
 
         # Extract some key metrics for the report
-        echo "#### Key Metrics" >> "$report_file"
+        echo "#### Key Metrics (warm /simple/numpy/ load; cold runs are single requests)" >> "$report_file"
         echo "| Service | Test | Requests/sec | Avg Latency |" >> "$report_file"
         echo "|---------|------|-------------|-------------|" >> "$report_file"
 
@@ -430,7 +447,8 @@ main() {
     log_info "  Results Directory: $RESULTS_DIR"
     echo ""
 
-    # Validate environment
+    # Build the image under test, then validate environment
+    build_services
     validate_environment
 
     # Start resource monitoring; a monitor that fails to start does not stop the run

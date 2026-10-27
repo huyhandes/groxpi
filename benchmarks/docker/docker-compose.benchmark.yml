@@ -7,7 +7,10 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: groxpi:latest
+    # Its own tag, so the image built from this checkout is never confused with
+    # a groxpi:latest from the other compose files. benchmark.sh rebuilds it once
+    # at the start of a suite run; recreating for a cold run does not rebuild.
+    image: groxpi:bench
     container_name: groxpi-bench
     restart: unless-stopped
     ports:

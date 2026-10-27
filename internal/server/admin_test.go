@@ -148,8 +148,8 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 		"the poll sends the filter box and the table's cache generation")
 	assert.Contains(t, page, `<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch"`,
 		"the prefetch form posts without JavaScript too")
-	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText"`,
-		"the prefetch reply, error or not, is shown")
+	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText || 'Prefetch failed: ' + event.detail.xhr.status"`,
+		"the prefetch reply, error or not, is shown, and a failure with no body says so")
 	assert.Contains(t, page, `id="prefetch-status"`)
 	assert.Contains(t, page, `<form id="filter-form" class="controls" method="get" action="/admin">`,
 		"the no-JS GET form stays")

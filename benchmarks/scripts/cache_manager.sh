@@ -124,11 +124,11 @@ verify_cache_clear() {
         endpoint="/index/"
     fi
 
-    # Make a simple request to see if cache is cold
-    local start_time=$(date +%s%N)
-    if curl -sf --connect-timeout 10 --max-time $TIMEOUT "$url$endpoint" >/dev/null 2>&1; then
-        local end_time=$(date +%s%N)
-        local duration_ms=$(( (end_time - start_time) / 1000000 ))
+    # Make a simple request to see if cache is cold. curl times it: BSD date
+    # has no %N, so clock arithmetic would break on macOS.
+    local time_total duration_ms
+    if time_total=$(curl -sf -o /dev/null -w '%{time_total}' --connect-timeout 10 --max-time $TIMEOUT "$url$endpoint" 2>/dev/null); then
+        duration_ms=$(awk -v t="$time_total" 'BEGIN { printf "%d", t * 1000 }')
 
         log_info "$name responded to index request in ${duration_ms}ms"
         if [ $duration_ms -gt 100 ]; then
@@ -214,9 +214,15 @@ main() {
             verify_cache_clear "$PROXPI_URL" "proxpi"
             ;;
 
-        clear-all|*)
+        clear-all)
             # No verification request afterwards: it would warm the caches just emptied.
             recreate_services "$GROXPI_SERVICE" "$PROXPI_SERVICE"
+            ;;
+
+        *)
+            log_error "Unknown operation: $OPERATION"
+            show_usage
+            exit 1
             ;;
     esac
 

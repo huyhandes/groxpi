@@ -11,6 +11,11 @@ TIMESTAMP="${1:-}"
 RESULTS_DIR="${2:-${RESULTS_DIR:-$(dirname "$0")/../results}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# uv_install_test.sh leaves these fields empty when it cannot measure them. A
+# column that is empty in every row would be sniffed as VARCHAR and break AVG
+# and arithmetic, so their types are given rather than detected.
+UV_TYPES="{'installed_size_mb': 'DOUBLE', 'dependency_count': 'BIGINT'}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -242,7 +247,7 @@ analyze_installation_performance() {
         ROUND(MAX(install_time_seconds), 2) as max_install_time_sec,
         COUNT(*) as successful_installs,
         ROUND(AVG(installed_size_mb), 1) as avg_size_mb
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE install_success = true AND test_type = 'individual'
     GROUP BY service, package, cache_mode
     ORDER BY service, package, cache_mode;
@@ -256,7 +261,7 @@ analyze_installation_performance() {
             package,
             cache_mode,
             AVG(install_time_seconds) as avg_time
-        FROM read_csv('$uv_file', header=true)
+        FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
         WHERE install_success = true AND test_type = 'individual'
         AND cache_mode IN ('cold', 'warm')
         GROUP BY service, package, cache_mode
@@ -291,7 +296,7 @@ analyze_installation_performance() {
         ROUND(AVG(install_time_seconds), 2) as avg_install_time_sec,
         ROUND(AVG(dependency_count), 0) as avg_dependencies,
         ROUND(AVG(install_time_seconds) / NULLIF(AVG(installed_size_mb), 0), 4) as sec_per_mb
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE install_success = true
     AND installed_size_mb IS NOT NULL
     AND installed_size_mb > 0
@@ -310,7 +315,7 @@ analyze_installation_performance() {
         ROUND(installed_size_mb, 1) as total_size_mb,
         dependency_count as total_dependencies,
         ROUND(installed_size_mb / install_time_seconds, 2) as mb_per_second
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE test_type = 'batch' AND install_success = true
     ORDER BY service, mb_per_second DESC;
     " "Batch Installation Efficiency"
@@ -324,7 +329,7 @@ analyze_installation_performance() {
         COUNT(*) as total_attempts,
         SUM(CASE WHEN install_success THEN 1 ELSE 0 END) as successful_installs,
         ROUND((SUM(CASE WHEN install_success THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 1) as success_rate_percent
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     GROUP BY service, cache_mode, test_type
     ORDER BY service, cache_mode, test_type;
     " "Installation Success Rates"
@@ -389,7 +394,7 @@ generate_executive_summary() {
             SELECT
                 service,
                 ROUND(AVG(install_time_seconds), 1) as avg_time
-            FROM read_csv('$uv_file', header=true)
+            FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
             WHERE install_success = true AND test_type = 'individual' AND cache_mode = 'cold'
             GROUP BY service
         )
@@ -404,7 +409,7 @@ generate_executive_summary() {
             SELECT
                 service,
                 ROUND((SUM(CASE WHEN install_success THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 1) as success_rate
-            FROM read_csv('$uv_file', header=true)
+            FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
             GROUP BY service
         )
         SELECT '✅ ' || service || ' success rate: ' || success_rate || '%' as summary
