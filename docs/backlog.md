@@ -165,6 +165,18 @@ that proves it. Delete an entry when it ships.
   a stable meaning; drop the tag from the other workflow.
 - **Check:** `git grep -n 'value=latest' .github/workflows` returns exactly one line.
 
+### The MinIO compose files reference images that no longer exist
+
+- **Where:** `docker-compose.minio.yml` and `docker-compose.test.yml` (`minio/minio:latest`,
+  `minio/mc:latest`).
+- **What:** MinIO no longer publishes public images: both are gone from Docker Hub and
+  `quay.io/minio/minio` refuses anonymous pulls, so neither compose file starts. (The CI `minio` job
+  builds the server from a pinned release tag instead.)
+- **Fix:** switch to an S3-compatible server with a public registry image, or build MinIO from a
+  pinned release tag in a Dockerfile stage; create the bucket without `minio/mc`.
+- **Check:** `docker compose -f docker-compose.minio.yml up` starts and groxpi passes its HeadBucket
+  check.
+
 ## Test gaps
 
 - A cache commit failure in `hybrid` still uploads the verified spool to S3.
