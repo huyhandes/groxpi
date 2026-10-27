@@ -43,6 +43,18 @@ jobs:
           echo "Invalid version: $VERSION" >&2
           exit 1
         fi
+        # A re-push to release-X.Y.Z must not republish X.Y.Z from another
+        # commit. No checkout in this job, so ask the remote by URL.
+        # ls-remote --exit-code: 0 = tag found, 2 = not found, else an error.
+        rc=0
+        git ls-remote --exit-code --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/v$VERSION" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          echo "Tag v$VERSION already exists: bump the version or delete the tag" >&2
+          exit 1
+        elif [ "$rc" -ne 2 ]; then
+          echo "Could not check for tag v$VERSION (git ls-remote exit $rc)" >&2
+          exit 1
+        fi
         echo "version=${VERSION}" >> $GITHUB_OUTPUT
         echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
         echo "Extracted version: ${VERSION}"

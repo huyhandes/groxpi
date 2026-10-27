@@ -185,7 +185,7 @@ connection setup, headers *and* body. Neither name means what it says:
 | `PORT` | `5000` | Listen port. groxpi always binds all interfaces. |
 | `GROXPI_LOGGING_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR`. |
 | `GROXPI_LOG_FORMAT` | `console` | `console` or `json`. |
-| `GROXPI_LOG_COLOR` | `true` | ANSI colour in `console` format. |
+| `GROXPI_LOG_COLOR` | `true` | ANSI colour in `console` format. The Docker image sets `false`. |
 
 ## Observability
 
