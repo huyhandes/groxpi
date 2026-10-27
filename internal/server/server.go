@@ -65,6 +65,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	mux.HandleFunc("GET /simple/{package}/{$}", s.handleListFiles)
 	mux.HandleFunc("GET /index/{$}", s.handleListPackages)
 	mux.HandleFunc("GET /index/{package}", s.handleListFiles)
+	mux.HandleFunc("GET /index/{package}/{$}", s.handleListFiles)
 	mux.HandleFunc("GET /simple/{package}/{file}", s.handleFile)
 	mux.HandleFunc("GET /index/{package}/{file}", s.handleFile)
 

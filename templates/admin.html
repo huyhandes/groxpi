@@ -29,7 +29,8 @@
 
 <!-- The filter is a plain GET: the listing is paged on the server, so the
      query has to reach admin.List to search every package, not just the rows
-     on screen. Submitting starts again at page 1. -->
+     on screen. Submitting starts again at page 1. With JavaScript, the poll
+     below also re-runs as the operator types, sending this box with it. -->
 <form class="controls" method="get" action="/admin">
   <input id="filter" name="q" type="search" value="{{.Query}}" placeholder="Filter packages…" autocomplete="off">
   <button type="submit">Filter</button>
@@ -38,7 +39,8 @@
 <!-- The table polls: prefetch has no progress bar, so files appearing here are
      the progress display. The first render is server-side, so the poll only
      needs to pick up changes. -->
-<div id="cache" hx-get="/admin/rows?page={{.Page}}{{if .Query}}&amp;q={{.Query}}{{end}}" hx-trigger="every 3s" hx-swap="innerHTML">
+<div id="cache" hx-get="/admin/rows?page={{.Page}}" hx-include="#filter"
+     hx-trigger="every 3s, input changed delay:300ms from:#filter, search from:#filter" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>
 </body>
