@@ -17,9 +17,9 @@ Any other value is logged as a warning and the default is kept.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Primary upstream index. |
-| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. |
+| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. `0` means the answer is not cached: it is re-fetched on every request. |
 | `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. |
-| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). |
+| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). `0` means that index's answer is not cached: it is re-fetched on every request. |
 | `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification on every upstream call: index pages, the root index and file downloads. |
 
 ### How extra indexes are resolved
