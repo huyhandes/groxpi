@@ -137,12 +137,13 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 
 	page := string(readBody(t, authGet(h.mux, "/admin?q=needle")))
 	assert.Contains(t, page, `value="needle"`, "the box shows the active filter")
-	// The poll reads the live filter form instead of a q and page baked into
+	// The table reads the live filter form instead of a q and page baked into
 	// its URL, so typing filters without a submit and htmx escapes the box.
-	assert.Contains(t, page, `hx-get="/admin/rows"`, "the poll URL carries no hand-built q or page")
-	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the poll sends the filter box and the page")
-	assert.Contains(t, page, `hx-trigger="every 3s [!document.hidden], input changed delay:300ms from:#filter, search from:#filter"`,
-		"typing in the box re-polls; a hidden tab does not")
+	assert.Contains(t, page, `hx-get="/admin/rows"`, "the table URL carries no hand-built q or page")
+	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the table sends the filter box and the page")
+	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
+		"typing in the box reloads the table")
+	assert.Contains(t, page, `hx-get="/admin/inflight" hx-include="#filter-form"`, "the poll sends the filter box")
 	assert.Contains(t, page, `<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch"`,
 		"the prefetch form posts without JavaScript too")
 	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText"`,
@@ -228,10 +229,41 @@ func TestAdminRows_FilterAppliesToDownloads(t *testing.T) {
 	t.Cleanup(func() { up.Release(); _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() })
 	require.Eventually(t, func() bool { return len(h.svc.InFlight()) == 1 }, 5*time.Second, time.Millisecond)
 
-	other := string(readBody(t, authGet(h.mux, "/admin/rows?q=other")))
+	other := string(readBody(t, authGet(h.mux, "/admin/inflight?q=other")))
 	assert.NotContains(t, other, `class="inflight"`, "a download for another package is filtered out")
-	match := string(readBody(t, authGet(h.mux, "/admin/rows?q=Slow_Pkg")))
+	match := string(readBody(t, authGet(h.mux, "/admin/inflight?q=Slow_Pkg")))
 	assert.Contains(t, match, `class="inflight" data-package="slow-pkg"`, "the filtered package's download stays")
+}
+
+// TestAdminInflight_PollSkipsCacheListing pins that the page's periodic poll is
+// the in-flight downloads only: it never lists cached packages, so it never
+// walks the cache. The package table reloads on a filter change, an explicit
+// refresh, or when the poll reports that a download it was showing finished.
+func TestAdminInflight_PollSkipsCacheListing(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	path := filepath.Join(h.cacheDir, "packages", "cached-pkg", "cached_pkg-1.0.tar.gz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+
+	resp := authGet(h.mux, "/admin/inflight")
+	poll := string(readBody(t, resp))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, poll, "cached-pkg", "the poll must not list cached packages")
+	assert.NotContains(t, poll, "package(s)")
+	assert.Empty(t, resp.Header.Get("HX-Trigger"), "nothing was showing, so nothing finished")
+
+	resp = authGet(h.mux, "/admin/inflight?shown=1")
+	_ = readBody(t, resp)
+	assert.Equal(t, "cache-changed", resp.Header.Get("HX-Trigger"),
+		"a download the page showed has finished, so the package table reloads")
+
+	page := string(readBody(t, authGet(h.mux, "/admin")))
+	assert.Contains(t, page, `hx-get="/admin/inflight"`)
+	assert.Contains(t, page, `hx-trigger="every 3s [!document.hidden]"`)
+	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
+		"the package table no longer polls")
+	assert.Contains(t, page, `data-package="cached-pkg"`, "the first render still lists the cache")
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +331,7 @@ func postPrefetchSite(router http.Handler, pkg, site string) *http.Response {
 	return do(router, req)
 }
 
-func TestAdminCrossSite_PrefetchRejectedAndHandlerDoesNotRun(t *testing.T) {
+func TestAdminCrossSite_PrefetchRejected(t *testing.T) {
 	up := newPyPIWith(t, "xsite", "xsite-1.0.0.tar.gz", testPayload(64))
 	router := newAdminServer(t, up.URL).mux
 

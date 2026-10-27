@@ -51,3 +51,19 @@ func TestEvictPackage_NothingCachedSucceeds(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Zero(t, up.FileHits("present-1.0.0.tar.gz"))
 }
+
+// TestEvictPackage_ListRouteEvictsPackageNamedList pins that the proxpi route
+// DELETE /cache/list does not shadow a package called "list": it evicts it.
+func TestEvictPackage_ListRouteEvictsPackageNamedList(t *testing.T) {
+	up := newPyPIWith(t, "list", "list-1.0.0.tar.gz", testPayload(2048))
+	router, cacheDir := newEvictionServer(t, up.URL)
+
+	_ = readBody(t, getFile(router, "list", "list-1.0.0.tar.gz"))
+	waitCached(t, cacheDir, "list", "list-1.0.0.tar.gz")
+
+	resp := deletePackage(router, "list")
+	assert.Equal(t, `{"status":"success","data":null}`, string(readBody(t, resp)))
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NoFileExists(t, cachedPath(cacheDir, "list", "list-1.0.0.tar.gz"),
+		"DELETE /cache/list must evict the package named list")
+}

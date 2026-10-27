@@ -157,6 +157,8 @@ type Package struct {
 	Age      string
 	Accessed string // most recent access across the package's files
 	Files    []File
+
+	created time.Time // earliest file's; what Age renders
 }
 
 // File is one cached file.
@@ -201,8 +203,12 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 		if pkg == nil {
 			// The snapshot is most recently accessed first, so the first file
 			// seen carries the package's last access.
-			pkg = &Package{Name: packageName, Age: humanAge(now, entry.CreatedAt), Accessed: humanAge(now, entry.Accessed)}
+			pkg = &Package{Name: packageName, Accessed: humanAge(now, entry.Accessed), created: entry.CreatedAt}
 			byName[packageName] = pkg
+		}
+		// The package is as old as its oldest file.
+		if !entry.CreatedAt.IsZero() && (pkg.created.IsZero() || entry.CreatedAt.Before(pkg.created)) {
+			pkg.created = entry.CreatedAt
 		}
 		pkg.Size += entry.Size
 		pkg.Files = append(pkg.Files, File{
@@ -216,6 +222,7 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 
 	view.Packages = make([]Package, 0, len(byName))
 	for _, pkg := range byName {
+		pkg.Age = humanAge(now, pkg.created)
 		sort.Slice(pkg.Files, func(i, j int) bool { return pkg.Files[i].Name < pkg.Files[j].Name })
 		view.Packages = append(view.Packages, *pkg)
 	}
@@ -243,6 +250,10 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 // NormalizeQuery is the form a filter is matched in: trimmed and folded the way
 // cached package names are (PEP 503), so "typing_ext" finds "typing-ext".
 func NormalizeQuery(q string) string { return index.NormalizeName(strings.TrimSpace(q)) }
+
+// Failures is the recent prefetch failures, newest first, without the cache
+// walk List does.
+func (s *Service) Failures() []Failure { return s.errors.list() }
 
 // InFlight lists the downloads running now, for the page's "Downloading now"
 // rows.

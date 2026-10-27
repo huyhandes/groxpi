@@ -58,8 +58,8 @@ latest timestamp when none is given — and has a `--help`.
 ## Cache state
 
 A comparison is meaningless unless both proxies start from the same cache state.
-`scripts/cache_manager.sh` clears them between runs. On groxpi `DELETE /cache/list` does nothing
-(the root index is proxied, not cached), so the script issues `DELETE /cache/<package>` for every
+`scripts/cache_manager.sh` clears them between runs. On groxpi `DELETE /cache/list` invalidates no list
+(the root index is proxied, not cached; it evicts only a package named `list`), so the script issues `DELETE /cache/<package>` for every
 package under test — `BENCH_PACKAGES`, a space-separated list defaulting to the scenarios' packages.
 proxpi gets `DELETE /cache/list` as well. Any failed groxpi eviction aborts the run.
 

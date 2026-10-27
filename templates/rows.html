@@ -1,4 +1,4 @@
-{{define "rows"}}
+{{define "inflight"}}
 {{if .Errors}}
 <div class="errors">
   <strong>Recent failures</strong>
@@ -28,7 +28,9 @@
   </table>
 </div>
 {{end}}
+{{end}}
 
+{{define "rows"}}
 <table>
   <thead>
     <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Last accessed</th><th></th></tr>
@@ -40,7 +42,8 @@
       <td class="num">{{bytes $pkg.Size}}</td>
       <td class="num muted">{{$pkg.Age}}</td>
       <td class="num">{{$pkg.Accessed}}</td>
-      <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none">Evict</button></td>
+      <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none"
+                  hx-on::after-request="htmx.trigger(document.body, 'cache-changed')">Evict</button></td>
     </tr>
     {{range $file := $pkg.Files}}
     <tr class="file" data-package="{{$pkg.Name}}">

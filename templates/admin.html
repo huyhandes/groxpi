@@ -35,22 +35,32 @@
 <!-- The filter is a plain GET: the listing is paged on the server, so the
      query has to reach admin.List to search every package, not just the rows
      on screen. A plain submit sends only q, so a new filter starts at page 1.
-     The page the poll keeps lives in the hidden field outside the form; with
-     JavaScript, typing resets it to 1, and the poll below re-runs as the
+     The page the table keeps lives in the hidden field outside the form; with
+     JavaScript, typing resets it to 1, and the table below reloads as the
      operator types, sending the form and that field with it. -->
 <form id="filter-form" class="controls" method="get" action="/admin">
   <input id="filter" name="q" type="search" value="{{.Filter}}" placeholder="Filter packages…" autocomplete="off"
          hx-on:input="document.getElementById('page').value = 1">
   <button type="submit">Filter</button>
+  <button type="button" hx-get="/admin/rows" hx-include="#filter-form, #page" hx-target="#cache">Refresh</button>
 </form>
 <input id="page" name="page" type="hidden" value="{{.Page}}">
 
-<!-- The table polls: prefetch has no progress bar, so files appearing here are
-     the progress display. The first render is server-side, so the poll only
-     needs to pick up changes, and a hidden tab skips it rather than re-walking
-     the cache every 3s for nobody. -->
+<!-- Only the in-flight downloads poll: prefetch has no progress bar, so they
+     are the progress display, and they are in memory. The poll says how many
+     download rows it shows; when one has finished the reply fires
+     cache-changed, and the package table reloads to show the file that
+     landed. A hidden tab skips the poll. -->
+<div id="inflight" hx-get="/admin/inflight" hx-include="#filter-form"
+     hx-vals='js:{shown: document.querySelectorAll("#inflight tr.inflight").length}'
+     hx-trigger="every 3s [!document.hidden]" hx-swap="innerHTML">
+{{template "inflight" .}}
+</div>
+
+<!-- The package table walks the cache, so it never polls: it reloads on a
+     filter change, the Refresh button, an eviction, or a finished download. -->
 <div id="cache" hx-get="/admin/rows" hx-include="#filter-form, #page"
-     hx-trigger="every 3s [!document.hidden], input changed delay:300ms from:#filter, search from:#filter" hx-swap="innerHTML">
+     hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>
 </body>

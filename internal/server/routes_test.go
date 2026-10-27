@@ -141,6 +141,7 @@ var adminPaths = []struct {
 }{
 	{http.MethodGet, "/admin"},
 	{http.MethodGet, "/admin/rows"},
+	{http.MethodGet, "/admin/inflight"},
 	{http.MethodGet, "/admin/htmx.min.js"},
 	{http.MethodPost, "/admin/prefetch"},
 	{http.MethodDelete, "/cache/list"},
