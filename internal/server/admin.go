@@ -149,12 +149,13 @@ func (s *Server) handleAdminRows(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminInflight serves the fragment the page polls: in-flight downloads
 // and recent failures, both in memory, so the poll never walks the cache. The
-// page sends how many download rows it is showing; fewer now means one finished
-// and landed, so the response tells the page to reload the package table.
+// page sends the cache generation its package table was rendered at; a
+// different one now means a file landed or went, however briefly its download
+// was in flight, so the response tells the page to reload the package table.
 func (s *Server) handleAdminInflight(w http.ResponseWriter, r *http.Request) {
 	view := admin.View{Errors: s.admin.Failures(), Query: admin.NormalizeQuery(r.URL.Query().Get("q"))}
 	view.Downloading = s.inFlight(view.Query)
-	if shown, err := strconv.Atoi(r.URL.Query().Get("shown")); err == nil && shown > len(view.Downloading) {
+	if gen, err := strconv.ParseUint(r.URL.Query().Get("gen"), 10, 64); err == nil && gen != s.admin.Generation() {
 		w.Header().Set("HX-Trigger", "cache-changed")
 	}
 	s.render(w, r, "inflight", view)

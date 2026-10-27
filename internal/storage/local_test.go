@@ -206,6 +206,32 @@ func TestLocalStorage_EvictsOldestByAtime(t *testing.T) {
 	assertAccounted(t, s, 1000) // what is left on disk is what is counted
 }
 
+// TestStore_GenerationCountsSizeEviction pins that a size-driven eviction, which
+// runs inside the cache with no Store call around it, still changes the
+// generation the admin page polls, as does the commit that triggered it.
+func TestStore_GenerationCountsSizeEviction(t *testing.T) {
+	l, err := NewLocalStorage(t.TempDir(), 1000, 0)
+	require.NoError(t, err)
+	s := NewStore(l, nil, nil, "", false)
+	for _, k := range []string{"packages/a", "packages/b", "packages/c", "packages/d"} {
+		putN(t, l, k, 250)
+	}
+
+	gen := s.Generation()
+	key := "packages/e"
+	tmp, err := os.CreateTemp(filepath.Dir(l.buildPath(key)), tmpPrefix+"*")
+	require.NoError(t, err)
+	_, err = tmp.Write(bytes.Repeat([]byte("x"), 250))
+	require.NoError(t, errors.Join(err, tmp.Close()))
+	require.NoError(t, l.commit(tmp.Name(), key, 250))
+	committed := s.Generation()
+	assert.NotEqual(t, gen, committed, "a commit changes the generation")
+
+	l.maybeEvict(context.Background())
+	require.Len(t, l.Snapshot(), 3, "the eviction ran")
+	assert.NotEqual(t, committed, s.Generation(), "a size eviction changes the generation")
+}
+
 func TestLocalStorage_RestartPreservesRecency(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewLocalStorage(dir, 1000, 0)

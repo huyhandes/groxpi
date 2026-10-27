@@ -139,6 +139,7 @@ type View struct {
 	Total       int        // matching packages across every page
 	Query       string     // the normalized filter; empty lists everything
 	Filter      string     // the filter as typed, trimmed: what the box shows
+	Gen         uint64     // the cache generation the listing was taken at
 
 	// Page is 1-based; PrevPage and NextPage are 0 when there is no such page.
 	Page, PrevPage, NextPage int
@@ -189,7 +190,9 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 	now := time.Now()
 	filter := strings.TrimSpace(query)
 	query = NormalizeQuery(filter)
-	view := View{Errors: s.errors.list(), Page: page, Query: query, Filter: filter}
+	// The generation is read before the walk, so a change during it shows as
+	// newer on the next poll rather than being lost.
+	view := View{Errors: s.errors.list(), Page: page, Query: query, Filter: filter, Gen: s.store.Generation()}
 
 	// The listing is the cache's own walk; the durable store is never listed.
 	byName := make(map[string]*Package)
@@ -250,6 +253,10 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 // NormalizeQuery is the form a filter is matched in: trimmed and folded the way
 // cached package names are (PEP 503), so "typing_ext" finds "typing-ext".
 func NormalizeQuery(q string) string { return index.NormalizeName(strings.TrimSpace(q)) }
+
+// Generation is the cache generation: it changes whenever a file lands in or
+// leaves the cache, so a listing taken at an older one is stale.
+func (s *Service) Generation() uint64 { return s.store.Generation() }
 
 // Failures is the recent prefetch failures, newest first, without the cache
 // walk List does.

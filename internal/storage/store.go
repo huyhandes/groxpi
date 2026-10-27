@@ -353,9 +353,10 @@ func (s *Store) drop(f *flight, committed bool) {
 	if committed {
 		s.commits[s.commitSlot(f.key)]++
 	}
-	n := len(s.flights)
+	// Recorded under mu, like the register in Open: two drops recording after
+	// unlocking could land out of order and leave the gauge stuck above zero.
+	telemetry.DownloadsInFlight(context.Background(), int64(len(s.flights)))
 	s.mu.Unlock()
-	telemetry.DownloadsInFlight(context.Background(), int64(n))
 }
 
 // lookup finds a stored object. In hybrid mode a cache miss with a durable hit
@@ -683,6 +684,18 @@ func (s *Store) InFlight() []Progress {
 	s.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Started.Before(out[j].Started) })
 	return out
+}
+
+// Generation changes whenever a file lands in or leaves the cache, by
+// download, promotion, eviction or TTL, so a caller holding an older value
+// knows Snapshot would list something else. With no cache (pure s3) it is
+// always 0, as Snapshot is always empty. Read it before Snapshot: a change
+// during the walk then shows as a newer value next time.
+func (s *Store) Generation() uint64 {
+	if s.cache == nil {
+		return 0
+	}
+	return s.cache.generation.Load()
 }
 
 // Snapshot lists every file in the cache, most recently accessed first, for the
