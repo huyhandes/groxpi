@@ -96,11 +96,8 @@ func handleCacheList(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleCachePackage(w http.ResponseWriter, r *http.Request) {
+	// The mux never matches an empty {package}, so there is no empty-name case.
 	packageName := r.PathValue("package")
-	if packageName == "" {
-		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Package name required"}`)
-		return
-	}
 	err := s.admin.Evict(r.Context(), packageName)
 	if errors.Is(err, storage.ErrInvalidKey) {
 		writeStatus(w, http.StatusBadRequest, `{"status":"error","message":"Invalid package name"}`)

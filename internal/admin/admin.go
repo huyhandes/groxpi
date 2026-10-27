@@ -238,9 +238,9 @@ func (s *Service) List(_ context.Context, page int, query string) View {
 	return view
 }
 
-// NormalizeQuery is the form a filter is matched in: trimmed and lower-cased,
-// as cached package names are.
-func NormalizeQuery(q string) string { return strings.ToLower(strings.TrimSpace(q)) }
+// NormalizeQuery is the form a filter is matched in: trimmed and folded the way
+// cached package names are (PEP 503), so "typing_ext" finds "typing-ext".
+func NormalizeQuery(q string) string { return index.NormalizeName(strings.TrimSpace(q)) }
 
 // InFlight lists the downloads running now, for the page's "Downloading now"
 // rows.

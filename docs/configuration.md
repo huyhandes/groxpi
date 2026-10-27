@@ -3,7 +3,11 @@
 groxpi is configured entirely through environment variables. Every setting below exists in
 `internal/config/config.go`; nothing else is read.
 
-Durations are in **seconds**. The timeout settings accept a decimal fraction; the others are integers.
+Every duration setting accepts either a Go duration string — a number with a unit suffix (`ns`, `us`,
+`ms`, `s`, `m`, `h`), combinable as in `1h30m` or `1.5h` — or a bare number of seconds, fractions
+allowed (`300`, `2.5`), which is proxpi's spelling. A negative value, `NaN`, `Inf`, a value too large for
+a Go duration (about 292 years) or anything else unparseable is logged as a warning and the default is
+kept.
 
 Booleans accept `1`, `true`, `yes`, `on` for true and `0`, `false`, `no`, `off` for false, in any case.
 Any other value is logged as a warning and the default is kept.
@@ -207,11 +211,12 @@ be updated.
 
 ## Settings inherited from Python proxpi
 
-groxpi reads the same variable names as proxpi where the setting still exists: `GROXPI_INDEX_URL`,
-`GROXPI_INDEX_TTL`, `GROXPI_EXTRA_INDEX_URLS`, `GROXPI_EXTRA_INDEX_TTLS`, `GROXPI_CACHE_SIZE`,
-`GROXPI_CACHE_DIR`, `GROXPI_DOWNLOAD_TIMEOUT`, `GROXPI_CONNECT_TIMEOUT`, `GROXPI_READ_TIMEOUT`,
-`GROXPI_LOGGING_LEVEL`, `GROXPI_DISABLE_INDEX_SSL_VERIFICATION`. `PROXPI_`-prefixed spellings are not
-read.
+proxpi's `PROXPI_*` variables are **not read**. Each setting proxpi had that still exists keeps its
+suffix under the `GROXPI_` prefix — rename `PROXPI_INDEX_URL` to `GROXPI_INDEX_URL` and so on:
+`GROXPI_INDEX_URL`, `GROXPI_INDEX_TTL`, `GROXPI_EXTRA_INDEX_URLS`, `GROXPI_EXTRA_INDEX_TTLS`,
+`GROXPI_CACHE_SIZE`, `GROXPI_CACHE_DIR`, `GROXPI_DOWNLOAD_TIMEOUT`, `GROXPI_CONNECT_TIMEOUT`,
+`GROXPI_READ_TIMEOUT`, `GROXPI_LOGGING_LEVEL`, `GROXPI_DISABLE_INDEX_SSL_VERIFICATION`. A deployment
+that still sets only the `PROXPI_*` names runs on defaults.
 
 `GROXPI_BINARY_FILE_MIME_TYPE` does not exist. A package file's content type comes from its filename
 extension.

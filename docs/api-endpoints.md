@@ -10,7 +10,8 @@ Every route groxpi registers, and nothing else.
 | `GET` | `/simple/<package>/<file>` | — | Download one distribution file. |
 | `GET` | `/simple/<package>/<file>.metadata` | — | PEP 658 core metadata for one distribution, when the index advertises it. |
 | `GET` | `/index/` | — | Alias of `/simple/`. |
-| `GET` | `/index/<package>` | — | Alias of `/simple/<package>/` (note: no trailing slash). |
+| `GET` | `/index/<package>/` | — | Alias of `/simple/<package>/`; what pip requests under an `/index/` index URL. |
+| `GET` | `/index/<package>` | — | Also an alias of `/simple/<package>/`: no redirect, unlike `/simple/<package>`. |
 | `GET` | `/index/<package>/<file>` | — | Alias of `/simple/<package>/<file>`. |
 | `GET` | `/health` | — | Liveness and configuration echo. |
 | `GET` | `/admin` | basic | Cache administration page. |
@@ -60,10 +61,15 @@ before anything else happens. `Flask`, `flask` and `FLASK` are one cache entry.
 
 ## The root index
 
-`GET /simple/` is a byte-level pass-through. The client's `Accept` and `Accept-Encoding` are forwarded
-upstream and the body is returned undecoded, with the upstream status, `Content-Type` and
-`Content-Encoding`. `?format=` overrides `Accept` here too, and the response carries
-`Vary: Accept, Accept-Encoding`.
+`GET /simple/` is a byte-level pass-through of one of four upstream representations. The client's
+headers are not forwarded verbatim; they are normalised first:
+
+- `Accept` becomes `application/vnd.pypi.simple.v1+json` when the request asks for JSON (by the same
+  `?format=` / `Accept` rule as a package page above), and `text/html` otherwise.
+- `Accept-Encoding` becomes `gzip` when the client's header contains `gzip`, and is not sent otherwise.
+
+The body is returned undecoded, with the upstream status, `Content-Type` and `Content-Encoding`, and the
+response carries `Vary: Accept, Accept-Encoding`.
 
 Nothing is cached: the full project list is tens of megabytes, and every representation a client can
 ask for is one the upstream already produces. Concurrent requests for the same representation are
@@ -182,10 +188,12 @@ download in progress — package, file, bytes so far against the declared size, 
 requests are coalesced onto it — and disappears when nothing is in flight. The page polls
 `GET /admin/rows` for updates. Both `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
 malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
-across pages, and the page's poll keeps the page it was rendered for. Both also accept `?q=` (trimmed,
-case-insensitive substring of the package name), applied to every cached package before paging and to the
-"Downloading now" rows; the page's filter box submits it and the poll and pager links keep it. The listing shows the local cache only, so in pure `s3`
-mode, which has no cache, the table is empty.
+across pages, and the page's poll keeps the page it was rendered for. Both also accept `?q=`, a substring
+of the package name, trimmed and normalised like a package name (so `Typing_Ext` matches `typing-ext`),
+applied to every cached package before paging and to the "Downloading now" rows. The page's filter box
+sends it with every poll, re-polling as the operator types; without JavaScript, submitting the box
+reloads the page with it. The pager links keep it. The listing shows the local cache only, so in pure
+`s3` mode, which has no cache, the table is empty.
 
 ### `POST /admin/prefetch`
 
@@ -212,7 +220,7 @@ cached, so there is no cached list to invalidate. The route exists so Python-pro
 ### `DELETE /cache/<package>`
 
 Drops the package's index cache entry **and deletes its cached files**. Answers
-`{"status":"success","data":null}`, `400` for an empty package name, `400`
+`{"status":"success","data":null}`, `400`
 (`{"status":"error","message":"Invalid package name"}`) for a name that is not a single path segment
 (containing `/`, `\` or NUL, or starting with `.`, after normalisation), in which case nothing is
 deleted and the index entry is kept, or `500` if the deletion failed.
@@ -239,7 +247,7 @@ the package back from S3. In pure `s3` mode the objects under the package's pref
 | `403` | An admin route reached with a `Sec-Fetch-Site` header reporting a cross-site request. |
 | `404` | Unknown path, unknown package, unknown file, or an admin route that is not configured. On a file route (`/simple/<package>/<file>`, `/index/<package>/<file>`) also any index resolution failure, absence or not (`Package not found`). |
 | `405` | Known path reached with the wrong method — the response carries `Allow`. |
-| `500` | On a package index route (`/simple/<package>/`, `/index/<package>`), index resolution failed for a reason other than absence (including an index body over the 64 MiB cap); or a storage operation failed. |
+| `500` | On a package index route (`/simple/<package>/`, `/index/<package>/`, `/index/<package>`), index resolution failed for a reason other than absence (including an index body over the 64 MiB cap); or a storage operation failed. |
 | `502` | The upstream root index could not be fetched, or exceeded the 256 MiB cap; or a file to redirect has an upstream URL that does not parse. |
 | `503` | A prefetch was submitted after shutdown had begun. |
 

@@ -279,11 +279,6 @@ func Load() (*Config, error) {
 
 	// Validate S3 configuration if S3 or hybrid storage is selected
 	if cfg.StorageType == "s3" || cfg.StorageType == "hybrid" {
-		// Set S3 endpoint to AWS default if not specified
-		if cfg.S3Endpoint == "" {
-			cfg.S3Endpoint = "s3.amazonaws.com"
-		}
-
 		// Only the bucket is required. Credentials are deliberately not
 		// checked: with none configured the AWS default chain takes over, which
 		// is how instance, task and web-identity roles work.
@@ -347,13 +342,15 @@ func parseDuration(key, value string, defaultValue time.Duration) time.Duration 
 	d, err := time.ParseDuration(value)
 	if err != nil {
 		seconds, floatErr := strconv.ParseFloat(value, 64)
+		nanos := seconds * float64(time.Second)
 		// NaN, ±Inf and anything past ~292 years do not fit a time.Duration;
 		// converting them would wrap or be implementation-defined.
-		if floatErr != nil || math.IsNaN(seconds) || math.Abs(seconds) > math.MaxInt64/1e9 {
+		// float64(math.MaxInt64) is exactly 2^63, the first value out of range.
+		if floatErr != nil || math.IsNaN(nanos) || math.Abs(nanos) >= float64(math.MaxInt64) {
 			invalidEnv(key, value, defaultValue)
 			return defaultValue
 		}
-		d = time.Duration(seconds * float64(time.Second))
+		d = time.Duration(nanos)
 	}
 	if d < 0 {
 		invalidEnv(key, value, defaultValue)

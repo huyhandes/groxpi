@@ -86,8 +86,10 @@ nothing it does not.
 
 ## Migrating from Python proxpi
 
-The URLs are the same, so clients need no changes. Environment variables keep their names where the
-setting still exists; `PROXPI_`-prefixed spellings are not read. Two things changed behaviour:
+The URLs are the same, so clients need no changes. proxpi's `PROXPI_*` environment variables are not
+read: rename each to its `GROXPI_*` equivalent, listed in
+[docs/configuration.md](docs/configuration.md#settings-inherited-from-python-proxpi). Two things changed
+behaviour:
 
 - **Extra indexes now participate in resolution**, queried before the primary, first hit winning whole.
   A package that used to resolve to PyPI may now resolve to an extra index.

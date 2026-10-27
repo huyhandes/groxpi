@@ -492,6 +492,12 @@ func characterizeIndex(t *testing.T, e *env) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
+	t.Run("package_index_alias_trailing_slash", func(t *testing.T) {
+		// pip appends the slash to every project URL under --index-url.
+		resp, body := p.get("/index/demo/")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, wantPkgHTML, string(body))
+	})
 	t.Run("package_name_normalized", func(t *testing.T) {
 		resp, body := p.get("/simple/Demo/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
