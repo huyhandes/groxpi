@@ -47,12 +47,13 @@
 <input id="page" name="page" type="hidden" value="{{.Page}}">
 
 <!-- Only the in-flight downloads poll: prefetch has no progress bar, so they
-     are the progress display, and they are in memory. The poll says how many
-     download rows it shows; when one has finished the reply fires
-     cache-changed, and the package table reloads to show the file that
-     landed. A hidden tab skips the poll. -->
-<div id="inflight" hx-get="/admin/inflight" hx-include="#filter-form"
-     hx-vals='js:{shown: document.querySelectorAll("#inflight tr.inflight").length}'
+     are the progress display, and they are in memory. The poll sends the
+     cache generation the package table was rendered at (#gen, inside it);
+     when a file has landed or gone since, the reply fires cache-changed and
+     the table reloads, carrying the new generation. A filter change reloads
+     the table without changing the generation, so it causes no second
+     reload. A hidden tab skips the poll. -->
+<div id="inflight" hx-get="/admin/inflight" hx-include="#filter-form, #gen"
      hx-trigger="every 3s [!document.hidden]" hx-swap="innerHTML">
 {{template "inflight" .}}
 </div>

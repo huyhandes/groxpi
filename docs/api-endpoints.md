@@ -191,8 +191,11 @@ requests are coalesced onto it — and disappears when nothing is in flight.
 
 Only the in-flight section polls: every 3s while the tab is visible the page fetches
 `GET /admin/inflight`, which renders the downloads and failures from memory and never walks the cache.
-The page sends `?shown=N`, the number of download rows it is showing; when fewer are in flight now, a
-download has finished and the reply carries `HX-Trigger: cache-changed`. The package table,
+The page sends `?gen=N`, the cache generation its package table was rendered at (the table carries it
+as a hidden `gen` field). The generation changes whenever a file lands in or leaves the local cache —
+a finished download or promotion, an eviction, a size or TTL eviction — so when the poll's `gen`
+differs from the current one the reply carries `HX-Trigger: cache-changed`, even for a download that
+started and finished between two polls. A missing or malformed `gen` triggers nothing. The package table,
 `GET /admin/rows`, walks the cache, so it reloads only on that event, a filter change, the Refresh
 button, or an eviction from the page.
 

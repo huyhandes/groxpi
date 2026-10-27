@@ -60,6 +60,10 @@ type LocalStorage struct {
 	size   atomic.Int64
 	walkMu sync.Mutex // one eviction walk at a time
 
+	// generation changes whenever a file lands or goes: commit and remove are
+	// the only two paths that change what Snapshot lists, the TTL sweep included.
+	generation atomic.Uint64
+
 	stopSweep context.CancelFunc // nil when no TTL sweeper runs
 	sweeper   sync.WaitGroup
 }
@@ -228,6 +232,7 @@ func (l *LocalStorage) remove(key string, size int64) error {
 		return err
 	}
 	l.size.Add(-size)
+	l.generation.Add(1)
 	return nil
 }
 
@@ -357,6 +362,7 @@ func (l *LocalStorage) commit(tmpPath, key string, written int64) error {
 		return fmt.Errorf("failed to move file: %w", err)
 	}
 	l.size.Add(written - replaced)
+	l.generation.Add(1)
 	return nil
 }
 

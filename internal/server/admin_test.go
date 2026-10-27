@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -143,7 +144,8 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the table sends the filter box and the page")
 	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
 		"typing in the box reloads the table")
-	assert.Contains(t, page, `hx-get="/admin/inflight" hx-include="#filter-form"`, "the poll sends the filter box")
+	assert.Contains(t, page, `hx-get="/admin/inflight" hx-include="#filter-form, #gen"`,
+		"the poll sends the filter box and the table's cache generation")
 	assert.Contains(t, page, `<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch"`,
 		"the prefetch form posts without JavaScript too")
 	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText"`,
@@ -238,7 +240,7 @@ func TestAdminRows_FilterAppliesToDownloads(t *testing.T) {
 // TestAdminInflight_PollSkipsCacheListing pins that the page's periodic poll is
 // the in-flight downloads only: it never lists cached packages, so it never
 // walks the cache. The package table reloads on a filter change, an explicit
-// refresh, or when the poll reports that a download it was showing finished.
+// refresh, or when the poll reports the cache generation changed.
 func TestAdminInflight_PollSkipsCacheListing(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	h := newAdminServer(t, up.URL)
@@ -251,12 +253,7 @@ func TestAdminInflight_PollSkipsCacheListing(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.NotContains(t, poll, "cached-pkg", "the poll must not list cached packages")
 	assert.NotContains(t, poll, "package(s)")
-	assert.Empty(t, resp.Header.Get("HX-Trigger"), "nothing was showing, so nothing finished")
-
-	resp = authGet(h.mux, "/admin/inflight?shown=1")
-	_ = readBody(t, resp)
-	assert.Equal(t, "cache-changed", resp.Header.Get("HX-Trigger"),
-		"a download the page showed has finished, so the package table reloads")
+	assert.Empty(t, resp.Header.Get("HX-Trigger"), "a poll without a generation triggers nothing")
 
 	page := string(readBody(t, authGet(h.mux, "/admin")))
 	assert.Contains(t, page, `hx-get="/admin/inflight"`)
@@ -264,6 +261,54 @@ func TestAdminInflight_PollSkipsCacheListing(t *testing.T) {
 	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
 		"the package table no longer polls")
 	assert.Contains(t, page, `data-package="cached-pkg"`, "the first render still lists the cache")
+}
+
+var genInput = regexp.MustCompile(`<input id="gen" name="gen" type="hidden" value="(\d+)">`)
+
+// cacheGen is the cache generation a rows render carries for the poll to send.
+func cacheGen(t *testing.T, router http.Handler) string {
+	t.Helper()
+	m := genInput.FindStringSubmatch(string(readBody(t, authGet(router, "/admin/rows"))))
+	require.NotNil(t, m, "the package table carries the cache generation")
+	return m[1]
+}
+
+func pollTrigger(t *testing.T, router http.Handler, gen string) string {
+	t.Helper()
+	resp := authGet(router, "/admin/inflight?gen="+gen)
+	_ = readBody(t, resp)
+	return resp.Header.Get("HX-Trigger")
+}
+
+// TestAdminInflight_CacheGenerationTriggersReload pins that the poll compares
+// the cache generation the table was rendered at, not a row count: a download
+// that starts and finishes between two polls, or an eviction, still reloads the
+// table, and a poll at the current generation does not.
+func TestAdminInflight_CacheGenerationTriggersReload(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+
+	gen0 := cacheGen(t, h.mux)
+	assert.Empty(t, pollTrigger(t, h.mux, gen0), "nothing changed")
+
+	_ = readBody(t, getFile(h.mux, "pkg", "pkg-1.0.0.tar.gz"))
+	waitCached(t, h.cacheDir, "pkg", "pkg-1.0.0.tar.gz")
+	assert.Equal(t, "cache-changed", pollTrigger(t, h.mux, gen0),
+		"a download landed between polls, so the package table reloads")
+
+	gen1 := cacheGen(t, h.mux)
+	assert.NotEqual(t, gen0, gen1)
+	assert.Empty(t, pollTrigger(t, h.mux, gen1), "the table is current")
+	assert.Empty(t, pollTrigger(t, h.mux, gen1), "a repeated poll stays quiet")
+
+	req := httptest.NewRequest(http.MethodDelete, "/cache/pkg", nil)
+	req.SetBasicAuth(adminUser, adminPass)
+	resp := do(h.mux, req)
+	_ = readBody(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "cache-changed", pollTrigger(t, h.mux, gen1),
+		"an eviction changes the cache, so the package table reloads")
+	assert.Empty(t, pollTrigger(t, h.mux, cacheGen(t, h.mux)))
 }
 
 // ---------------------------------------------------------------------------
