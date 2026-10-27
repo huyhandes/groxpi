@@ -1216,3 +1216,157 @@ func TestStore_EvictDuringPromotionLookupIsNotUndone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "upstream bytes", string(cached), "the evicted bytes were not promoted back")
 }
+
+// TestStore_StalledS3LookupFallsBack pins that a lookup GET whose headers do not
+// arrive within the S3 header deadline is a miss: the file is fetched upstream
+// instead of the request waiting on S3.
+func TestStore_StalledS3LookupFallsBack(t *testing.T) {
+	for _, mode := range []string{"s3", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			remote, bucket := newFakeS3(t)
+			remote.getHeaderTimeout = 200 * time.Millisecond
+			bucket.seed(mustKey(t, "pkg", "pkg-1.0.tar.gz"), []byte("stale bytes"))
+			bucket.getHold, bucket.getHeld = make(chan struct{}), make(chan struct{})
+			t.Cleanup(func() { close(bucket.getHold) }) // before the server closes
+			var cache *LocalStorage
+			if mode == "hybrid" {
+				var err error
+				cache, err = NewLocalStorage(t.TempDir(), 0, 0)
+				require.NoError(t, err)
+			}
+			f := &fakeFetcher{body: []byte("upstream bytes")}
+			s := NewStore(cache, remote, f, t.TempDir(), false)
+
+			start := time.Now()
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.tar.gz")
+			require.NoError(t, err)
+			got, err := io.ReadAll(obj)
+			require.NoError(t, err)
+			_ = obj.Close()
+			assert.Less(t, time.Since(start), 3*time.Second, "the lookup gave up at its deadline")
+			assert.Equal(t, "upstream bytes", string(got))
+			assert.Equal(t, int64(1), f.calls.Load(), "the stalled lookup fell back to upstream")
+			require.NoError(t, s.Close())
+		})
+	}
+}
+
+// TestStore_ClientLeavingDuringS3LookupStopsTheWait pins that a lookup GET held
+// by S3 ends when its client leaves, and that nothing is fetched for it.
+func TestStore_ClientLeavingDuringS3LookupStopsTheWait(t *testing.T) {
+	remote, bucket := newFakeS3(t)
+	bucket.getHold, bucket.getHeld = make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(bucket.getHold) })
+	f := &fakeFetcher{body: []byte("upstream bytes")}
+	s := NewStore(nil, remote, f, t.TempDir(), false)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := s.Open(ctx, "pkg", "pkg-1.0.tar.gz")
+		errc <- err
+	}()
+	<-bucket.getHeld
+	cancel()
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Open still waiting on S3 after its client left")
+	}
+	require.NoError(t, s.Close())
+	assert.Zero(t, f.resolves.Load(), "nothing is fetched for a client that left")
+}
+
+// dropOnceS3 serves one object whose first GET sends Content-Length and half the
+// body, then drops the connection; every later GET is served whole (ranges
+// honoured).
+func dropOnceS3(t *testing.T, body []byte) *S3Storage {
+	t.Helper()
+	var dropped atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Count(r.URL.Path, "/") < 2 || r.Method == http.MethodPut {
+			return // bucket check or upload
+		}
+		if r.Method == http.MethodGet && dropped.CompareAndSwap(false, true) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			_, _ = w.Write(body[:len(body)/2])
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := NewS3Storage(&S3Config{Endpoint: srv.URL, AccessKeyID: "test", SecretAccessKey: "test",
+		Bucket: "b", ForcePathStyle: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = remote.Close() })
+	return remote
+}
+
+// TestStore_S3BodyDropIsResumed pins that one connection drop mid-body does not
+// fail an S3 hit or a promotion: the read resumes at its offset.
+func TestStore_S3BodyDropIsResumed(t *testing.T) {
+	body := make([]byte, 3<<20+17)
+	for i := range body {
+		body[i] = byte(i * 13)
+	}
+	sum := sha256.Sum256(body)
+	for _, mode := range []string{"s3", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			remote := dropOnceS3(t, body)
+			var cache *LocalStorage
+			if mode == "hybrid" {
+				var err error
+				cache, err = NewLocalStorage(t.TempDir(), 0, 0)
+				require.NoError(t, err)
+			}
+			f := &fakeFetcher{err: errors.New("upstream must not be called")}
+			s := NewStore(cache, remote, f, t.TempDir(), false)
+
+			obj, err := s.Open(t.Context(), "pkg", "pkg-1.0.whl")
+			require.NoError(t, err)
+			got, err := io.ReadAll(obj)
+			require.NoError(t, err)
+			_ = obj.Close()
+			require.NoError(t, s.Close())
+			assert.Equal(t, sum, sha256.Sum256(got), "the full, correct bytes")
+			if cache != nil {
+				cached, err := os.ReadFile(cache.buildPath(mustKey(t, "pkg", "pkg-1.0.whl")))
+				require.NoError(t, err)
+				assert.Equal(t, sum, sha256.Sum256(cached), "the promotion cached the full bytes")
+			}
+			assert.Zero(t, f.calls.Load())
+		})
+	}
+}
+
+// failingReader returns its bytes, then err.
+type failingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (f *failingReader) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if err == io.EOF {
+		return n, f.err
+	}
+	return n, err
+}
+
+func TestRangedReader_SecondFailureInARowIsReturned(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 100)
+	boom := errors.New("connection reset")
+	opens := 0
+	r := &rangedReader{size: int64(len(data)),
+		body: io.NopCloser(&failingReader{r: bytes.NewReader(data[:10]), err: boom}),
+		open: func(int64, int64) (io.ReadCloser, error) {
+			opens++
+			return io.NopCloser(&failingReader{r: strings.NewReader(""), err: boom}), nil
+		}}
+	got, err := io.ReadAll(r)
+	require.ErrorIs(t, err, boom)
+	assert.Len(t, got, 10)
+	assert.Equal(t, 1, opens, "one reopen at the failed offset, then the error")
+}
