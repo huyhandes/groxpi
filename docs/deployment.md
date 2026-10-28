@@ -51,9 +51,17 @@ valid and is what the Kubernetes manifest below uses.
 docker compose up -d      # see docker-compose.yml
 ```
 
-`docker-compose.minio.yml` is meant to bring up MinIO alongside groxpi for exercising the S3 path
-locally, but it is currently broken: the MinIO images it references are no longer publicly pullable.
-See "The MinIO compose files reference images that no longer exist" in [backlog.md](backlog.md).
+`docker-compose.rustfs.yml` brings up [RustFS](https://github.com/rustfs/rustfs), an S3-compatible
+server, alongside groxpi in `s3` mode for exercising the S3 path locally. A one-shot `s3-init` service
+creates the bucket first, because groxpi only probes it:
+
+```bash
+docker compose -f docker-compose.rustfs.yml up -d --wait
+docker compose -f docker-compose.rustfs.yml down -v   # stop and drop the bucket volume
+```
+
+The RustFS console listens on port 9001; the credentials are the `rustfsadmin` defaults in the file,
+for local use only.
 
 ## Kubernetes
 

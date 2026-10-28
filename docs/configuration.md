@@ -109,7 +109,7 @@ The durable store only: every verified download is uploaded to the bucket and ne
 | `AWS_ACCESS_KEY_ID` | *(unset)* | Optional static access key. |
 | `AWS_SECRET_ACCESS_KEY` | *(unset)* | Optional static secret key. |
 | `GROXPI_S3_USE_SSL` | `true` | Use HTTPS when the endpoint carries no scheme. |
-| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. Required for MinIO. |
+| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. Required for MinIO, and for RustFS unless it sets `RUSTFS_SERVER_DOMAINS`. |
 | `GROXPI_S3_ENABLE_HTTP2` | `true` | Allow HTTP/2 to the endpoint. |
 
 The backend is the official AWS SDK for Go v2. **Static credentials are not required**: with none
@@ -121,6 +121,7 @@ groxpi probes the bucket with `HeadBucket` at startup and refuses to start if it
 [deployment.md](deployment.md) for the IAM-role path and the permissions the bucket policy needs.
 
 For MinIO set `GROXPI_S3_FORCE_PATH_STYLE=true`: MinIO cannot resolve virtual-hosted bucket names.
+RustFS needs it too unless `RUSTFS_SERVER_DOMAINS` names its virtual-hosted domain.
 Checksum calculation and validation are configured as *when required* rather than always, because
 older MinIO releases reject the checksum trailers the SDK emits by default.
 
