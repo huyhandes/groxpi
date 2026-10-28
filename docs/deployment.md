@@ -60,7 +60,8 @@ docker compose -f docker-compose.rustfs.yml up -d --wait
 docker compose -f docker-compose.rustfs.yml down -v   # stop and drop the bucket volume
 ```
 
-The RustFS console listens on port 9001; the credentials are the `rustfsadmin` defaults in the file,
+groxpi is published on host port 5001 (macOS AirPlay Receiver holds 5000). The RustFS console
+listens on port 9001; the credentials are the `rustfsadmin` defaults in the file,
 for local use only.
 
 ## Kubernetes
