@@ -1,22 +1,21 @@
-# Docker Compose configuration for groxpi testing with MinIO
-# Usage: docker-compose -f docker-compose.test.yml up -d
+# Docker Compose configuration for groxpi testing with RustFS
+# Usage: docker compose -f docker-compose.test.yml up -d --wait
 
 services:
-  # MinIO S3-compatible storage for testing
-  minio-test:
-    image: minio/minio:latest
-    container_name: groxpi-minio-test
-    command: server /data --console-address ":9001"
+  # RustFS S3-compatible storage for testing (https://github.com/rustfs/rustfs)
+  s3-test:
+    image: rustfs/rustfs:1.0.4
+    container_name: groxpi-s3-test
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # Web Console
     volumes:
-      - minio_test_data:/data
+      - s3_test_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -24,23 +23,28 @@ services:
     networks:
       - test-network
 
-  # MinIO Client for test bucket initialization
-  minio-init:
-    image: minio/mc:latest
-    container_name: groxpi-minio-init
+  # One-shot test bucket creation (path-style; see docker-compose.rustfs.yml)
+  s3-test-init:
+    image: amazon/aws-cli:2.39.0
+    container_name: groxpi-s3-test-init
     depends_on:
-      minio-test:
+      s3-test:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://s3-test:9000
     entrypoint: >
-      /bin/sh -c "
-      mc alias set minio-test http://minio-test:9000 minioadmin minioadmin &&
-      mc mb -p minio-test/groxpi-test
+      /bin/sh -ec "
+      aws configure set default.s3.addressing_style path;
+      aws s3api head-bucket --bucket groxpi-test 2>/dev/null || aws s3 mb s3://groxpi-test
       "
     networks:
       - test-network
 
 volumes:
-  minio_test_data:
+  s3_test_data:
     driver: local
 
 networks:

@@ -21,7 +21,7 @@ services:
 
       # Storage Configuration (default: local)
       - GROXPI_STORAGE_TYPE=local
-      # Uncomment for S3/MinIO storage:
+      # Uncomment for S3 storage (docker-compose.rustfs.yml runs a local S3):
       # - GROXPI_STORAGE_TYPE=s3
       # - AWS_ACCESS_KEY_ID=YOUR-ACCESS-KEY-ID
       # - AWS_SECRET_ACCESS_KEY=YOUR-SECRET-ACCESS-KEY
