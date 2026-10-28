@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"github.com/huyhandes/groxpi/internal/config"
 )
 
 // S3Config holds S3 storage configuration
@@ -32,9 +34,20 @@ type S3Config struct {
 
 	// Performance tuning
 	ConnectTimeout time.Duration
-	RequestTimeout time.Duration
 	EnableHTTP2    bool // Enable HTTP/2 for better multiplexing (default: true)
 }
+
+// s3ResponseHeaderTimeout bounds how long S3 may take to start answering any
+// request, per attempt. It is deliberately not the download budget, which
+// bounds a package fetch from upstream. It is long because an upload's answer
+// may legitimately take that long; GETs are held to s3GetHeaderTimeout.
+const s3ResponseHeaderTimeout = 5 * time.Minute
+
+// s3GetHeaderTimeout bounds how long a GET waits for its response headers, the
+// SDK's retries included. A lookup that runs out of it is a miss, so a stalled
+// S3 falls back instead of holding the request. The body read after the
+// headers is not bound by it.
+const s3GetHeaderTimeout = 30 * time.Second
 
 // s3MaxConns bounds the single HTTP connection pool shared by every S3 operation.
 const s3MaxConns = 100
@@ -47,7 +60,7 @@ func newS3Transport(cfg *S3Config) *http.Transport {
 		MaxConnsPerHost:       s3MaxConns,
 		IdleConnTimeout:       90 * time.Second,
 		DisableCompression:    true, // S3 handles compression
-		ResponseHeaderTimeout: cfg.RequestTimeout,
+		ResponseHeaderTimeout: s3ResponseHeaderTimeout,
 		TLSHandshakeTimeout:   cfg.ConnectTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     cfg.EnableHTTP2,
@@ -60,10 +73,11 @@ func newS3Transport(cfg *S3Config) *http.Transport {
 
 // S3Storage is the durable store on an S3-compatible backend.
 type S3Storage struct {
-	client    *s3.Client
-	transport *http.Transport
-	bucket    string
-	prefix    string
+	client           *s3.Client
+	transport        *http.Transport
+	bucket           string
+	prefix           string
+	getHeaderTimeout time.Duration // s3GetHeaderTimeout; tests lower it
 }
 
 // endpointURL turns a bare host, or a host that already carries a scheme, into
@@ -84,12 +98,12 @@ func endpointURL(endpoint string, useSSL bool) string {
 // instance metadata, container credentials, web identity — unless a static key
 // pair is configured explicitly. Nothing here requires static keys, which is
 // what makes instance and task roles usable.
-func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
+func NewS3Storage(settings *S3Config) (*S3Storage, error) {
+	// Defaults go on a copy: the caller's config is not ours to rewrite.
+	c := *settings
+	cfg := &c
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 10 * time.Second
-	}
-	if cfg.RequestTimeout == 0 {
-		cfg.RequestTimeout = 5 * time.Minute
 	}
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
@@ -107,7 +121,8 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
-	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
+	staticCreds := cfg.AccessKeyID != "" && cfg.SecretAccessKey != ""
+	if staticCreds {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
 		))
@@ -138,17 +153,19 @@ func NewS3Storage(cfg *S3Config) (*S3Storage, error) {
 	}
 
 	slog.Info("S3 storage backend initialized",
-		"endpoint", cfg.Endpoint,
+		"endpoint", config.RedactURL(cfg.Endpoint),
 		"bucket", cfg.Bucket,
 		"prefix", cfg.Prefix,
 		"path_style", cfg.ForcePathStyle,
-		"static_credentials", cfg.AccessKeyID != "")
+		"static_credentials", staticCreds)
 
 	return &S3Storage{
 		client:    client,
 		transport: transport,
 		bucket:    cfg.Bucket,
 		prefix:    strings.TrimSuffix(cfg.Prefix, "/"),
+
+		getHeaderTimeout: s3GetHeaderTimeout,
 	}, nil
 }
 
@@ -197,12 +214,62 @@ func s3Error(err error, key string) error {
 	return fmt.Errorf("s3 operation on %s failed: %w", key, err)
 }
 
-// Get retrieves an object from S3.
+// errGetHeaderTimeout is why a GET whose headers took too long was abandoned.
+var errGetHeaderTimeout = errors.New("s3 response headers timed out")
+
+// getObject issues a GET whose header phase ends at s.getHeaderTimeout or when
+// ctx ends, whichever is first. The body does not depend on ctx: it is read
+// until the caller closes it, however long that takes.
+func (s *S3Storage) getObject(ctx context.Context, in *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	gctx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	timer := time.AfterFunc(s.getHeaderTimeout, func() { cancel(errGetHeaderTimeout) })
+	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	out, err := s.client.GetObject(gctx, in)
+
+	// A false Stop means its cancel ran or is about to: a body that arrived
+	// as it fired is dead or dying, so it is closed rather than returned.
+	var abandoned error
+	timerStopped, clientStopped := timer.Stop(), stop()
+	switch {
+	case !timerStopped:
+		abandoned = errGetHeaderTimeout
+	case !clientStopped:
+		abandoned = context.Cause(ctx)
+	}
+	if abandoned != nil {
+		if err == nil {
+			_ = out.Body.Close()
+		}
+		cancel(abandoned)
+		return nil, fmt.Errorf("GET abandoned: %w", abandoned)
+	}
+	if err != nil {
+		cancel(nil)
+		return nil, err
+	}
+	out.Body = cancelOnClose{out.Body, cancel}
+	return out, nil
+}
+
+// cancelOnClose releases a GET's context when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (c cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel(nil)
+	return err
+}
+
+// Get retrieves an object from S3. ctx bounds only the wait for the response
+// headers (as does s3GetHeaderTimeout); the body is read until it is closed.
 //
 // Reads are deliberately not deduplicated: an S3 reader can only be consumed
 // once, so concurrent callers each need their own.
 func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+	out, err := s.getObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.buildKey(key)),
 	})
@@ -220,9 +287,10 @@ func (s *S3Storage) Get(ctx context.Context, key string) (io.ReadCloser, *Object
 	return out.Body, info, nil
 }
 
-// getRange opens bytes off through end (inclusive) of an object's body.
+// getRange opens bytes off through end (inclusive) of an object's body, with
+// the header phase bounded as Get's is.
 func (s *S3Storage) getRange(ctx context.Context, key string, off, end int64) (io.ReadCloser, error) {
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+	out, err := s.getObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.buildKey(key)),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, end)),

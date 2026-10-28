@@ -6,27 +6,18 @@ that proves it. Delete an entry when it ships.
 
 ## Storage
 
-### Evicting a package can race an in-flight upload
-
-- **Where:** `internal/storage/store.go` — `Store.DeletePrefix` vs the upload at the end of `Store.fill`.
-- **What:** in `hybrid` or `s3` mode, an admin evict that runs while a download of the same package is
-  still uploading deletes the S3 objects, then the upload lands and recreates one. The next cache miss
-  promotes it back, so the evict is partly undone.
-- **Fix:** have `DeletePrefix` wait for (or cancel) flights whose key has the prefix before deleting,
-  or record an eviction generation that a finishing upload checks first.
-- **Check:** a store test that gates the fake S3 PUT, evicts mid-upload, releases the gate, and asserts
-  the bucket is empty.
-
 ### A file can be fetched and uploaded twice
 
-- **Where:** `internal/storage/store.go` — the `ponytail:` comment in `Store.Open`.
-- **What:** a leader that commits between another request's `lookup` and its lock on the flight map is
-  missed, so that request starts a second download. In `hybrid` and `s3` mode that is also a second
-  S3 upload. A cache commit failure, or the LRU evicting the file before a reader returns, causes the
-  same. The result is correct; the cost is one extra upstream fetch and PUT.
-- **Fix:** re-run `lookup` under the flight-map lock (or right after taking it) before starting a
-  leader.
-- **Check:** a test that forces the interleaving and counts fetcher calls and bucket PUTs (both 1).
+- **Where:** `internal/storage/store.go` — `Store.commitHybrid`.
+- **What:** a request that missed a flight committing just before it leads re-checks once and serves
+  the commit. One window remains in `hybrid` mode: the flight unregisters after the cache rename and
+  before its S3 upload lands, so if the cache commit failed (or the LRU evicted the file) a request in
+  that window misses both tiers and starts a second download and a second S3 upload. The result is
+  correct; the cost is one extra upstream fetch and PUT.
+- **Fix:** when the cache commit fails, keep the flight registered until the upload finishes, as
+  `commitS3` does.
+- **Check:** a hybrid store test that fails the cache commit, gates the fake S3 PUT, opens the file
+  again, and counts fetcher calls and bucket PUTs (both 1).
 
 ### HEAD and conditional requests on pure-s3 hits cost a full GetObject
 
@@ -68,16 +59,67 @@ that proves it. Delete an entry when it ships.
 - **Fix:** multipart upload from the spool file (`io.SectionReader` per part) above a threshold.
 - **Check:** a fake S3 that accepts multipart; upload a file over a lowered threshold.
 
-## Observability
+### The default cache dir is the shared temp directory
 
-### The upstream-fetch metric includes the S3 upload in hybrid mode
+- **Where:** `internal/config/config.go` — the `GROXPI_CACHE_DIR` default (`os.TempDir()`).
+- **What:** the bare binary caches under `/tmp/packages`. Another local user can pre-create files
+  there, and a cache hit is served without re-verifying its hash, so a planted file is served as the
+  package. The Docker image sets `GROXPI_CACHE_DIR=/cache` and is not affected.
+- **Fix:** default to `os.UserCacheDir()/groxpi`, falling back to `os.TempDir()/groxpi` when there is
+  no user cache dir.
+- **Check:** a config test asserting the default `CacheDir`.
 
-- **Where:** `internal/storage/store.go` — `Store.lead`, `telemetry.UpstreamFetch`.
-- **What:** `fill` (which ends with the synchronous S3 upload) runs inside the timed region, so the
-  upstream-fetch duration in `hybrid` and `s3` mode includes the PUT.
-- **Fix:** record the duration when the spool is verified, before the commit and upload, and give the
-  upload its own span.
-- **Check:** a test with a slow fake S3 asserting the recorded fetch duration excludes the PUT delay.
+### Package names that are not valid PEP 508 reach the upstream index
+
+- **Where:** `internal/storage/store.go` — `Key`; `internal/index/service.go` — `Service.Resolve`.
+- **What:** a name that normalises to something no project can have (`..` becomes `-`) passes `Key`'s
+  single-segment check, so the request costs an upstream index query before it answers `404`.
+- **Fix:** one shared `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` check on the normalised name, applied in
+  `storage.Key` and `index.Resolve`.
+- **Check:** a table test of junk names asserting `ErrInvalidKey` and zero upstream hits.
+
+### In s3 mode an upload still shows as in flight
+
+- **Where:** `internal/storage/store.go` — `Store.commitS3`.
+- **What:** `commitS3` unregisters the flight after its S3 Put, so `InFlight()` (the admin page)
+  lists a download whose bytes are all served for as long as the upload takes.
+- **Fix:** mark the flight as uploading once it finishes, and leave it out of `InFlight()` (or show it
+  as an upload) while it stays registered for joiners.
+- **Check:** an s3 store test that gates the fake S3 PUT and asserts `InFlight()` no longer lists the
+  file once its reader has the whole body.
+
+## Index
+
+### An upstream index outage answers 404 on file routes
+
+- **Where:** `internal/server/server.go` — `Server.handleFile`, the `default` branch.
+- **What:** any index resolution failure on `/simple/<pkg>/<file>` or `/index/<pkg>/<file>` answers
+  `404 Package not found`, an outage included (`docs/api-endpoints.md` documents it), while the
+  package routes answer `500` for the same failure. pip treats a `404` as final and does not retry.
+- **Fix:** answer `404` only for `index.ErrNotFound`, and map any other index failure on a file route
+  to `502` (or `500`, matching the package routes).
+- **Check:** a server test with a failing upstream index asserting a file route no longer answers `404`.
+
+### A failed index resolution sends its error text to the client
+
+- **Where:** `internal/server/index.go` — `Server.handleListFiles`, the `500` branch (pinned by
+  `internal/server/characterization_test.go`).
+- **What:** the body is `Error fetching package: ` plus the resolution error. Credentials are
+  redacted, but the text still names the index, so an unauthenticated client learns the host of a
+  private extra index.
+- **Fix:** answer a generic body (`Error fetching package`); the detail stays in the error log line.
+- **Check:** a characterization test with a failing private index URL asserting its host is absent
+  from the response body.
+
+### The HTML package page carries no `#sha256=` href fragment
+
+- **Where:** `internal/index/simple.go` — `RenderSimpleHTML`.
+- **What:** PEP 503 lets a link carry its digest as `#sha256=<hex>`; the page groxpi renders links to
+  `/simple/<pkg>/<file>` with no fragment, so an HTML-only client cannot verify the download against
+  the index (the PEP 691 JSON body does carry `hashes`).
+- **Fix:** append `#sha256=` plus the file's `Hashes["sha256"]` to the href when the upstream gave one.
+- **Check:** a `RenderSimpleHTML` case with a hash asserting the fragment, and the round-trip test
+  comparing `Hashes`.
 
 ## Admin and UI
 
@@ -90,13 +132,50 @@ that proves it. Delete an entry when it ships.
   last-modified only; no access time).
 - **Check:** a server test in s3 mode against the fake bucket asserting rows appear.
 
+### Admin Evict can be undone by an in-flight index lookup
+
+- **Where:** `internal/admin/admin.go` — `Service.Evict`; `internal/index/service.go` —
+  `Service.Resolve`, the `cache.set` calls inside the shared lookup.
+- **What:** `Evict` calls `Invalidate`, but a lookup for the same package already running upstream
+  writes its result into the index cache when it returns, after the invalidation. The evicted
+  listing is back until it expires: the cost is at most one index TTL of stale listing.
+- **Fix:** keep a per-key generation in the index cache, bumped by `invalidate`; the lookup reads it
+  before querying and skips the write when it changed.
+- **Check:** a `testing/synctest` test that holds an upstream lookup, evicts the package, releases the
+  lookup, and asserts the next `Resolve` misses the index cache.
+
 ### The landing page reports a hardcoded version
 
-- **Where:** `internal/server/server.go` — `handleHome`.
-- **What:** `/` prints a fixed version string, not the build's.
-- **Fix:** read it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
+- **Where:** `internal/config/config.go` — `Version`, the one constant the startup log, the home
+  page and every upstream User-Agent read.
+- **What:** the constant is fixed in source, not the build's version.
+- **Fix:** set it from `runtime/debug.ReadBuildInfo` (or an `-ldflags -X` variable set in the
   Dockerfile).
-- **Check:** a test asserting the page carries the build-info version.
+- **Check:** a test asserting the home page and User-Agent carry the build-info version.
+
+## Container and release
+
+### The container runs as root
+
+- **Where:** `Dockerfile` — the final `scratch` stage sets no `USER`.
+- **What:** groxpi runs as uid 0 inside the container. Nothing it does needs root: it listens on an
+  unprivileged port and writes only under `/cache`.
+- **Fix:** `USER 65532:65532` in the final stage, with `/cache` created and owned by that uid in the
+  build stage and copied in (`COPY --chown`), since `scratch` has no shell to `chown` with. Existing
+  deployments whose `/cache` volume was written by root need a one-off `chown -R 65532:65532` on the
+  volume when they upgrade, or the new process cannot write to its cache; say so in the release notes.
+- **Check:** `docker run --rm <image> --health-check` succeeds and `docker inspect` reports
+  `Config.User` as `65532:65532`; a compose run against a fresh volume caches a file.
+
+### Two workflows push the `latest` image tag
+
+- **Where:** `.github/workflows/docker.yml` (`type=raw,value=latest` on every main build that passed CI) and
+  `.github/workflows/release.yml` (`type=raw,value=latest` on every release).
+- **What:** `latest` means "newest main build" or "newest release" depending on which workflow ran
+  last, so a user pulling `latest` cannot tell which they got.
+- **Fix:** pick one owner. Releases owning `latest` (main pushes only `main` / `sha-` tags) gives users
+  a stable meaning; drop the tag from the other workflow.
+- **Check:** `git grep -n 'value=latest' .github/workflows` returns exactly one line.
 
 ## Test gaps
 

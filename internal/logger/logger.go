@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 
@@ -25,11 +26,6 @@ import (
 // that admits errors. slog has no fatal level of its own.
 const LevelFatal = slog.Level(12)
 
-// Logger is the global logger. Init replaces it and also installs it as the
-// slog default, which is what the package-level slog calls throughout the
-// codebase use.
-var Logger = slog.Default()
-
 // LogConfig holds logging configuration
 type LogConfig struct {
 	Level  string // DEBUG, INFO, WARN, ERROR
@@ -37,12 +33,16 @@ type LogConfig struct {
 	Color  bool   // enable color output for console
 }
 
-// Init initializes the global logger
+// Init installs the configured logger as the slog default, which is what the
+// package-level slog calls throughout the codebase use. An unknown level or
+// format falls back to the default and is announced once the logger is up, the
+// way config announces any other malformed setting.
 func Init(cfg LogConfig) {
-	level := ParseLevel(cfg.Level)
+	level, levelOK := parseLevel(cfg.Level)
 
 	var sink slog.Handler
-	switch strings.ToLower(cfg.Format) {
+	format := strings.ToLower(cfg.Format)
+	switch format {
 	case "json":
 		// JSON format for log collectors
 		sink = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -54,28 +54,45 @@ func Init(cfg LogConfig) {
 		sink = newConsoleHandler(os.Stdout, cfg.Color)
 	}
 
-	Logger = slog.New(&fanout{
+	slog.SetDefault(slog.New(&fanout{
 		level:    level,
 		handlers: []slog.Handler{sink, otelslog.NewHandler(telemetry.ScopeName)},
-	})
-	slog.SetDefault(Logger)
+	}))
+
+	if !levelOK {
+		warnInvalid("GROXPI_LOGGING_LEVEL", cfg.Level, "INFO")
+	}
+	if format != "" && format != "json" && format != "console" {
+		warnInvalid("GROXPI_LOG_FORMAT", cfg.Format, "console")
+	}
 }
 
-// ParseLevel converts a string level to a slog.Level.
-func ParseLevel(level string) slog.Level {
+// warnInvalid matches config's malformed-variable warning, so both read the
+// same in the log.
+func warnInvalid(key, value, fallback string) {
+	slog.Warn("Ignoring malformed environment variable, using default instead",
+		"variable", key,
+		"value", value,
+		"default", fallback)
+}
+
+// parseLevel converts a level name to a slog.Level, reporting whether the name
+// was recognised; anything unknown is INFO. An empty name is the unset default,
+// not a mistake.
+func parseLevel(level string) (slog.Level, bool) {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
-		return slog.LevelDebug
-	case "INFO":
-		return slog.LevelInfo
+		return slog.LevelDebug, true
+	case "INFO", "":
+		return slog.LevelInfo, true
 	case "WARN", "WARNING":
-		return slog.LevelWarn
+		return slog.LevelWarn, true
 	case "ERROR":
-		return slog.LevelError
+		return slog.LevelError, true
 	case "FATAL":
-		return LevelFatal
+		return LevelFatal, true
 	default:
-		return slog.LevelInfo
+		return slog.LevelInfo, false
 	}
 }
 
@@ -83,7 +100,7 @@ func ParseLevel(level string) slog.Level {
 // which is why this one wrapper exists where the rest of the codebase calls
 // slog directly.
 func Fatal(msg string, args ...any) {
-	Logger.Log(context.Background(), LevelFatal, msg, args...)
+	slog.Log(context.Background(), LevelFatal, msg, args...)
 	os.Exit(1)
 }
 
@@ -155,8 +172,8 @@ type consoleHandler struct {
 	mu     *sync.Mutex
 	w      io.Writer
 	color  bool
-	prefix string // accumulated group prefix
-	attrs  []slog.Attr
+	prefix string // accumulated group prefix, applied to attrs added later
+	pre    string // attrs from WithAttrs, rendered with the prefix they were added under
 }
 
 // consoleTimeFormat is the wall-clock stamp on a console line. Console output is
@@ -182,9 +199,7 @@ func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 	}
 	b.WriteByte(' ')
 	b.WriteString(r.Message)
-	for _, a := range h.attrs {
-		appendAttr(&b, h.prefix, a)
-	}
+	b.WriteString(h.pre)
 	r.Attrs(func(a slog.Attr) bool {
 		appendAttr(&b, h.prefix, a)
 		return true
@@ -198,8 +213,13 @@ func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	var b strings.Builder
+	b.WriteString(h.pre)
+	for _, a := range attrs {
+		appendAttr(&b, h.prefix, a)
+	}
 	next := *h
-	next.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
+	next.pre = b.String()
 	return &next
 }
 
@@ -225,10 +245,22 @@ func appendAttr(b *strings.Builder, prefix string, a slog.Attr) {
 	b.WriteString(a.Key)
 	b.WriteByte('=')
 	v := a.Value.String()
-	if strings.ContainsAny(v, " \"") {
+	if needsQuote(v) {
 		v = strconv.Quote(v)
 	}
 	b.WriteString(v)
+}
+
+// needsQuote reports whether a console value must be quoted: it holds a
+// key=value delimiter (space, quote, equals) or a rune that is not printable,
+// such as a newline or a terminal escape.
+func needsQuote(v string) bool {
+	for _, r := range v {
+		if !unicode.IsPrint(r) || r == ' ' || r == '"' || r == '=' {
+			return true
+		}
+	}
+	return false
 }
 
 func levelTag(l slog.Level) string {

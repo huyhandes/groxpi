@@ -11,9 +11,9 @@ on:
         required: true
         type: string
 
+# Read-only by default; only the jobs that publish get write access.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   prepare:
@@ -25,22 +25,80 @@ jobs:
     steps:
     - name: Extract version from branch or input
       id: version
+      env:
+        # Passed through env, never interpolated into the script: an input is
+        # caller-controlled text and ${{ }} would splice it in as shell.
+        EVENT_NAME: ${{ github.event_name }}
+        INPUT_VERSION: ${{ inputs.version }}
       run: |
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          VERSION="${{ github.event.inputs.version }}"
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          VERSION="$INPUT_VERSION"
         else
           # Extract version from branch name (e.g., release-1.2.3 -> 1.2.3)
           VERSION=$(echo "${GITHUB_REF#refs/heads/release-}" | sed 's/^v//')
+        fi
+        # Later jobs splice the version into their scripts, so only a plain
+        # version string may leave this step.
+        if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+          echo "Invalid version: $VERSION" >&2
+          exit 1
+        fi
+        # A re-push to release-X.Y.Z must not republish X.Y.Z from another
+        # commit. No checkout in this job, so ask the remote by URL.
+        # ls-remote --exit-code: 0 = tag found, 2 = not found, else an error.
+        rc=0
+        git ls-remote --exit-code --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/v$VERSION" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          echo "Tag v$VERSION already exists: bump the version or delete the tag" >&2
+          exit 1
+        elif [ "$rc" -ne 2 ]; then
+          echo "Could not check for tag v$VERSION (git ls-remote exit $rc)" >&2
+          exit 1
         fi
         echo "version=${VERSION}" >> $GITHUB_OUTPUT
         echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
         echo "Extracted version: ${VERSION}"
         echo "Tag: v${VERSION}"
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Run go vet
+      run: go vet ./...
+
+    - name: Install staticcheck
+      run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+
+    - name: Run staticcheck
+      run: staticcheck ./...
+
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v8
+      with:
+        # Pinned to the same v2 release as ci.yml; "latest" can resolve to a
+        # line that refuses a go1.26 target.
+        version: v2.12.2
+        args: --timeout=10m
+
+    - name: Run tests
+      run: go test -short -race ./...
+
   build-binaries:
     name: Build Binaries
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, test]
     strategy:
       matrix:
         include:
@@ -75,10 +133,10 @@ jobs:
       run: |
         BINARY_NAME="groxpi-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
         go build \
-          -ldflags="-s -w -X main.version=${{ needs.prepare.outputs.version }}" \
-          -a -installsuffix cgo \
+          -trimpath \
+          -ldflags="-s -w" \
           -o "${BINARY_NAME}" \
-          cmd/groxpi/main.go
+          ./cmd/groxpi
 
         # Generate checksum
         shasum -a 256 "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
@@ -98,7 +156,10 @@ jobs:
   build-docker:
     name: Build Docker Images
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, test]
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
 
     steps:
     - name: Checkout code
@@ -134,8 +195,6 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        build-args: |
-          VERSION=${{ needs.prepare.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
@@ -143,6 +202,8 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [prepare, build-binaries, build-docker]
+    permissions:
+      contents: write # create the tag and the release
 
     steps:
     - name: Checkout code
@@ -196,12 +257,13 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ needs.prepare.outputs.tag }}
+        # Tag the commit that was tested and built, not the default branch.
+        target_commitish: ${{ github.sha }}
         name: "Groxpi ${{ needs.prepare.outputs.tag }}"
         body_path: release_notes.md
         files: release-assets/*
         draft: false
         prerelease: false
-        generate_release_notes: true
         make_latest: true
 
     - name: Clean up release branch (optional)

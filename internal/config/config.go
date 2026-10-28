@@ -3,17 +3,30 @@ package config
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
+// Version is groxpi's version: the startup log, the home page and every
+// upstream User-Agent carry it. It is a constant, not read from build info.
+const Version = "1.0.0"
+
+// UserAgent is the User-Agent header on every upstream request.
+const UserAgent = "groxpi/" + Version
+
 // defaultExtraIndexTTL is the TTL an extra index gets when its position in
 // GROXPI_EXTRA_INDEX_TTLS is missing or unparseable.
 const defaultExtraIndexTTL = 3 * time.Minute
+
+// DefaultDownloadIdleTimeout is GROXPI_DOWNLOAD_IDLE_TIMEOUT when unset or at
+// or below zero.
+const DefaultDownloadIdleTimeout = 60 * time.Second
 
 // Index is one configured upstream index: where to fetch from, and how long its
 // answers stay cached. The TTL is per index so a fast-moving private index can be
@@ -33,9 +46,9 @@ func (i Index) Redacted() string { return RedactURL(i.URL) }
 // without credentials untouched. An unparseable URL is dropped whole: we cannot
 // tell where its credentials end.
 //
-// It lives here rather than beside the HTTP client because internal/pypi already
-// imports this package, so a helper both sides can reach has to sit on the side
-// without the dependency.
+// It lives here rather than beside an HTTP client because index, download and
+// storage all import this package, so it is the one place every module that
+// names a URL can reach.
 func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -48,10 +61,6 @@ func RedactURL(raw string) string {
 	return u.String()
 }
 
-// RedactURLError strips credentials out of the URL net/http embeds in its
-// transport errors: *url.Error prints the URL it failed on, user-info and all, so
-// returning one unredacted leaks a private index's password into any log or
-// response that records the error.
 // credentialedURLPattern matches the user-info component of an absolute URL: a
 // scheme, then everything up to the "@" that is still inside the authority. The
 // character class cannot cross a "/", so a path containing "@" is not matched.
@@ -72,6 +81,10 @@ func RedactErrorText(err error) string {
 	return credentialedURLPattern.ReplaceAllString(err.Error(), "${1}redacted@")
 }
 
+// RedactURLError strips credentials out of the URL net/http embeds in its
+// transport errors: *url.Error prints the URL it failed on, user-info and all, so
+// returning one unredacted leaks a private index's password into any log or
+// response that records the error.
 func RedactURLError(err error) error {
 	var uerr *url.Error
 	if errors.As(err, &uerr) {
@@ -88,7 +101,7 @@ func (c *Config) ResolutionOrder() []Index {
 	indexes := make([]Index, 0, len(c.ExtraIndexURLs)+1)
 	for i, extra := range c.ExtraIndexURLs {
 		ttl := defaultExtraIndexTTL
-		if i < len(c.ExtraIndexTTLs) && c.ExtraIndexTTLs[i] > 0 {
+		if i < len(c.ExtraIndexTTLs) {
 			ttl = c.ExtraIndexTTLs[i]
 		}
 		indexes = append(indexes, Index{URL: extra, TTL: ttl})
@@ -131,9 +144,10 @@ type Config struct {
 	S3EnableHTTP2 bool // Enable HTTP/2 for better multiplexing
 
 	// Timeout configuration
-	DownloadTimeout time.Duration
-	ConnectTimeout  time.Duration
-	ReadTimeout     time.Duration
+	DownloadTimeout     time.Duration
+	DownloadIdleTimeout time.Duration // longest gap between body bytes of an upstream file
+	ConnectTimeout      time.Duration
+	ReadTimeout         time.Duration
 
 	// Server configuration
 	Port      string
@@ -170,7 +184,10 @@ func (c *Config) AdminConfigured() bool {
 	return c.AdminUsername != "" && c.AdminPassword != ""
 }
 
-func Load() *Config {
+// Load reads the configuration from the environment. A malformed optional value
+// falls back to its default with a warning; a setting the proxy cannot run
+// without (storage type, bucket) is an error.
+func Load() (*Config, error) {
 	cfg := &Config{
 		IndexURL:               getEnv("GROXPI_INDEX_URL", "https://pypi.org/simple/"),
 		IndexTTL:               getDurationEnv("GROXPI_INDEX_TTL", 30*time.Minute),
@@ -178,6 +195,7 @@ func Load() *Config {
 		IndexCacheSize:         getIntEnv("GROXPI_INDEX_CACHE_SIZE", 256*1024*1024), // 256MB, provisional
 		CacheDir:               getEnv("GROXPI_CACHE_DIR", ""),
 		DownloadTimeout:        getDurationEnv("GROXPI_DOWNLOAD_TIMEOUT", 900*time.Millisecond),
+		DownloadIdleTimeout:    getDurationEnv("GROXPI_DOWNLOAD_IDLE_TIMEOUT", DefaultDownloadIdleTimeout),
 		Port:                   getEnv("PORT", "5000"),
 		LogLevel:               getEnv("GROXPI_LOGGING_LEVEL", "INFO"),
 		LogFormat:              getEnv("GROXPI_LOG_FORMAT", "console"),
@@ -192,7 +210,7 @@ func Load() *Config {
 		ReadTimeout:            getDurationEnv("GROXPI_READ_TIMEOUT", 0),
 
 		// Storage configuration
-		StorageType:       getEnv("GROXPI_STORAGE_TYPE", "local"),
+		StorageType:       strings.ToLower(strings.TrimSpace(getEnv("GROXPI_STORAGE_TYPE", "local"))),
 		S3Endpoint:        getEnv("AWS_ENDPOINT_URL", ""),
 		S3AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", ""),
 		S3SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", ""),
@@ -211,23 +229,39 @@ func Load() *Config {
 		LocalCacheTTL:  getDurationEnv("GROXPI_LOCAL_CACHE_TTL", 0), // 0 = disabled
 	}
 
-	// Parse extra index URLs
+	// Parse extra index URLs. Like the TTLs below the list is positional: an
+	// empty item is skipped, but it still owns its TTL slot (dropped after the
+	// TTLs are parsed), so "a,,b" with "60,,120" gives b 120.
+	var emptyURLSlots []int
 	if extraURLs := getEnv("GROXPI_EXTRA_INDEX_URLS", ""); extraURLs != "" {
-		cfg.ExtraIndexURLs = splitAndTrim(extraURLs, ",")
-	}
-
-	// Parse extra index TTLs
-	if extraTTLs := getEnv("GROXPI_EXTRA_INDEX_TTLS", ""); extraTTLs != "" {
-		ttlStrs := splitAndTrim(extraTTLs, ",")
-		cfg.ExtraIndexTTLs = make([]time.Duration, len(ttlStrs))
-		for i, ttlStr := range ttlStrs {
-			ttl, err := strconv.Atoi(ttlStr)
-			if err != nil || ttl < 0 {
-				invalidEnv("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
-				cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
+		for i, item := range strings.Split(extraURLs, ",") {
+			if item = strings.TrimSpace(item); item == "" {
+				slog.Warn("Ignoring empty GROXPI_EXTRA_INDEX_URLS item; its GROXPI_EXTRA_INDEX_TTLS slot is skipped too",
+					"variable", "GROXPI_EXTRA_INDEX_URLS", "position", i)
+				emptyURLSlots = append(emptyURLSlots, i)
 				continue
 			}
-			cfg.ExtraIndexTTLs[i] = time.Duration(ttl) * time.Second
+			cfg.ExtraIndexURLs = append(cfg.ExtraIndexURLs, item)
+		}
+	}
+
+	// Parse extra index TTLs. Split without dropping empty entries: the list is
+	// positional, so "60,,120" must leave the second index on the default rather
+	// than hand it the third index's TTL.
+	if extraTTLs := getEnv("GROXPI_EXTRA_INDEX_TTLS", ""); extraTTLs != "" {
+		ttlStrs := strings.Split(extraTTLs, ",")
+		cfg.ExtraIndexTTLs = make([]time.Duration, len(ttlStrs))
+		for i, ttlStr := range ttlStrs {
+			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
+			if ttlStr = strings.TrimSpace(ttlStr); ttlStr != "" {
+				cfg.ExtraIndexTTLs[i] = parseDuration("GROXPI_EXTRA_INDEX_TTLS", ttlStr, defaultExtraIndexTTL)
+			}
+		}
+		// Drop the slots of skipped URLs, last first so earlier positions hold.
+		for _, slot := range slices.Backward(emptyURLSlots) {
+			if slot < len(cfg.ExtraIndexTTLs) {
+				cfg.ExtraIndexTTLs = slices.Delete(cfg.ExtraIndexTTLs, slot, slot+1)
+			}
 		}
 	} else {
 		// Default TTL for extra indices
@@ -235,6 +269,12 @@ func Load() *Config {
 		for i := range cfg.ExtraIndexTTLs {
 			cfg.ExtraIndexTTLs[i] = defaultExtraIndexTTL
 		}
+	}
+
+	// A stalled body with no idle bound hangs every request tailing it, so zero
+	// is the default, not "never".
+	if cfg.DownloadIdleTimeout <= 0 {
+		cfg.DownloadIdleTimeout = DefaultDownloadIdleTimeout
 	}
 
 	// Set default cache dir if not specified
@@ -247,22 +287,25 @@ func Load() *Config {
 		cfg.LocalCacheDir = cfg.CacheDir
 	}
 
+	// An unknown storage type is fatal, like a missing bucket: falling back to
+	// local would run without the durable store the operator asked for.
+	switch cfg.StorageType {
+	case "local", "s3", "hybrid":
+	default:
+		return nil, errors.New(`GROXPI_STORAGE_TYPE must be "local", "s3" or "hybrid", got "` + cfg.StorageType + `"`)
+	}
+
 	// Validate S3 configuration if S3 or hybrid storage is selected
 	if cfg.StorageType == "s3" || cfg.StorageType == "hybrid" {
-		// Set S3 endpoint to AWS default if not specified
-		if cfg.S3Endpoint == "" {
-			cfg.S3Endpoint = "s3.amazonaws.com"
-		}
-
 		// Only the bucket is required. Credentials are deliberately not
 		// checked: with none configured the AWS default chain takes over, which
 		// is how instance, task and web-identity roles work.
 		if cfg.S3Bucket == "" {
-			panic("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
+			return nil, errors.New("GROXPI_S3_BUCKET must be set when using S3 or hybrid storage")
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func getEnv(key, defaultValue string) string {
@@ -273,9 +316,10 @@ func getEnv(key, defaultValue string) string {
 }
 
 // invalidEnv reports a setting that could not be used and names the value taken
-// instead. Load has no error return - a mistyped cache size must not stop the
-// proxy from starting - so the substitution has to be visible in the log, or an
-// operator who wrote "512MB" never learns their tuning was ignored.
+// instead. Load fails only on a setting the proxy cannot run without - a
+// mistyped cache size must not stop the proxy from starting - so the
+// substitution has to be visible in the log, or an operator who wrote "512MB"
+// never learns their tuning was ignored.
 func invalidEnv(key, value string, fallback any) {
 	slog.Warn("Ignoring malformed environment variable, using default instead",
 		"variable", key,
@@ -307,14 +351,25 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 		return defaultValue
 	}
 
+	return parseDuration(key, value, defaultValue)
+}
+
+// parseDuration reads a Go duration ("5m", "90s") or, as proxpi did, a bare
+// number of seconds. A negative or unparseable value is announced and replaced
+// by defaultValue.
+func parseDuration(key, value string, defaultValue time.Duration) time.Duration {
 	d, err := time.ParseDuration(value)
 	if err != nil {
 		seconds, floatErr := strconv.ParseFloat(value, 64)
-		if floatErr != nil {
+		nanos := seconds * float64(time.Second)
+		// NaN, ±Inf and anything past ~292 years do not fit a time.Duration;
+		// converting them would wrap or be implementation-defined.
+		// float64(math.MaxInt64) is exactly 2^63, the first value out of range.
+		if floatErr != nil || math.IsNaN(nanos) || math.Abs(nanos) >= float64(math.MaxInt64) {
 			invalidEnv(key, value, defaultValue)
 			return defaultValue
 		}
-		d = time.Duration(seconds * float64(time.Second))
+		d = time.Duration(nanos)
 	}
 	if d < 0 {
 		invalidEnv(key, value, defaultValue)
@@ -323,21 +378,20 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 	return d
 }
 
+// getBoolEnv reads a boolean from a fixed set of spellings. Anything else keeps
+// the default and is announced: reading every unknown value as true turned
+// GROXPI_S3_USE_SSL=disable into SSL on.
 func getBoolEnv(key string, defaultValue bool) bool {
-	value := strings.ToLower(os.Getenv(key))
-	if value == "" {
+	value := os.Getenv(key)
+	switch strings.ToLower(value) {
+	case "":
+		return defaultValue
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		invalidEnv(key, value, defaultValue)
 		return defaultValue
 	}
-	return value != "0" && value != "no" && value != "off" && value != "false"
-}
-
-func splitAndTrim(s, sep string) []string {
-	parts := strings.Split(s, sep)
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }

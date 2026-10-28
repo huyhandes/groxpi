@@ -1,7 +1,5 @@
 # Docker Compose configuration for benchmarking groxpi vs proxpi
-# Usage: docker-compose -f benchmarks/docker/docker-compose.benchmark.yml up
-
-version: '3.8'
+# Usage: docker compose -f benchmarks/docker/docker-compose.benchmark.yml up
 
 services:
   # groxpi service for benchmarking
@@ -9,7 +7,10 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: groxpi:latest
+    # Its own tag, so the image built from this checkout is never confused with
+    # a groxpi:latest from the other compose files. benchmark.sh rebuilds it once
+    # at the start of a suite run; recreating for a cold run does not rebuild.
+    image: groxpi:bench
     container_name: groxpi-bench
     restart: unless-stopped
     ports:
@@ -22,14 +23,20 @@ services:
       GROXPI_CACHE_DIR: /cache
       GROXPI_LOGGING_LEVEL: INFO
       GROXPI_STORAGE_TYPE: local
+    # Anonymous cache volumes: scripts/cache_manager.sh empties a cache with
+    # `docker compose rm -sfv`, which removes anonymous volumes but not named ones.
     volumes:
-      - groxpi_bench_cache:/cache
+      - /cache
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/health || exit 1"]
+      # scratch image: no shell, no wget. The binary is its own probe.
+      test: ["CMD", "/groxpi", "--health-check"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+      # Probe every second while starting, so a cold run's `up --wait` returns
+      # as soon as the proxy is healthy rather than after the first 30s interval.
+      start_interval: 1s
     labels:
       - "benchmark.service=groxpi"
     networks:
@@ -50,24 +57,22 @@ services:
       PROXPI_CACHE_DIR: /var/cache/proxpi
       PROXPI_LOGGING_LEVEL: INFO
     volumes:
-      - proxpi_bench_cache:/var/cache/proxpi
+      - /var/cache/proxpi
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5000/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+      # Probe every second while starting, so a cold run's `up --wait` returns
+      # as soon as the proxy is healthy rather than after the first 30s interval.
+      start_interval: 1s
     labels:
       - "benchmark.service=proxpi"
     networks:
       - benchmark-network
 
-volumes:
-  groxpi_bench_cache:
-    driver: local
-  proxpi_bench_cache:
-    driver: local
-
 networks:
   benchmark-network:
+    name: benchmark-network
     driver: bridge

@@ -9,14 +9,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration with defaults
-GROXPI_URL=""
-PROXPI_URL=""
+GROXPI_URL="${GROXPI_URL:-}"
+PROXPI_URL="${PROXPI_URL:-}"
 TIMESTAMP=""
 API_ONLY=false
 UV_ONLY=false
 RESOURCE_MONITORING=true
-DOCKER_NETWORK="benchmark-network"
+DOCKER_NETWORK="${DOCKER_NETWORK:-benchmark-network}"
 RESULTS_DIR="$SCRIPT_DIR/results"
+# The compose file whose containers the suite measures (also read by
+# scripts/cache_manager.sh, which recreates them for every cold run)
+COMPOSE_FILE="${BENCH_COMPOSE_FILE:-$SCRIPT_DIR/docker/docker-compose.benchmark.yml}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -45,15 +48,18 @@ show_usage() {
     echo "  --timestamp TS     Use specific timestamp (default: auto-generated)"
     echo "  --api-only         Run only WRK API benchmarks"
     echo "  --uv-only          Run only UV installation benchmarks"
-    echo "  --no-monitoring    Disable resource monitoring"
+    echo "  --no-monitoring    Disable resource monitoring (it samples the local"
+    echo "                     containers groxpi-bench and proxpi-bench only)"
     echo "  --docker-network N Docker network name (default: benchmark-network)"
-    echo "  --results-dir DIR  Results directory (default: ./results)"
+    echo "  --results-dir DIR  Results directory (default: <script dir>/results)"
     echo "  -h, --help         Show this help message"
     echo ""
     echo "Environment Variables:"
     echo "  GROXPI_URL         Alternative way to specify groxpi URL"
     echo "  PROXPI_URL         Alternative way to specify proxpi URL"
     echo "  DOCKER_NETWORK     Docker network name"
+    echo "  BENCH_COMPOSE_FILE Compose file of the benchmarked containers"
+    echo "                     (default: docker/docker-compose.benchmark.yml)"
     echo ""
     echo "Examples:"
     echo "  $0 --groxpi-url http://server1:5005 --proxpi-url http://server2:5006"
@@ -113,10 +119,6 @@ parse_arguments() {
         esac
     done
 
-    # Use environment variables if not provided via command line
-    GROXPI_URL="${GROXPI_URL:-${GROXPI_URL:-}}"
-    PROXPI_URL="${PROXPI_URL:-${PROXPI_URL:-}}"
-
     # Generate timestamp if not provided
     if [ -z "$TIMESTAMP" ]; then
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -139,8 +141,22 @@ parse_arguments() {
         exit 1
     fi
 
-    # Create results directory
+    # Create results directory; the stage scripts read RESULTS_DIR too, so every
+    # file of a run lands in the one directory.
     mkdir -p "$RESULTS_DIR"
+    export RESULTS_DIR
+}
+
+# Build groxpi-bench from this checkout once per suite run, and recreate any
+# container whose image changed, so the run measures the current code rather
+# than whichever image was built last. Cold runs recreate without rebuilding.
+build_services() {
+    log_info "Building groxpi-bench and starting the benchmark services..."
+    if ! docker compose -f "$COMPOSE_FILE" up -d --build --wait groxpi-bench proxpi-bench; then
+        log_error "Building or starting the benchmark services failed ($COMPOSE_FILE)"
+        exit 1
+    fi
+    log_success "Benchmark services built and healthy"
 }
 
 # Function to validate environment and dependencies
@@ -178,7 +194,8 @@ start_resource_monitoring() {
     local monitor_script="$SCRIPT_DIR/scripts/monitor_resources.sh"
     local resource_file="$RESULTS_DIR/resources-${TIMESTAMP}.csv"
 
-    # Extract container names from URLs for docker container monitoring
+    # The containers of docker/docker-compose.benchmark.yml on this host,
+    # whatever the URLs point at
     local groxpi_container="groxpi-bench"
     local proxpi_container="proxpi-bench"
 
@@ -303,14 +320,14 @@ EOF
         echo "" >> "$report_file"
 
         # Extract some key metrics for the report
-        echo "#### Key Metrics" >> "$report_file"
+        echo "#### Key Metrics (warm /simple/numpy/ load; cold runs are single requests)" >> "$report_file"
         echo "| Service | Test | Requests/sec | Avg Latency |" >> "$report_file"
         echo "|---------|------|-------------|-------------|" >> "$report_file"
 
         # Process the CSV to extract key metrics
         if command -v awk >/dev/null 2>&1; then
             tail -n +2 "$RESULTS_DIR/wrk-summary-${TIMESTAMP}.csv" | \
-            awk -F',' '$3=="load" && $4=="index-warm" {printf "| %s | %s | %s | %s |\n", $2, $4, $6, $7}' >> "$report_file" || true
+            awk -F',' '$4=="load" && $5=="numpy-warm" {printf "| %s | %s | %s | %s |\n", $3, $5, $7, $8}' >> "$report_file" || true
         fi
     else
         echo "No WRK results found." >> "$report_file"
@@ -333,10 +350,10 @@ EOF
         if command -v awk >/dev/null 2>&1; then
             local packages=("numpy" "pandas" "polars" "fastapi")
             for pkg in "${packages[@]}"; do
-                local groxpi_cold=$(awk -F',' "\$2==\"groxpi\" && \$3~\"cold\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local groxpi_warm=$(awk -F',' "\$2==\"groxpi\" && \$3~\"warm\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local proxpi_cold=$(awk -F',' "\$2==\"proxpi\" && \$3~\"cold\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
-                local proxpi_warm=$(awk -F',' "\$2==\"proxpi\" && \$3~\"warm\" && \$5==\"$pkg\" {print \$6}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local groxpi_cold=$(awk -F',' "\$3==\"groxpi\" && \$5==\"cold\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local groxpi_warm=$(awk -F',' "\$3==\"groxpi\" && \$5==\"warm\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local proxpi_cold=$(awk -F',' "\$3==\"proxpi\" && \$5==\"cold\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
+                local proxpi_warm=$(awk -F',' "\$3==\"proxpi\" && \$5==\"warm\" && \$6==\"$pkg\" {print \$7}" "$RESULTS_DIR/uv-summary-${TIMESTAMP}.csv" | head -1)
 
                 if [ -n "$groxpi_cold" ] || [ -n "$proxpi_cold" ]; then
                     echo "| groxpi | $pkg | ${groxpi_cold:-N/A} | ${groxpi_warm:-N/A} |" >> "$report_file"
@@ -359,7 +376,7 @@ EOF
         echo "" >> "$report_file"
         echo "Use the DuckDB analysis script for detailed analysis:" >> "$report_file"
         echo "\`\`\`bash" >> "$report_file"
-        echo "./scripts/analyze_results_duckdb.sh $TIMESTAMP" >> "$report_file"
+        echo "./scripts/analyze_results_duckdb.sh $TIMESTAMP \"$RESULTS_DIR\"" >> "$report_file"
         echo "\`\`\`" >> "$report_file"
     else
         echo "No resource monitoring data available." >> "$report_file"
@@ -382,7 +399,7 @@ EOF
     cat >> "$report_file" << EOF
 
 ### Analysis
-- Run \`./scripts/analyze_results_duckdb.sh $TIMESTAMP\` for detailed DuckDB-powered analysis
+- Run \`./scripts/analyze_results_duckdb.sh $TIMESTAMP "$RESULTS_DIR"\` for detailed DuckDB-powered analysis
 - Summary CSVs can be imported into Excel, Google Sheets, or analyzed with DuckDB/pandas
 
 ## Notes
@@ -430,11 +447,12 @@ main() {
     log_info "  Results Directory: $RESULTS_DIR"
     echo ""
 
-    # Validate environment
+    # Build the image under test, then validate environment
+    build_services
     validate_environment
 
-    # Start resource monitoring
-    start_resource_monitoring
+    # Start resource monitoring; a monitor that fails to start does not stop the run
+    start_resource_monitoring || true
 
     local tests_failed=false
 
@@ -488,7 +506,7 @@ main() {
 
     log_info "Next steps:"
     log_info "  1. Review the consolidated report: $RESULTS_DIR/benchmark-report-${TIMESTAMP}.md"
-    log_info "  2. Run detailed analysis: ./scripts/analyze_results_duckdb.sh $TIMESTAMP"
+    log_info "  2. Run detailed analysis: ./scripts/analyze_results_duckdb.sh $TIMESTAMP \"$RESULTS_DIR\""
     log_info "  3. Copy CSV files to your analysis environment if needed"
 }
 

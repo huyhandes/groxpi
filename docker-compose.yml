@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   groxpi:
     build:
@@ -19,13 +17,12 @@ services:
       - GROXPI_CACHE_SIZE=5368709120 # 5GB
       - GROXPI_INDEX_TTL=1800 # 30 minutes
       - GROXPI_CACHE_DIR=/cache
-      - GROXPI_LOGGING_LEVEL=DEBUG
+      - GROXPI_LOGGING_LEVEL=INFO
 
       # Storage Configuration (default: local)
       - GROXPI_STORAGE_TYPE=local
-      # Uncomment for S3/MinIO storage:
+      # Uncomment for S3 storage (docker-compose.rustfs.yml runs a local S3):
       # - GROXPI_STORAGE_TYPE=s3
-      # - AWS_ENDPOINT_URL=s3.amazonaws.com
       # - AWS_ACCESS_KEY_ID=YOUR-ACCESS-KEY-ID
       # - AWS_SECRET_ACCESS_KEY=YOUR-SECRET-ACCESS-KEY
       # - AWS_REGION=us-east-1

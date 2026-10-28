@@ -41,9 +41,12 @@ private index does not have.
    deliberately *not* queried speculatively: sending PyPI a request for
    `acme-internal-utils` leaks the internal package name even if the response is
    thrown away.
-6. **Per-index TTL.** The cache entry is stored with the answering index's TTL and
-   records which index answered, so a fast-moving private index is not held stale
-   by PyPI's schedule.
+6. **Per-index TTL.** The cache entry is stored with the answering index's TTL,
+   so a fast-moving private index is not held stale by PyPI's schedule. The entry
+   does not record which index answered; only its expiry reflects it. A package
+   that no index has (point 3) is cached as a miss for the shortest TTL in the
+   resolution order, so a newly published private package is hidden no longer
+   than the fastest-moving index allows. An error (point 4) is never cached.
 7. **Credentials in the URL are redacted at every rendering site.** `Index.Redacted()`
    / `config.RedactURL` replace the user-info with a fixed placeholder, and the raw
    URL is never formatted into a log field, an error or a response body. Transport

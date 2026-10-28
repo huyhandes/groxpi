@@ -1,17 +1,12 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "benchmark-test"
 version = "0.1.0"
 description = "Benchmark testing project for groxpi vs proxpi"
-readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 dependencies = []
 
-# Index configuration for proxpi
+# Index under test; uv_install_test.sh substitutes the server URL (scheme included)
 [[tool.uv.index]]
-name = "proxpi"
-url = "http://<index_endpoint>/simple/"
+name = "proxy"
+url = "<index_endpoint>/simple/"
 default = true

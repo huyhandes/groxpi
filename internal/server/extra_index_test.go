@@ -131,7 +131,7 @@ func newMultiIndexServer(t *testing.T, cfg *config.Config, primary *fakeUpstream
 	}
 	cfg.LogLevel = "ERROR"
 
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 	return srv
 }
@@ -339,24 +339,6 @@ func TestResolution_IndexFailureDoesNotFallThroughToThePrimary(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, indexStatus(t, srv, "internal"))
 }
 
-// --- Credential redaction ----------------------------------------------------
-
-func TestRedactURL(t *testing.T) {
-	tests := []struct {
-		raw, want string
-	}{
-		{"https://pypi.org/simple/", "https://pypi.org/simple/"},
-		{"https://user:s3cr3t@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
-		{"https://token@private.example.com/simple/", "https://redacted@private.example.com/simple/"},
-		{"://nonsense", "[unparseable-url]"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, config.RedactURL(tt.raw), tt.raw)
-	}
-	assert.Equal(t, "https://redacted@private.example.com/simple/",
-		config.Index{URL: "https://user:s3cr3t@private.example.com/simple/"}.Redacted())
-}
-
 // lockedBuffer collects log output from concurrent writers.
 type lockedBuffer struct {
 	mu  sync.Mutex
@@ -416,7 +398,7 @@ func TestCredentialsNeverAppearInLogsOrHealth(t *testing.T) {
 		DownloadTimeout: time.Second,
 		LogLevel:        "DEBUG",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	// Request path: resolved by the first extra, which never reaches the broken one.
@@ -471,8 +453,7 @@ type wireFile struct {
 	Hashes         map[string]string `json:"hashes"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	URL            string            `json:"url"`
-	Yanked         bool              `json:"yanked,omitempty"`
-	YankedReason   string            `json:"yanked-reason,omitempty"`
+	Yanked         any               `json:"yanked,omitempty"`
 }
 
 type wireFiles struct {
@@ -492,4 +473,23 @@ func getIndex(t *testing.T, router http.Handler, pkg string) []byte {
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return body
+}
+
+// TestFileMiss_UnknownPackageResolvesTheIndexOnce: a file request for a package
+// no index lists costs one resolution, one query per configured index, not a
+// second resolution to decide how to answer.
+func TestFileMiss_UnknownPackageResolvesTheIndexOnce(t *testing.T) {
+	extra := newFakeUpstreamIndex(t, "extra", nil)
+	primary := newFakeUpstreamIndex(t, "primary", nil)
+	srv := newMultiIndexServer(t, nil, primary, extra)
+
+	req := httptest.NewRequest(http.MethodGet, "/simple/nonexistent/nonexistent-1.0.tar.gz", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Contains(t, w.Body.String(), "Package not found")
+	for _, upstream := range []*fakeUpstreamIndex{extra, primary} {
+		assert.Equal(t, 1, upstream.hitsFor("nonexistent"), "%s queried once", upstream.name)
+	}
 }

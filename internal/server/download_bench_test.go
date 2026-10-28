@@ -65,7 +65,7 @@ func BenchmarkDownloadCoordination_SingleFile(b *testing.B) {
 		LogLevel:        "ERROR",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(b, cfg)
 	router := srv.Router()
 
 	b.ResetTimer()
@@ -140,7 +140,7 @@ func BenchmarkDownloadCoordination_ConcurrentRequests(b *testing.B) {
 		LogLevel:        "ERROR",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(b, cfg)
 	router := srv.Router()
 
 	concurrencyLevels := []int{1, 2, 5, 10, 20}
@@ -252,7 +252,7 @@ func BenchmarkDownloadCoordination_LargeFile(b *testing.B) {
 		LogLevel:        "ERROR",
 	}
 
-	srv := New(cfg)
+	srv := newTestServer(b, cfg)
 	router := srv.Router()
 
 	b.ResetTimer()

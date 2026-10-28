@@ -8,7 +8,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 # Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+RUN apk add --no-cache ca-certificates
 
 # Set working directory
 WORKDIR /build
@@ -24,16 +24,15 @@ COPY . .
 
 # Build the application with optimizations for target architecture
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags='-w -s -extldflags "-static"' \
-    -a -installsuffix cgo \
+    -trimpath \
+    -ldflags='-w -s' \
     -o groxpi \
-    cmd/groxpi/main.go
+    ./cmd/groxpi
 
 # Stage 2: Runtime stage
 FROM scratch
 
-# Copy timezone data and certificates from builder
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+# Copy CA certificates from builder (nothing loads a time zone, so no tzdata)
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy the binary
@@ -46,12 +45,10 @@ COPY --from=builder /build/groxpi /groxpi
 # Create cache directory
 VOLUME ["/cache"]
 
-# Set environment variables
+# Settings whose image default differs from config.go: the cache lives on the
+# volume, and container logs are read by collectors, not a terminal.
 ENV GROXPI_CACHE_DIR=/cache
-ENV GROXPI_INDEX_URL=https://pypi.org/simple/
-ENV GROXPI_CACHE_SIZE=5368709120
-ENV GROXPI_INDEX_TTL=1800
-ENV PORT=5000
+ENV GROXPI_LOG_COLOR=false
 
 # Expose port
 EXPOSE 5000

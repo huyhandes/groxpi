@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,6 +29,11 @@ const (
 	lowWatermarkPercent = 90
 
 	tmpPrefix = ".tmp-"
+
+	// packagesDir is the only part of baseDir the cache owns: every Key lives
+	// under it, so the walk never lists, counts or deletes anything else in a
+	// shared directory such as the default os.TempDir().
+	packagesDir = "packages"
 )
 
 // CacheEntry is one cached file as the listing shows it. The filesystem is the
@@ -54,6 +59,10 @@ type LocalStorage struct {
 
 	size   atomic.Int64
 	walkMu sync.Mutex // one eviction walk at a time
+
+	// generation changes whenever a file lands or goes: commit and remove are
+	// the only two paths that change what Snapshot lists, the TTL sweep included.
+	generation atomic.Uint64
 
 	stopSweep context.CancelFunc // nil when no TTL sweeper runs
 	sweeper   sync.WaitGroup
@@ -131,13 +140,17 @@ func removeStaleTemp(path string, mtime time.Time) {
 	}
 }
 
-// scan walks the cache directory and reports every committed file. Temp files
+// scan walks <baseDir>/packages and reports every committed file, keyed
+// relative to baseDir. Nothing outside packages/ is touched.
+func (l *LocalStorage) scan() ([]CacheEntry, error) { return l.scanDir(packagesDir) }
+
+// scanDir is scan restricted to dir, a slash-separated path under packages/. Temp files
 // are not reported; one whose mtime is older than touchInterval is a crash
 // leftover (a write in progress keeps its mtime fresh) and is removed. Files
 // vanishing mid-walk are not errors.
-func (l *LocalStorage) scan() ([]CacheEntry, error) {
+func (l *LocalStorage) scanDir(dir string) ([]CacheEntry, error) {
 	var entries []CacheEntry
-	err := filepath.WalkDir(l.baseDir, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(filepath.Join(l.baseDir, filepath.FromSlash(dir)), func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			var info fs.FileInfo
 			if info, err = d.Info(); err == nil && strings.HasPrefix(d.Name(), tmpPrefix) {
@@ -219,13 +232,15 @@ func (l *LocalStorage) remove(key string, size int64) error {
 		return err
 	}
 	l.size.Add(-size)
+	l.generation.Add(1)
 	return nil
 }
 
 // maybeEvict runs an eviction walk when the size counter crosses maxSize.
 //
-// ponytail: runs synchronously on the Put that crosses the limit; move to a
-// background goroutine if that one Put's latency ever matters.
+// ponytail: runs synchronously on the flight goroutine that crosses the limit,
+// after its readers have their last byte; it delays only that flight's hybrid
+// upload. Move it to a goroutine if that ever matters.
 func (l *LocalStorage) maybeEvict(ctx context.Context) {
 	due := func() bool {
 		return l.maxSize > 0 && l.size.Load() > l.maxSize
@@ -271,8 +286,9 @@ func (l *LocalStorage) Snapshot() []CacheEntry {
 
 // DeletePrefix removes every cached file whose key starts with prefix and
 // reports how many were removed. A prefix matching nothing is not an error.
+// Only the directory holding the prefix is walked, not the whole cache.
 func (l *LocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, error) {
-	entries, err := l.scan()
+	entries, err := l.scanDir(prefixDir(prefix))
 	if err != nil {
 		return 0, err
 	}
@@ -293,14 +309,27 @@ func (l *LocalStorage) DeletePrefix(ctx context.Context, prefix string) (int, er
 	return deleted, errors.Join(errs...)
 }
 
+// prefixDir is the deepest directory under packages/ that holds every key
+// starting with prefix: "packages/a/" gives "packages/a", "packages/a" gives
+// "packages". A prefix that does not stay under packages/ gives packages/ itself.
+func prefixDir(prefix string) string {
+	dir := path.Clean(path.Dir(prefix + "x"))
+	if dir != packagesDir && !strings.HasPrefix(dir, packagesDir+"/") {
+		return packagesDir
+	}
+	return dir
+}
+
 // buildPath constructs the full filesystem path
 func (l *LocalStorage) buildPath(key string) string {
-	// Join cleans ".." segments, so a key can only ever name a path under baseDir.
+	// Defence in depth: Key already refuses names that leave their segment, and
+	// Clean drops any ".." left, so a key can only name a path inside baseDir.
 	return filepath.Join(l.baseDir, filepath.Clean("/"+key))
 }
 
-// Get retrieves an object from local filesystem
-func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *ObjectInfo, error) {
+// Get opens a cached file. The concrete *os.File is what the Store hands to
+// http.ServeContent as a seekable body.
+func (l *LocalStorage) Get(ctx context.Context, key string) (*os.File, *ObjectInfo, error) {
 	path := l.buildPath(key)
 
 	file, err := os.Open(path) // #nosec G304 -- path is confined to baseDir by buildPath
@@ -320,8 +349,9 @@ func (l *LocalStorage) Get(ctx context.Context, key string) (io.ReadCloser, *Obj
 
 // commit renames a finished temp file (in key's directory) into place and
 // accounts for its size. It is the whole of a local write once the spool's
-// bytes are on disk.
-func (l *LocalStorage) commit(ctx context.Context, tmpPath, key string, written int64) error {
+// bytes are on disk. The caller runs maybeEvict afterwards, off the path that
+// releases readers.
+func (l *LocalStorage) commit(tmpPath, key string, written int64) error {
 	path := l.buildPath(key)
 	// An overwrite replaces the old file's bytes rather than adding to them.
 	var replaced int64
@@ -332,7 +362,7 @@ func (l *LocalStorage) commit(ctx context.Context, tmpPath, key string, written 
 		return fmt.Errorf("failed to move file: %w", err)
 	}
 	l.size.Add(written - replaced)
-	l.maybeEvict(ctx)
+	l.generation.Add(1)
 	return nil
 }
 

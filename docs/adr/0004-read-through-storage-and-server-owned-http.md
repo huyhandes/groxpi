@@ -54,7 +54,8 @@ scan re-adds files in directory-walk order.
    `InFlight`. The server renders its page.
 
 Dependencies point one way: `server → admin → storage → download → index`, with `server` also calling
-`storage` and `index` directly.
+`storage` and `index` directly, `admin` also calling `index`, and `storage` also calling `index`
+(`NormalizeName`) and `config` (`New`).
 
 ## Constraints
 
@@ -98,3 +99,50 @@ blurred them.
   redirected in redirect mode) rather than a `200` cut off mid-body. `Range` and conditional requests
   still go through `http.ServeContent`; a ranged read fetches bounded windows, starting at 1 MiB and
   doubling up to a cap, instead of an open-ended `bytes=<off>-`. S3 hits still carry no `ETag`.
+
+## Amendment — 2026-10-27: redirect mode lives in storage
+
+Decision 2 made redirect mode a server decision built on a per-call no-fetch option to `Open`. That
+left the server, admin and download each re-deriving the mode from `GROXPI_DOWNLOAD_TIMEOUT`.
+
+- **The mode is set once, when the store is built.** `storage.NewStore(..., redirect bool)` takes it
+  and `Store.Open(ctx, pkg, file)` has no fetch flag. A redirect-mode store starts no flight on a miss
+  in every tier; a hybrid durable hit is still promoted into the cache. What the miss returns is a
+  `*storage.RedirectError` with reason `caching_disabled` (see "a miss says why it missed" below),
+  not `ErrNotFound`.
+- **Everyone else asks the store.** The server's redirect reason and admin's up-front "caching is
+  disabled" prefetch refusal read `Store.Redirects()`. Download no longer substitutes a 5-minute budget
+  for a zero timeout, because a redirect-mode store never calls `Fetch`.
+- The externally visible behaviour of redirect mode is unchanged.
+
+## Amendment — 2026-10-27: a miss says why it missed
+
+Decisions 2 and 3 left the server re-resolving the index after every miss it could not serve, to
+learn whether to redirect or answer `404`. A failed miss cost two index resolutions, and every
+coalesced joiner of a failed flight paid its own.
+
+- **The Fetcher is Resolve + Fetch** (§3). `storage.Fetcher` is `Resolve(ctx, pkg, file)
+  (download.Target, error)` and `Fetch(ctx, download.Target)`. The store holds the target: the flight's
+  leader resolves once and fetches that target; joiners take the leader's outcome and never resolve.
+- **A miss returns an error that says why** (§2). `Object` stays success-only. A miss the store does not
+  serve is a `*storage.RedirectError{URL, Reason, Err}` — `caching_disabled` in redirect mode (resolved
+  on the request, no flight) or `fetch_failed` when the fetch or its spool failed before the body
+  started — a wrapped `download.ErrNotListed`, or an index-resolution error. The server maps those to
+  `302`, `404 File not found` and `404 Package not found`, records the redirect telemetry, and never
+  calls `download`. Failures after the spool starts, verification included, still abort and never
+  redirect.
+- **One place strips credentials.** `RedirectError.URL` comes only from `download.Target.RedirectURL`,
+  which drops userinfo and reports that it did (`RedirectError.Stripped`, for the server's warning); an
+  unparseable URL yields none and the server answers `502` rather than hand it out.
+
+## Amendment — 2026-10-27: index renders the PEP 503 body
+
+Decision 1 put every template in `server`. The PEP 503 HTML page is not a template: it is the HTML
+form of the index's own file list, and the parser that reads upstream pages lives in `index`.
+
+- **`index` owns both directions of the simple-index body.** `parseSimpleHTML` reads an upstream page
+  and `index.RenderSimpleHTML(pkg, files)` writes groxpi's page, so a change to what a file entry
+  carries is made in one package. Rendering escapes every interpolated value, and a round-trip test
+  (render, then parse) keeps the two directions in step.
+- **The server still owns HTTP.** Routes, status codes, headers, content negotiation and the write of
+  the rendered bytes stay in `server`; `index` returns a body and knows nothing of the request.

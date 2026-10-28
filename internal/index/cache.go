@@ -1,5 +1,3 @@
-// Package cache holds the in-memory index cache: one entry per cached index
-// resource, carrying every representation that resource is served in.
 package index
 
 import (
@@ -13,7 +11,7 @@ import (
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
 
-// Entry is one cached index resource. The parsed list and the serialised bodies
+// Entry is one cached package index. The parsed list and the serialised bodies
 // are produced together by the constructors below and never mutated afterwards,
 // so a reader cannot observe a body that disagrees with the list it came from.
 // HTML is not stored: it is the uncommon content type and is cheap to render
@@ -23,6 +21,10 @@ type Entry struct {
 	JSON  []byte     // marshalled PEP 691 body
 	GZIP  []byte     // gzip of JSON, produced once at fill time
 
+	// missing marks a cached "not found on every index". Such an entry has no
+	// files or bodies, and Resolve answers it with ErrNotFound instead of
+	// handing it out.
+	missing   bool
 	size      int64
 	expiresAt time.Time
 	// lastAccess is nanoseconds since the epoch, written by readers holding only
@@ -30,12 +32,22 @@ type Entry struct {
 	lastAccess atomic.Int64
 }
 
-// NewPackageEntry builds the entry for one package's file list. body must be the
+// newPackageEntry builds the entry for one package's file list. body must be the
 // marshalled form of files.
-func NewPackageEntry(files []FileInfo, body []byte) *Entry {
+func newPackageEntry(files []FileInfo, body []byte) *Entry {
 	e := &Entry{Files: files, JSON: body}
 	e.finish()
 	return e
+}
+
+// missEntrySize is what a cached miss charges against the byte budget. It holds
+// no body, but a scanner spraying unknown names must still be bounded by the
+// budget rather than grow the map without limit.
+const missEntrySize = 64
+
+// newMissEntry is the entry for a package no configured index has.
+func newMissEntry() *Entry {
+	return &Entry{missing: true, size: missEntrySize}
 }
 
 func (e *Entry) finish() {
@@ -55,13 +67,10 @@ func (e *Entry) finish() {
 	e.size = int64(2*len(e.JSON) + len(e.GZIP))
 }
 
-// Size is the entry's charge against the cache byte budget.
-func (e *Entry) Size() int64 { return e.size }
-
-// IndexCache maps an index key to its Entry, bounded by a total byte budget with
-// least-recently-used eviction, and swept for expired entries on a timer so
-// staleness is reclaimed without waiting for a read.
-type IndexCache struct {
+// indexCache maps a normalised package name to its Entry, bounded by a total
+// byte budget with least-recently-used eviction, and swept for expired entries
+// on a timer so staleness is reclaimed without waiting for a read.
+type indexCache struct {
 	mu       sync.RWMutex
 	entries  map[string]*Entry
 	bytes    int64
@@ -71,11 +80,11 @@ type IndexCache struct {
 	stopOnce sync.Once
 }
 
-// NewIndexCache returns a cache bounded to maxBytes across every stored
+// newIndexCache returns a cache bounded to maxBytes across every stored
 // representation (<= 0 means unbounded) that sweeps expired entries every
-// sweepEvery (<= 0 disables the sweep). Call Close to stop the sweeper.
-func NewIndexCache(maxBytes int64, sweepEvery time.Duration) *IndexCache {
-	c := &IndexCache{
+// sweepEvery (<= 0 disables the sweep). Call close to stop the sweeper.
+func newIndexCache(maxBytes int64, sweepEvery time.Duration) *indexCache {
+	c := &indexCache{
 		entries:  make(map[string]*Entry),
 		maxBytes: maxBytes,
 		stop:     make(chan struct{}),
@@ -86,12 +95,12 @@ func NewIndexCache(maxBytes int64, sweepEvery time.Duration) *IndexCache {
 	return c
 }
 
-// Close stops the background sweeper. Safe to call more than once.
-func (c *IndexCache) Close() {
+// close stops the background sweeper. Safe to call more than once.
+func (c *indexCache) close() {
 	c.stopOnce.Do(func() { close(c.stop) })
 }
 
-func (c *IndexCache) sweep(every time.Duration) {
+func (c *indexCache) sweep(every time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -99,22 +108,21 @@ func (c *IndexCache) sweep(every time.Duration) {
 		case <-c.stop:
 			return
 		case <-ticker.C:
-			c.Expire()
+			c.expire()
 		}
 	}
 }
 
-// Expire drops every entry past its TTL. Called by the sweeper; exported so the
-// sweep can be exercised without waiting on a timer.
-func (c *IndexCache) Expire() {
+// expire drops every entry past its TTL. Only the sweeper calls it.
+func (c *indexCache) expire() {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	expired := int64(0)
-	for key, entry := range c.entries {
+	for pkg, entry := range c.entries {
 		if now.After(entry.expiresAt) {
-			c.removeLocked(key)
+			c.removeLocked(pkg)
 			expired++
 		}
 	}
@@ -123,9 +131,10 @@ func (c *IndexCache) Expire() {
 	}
 }
 
-func (c *IndexCache) Get(key string) (*Entry, bool) {
+// get returns a package's live entry, which may be a cached miss.
+func (c *indexCache) get(pkg string) (*Entry, bool) {
 	c.mu.RLock()
-	entry, exists := c.entries[key]
+	entry, exists := c.entries[pkg]
 	c.mu.RUnlock()
 
 	if !exists {
@@ -137,8 +146,8 @@ func (c *IndexCache) Get(key string) (*Entry, bool) {
 		// the next sweep - which is half an hour away by default, long enough to
 		// evict live entries to make room for dead ones.
 		c.mu.Lock()
-		if current, still := c.entries[key]; still && current == entry {
-			c.removeLocked(key)
+		if current, still := c.entries[pkg]; still && current == entry {
+			c.removeLocked(pkg)
 		}
 		c.mu.Unlock()
 		return nil, false
@@ -147,7 +156,17 @@ func (c *IndexCache) Get(key string) (*Entry, bool) {
 	return entry, true
 }
 
-func (c *IndexCache) Set(key string, entry *Entry, ttl time.Duration) {
+// set stores a package's entry for ttl, evicting to stay inside the budget. A
+// ttl of zero means "do not cache": the entry would be expired on arrival, and
+// with no positive TTL there is no sweeper to reclaim it. Any older entry is
+// still dropped, so it is not served on until it expires. An entry bigger than
+// the whole budget is not stored either, since evicting everything else would
+// still not make room for it.
+func (c *indexCache) set(pkg string, entry *Entry, ttl time.Duration) {
+	if ttl <= 0 {
+		c.invalidate(pkg)
+		return
+	}
 	now := time.Now()
 	entry.expiresAt = now.Add(ttl)
 	entry.lastAccess.Store(now.UnixNano())
@@ -155,22 +174,33 @@ func (c *IndexCache) Set(key string, entry *Entry, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Replacing a key subtracts the old charge, so a key cannot be accounted for
-	// twice however often it is refilled.
-	c.removeLocked(key)
-	c.entries[key] = entry
+	// Replacing a package subtracts the old charge, so it cannot be accounted
+	// for twice however often it is refilled.
+	c.removeLocked(pkg)
+	if c.maxBytes > 0 && entry.size > c.maxBytes {
+		return
+	}
+	c.entries[pkg] = entry
 	c.bytes += entry.size
 	c.evictLocked()
 	telemetry.CacheOccupancy(context.Background(), telemetry.LayerIndex, c.bytes)
 }
 
-// removeLocked deletes a key and refunds its bytes. Accounting is incremental:
-// nothing re-sums the map. Occupancy is reported here, the one place the total
-// changes downwards, and there is no request context to attribute it to.
-func (c *IndexCache) removeLocked(key string) {
-	if entry, exists := c.entries[key]; exists {
+// invalidate drops a package's entry, a cached miss included.
+func (c *indexCache) invalidate(pkg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeLocked(pkg)
+}
+
+// removeLocked deletes a package and refunds its bytes. Accounting is
+// incremental: nothing re-sums the map. Occupancy is reported here, the one
+// place the total changes downwards, and there is no request context to
+// attribute it to.
+func (c *indexCache) removeLocked(pkg string) {
+	if entry, exists := c.entries[pkg]; exists {
 		c.bytes -= entry.size
-		delete(c.entries, key)
+		delete(c.entries, pkg)
 		telemetry.CacheOccupancy(context.Background(), telemetry.LayerIndex, c.bytes)
 	}
 }
@@ -188,14 +218,14 @@ const evictSample = 8
 // evictLocked drops least-recently-used entries until the cache fits its budget.
 // Each victim costs a bounded sample rather than a full scan, so filling a cache
 // of n packages stays linear in n instead of quadratic.
-func (c *IndexCache) evictLocked() {
+func (c *indexCache) evictLocked() {
 	for c.maxBytes > 0 && c.bytes > c.maxBytes && len(c.entries) > 0 {
 		var victim string
 		var oldest int64
 		seen := 0
-		for key, entry := range c.entries {
+		for pkg, entry := range c.entries {
 			if access := entry.lastAccess.Load(); victim == "" || access < oldest {
-				victim, oldest = key, access
+				victim, oldest = pkg, access
 			}
 			if seen++; seen == evictSample {
 				break
@@ -205,33 +235,3 @@ func (c *IndexCache) evictLocked() {
 		telemetry.CacheEviction(context.Background(), telemetry.LayerIndex, 1)
 	}
 }
-
-func (c *IndexCache) InvalidatePackage(packageName string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.removeLocked(packageKey(packageName))
-}
-
-func (c *IndexCache) GetPackage(packageName string) (*Entry, bool) {
-	return c.Get(packageKey(packageName))
-}
-
-func (c *IndexCache) SetPackage(packageName string, entry *Entry, ttl time.Duration) {
-	c.Set(packageKey(packageName), entry, ttl)
-}
-
-// Len reports the number of live entries, Bytes their total charge. Both exist
-// for tests and future metrics.
-func (c *IndexCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.entries)
-}
-
-func (c *IndexCache) Bytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.bytes
-}
-
-func packageKey(packageName string) string { return "package:" + packageName }

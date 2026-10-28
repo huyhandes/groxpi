@@ -13,9 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/singleflight"
-
-	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/index"
 	"github.com/huyhandes/groxpi/internal/storage"
 )
@@ -25,10 +22,9 @@ var ErrShuttingDown = errors.New("shutting down; prefetch not accepted")
 
 // Service is the admin module.
 type Service struct {
-	store   *storage.Store
-	index   *index.Service
-	noCache bool // redirect mode: prefetch has nothing to warm
-	errors  failures
+	store  *storage.Store
+	index  *index.Service
+	errors failures
 
 	// prefetches counts the detached prefetch goroutines so shutdown can wait for
 	// them: one of them may be writing to storage when the signal arrives.
@@ -38,18 +34,21 @@ type Service struct {
 	// still parked reading its request body when shutdown starts could otherwise
 	// do exactly that: http.Server.Shutdown reports its timeout but does not kill
 	// the handler.
+	//
+	// running holds the packages with a prefetch goroutine alive, under the same
+	// lock, so a duplicate submission is skipped before any goroutine starts.
 	prefetches   sync.WaitGroup
 	prefetchMu   sync.Mutex
 	shuttingDown bool
-	prefetchSF   singleflight.Group
+	running      map[string]struct{}
 }
 
 // New builds the admin module.
-func New(cfg *config.Config, store *storage.Store, idx *index.Service) *Service {
+func New(store *storage.Store, idx *index.Service) *Service {
 	return &Service{
 		store:   store,
 		index:   idx,
-		noCache: cfg.DownloadTimeout <= 0,
+		running: map[string]struct{}{},
 	}
 }
 
@@ -74,11 +73,16 @@ func (s *Service) Close(ctx context.Context) {
 // Evict drops a package's index entry and every cached file of it. Dropping the
 // index entry alone would report success while leaving every cached file on
 // disk; deleting goes through the cache's own path, keyed off the package prefix
-// every storage key already carries.
+// every storage key already carries. A name the storage key refuses returns a
+// wrapped storage.ErrInvalidKey before anything is dropped.
 func (s *Service) Evict(ctx context.Context, packageName string) error {
+	prefix, err := storage.Key(packageName, "")
+	if err != nil {
+		return fmt.Errorf("cannot evict package: %w", err)
+	}
 	s.index.Invalidate(packageName)
 
-	deleted, err := s.store.DeletePrefix(ctx, storage.Key(packageName, ""))
+	deleted, err := s.store.DeletePrefix(ctx, prefix)
 	if err != nil {
 		return fmt.Errorf("failed to delete cached files: %w", err)
 	}
@@ -131,8 +135,11 @@ type View struct {
 	Packages    []Package // the current page only
 	Errors      []Failure
 	Downloading []Download // filled by the caller from InFlight
-	Size        int64      // across every page
-	Total       int        // packages across every page
+	Size        int64      // across every page of the matches
+	Total       int        // matching packages across every page
+	Query       string     // the normalized filter; empty lists everything
+	Filter      string     // the filter as typed, trimmed: what the box shows
+	Gen         uint64     // the cache generation the listing was taken at
 
 	// Page is 1-based; PrevPage and NextPage are 0 when there is no such page.
 	Page, PrevPage, NextPage int
@@ -151,6 +158,8 @@ type Package struct {
 	Age      string
 	Accessed string // most recent access across the package's files
 	Files    []File
+
+	created time.Time // earliest file's; what Age renders
 }
 
 // File is one cached file.
@@ -174,15 +183,22 @@ type Download struct {
 // List groups one page of the cache snapshot into the page's rows. Storage keys
 // already encode the package and filename in a fixed shape, so grouping is
 // string manipulation and needs no second index.
-func (s *Service) List(_ context.Context, page int) View {
+//
+// A non-empty query keeps only packages whose name contains it (case-folded),
+// and is applied before paging so a match on any page is found.
+func (s *Service) List(_ context.Context, page int, query string) View {
 	now := time.Now()
-	view := View{Errors: s.errors.list(), Page: page}
+	filter := strings.TrimSpace(query)
+	query = NormalizeQuery(filter)
+	// The generation is read before the walk, so a change during it shows as
+	// newer on the next poll rather than being lost.
+	view := View{Errors: s.errors.list(), Page: page, Query: query, Filter: filter, Gen: s.store.Generation()}
 
 	// The listing is the cache's own walk; the durable store is never listed.
 	byName := make(map[string]*Package)
 	for _, entry := range s.store.Snapshot() {
 		packageName, fileName, ok := splitPackageKey(entry.Key)
-		if !ok {
+		if !ok || !strings.Contains(packageName, query) {
 			continue
 		}
 
@@ -190,8 +206,12 @@ func (s *Service) List(_ context.Context, page int) View {
 		if pkg == nil {
 			// The snapshot is most recently accessed first, so the first file
 			// seen carries the package's last access.
-			pkg = &Package{Name: packageName, Age: humanAge(now, entry.CreatedAt), Accessed: humanAge(now, entry.Accessed)}
+			pkg = &Package{Name: packageName, Accessed: humanAge(now, entry.Accessed), created: entry.CreatedAt}
 			byName[packageName] = pkg
+		}
+		// The package is as old as its oldest file.
+		if !entry.CreatedAt.IsZero() && (pkg.created.IsZero() || entry.CreatedAt.Before(pkg.created)) {
+			pkg.created = entry.CreatedAt
 		}
 		pkg.Size += entry.Size
 		pkg.Files = append(pkg.Files, File{
@@ -205,6 +225,7 @@ func (s *Service) List(_ context.Context, page int) View {
 
 	view.Packages = make([]Package, 0, len(byName))
 	for _, pkg := range byName {
+		pkg.Age = humanAge(now, pkg.created)
 		sort.Slice(pkg.Files, func(i, j int) bool { return pkg.Files[i].Name < pkg.Files[j].Name })
 		view.Packages = append(view.Packages, *pkg)
 	}
@@ -228,6 +249,18 @@ func (s *Service) List(_ context.Context, page int) View {
 	}
 	return view
 }
+
+// NormalizeQuery is the form a filter is matched in: trimmed and folded the way
+// cached package names are (PEP 503), so "typing_ext" finds "typing-ext".
+func NormalizeQuery(q string) string { return index.NormalizeName(strings.TrimSpace(q)) }
+
+// Generation is the cache generation: it changes whenever a file lands in or
+// leaves the cache, so a listing taken at an older one is stale.
+func (s *Service) Generation() uint64 { return s.store.Generation() }
+
+// Failures is the recent prefetch failures, newest first, without the cache
+// walk List does.
+func (s *Service) Failures() []Failure { return s.errors.list() }
 
 // InFlight lists the downloads running now, for the page's "Downloading now"
 // rows.

@@ -42,7 +42,8 @@ func (s *Service) Prefetch(ctx context.Context, pkgs ...string) error {
 // startPrefetch runs one prefetch in the background. Everything that makes a
 // detached goroutine dangerous is handled here rather than in the work itself:
 // it is registered so shutdown waits for it, deduplicated so an impatient
-// operator submitting the same name ten times gets one download, deadlined so it
+// operator submitting the same name ten times gets one goroutine (a duplicate
+// is skipped, not queued, while one runs), deadlined so it
 // cannot outlive the process it is holding open, and its panics are contained —
 // the server's recover middleware only wraps the request goroutine.
 //
@@ -50,16 +51,27 @@ func (s *Service) Prefetch(ctx context.Context, pkgs ...string) error {
 // finished anyway. Taking the lock around the registration is what keeps the Add
 // from racing Close's Wait.
 func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
+	packageName = index.NormalizeName(packageName) // the dedupe key: every spelling is one package
 	s.prefetchMu.Lock()
 	if s.shuttingDown {
 		s.prefetchMu.Unlock()
 		return false
 	}
+	if _, dup := s.running[packageName]; dup {
+		s.prefetchMu.Unlock()
+		return true
+	}
+	s.running[packageName] = struct{}{}
 	s.prefetches.Add(1)
 	s.prefetchMu.Unlock()
 
 	go func() {
 		defer s.prefetches.Done()
+		defer func() {
+			s.prefetchMu.Lock()
+			delete(s.running, packageName)
+			s.prefetchMu.Unlock()
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("Prefetch panicked", "package", packageName, "panic", r)
@@ -69,11 +81,7 @@ func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 
 		ctx, cancel := context.WithTimeout(ctx, prefetchDeadline)
 		defer cancel()
-
-		_, _, _ = s.prefetchSF.Do(packageName, func() (any, error) {
-			s.prefetchPackage(ctx, packageName)
-			return nil, nil
-		})
+		s.prefetchPackage(ctx, packageName)
 	}()
 
 	return true
@@ -84,6 +92,13 @@ func (s *Service) startPrefetch(ctx context.Context, packageName string) bool {
 // recent-errors area as well as logged: an operator watching an empty table must
 // not have to read the server log to learn why it is empty.
 func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
+	// In redirect mode nothing is cached, so there is nothing to warm: one
+	// failure for the package, not one per file after a wasted index lookup.
+	if s.store.Redirects() {
+		s.errors.record(packageName, "caching is disabled (download timeout is 0)")
+		return
+	}
+
 	entry, err := s.index.Resolve(ctx, packageName)
 	if err != nil {
 		if errors.Is(err, index.ErrNotFound) {
@@ -118,10 +133,7 @@ func (s *Service) prefetchPackage(ctx context.Context, packageName string) {
 // warm caches one file with no client attached: open it through the store and
 // drain it. A hit is already cached; a miss drains the whole download path.
 func (s *Service) warm(ctx context.Context, packageName, fileName string) error {
-	if s.noCache {
-		return errors.New("caching is disabled (download timeout is 0)")
-	}
-	obj, err := s.store.Open(ctx, packageName, fileName, true)
+	obj, err := s.store.Open(ctx, packageName, fileName)
 	if err != nil {
 		return err
 	}
@@ -159,6 +171,10 @@ func newestReleaseFiles(files []index.FileInfo) []index.FileInfo {
 		if !ok {
 			continue
 		}
+		// The local label ("+cpu", "+cu118") names a build of the release, not a
+		// different release: without dropping it, PEP 440 orders the builds and
+		// only one of 2.1.0, 2.1.0+cpu and 2.1.0+cu118 would be warmed.
+		raw, _, _ = strings.Cut(raw, "+")
 		parsed, err := pep440.Parse(raw)
 		if err != nil {
 			slog.Debug("Skipping file with unparseable version", "file", file.Name, "version", raw)

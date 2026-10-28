@@ -9,9 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -26,85 +27,144 @@ import (
 // JSONContentType is the PEP 691 media type of every index body served as JSON.
 const JSONContentType = "application/vnd.pypi.simple.v1+json"
 
-// upstream is the one-method view of Client that resolution needs. It is an
-// interface because the tests have a second implementation.
+// upstream is the one-method view of client that resolution needs. It is an
+// interface because the tests have a second implementation (fakeUpstream).
 type upstream interface {
 	GetPackageFiles(ctx context.Context, index config.Index, packageName string) ([]FileInfo, error)
 }
 
 // Service is the index module. One instance serves every configured index.
 type Service struct {
-	cache    *IndexCache
+	cache    *indexCache
 	upstream upstream
 	sf       singleflight.Group
 
 	// indexes is the resolution order: extra indexes first, primary last. Each
 	// carries its own TTL.
 	indexes []config.Index
+	// missTTL is how long "not found on every index" is remembered: the shortest
+	// TTL in the resolution order, so a package newly published to any index is
+	// hidden no longer than that index's own entries would be stale.
+	missTTL time.Duration
 
 	// The root index is proxied rather than parsed, so it needs an HTTP client of
 	// its own instead of the typed index client.
 	rootURL    string
 	rootClient *http.Client
+
+	// transport is the one upstream transport, shared by the index client, the
+	// root client and download (through Transport).
+	transport *http.Transport
 }
 
 // New builds the index module from configuration. Expired entries are swept at
-// the index TTL cadence: an entry outlives its TTL by at most one interval, and
-// nothing scans on the read path.
+// the shortest positive TTL in the resolution order: an entry outlives its TTL
+// by at most one interval, and nothing scans on the read path.
 func New(cfg *config.Config) *Service {
-	return newService(cfg, NewIndexCache(cfg.IndexCacheSize, cfg.IndexTTL), NewClient(cfg))
+	transport := newTransport(cfg)
+	return newService(cfg, newIndexCache(cfg.IndexCacheSize, sweepInterval(cfg)), newClient(cfg, transport), transport)
 }
 
-func newService(cfg *config.Config, cache *IndexCache, up upstream) *Service {
+// sweepInterval is the shortest positive TTL across every configured index, or
+// 0 (no sweeper) when none is positive: a TTL of 0 caches nothing to sweep.
+func sweepInterval(cfg *config.Config) time.Duration {
+	var every time.Duration
+	for _, index := range cfg.ResolutionOrder() {
+		if index.TTL > 0 && (every == 0 || index.TTL < every) {
+			every = index.TTL
+		}
+	}
+	return every
+}
+
+func newService(cfg *config.Config, cache *indexCache, up upstream, transport *http.Transport) *Service {
+	indexes := cfg.ResolutionOrder()
+	missTTL := indexes[0].TTL
+	for _, index := range indexes[1:] {
+		missTTL = min(missTTL, index.TTL)
+	}
 	return &Service{
 		cache:    cache,
 		upstream: up,
-		indexes:  cfg.ResolutionOrder(),
+		indexes:  indexes,
+		missTTL:  missTTL,
 		rootURL:  strings.TrimSuffix(cfg.IndexURL, "/") + "/",
 		// ponytail: one fixed timeout for the whole proxied response. The root list
 		// is large but a single upstream GET; a byte-rate budget can come later if a
 		// slow index actually shows up.
-		rootClient: &http.Client{Timeout: 60 * time.Second},
+		rootClient: &http.Client{Transport: transport, Timeout: 60 * time.Second},
+		transport:  transport,
 	}
 }
 
-// Close stops the cache sweeper.
-func (s *Service) Close() { s.cache.Close() }
+// Transport is the upstream transport index built from configuration. download
+// sends file requests through it, so TLS settings and connection pooling are
+// the same for every upstream call.
+func (s *Service) Transport() http.RoundTripper { return s.transport }
 
-// Invalidate drops a package's cached entry so the next request goes upstream.
-func (s *Service) Invalidate(packageName string) { s.cache.InvalidatePackage(packageName) }
+// Close stops the cache sweeper.
+func (s *Service) Close() { s.cache.close() }
+
+// Invalidate drops a package's cached entry, a cached miss included, so the
+// next request goes upstream. Any spelling of the name drops the one normalised
+// entry.
+func (s *Service) Invalidate(packageName string) {
+	s.cache.invalidate(NormalizeName(packageName))
+}
 
 // Resolve returns the cache entry for a package — parsed file list and
 // serialised bodies, produced together — using the index cache and
 // deduplicating concurrent upstream fetches. It is the only path to the upstream
-// package index. A miss on every configured index is ErrNotFound.
+// package index. A miss on every configured index is ErrNotFound, and is itself
+// cached for the shortest index TTL. The name is normalised first, so every
+// spelling shares one entry and one upstream query.
 func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, error) {
+	packageName = NormalizeName(packageName)
 	ctx, span := telemetry.Tracer().Start(ctx, "index.resolve")
 	defer span.End()
 
-	if entry, found := s.cache.GetPackage(packageName); found {
+	if entry, found := s.cache.get(packageName); found {
 		telemetry.CacheHit(ctx, telemetry.LayerIndex)
+		if entry.missing {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, packageName)
+		}
 		return entry, nil
 	}
 	telemetry.CacheMiss(ctx, telemetry.LayerIndex)
 
-	result, err, _ := s.sf.Do("package-files:"+packageName, func() (any, error) {
+	result, err := s.shared(ctx, "package-files:"+packageName, func() (any, error) {
 		// The fetch fills the cache for every waiter, so it must not die with
 		// whichever client happened to trigger it.
-		index, files, err := s.queryIndexes(context.WithoutCancel(ctx), packageName)
-		if err != nil {
+		ctx := context.WithoutCancel(ctx)
+		index, files, err := s.queryIndexes(ctx, packageName)
+		if errors.Is(err, ErrNotFound) {
+			// Every index answered and none has the package. Remembering that is
+			// what stops a CI fleet retrying a typo from querying every upstream
+			// on every request. Errors are not remembered: an unreachable index
+			// says nothing about the package.
+			s.cache.set(packageName, newMissEntry(), s.missTTL)
 			return nil, err
+		}
+		// A failure is logged here, once per lookup: every waiter may have left
+		// by now, and the ones still waiting share this one failure.
+		fail := func(err error) (any, error) {
+			slog.ErrorContext(ctx, "Failed to fetch package files",
+				"error", config.RedactErrorText(err), "package", packageName)
+			return nil, err
+		}
+		if err != nil {
+			return fail(err)
 		}
 		body, err := encodePackageFiles(packageName, files)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode index for package %q: %w", packageName, err)
+			return fail(fmt.Errorf("failed to encode index for package %q: %w", packageName, err))
 		}
-		entry := NewPackageEntry(files, body)
+		entry := newPackageEntry(files, body)
 		// Never cache an empty index: a transient upstream fault would otherwise
 		// poison this package for the whole TTL. The TTL is the answering index's
 		// own, so a fast-moving private index is not held stale by PyPI's.
 		if len(files) > 0 {
-			s.cache.SetPackage(packageName, entry, index.TTL)
+			s.cache.set(packageName, entry, index.TTL)
 		}
 		return entry, nil
 	})
@@ -117,6 +177,40 @@ func (s *Service) Resolve(ctx context.Context, packageName string) (*Entry, erro
 		return nil, fmt.Errorf("unexpected index result type %T for package %q", result, packageName)
 	}
 	return entry, nil
+}
+
+// shared runs fn once per key for every concurrent caller, and lets each caller
+// stop waiting when its own context ends. fn must run detached from ctx: it
+// carries on for the callers still waiting, and fills the cache for later ones.
+// fn runs on its own goroutine, where a panic would kill the process, so a panic
+// comes back as an error instead.
+func (s *Service) shared(ctx context.Context, key string, fn func() (any, error)) (any, error) {
+	guarded := func() (v any, err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				err = panicError(ctx, rec)
+			}
+		}()
+		return fn()
+	}
+	select {
+	case r := <-s.sf.DoChan(key, guarded):
+		return r.Val, r.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// errPanic marks a lookup that panicked, e.g. a parser bug fed upstream data.
+var errPanic = errors.New("index lookup panicked")
+
+// panicError logs a recovered panic with its stack and turns it into an error,
+// so the caller answers a 5xx instead of the process dying with it.
+func panicError(ctx context.Context, rec any) error {
+	err := fmt.Errorf("%w: %v", errPanic, rec)
+	slog.ErrorContext(ctx, "Index lookup panicked",
+		"error", config.RedactErrorText(err), "stack", string(debug.Stack()))
+	return err
 }
 
 // resolutionResult classifies one index's answer for the resolution metric. A
@@ -195,10 +289,21 @@ func (s *Service) queryConcurrently(ctx context.Context, indexes []config.Index,
 				trace.WithAttributes(attribute.String(telemetry.AttrIndex, redacted)))
 			defer span.End()
 
+			// The upstream answer is parsed here, on a goroutine of its own:
+			// a panic must become this index's error, not kill the process.
+			// It runs before span.End, so a panicking query is recorded as an
+			// error too.
+			result := telemetry.ResultError
+			defer func() {
+				if rec := recover(); rec != nil {
+					answers[i] = indexAnswer{err: panicError(ctx, rec)}
+				}
+				span.SetAttributes(attribute.String(telemetry.AttrIndexResult, result))
+				telemetry.IndexResolution(queryCtx, redacted, result)
+			}()
+
 			files, err := s.upstream.GetPackageFiles(queryCtx, index, packageName)
-			result := resolutionResult(err)
-			span.SetAttributes(attribute.String(telemetry.AttrIndexResult, result))
-			telemetry.IndexResolution(queryCtx, redacted, result)
+			result = resolutionResult(err)
 
 			// Written before the channel closes and read after: no other
 			// synchronisation is needed.
@@ -211,12 +316,11 @@ func (s *Service) queryConcurrently(ctx context.Context, indexes []config.Index,
 		}
 	}()
 
+	// ctx carries no cancellation (Resolve detaches it so one client cannot
+	// abort a shared resolution), so each wait ends only when its query does;
+	// the HTTP client's timeout bounds that.
 	for i, index := range indexes {
-		select {
-		case <-done[i]:
-		case <-ctx.Done():
-			return config.Index{}, nil, ctx.Err()
-		}
+		<-done[i]
 
 		switch answer := answers[i]; {
 		case answer.err == nil:
@@ -257,52 +361,16 @@ type RootResponse struct {
 // is served through, not stored — but concurrent callers asking for the same
 // representation still share one upstream fetch.
 func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) (*RootResponse, error) {
-	result, err, _ := s.sf.Do("root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
+	result, err := s.shared(ctx, "root:"+accept+"\x00"+acceptEncoding, func() (any, error) {
 		// The fetch serves every waiter, so it must not die with whichever client
 		// happened to trigger it; the HTTP client's own timeout bounds it.
-		req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodGet, s.rootURL, nil)
+		ctx := context.WithoutCancel(ctx)
+		root, err := s.fetchRoot(ctx, accept, acceptEncoding)
 		if err != nil {
-			return nil, err
+			// Logged here, once per fetch, as for a package lookup.
+			slog.ErrorContext(ctx, "Failed to proxy root index", "error", config.RedactErrorText(err))
 		}
-		req.Header.Set("User-Agent", "groxpi/1.0.0")
-		if accept != "" {
-			req.Header.Set("Accept", accept)
-		}
-		// Setting this explicitly also stops net/http decompressing the body, which
-		// is what makes the pass-through byte-level.
-		if acceptEncoding != "" {
-			req.Header.Set("Accept-Encoding", acceptEncoding)
-		}
-
-		resp, err := s.rootClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		// The whole response is held in memory to be handed to every waiter, so an
-		// upstream that answers this route with an endless body would otherwise be
-		// an unauthenticated way to exhaust the process's memory. The ceiling is far
-		// above PyPI's own project list; exceeding it fails loudly rather than
-		// serving a truncated index. Reading one byte past the cap is what tells
-		// the two apart: a body of exactly the cap is served, the first byte over
-		// is an error.
-		//
-		// ponytail: the overflow branch is untested — reaching it needs a
-		// 256 MiB response body, which is not a test worth running.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRootIndexBytes+1))
-		if err != nil {
-			return nil, err
-		}
-		if int64(len(body)) > maxRootIndexBytes {
-			return nil, fmt.Errorf("root index exceeds the %d byte limit", maxRootIndexBytes)
-		}
-		return &RootResponse{
-			Status:          resp.StatusCode,
-			ContentType:     resp.Header.Get("Content-Type"),
-			ContentEncoding: resp.Header.Get("Content-Encoding"),
-			Body:            body,
-		}, nil
+		return root, err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to proxy root index: %w", err)
@@ -315,25 +383,63 @@ func (s *Service) ProxyRoot(ctx context.Context, accept, acceptEncoding string) 
 	return root, nil
 }
 
-// The wire shapes below are the typed replacement for the maps the index
-// responses used to be built from. Fields are declared in the key order
-// encoding/json emitted for those maps (alphabetical), so response bytes are
-// unchanged.
+// fetchRoot is ProxyRoot's one upstream GET, run once for every waiter.
+func (s *Service) fetchRoot(ctx context.Context, accept, acceptEncoding string) (*RootResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.rootURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", config.UserAgent)
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	// Setting this explicitly also stops net/http decompressing the body, which
+	// is what makes the pass-through byte-level.
+	if acceptEncoding != "" {
+		req.Header.Set("Accept-Encoding", acceptEncoding)
+	}
+
+	resp, err := s.rootClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// The whole response is held in memory to be handed to every waiter, so an
+	// upstream that answers this route with an endless body would otherwise be
+	// an unauthenticated way to exhaust the process's memory. The ceiling is far
+	// above PyPI's own project list; exceeding it fails loudly rather than
+	// serving a truncated index.
+	body, err := readCapped(resp.Body, maxRootIndexBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &RootResponse{
+		Status:          resp.StatusCode,
+		ContentType:     resp.Header.Get("Content-Type"),
+		ContentEncoding: resp.Header.Get("Content-Encoding"),
+		Body:            body,
+	}, nil
+}
+
+// The wire shapes below are the PEP 691 JSON this proxy serves for a package.
 
 type wireMeta struct {
 	APIVersion string `json:"api-version"`
 }
 
 type wireFile struct {
-	Filename       string            `json:"filename"`
-	Hashes         map[string]string `json:"hashes,omitempty"`
+	Filename string `json:"filename"`
+	// PEP 691: hashes MUST be present, even when empty.
+	Hashes         map[string]string `json:"hashes"`
 	RequiresPython string            `json:"requires-python,omitempty"`
 	URL            string            `json:"url"`
-	Yanked         bool              `json:"yanked,omitempty"`
-	YankedReason   string            `json:"yanked-reason,omitempty"`
-	// PEP 714: emit under both keys so old and new installers find it.
-	CoreMetadata     any `json:"core-metadata,omitempty"`
-	DistInfoMetadata any `json:"dist-info-metadata,omitempty"`
+	// PEP 691: yanked is true or the non-empty reason string; omitted when
+	// the file is not yanked.
+	Yanked any `json:"yanked,omitempty"`
+	// PEP 714: JSON servers emit core-metadata only ("should not emit the old
+	// keys in JSON"); the HTML page carries both attributes.
+	CoreMetadata any `json:"core-metadata,omitempty"`
 }
 
 type wireFiles struct {
@@ -355,25 +461,30 @@ func encodePackageFiles(packageName string, files []FileInfo) ([]byte, error) {
 			Filename:       file.Name,
 			Hashes:         file.Hashes,
 			RequiresPython: file.RequiresPython,
-			URL:            ProxyFileURL(packageName, file.Name),
+			URL:            proxyFileURL(packageName, file.Name),
+		}
+		if wf.Hashes == nil {
+			wf.Hashes = map[string]string{}
 		}
 		if file.IsYanked() {
 			wf.Yanked = true
-			wf.YankedReason = file.GetYankedReason()
+			if reason := file.GetYankedReason(); reason != "" {
+				wf.Yanked = reason
+			}
 		}
 		if hashes, ok := file.Metadata(); ok {
-			var v any = true
+			wf.CoreMetadata = true
 			if len(hashes) > 0 {
-				v = hashes
+				wf.CoreMetadata = hashes
 			}
-			wf.CoreMetadata, wf.DistInfoMetadata = v, v
 		}
 		body.Files = append(body.Files, wf)
 	}
 	return json.Marshal(body)
 }
 
-// ProxyFileURL is the path this proxy serves a package file at.
-func ProxyFileURL(packageName, fileName string) string {
-	return "/simple/" + packageName + "/" + fileName
+// proxyFileURL is the path this proxy serves a package file at, each segment
+// percent-encoded so a name with "#" or "?" is not cut short by the client.
+func proxyFileURL(packageName, fileName string) string {
+	return "/simple/" + url.PathEscape(packageName) + "/" + url.PathEscape(fileName)
 }

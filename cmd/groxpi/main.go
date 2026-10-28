@@ -35,21 +35,29 @@ func healthCheck(baseURL string) error {
 func main() {
 	// The health-check probe runs before anything else is constructed: no
 	// telemetry, no logger, no server, no storage backend.
+	cfg, cfgErr := config.Load()
 	if len(os.Args) > 1 && os.Args[1] == "--health-check" {
-		if err := healthCheck("http://127.0.0.1:" + config.Load().Port); err != nil {
+		err := cfgErr
+		if err == nil {
+			err = healthCheck("http://127.0.0.1:" + cfg.Port)
+		}
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "health check failed:", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	// Load configuration
-	cfg := config.Load()
+	// Bad configuration stops the process before anything is constructed. The
+	// logger is not configured yet, so this goes to slog's default (stderr).
+	if cfgErr != nil {
+		logger.Fatal("Invalid configuration", "error", cfgErr)
+	}
 
 	// Install the OpenTelemetry providers before the logger, so that the log
 	// bridge picks up a real provider when one is configured. With no endpoint
 	// configured this installs nothing and cannot fail.
-	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint, cfg.ServiceName)
+	shutdownTelemetry, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint != "", cfg.ServiceName)
 	if err != nil {
 		// A misconfigured exporter must not stop the proxy from serving.
 		slog.Warn("Telemetry disabled: failed to set up OpenTelemetry", "error", err)
@@ -63,49 +71,45 @@ func main() {
 		Color:  cfg.LogColor,
 	})
 
-	// Test debug logging immediately after logger init
-	slog.Debug("🔧 Logger initialized and debug logging is working",
-		"log_level", cfg.LogLevel,
-		"log_format", cfg.LogFormat,
-		"log_color", cfg.LogColor)
+	// fatal is logger.Fatal with the telemetry flushed first, under a short
+	// deadline: os.Exit skips every defer, so without it the record saying why
+	// the process died never reaches the collector.
+	fatal := func(msg string, args ...any) {
+		slog.Log(context.Background(), logger.LevelFatal, msg, args...)
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = shutdownTelemetry(flushCtx)
+		cancelFlush()
+		os.Exit(1)
+	}
 
 	// Log startup info
 	slog.Info("🚀 Starting groxpi server",
-		"version", "1.0.0",
-		"storage_type", cfg.StorageType,
+		"version", config.Version,
 		"log_level", cfg.LogLevel,
 		"log_format", cfg.LogFormat,
-		"otlp_endpoint", cfg.OTLPEndpoint)
+		"otlp_endpoint", config.RedactURL(cfg.OTLPEndpoint))
 
 	// Log configuration
 	slog.Info("📋 Configuration loaded",
 		"index_url", config.RedactURL(cfg.IndexURL),
-		"cache_size_bytes", cfg.CacheSize,
-		"cache_size_human", FormatBytes(cfg.CacheSize),
 		"index_ttl", cfg.IndexTTL,
 		"port", cfg.Port)
 
-	// Log storage configuration
-	if cfg.StorageType == "s3" {
-		slog.Info("☁️  S3 storage configured",
-			"endpoint", cfg.S3Endpoint,
-			"bucket", cfg.S3Bucket,
-			"prefix", cfg.S3Prefix,
-			"region", cfg.S3Region,
-			"ssl", cfg.S3UseSSL)
-	} else {
-		slog.Info("💾 Local storage configured", "cache_dir", cfg.CacheDir)
-	}
-
+	// The storage module logs its own "storage configured" line: it alone
+	// knows which cache the mode really uses.
 	// Create server
-	srv := server.New(cfg)
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		fatal("Failed to construct server", "error", err)
+	}
 	router := srv.Router()
 
 	// Create HTTP server
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second, // slowloris guard; bodies are streamed so no ReadTimeout
+		ReadHeaderTimeout: 10 * time.Second,  // slowloris guard; bodies are streamed so no ReadTimeout
+		IdleTimeout:       120 * time.Second, // reap idle keep-alive connections
 	}
 
 	// Start server in goroutine
@@ -113,7 +117,7 @@ func main() {
 		slog.Info("🌐 HTTP server starting", "address", ":"+cfg.Port)
 
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("Failed to start server", "error", err)
+			fatal("Failed to start server", "error", err)
 		}
 	}()
 
@@ -152,18 +156,4 @@ func shutdown(ctx context.Context, httpServer *http.Server, srv *server.Server) 
 	if err := srv.CloseContext(ctx); err != nil {
 		slog.Error("Failed to close storage backend", "error", err)
 	}
-}
-
-// formatBytes converts bytes to human readable format
-func FormatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

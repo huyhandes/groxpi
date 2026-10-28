@@ -21,6 +21,9 @@ WRK_TIMEOUT="30s"
 # Test packages - vary in size and complexity
 TEST_PACKAGES=("numpy" "pandas" "polars" "pyspark" "fastapi")
 
+# Failed measurements, counted instead of aborting so the summary CSV is still written
+FAILURES=0
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,7 +50,6 @@ show_usage() {
     echo "Test Scenarios:"
     echo "  all           - Run all test scenarios"
     echo "  cold-single   - Cold cache single request timing"
-    echo "  cold-load     - Cold cache load testing"
     echo "  warm-load     - Warm cache load testing"
     echo "  package-tests - Individual package testing"
     echo ""
@@ -107,8 +109,9 @@ test_server_connection() {
     fi
 }
 
-# Function to clear cache using cache_manager.sh
+# Empty one proxy's cache (groxpi or proxpi) using cache_manager.sh
 clear_cache() {
+    local target=$1
     local cache_manager_script="$(dirname "$0")/cache_manager.sh"
 
     if [ ! -f "$cache_manager_script" ]; then
@@ -116,9 +119,9 @@ clear_cache() {
         return 1
     fi
 
-    log_info "Clearing caches on both servers..."
-    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" clear-all; then
-        log_success "Caches cleared successfully"
+    log_info "Clearing $target cache..."
+    if "$cache_manager_script" "$GROXPI_URL" "$PROXPI_URL" "clear-$target"; then
+        log_success "$target cache cleared"
         # Wait a moment for cache clear to take effect
         sleep 3
         return 0
@@ -140,19 +143,13 @@ run_single_request_test() {
 
     log_info "Single request test: $service - $test_name ($endpoint)"
 
-    # Record start time
-    local start_time=$(date +%s.%N)
-
-    # Make single request
+    # Make single request; curl times it, so no clock arithmetic here
     local response
     local http_code
-    if response=$(curl -s -w "HTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}" --max-time 30 "$url$endpoint" 2>&1); then
-        local end_time=$(date +%s.%N)
-
+    if response=$(curl -s -o /dev/null -w "HTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}" --max-time 30 "$url$endpoint" 2>&1); then
         # Extract metrics
         http_code=$(echo "$response" | grep -o 'HTTP_CODE:[0-9]*' | cut -d':' -f2)
         time_total=$(echo "$response" | grep -o 'TIME_TOTAL:[0-9.]*' | cut -d':' -f2)
-        duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
 
         # Write results
         {
@@ -165,7 +162,6 @@ run_single_request_test() {
             echo "Results:"
             echo "  HTTP Code: $http_code"
             echo "  Response Time: ${time_total}s"
-            echo "  Total Duration: ${duration}s"
             echo ""
         } > "$output_file"
 
@@ -173,12 +169,23 @@ run_single_request_test() {
             log_success "  Response time: ${time_total}s (HTTP $http_code)"
         else
             log_warning "  Response time: ${time_total}s (HTTP $http_code)"
+            # Logged for the record, but counted as a failure: a non-200 is not a timing
+            return 1
         fi
     else
         log_error "  Request failed"
         echo "ERROR: Request failed" > "$output_file"
         return 1
     fi
+}
+
+# Print wrk's socket error counts if any is non-zero, else nothing.
+wrk_socket_errors() {
+    awk '/Socket errors:/ {
+        line = $0; sub(/^[ \t]*Socket errors: /, "", line); gsub(",", "")
+        if ($4 + $6 + $8 + $10 > 0) print line
+        exit
+    }' "$1"
 }
 
 # Function to run wrk load test
@@ -203,6 +210,32 @@ run_wrk_load_test() {
            --latency \
            "$url$endpoint" > "$output_file" 2>&1; then
 
+        # wrk counts every response as a request, so error replies would pass
+        # for throughput. wrk's "Non-2xx or 3xx responses" counter, despite its
+        # name, counts only status > 399, so any 4xx/5xx reply fails the
+        # measurement, and the log is renamed out of the summary CSV's glob so
+        # its rate is not reported.
+        local non_2xx
+        non_2xx=$(awk '/Non-2xx or 3xx responses:/ {print $NF; exit}' "$output_file")
+        if [ -n "$non_2xx" ]; then
+            local failed_file="${output_file%.log}.failed.log"
+            mv "$output_file" "$failed_file"
+            log_error "  Load test got $non_2xx 4xx/5xx responses; see $failed_file"
+            return 1
+        fi
+
+        # wrk prints "Socket errors: connect N, read N, write N, timeout N" when
+        # one is non-zero; errored and timed-out requests are not in the rate,
+        # so any non-zero count fails the measurement the same way.
+        local socket_errors
+        socket_errors=$(wrk_socket_errors "$output_file")
+        if [ -n "$socket_errors" ]; then
+            local failed_file="${output_file%.log}.failed.log"
+            mv "$output_file" "$failed_file"
+            log_error "  Load test had socket errors ($socket_errors); see $failed_file"
+            return 1
+        fi
+
         # Extract key metrics
         local rps=$(grep "Requests/sec:" "$output_file" | awk '{print $2}' | head -1)
         local latency_avg=$(grep "Latency" "$output_file" | awk '{print $2}' | head -1)
@@ -217,6 +250,24 @@ run_wrk_load_test() {
     fi
 }
 
+# Run one measurement; a failure is counted instead of aborting the suite
+single() { run_single_request_test "$@" || FAILURES=$((FAILURES + 1)); }
+load() { run_wrk_load_test "$@" || FAILURES=$((FAILURES + 1)); }
+
+# Empty one proxy's cache (groxpi or proxpi), then run one measurement against it:
+#   cold <target> <measurement> <args...>
+# Only the measured proxy is recreated. A failed clear is counted and the
+# measurement skipped, so a warm number is never recorded as a cold one.
+cold() {
+    local target=$1
+    shift
+    if clear_cache "$target"; then
+        "$@"
+    else
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 # Function to run cold cache tests
 run_cold_cache_tests() {
     local results_dir=$1
@@ -227,37 +278,20 @@ run_cold_cache_tests() {
     echo "=========================================="
     echo ""
 
-    # Clear caches
-    if ! clear_cache; then
-        log_error "Failed to clear caches, skipping cold cache tests"
-        return 1
-    fi
-
     if [ "$TEST_SCENARIO" = "cold-single" ] || [ "$TEST_SCENARIO" = "all" ]; then
         log_info "Running cold cache single request tests..."
 
         # Test package index
-        run_single_request_test "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
-        clear_cache  # Clear again for fair comparison
-        run_single_request_test "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
+        cold groxpi single "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
+        cold proxpi single "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
 
         # Test specific package (numpy)
-        clear_cache
-        run_single_request_test "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
-        clear_cache
-        run_single_request_test "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
+        cold groxpi single "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-cold" "$results_dir"
+        cold proxpi single "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-cold" "$results_dir"
     fi
 
-    if [ "$TEST_SCENARIO" = "cold-load" ] || [ "$TEST_SCENARIO" = "all" ]; then
-        log_info "Running cold cache load tests..."
-
-        # Test package index under load
-        clear_cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/" "groxpi" "index-cold" "$results_dir"
-
-        clear_cache
-        run_wrk_load_test "$PROXPI_URL" "/simple/" "proxpi" "index-cold" "$results_dir"
-    fi
+    # No cold load run: only its first request would miss, so it would measure a
+    # warm cache under a cold name. cold-single covers the cold request.
 }
 
 # Function to warm up cache
@@ -266,9 +300,6 @@ warm_up_cache() {
     local service=$2
 
     log_info "Warming up cache for $service..."
-
-    # Make requests to package index and specific packages
-    curl -s "$url/simple/" >/dev/null 2>&1 || true
 
     for package in "${TEST_PACKAGES[@]}"; do
         curl -s "$url/simple/$package/" >/dev/null 2>&1 || true
@@ -295,13 +326,10 @@ run_warm_cache_tests() {
 
         log_info "Running warm cache load tests..."
 
-        # Test package index with warm cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/" "groxpi" "index-warm" "$results_dir"
-        run_wrk_load_test "$PROXPI_URL" "/simple/" "proxpi" "index-warm" "$results_dir"
-
-        # Test specific package with warm cache
-        run_wrk_load_test "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-warm" "$results_dir"
-        run_wrk_load_test "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-warm" "$results_dir"
+        # Test specific package with warm cache. No /simple/ load run: groxpi
+        # passes the root index through uncached, so it would measure pypi.org.
+        load "$GROXPI_URL" "/simple/numpy/" "groxpi" "numpy-warm" "$results_dir"
+        load "$PROXPI_URL" "/simple/numpy/" "proxpi" "numpy-warm" "$results_dir"
     fi
 }
 
@@ -320,17 +348,40 @@ run_package_tests() {
         for package in "${TEST_PACKAGES[@]}"; do
             log_info "Testing package: $package"
 
-            # Clear and test groxpi
-            clear_cache
-            run_single_request_test "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
-
-            # Clear and test proxpi
-            clear_cache
-            run_single_request_test "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
+            cold groxpi single "$GROXPI_URL" "/simple/$package/" "groxpi" "$package-individual" "$results_dir"
+            cold proxpi single "$PROXPI_URL" "/simple/$package/" "proxpi" "$package-individual" "$results_dir"
 
             echo ""
         done
     fi
+}
+
+# Parse one `wrk --latency` log into CSV fields:
+#   requests_per_sec,avg_latency_ms,p50_latency_ms,p99_latency_ms,duration_seconds,threads,connections
+# wrk prints latencies as us/ms/s and the duration as s/m/h; all are normalised.
+# A field wrk did not print is left empty, which DuckDB reads as NULL.
+parse_wrk_log() {
+    awk '
+        function ms(v) {
+            if (v ~ /us$/) return sprintf("%.3f", substr(v, 1, length(v) - 2) / 1000)
+            if (v ~ /ms$/) return sprintf("%.3f", substr(v, 1, length(v) - 2))
+            if (v ~ /s$/)  return sprintf("%.3f", substr(v, 1, length(v) - 1) * 1000)
+            return ""
+        }
+        function secs(v) {
+            if (v ~ /s$/) return substr(v, 1, length(v) - 1) + 0
+            if (v ~ /m$/) return substr(v, 1, length(v) - 1) * 60
+            if (v ~ /h$/) return substr(v, 1, length(v) - 1) * 3600
+            return ""
+        }
+        $1 == "Running" && $3 == "test" { duration = secs($2) }
+        $2 == "threads" && $3 == "and" && $5 == "connections" { threads = $1; connections = $4 }
+        $1 == "Latency" && avg == "" { avg = ms($2) }
+        $1 == "50%" { p50 = ms($2) }
+        $1 == "99%" { p99 = ms($2) }
+        $1 == "Requests/sec:" { rps = $2 }
+        END { printf "%s,%s,%s,%s,%s,%s,%s\n", rps, avg, p50, p99, duration, threads, connections }
+    ' "$1"
 }
 
 # Function to generate summary CSV with proper DuckDB-friendly format
@@ -357,16 +408,9 @@ generate_summary_csv() {
             test_datetime="${test_datetime:-$(date '+%Y-%m-%d %H:%M:%S')}"
 
             if [ "$test_type" = "load" ]; then
-                # Extract wrk metrics with better parsing
-                local rps=$(grep "Requests/sec:" "$log_file" | awk '{print $2}' | head -1 | tr -d ',')
-                local avg_latency=$(grep "Latency" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-                local p50_latency=$(grep "50%" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-                local p99_latency=$(grep "99%" "$log_file" | awk '{print $2}' | head -1 | sed 's/ms//g' | sed 's/us/0.001/g' | sed 's/s/*1000/g' | bc -l 2>/dev/null || echo "")
-
-                # Extract additional metrics
-                local duration=$(grep "Duration:" "$log_file" | awk '{print $2}' | head -1 || echo "$WRK_DURATION")
-                local threads=$(grep "threads and" "$log_file" | awk '{print $1}' | head -1 || echo "$WRK_THREADS")
-                local connections=$(grep "connections" "$log_file" | awk '{print $3}' | head -1 || echo "$WRK_CONNECTIONS")
+                local rps avg_latency p50_latency p99_latency duration threads connections
+                IFS=, read -r rps avg_latency p50_latency p99_latency duration threads connections \
+                    < <(parse_wrk_log "$log_file")
 
                 # Get endpoint from log or derive from test name
                 local endpoint
@@ -375,18 +419,10 @@ generate_summary_csv() {
                 elif [[ $test_name == *"numpy"* ]]; then
                     endpoint="simple/numpy/"
                 else
-                    endpoint=$(grep "Running" "$log_file" | awk '{print $NF}' | head -1 | sed "s|^[^/]*/||" || echo "unknown")
+                    endpoint=$(awk '/^Running /{print $NF; exit}' "$log_file" | sed -E 's|^[a-z]+://[^/]*/||')
                 fi
 
-                # Clean up duration (convert to seconds if needed)
-                if [[ $duration == *"s" ]]; then
-                    duration=$(echo "$duration" | sed 's/s$//')
-                elif [[ $duration == *"m" ]]; then
-                    local mins=$(echo "$duration" | sed 's/m$//')
-                    duration=$((mins * 60))
-                fi
-
-                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,${rps:-NULL},${avg_latency:-NULL},${p50_latency:-NULL},${p99_latency:-NULL},NULL,NULL,${duration:-NULL},${threads:-NULL},${connections:-NULL}" >> "$summary_file"
+                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,$rps,$avg_latency,$p50_latency,$p99_latency,,,$duration,$threads,$connections" >> "$summary_file"
 
             elif [ "$test_type" = "single" ]; then
                 # Extract single request metrics
@@ -404,7 +440,7 @@ generate_summary_csv() {
                     endpoint="simple/${pkg}/"
                 fi
 
-                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,NULL,NULL,NULL,NULL,${response_time:-NULL},${http_code:-NULL},NULL,NULL,NULL" >> "$summary_file"
+                echo "$TIMESTAMP,$test_datetime,$service,$test_type,$test_name,$endpoint,,,,,$response_time,$http_code,,," >> "$summary_file"
             fi
         fi
     done
@@ -441,15 +477,12 @@ main() {
     fi
 
     # Create results directory
-    local results_dir="$(dirname "$0")/../results"
+    local results_dir="${RESULTS_DIR:-$(dirname "$0")/../results}"
     mkdir -p "$results_dir"
 
     # Run tests based on scenario
     case "$TEST_SCENARIO" in
         cold-single)
-            run_cold_cache_tests "$results_dir"
-            ;;
-        cold-load)
             run_cold_cache_tests "$results_dir"
             ;;
         warm-load)
@@ -481,8 +514,15 @@ main() {
     echo "Results saved to: $results_dir"
     echo "Summary: $results_dir/wrk-summary-${TIMESTAMP}.csv"
 
+    if [ "$FAILURES" -gt 0 ]; then
+        log_error "$FAILURES measurement(s) or cache clear(s) failed; see the logs above"
+        exit 1
+    fi
+
     log_success "WRK API testing completed successfully"
 }
 
-# Run main function
-main "$@"
+# Run main function (skipped when sourced, so parse_wrk_log can be checked alone)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

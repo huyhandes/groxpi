@@ -14,7 +14,7 @@
   tr.file td:first-child { padding-left: 2rem; font-family: ui-monospace, monospace; font-size: .9em; }
   .muted { color: #777; }
   .errors { border: 1px solid #c33; padding: .5rem 1rem; margin: 1rem 0; }
-  .errors li { color: #c33; }
+  .errors li, #evict-status { color: #c33; }
   form, .controls { display: flex; gap: .5rem; margin: .75rem 0; }
   input { padding: .3rem .5rem; }
 </style>
@@ -22,36 +22,52 @@
 <body>
 <h1>groxpi cache</h1>
 
-<form hx-post="/admin/prefetch" hx-swap="none">
+<!-- Without JavaScript the form posts and the browser shows the plain-text
+     reply. With htmx the reply, accepted or refused, goes into the status span:
+     htmx 2 swaps no error response by default, so after-request writes it. A
+     failure with no body (a dropped connection) shows its status instead. -->
+<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch" hx-swap="none"
+      hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText || 'Prefetch failed: ' + event.detail.xhr.status">
   <input name="package" placeholder="package name" required autocomplete="off">
   <button type="submit">Prefetch newest release</button>
+  <span id="prefetch-status" class="muted" role="status"></span>
 </form>
 
-<div class="controls">
-  <input id="filter" type="search" placeholder="Filter packages…" autocomplete="off">
+<!-- The filter is a plain GET: the listing is paged on the server, so the
+     query has to reach admin.List to search every package, not just the rows
+     on screen. A plain submit sends only q, so a new filter starts at page 1.
+     The page the table keeps lives in the hidden field outside the form; with
+     JavaScript, typing resets it to 1, and the table below reloads as the
+     operator types, sending the form and that field with it. -->
+<form id="filter-form" class="controls" method="get" action="/admin">
+  <input id="filter" name="q" type="search" value="{{.Filter}}" placeholder="Filter packages…" autocomplete="off"
+         hx-on:input="document.getElementById('page').value = 1">
+  <button type="submit">Filter</button>
+  <button type="button" hx-get="/admin/rows" hx-include="#filter-form, #page" hx-target="#cache">Refresh</button>
+</form>
+<input id="page" name="page" type="hidden" value="{{.Page}}">
+
+<!-- Only the in-flight downloads poll: prefetch has no progress bar, so they
+     are the progress display, and they are in memory. The poll sends the
+     cache generation the package table was rendered at (#gen, inside it);
+     when a file has landed or gone since, the reply fires cache-changed and
+     the table reloads, carrying the new generation. A filter change reloads
+     the table without changing the generation, so it causes no second
+     reload. A hidden tab skips the poll. -->
+<div id="inflight" hx-get="/admin/inflight" hx-include="#filter-form, #gen"
+     hx-trigger="every 3s [!document.hidden]" hx-swap="innerHTML">
+{{template "inflight" .}}
 </div>
 
-<!-- The table polls: prefetch has no progress bar, so files appearing here are
-     the progress display. The first render is server-side, so the poll only
-     needs to pick up changes. -->
-<div id="cache" hx-get="/admin/rows?page={{.Page}}" hx-trigger="every 3s" hx-swap="innerHTML">
+<!-- An Evict button asks first (hx-confirm), then writes a failed DELETE's
+     reply here; it sits outside #cache so the reload that follows keeps it. -->
+<p id="evict-status" role="status"></p>
+
+<!-- The package table walks the cache, so it never polls: it reloads on a
+     filter change, the Refresh button, an eviction, or a finished download. -->
+<div id="cache" hx-get="/admin/rows" hx-include="#filter-form, #page"
+     hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body" hx-swap="innerHTML">
 {{template "rows" .}}
 </div>
-
-<script>
-  // Client-side filter: the row count is in the hundreds, so narrowing them is a
-  // hidden attribute rather than a server round trip. Re-applied after every
-  // poll, because the swap replaces the rows the filter was hiding.
-  function applyFilter() {
-    var box = document.getElementById('filter');
-    var q = box ? box.value.trim().toLowerCase() : '';
-    var rows = document.querySelectorAll('#cache tr[data-package]');
-    for (var i = 0; i < rows.length; i++) {
-      rows[i].hidden = q !== '' && rows[i].dataset.package.indexOf(q) === -1;
-    }
-  }
-  document.getElementById('filter').addEventListener('input', applyFilter);
-  document.body.addEventListener('htmx:afterSwap', applyFilter);
-</script>
 </body>
 </html>

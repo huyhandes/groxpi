@@ -59,7 +59,7 @@ jobs:
 
     - name: Install staticcheck
       if: matrix.os == 'ubuntu-latest'
-      run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
 
     - name: Run staticcheck
       if: matrix.os == 'ubuntu-latest'
@@ -72,9 +72,76 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       uses: codecov/codecov-action@v4
       with:
-        file: ./coverage.out
+        files: ./coverage.out
         flags: unittests
         name: codecov-umbrella
+
+  minio:
+    name: MinIO Integration
+    runs-on: ubuntu-latest
+    env:
+      TEST_S3_ENDPOINT: localhost:9000
+      TEST_S3_ACCESS_KEY: minioadmin
+      TEST_S3_SECRET_KEY: minioadmin
+      TEST_S3_BUCKET: groxpi-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26.x'
+        cache: true
+
+    # MinIO no longer publishes public images, so build the server from a
+    # pinned release tag with the runner's Go and run it in the background.
+    - name: Cache MinIO binary
+      id: minio-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/minio-bin
+        key: minio-${{ runner.os }}-RELEASE.2025-10-15T17-29-55Z
+
+    - name: Build MinIO
+      if: steps.minio-cache.outputs.cache-hit != 'true'
+      run: GOBIN="$HOME/minio-bin" go install github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z
+
+    - name: Start MinIO and create the bucket
+      env:
+        MINIO_ROOT_USER: ${{ env.TEST_S3_ACCESS_KEY }}
+        MINIO_ROOT_PASSWORD: ${{ env.TEST_S3_SECRET_KEY }}
+        AWS_ACCESS_KEY_ID: ${{ env.TEST_S3_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ env.TEST_S3_SECRET_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+      run: |
+        nohup "$HOME/minio-bin/minio" server /tmp/minio-data --address :9000 > /tmp/minio.log 2>&1 &
+        for _ in $(seq 1 60); do
+          curl -fsS http://localhost:9000/minio/health/live && break
+          sleep 1
+        done
+        curl -fsS http://localhost:9000/minio/health/live || { cat /tmp/minio.log; exit 1; }
+        aws --endpoint-url http://localhost:9000 s3 mb "s3://$TEST_S3_BUCKET"
+
+    - name: Run MinIO tests
+      # TestS3WithRealClients is excluded: it needs pip/uv and real PyPI. The
+      # tests skip when MinIO is unreachable, so a skip fails this job.
+      shell: bash
+      run: |
+        go test -race -run 'MinIO' -v ./internal/storage/... | tee minio-test.out
+        if grep -q -- '--- SKIP' minio-test.out; then
+          echo "MinIO tests skipped: MinIO was not reachable" >&2
+          exit 1
+        fi
+        # A renamed test or a -run pattern that matches nothing passes with zero
+        # tests run; require each one by name.
+        for want in '--- PASS: TestS3WithMinIO_RejectsChecksumTrailers' '--- PASS: TestS3WithMinIO_StoreReadsAndDeletes' '--- PASS: TestS3WithMinIO '; do
+          if ! grep -qF -- "$want" minio-test.out; then
+            echo "missing from MinIO test output: $want" >&2
+            exit 1
+          fi
+        done
 
   security:
     name: Security Scan
@@ -96,7 +163,7 @@ jobs:
 
     - name: Run Gosec Security Scanner
       run: |
-        go install github.com/securego/gosec/v2/cmd/gosec@latest
+        go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
         gosec -no-fail -fmt sarif -out gosec-report.sarif -exclude-generated ./...
         # Remove fixes array from SARIF to avoid GitHub validation errors
         if [ -f gosec-report.sarif ]; then
@@ -149,7 +216,7 @@ jobs:
 
     - name: Build binary
       run: |
-        go build -ldflags="-s -w" -o groxpi cmd/groxpi/main.go
+        go build -trimpath -ldflags="-s -w" -o groxpi ./cmd/groxpi
         ls -la groxpi
         echo "Binary built successfully"
 

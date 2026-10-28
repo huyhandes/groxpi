@@ -8,8 +8,18 @@ set -euo pipefail
 
 # Configuration
 TIMESTAMP="${1:-}"
-RESULTS_DIR="${2:-$(dirname "$0")/../results}"
+RESULTS_DIR="${2:-${RESULTS_DIR:-$(dirname "$0")/../results}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# uv_install_test.sh leaves these fields empty when it cannot measure them. A
+# column that is empty in every row would be sniffed as VARCHAR and break AVG
+# and arithmetic, so their types are given rather than detected.
+UV_TYPES="{'installed_size_mb': 'DOUBLE', 'dependency_count': 'BIGINT'}"
+# wrk_api_test.sh leaves the load columns empty on single rows and the single
+# column empty on load rows, so a run with only one kind has all-empty columns.
+WRK_TYPES="{'requests_per_sec': 'DOUBLE', 'avg_latency_ms': 'DOUBLE', 'p50_latency_ms': 'DOUBLE', 'p99_latency_ms': 'DOUBLE', 'response_time_single_sec': 'DOUBLE', 'http_code': 'INTEGER'}"
+# monitor_resources.sh can leave the readings empty, for the same reason.
+RESOURCE_TYPES="{'cpu_percent': 'DOUBLE', 'memory_used_mb': 'DOUBLE'}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -32,7 +42,7 @@ show_usage() {
     echo ""
     echo "Parameters:"
     echo "  timestamp   - Specific timestamp to analyze (e.g., 20240101_120000)"
-    echo "  results_dir - Results directory (default: ../results)"
+    echo "  results_dir - Results directory (default: \$RESULTS_DIR, else ../results)"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Analyze latest results"
@@ -57,25 +67,34 @@ check_dependencies() {
     duckdb --version
 }
 
-# Function to find latest CSV files
-find_csv_files() {
-    local pattern_suffix="$1"
-    local files
+# Print the timestamp of the latest run, or nothing. The stage scripts name their
+# output <prefix>-YYYYMMDD_HHMMSS.csv, so the latest run is the greatest
+# timestamp over every prefix. One timestamp is then used for all three files:
+# picking the newest file per prefix could mix CSVs from different runs.
+latest_timestamp() {
+    local file name
+    for file in "$RESULTS_DIR"/resources-[0-9]*_[0-9]*.csv \
+                "$RESULTS_DIR"/wrk-summary-[0-9]*_[0-9]*.csv \
+                "$RESULTS_DIR"/uv-summary-[0-9]*_[0-9]*.csv; do
+        [ -f "$file" ] || continue
+        name=$(basename "$file" .csv)
+        echo "${name##*-}"
+    done | sort -r | head -n 1
+}
 
-    if [ -n "$TIMESTAMP" ]; then
-        files=($(find "$RESULTS_DIR" -name "*${TIMESTAMP}*${pattern_suffix}" -type f 2>/dev/null | sort))
-    else
-        files=($(find "$RESULTS_DIR" -name "*${pattern_suffix}" -type f 2>/dev/null | sort -t'_' -k2 -r))
-    fi
+# Print the path of the analysed run's CSV for a prefix, or nothing.
+find_csv_file() {
+    local prefix="$1"
+    local file="$RESULTS_DIR/${prefix}-${TIMESTAMP}.csv"
 
-    echo "${files[@]}"
+    if [ -n "$TIMESTAMP" ] && [ -f "$file" ]; then echo "$file"; fi
+    return 0
 }
 
 # Function to run DuckDB query and format output
 run_query() {
     local query="$1"
     local title="$2"
-    local output_file="${3:-}"
 
     echo ""
     echo "=========================================="
@@ -83,25 +102,19 @@ run_query() {
     echo "=========================================="
     echo ""
 
-    if [ -n "$output_file" ]; then
-        echo "Query: $query" > "$output_file"
-        echo "" >> "$output_file"
-        duckdb -c "$query" | tee -a "$output_file"
-    else
-        duckdb -c "$query"
-    fi
+    duckdb -c "$query"
 }
 
 # Function to analyze resource usage
 analyze_resources() {
-    local resource_files=($(find_csv_files "resources*.csv"))
+    local resource_file
+    resource_file=$(find_csv_file "resources")
 
-    if [ ${#resource_files[@]} -eq 0 ]; then
+    if [ -z "$resource_file" ]; then
         log_warning "No resource CSV files found"
         return
     fi
 
-    local resource_file="${resource_files[0]}"
     log_info "Analyzing resource data: $(basename "$resource_file")"
 
     # Resource usage summary
@@ -114,7 +127,7 @@ analyze_resources() {
         ROUND(MAX(memory_used_mb), 1) as max_memory_mb,
         COUNT(*) as data_points,
         DATE_DIFF('minute', MIN(timestamp::timestamp), MAX(timestamp::timestamp)) as duration_minutes
-    FROM read_csv('$resource_file', header=true)
+    FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
     WHERE cpu_percent IS NOT NULL
     GROUP BY container
     ORDER BY container;
@@ -132,7 +145,7 @@ analyze_resources() {
             WHEN memory_used_mb > 1000 THEN 'High Memory'
             ELSE 'Normal'
         END as load_level
-    FROM read_csv('$resource_file', header=true)
+    FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
     WHERE cpu_percent IS NOT NULL
     AND (cpu_percent > 30 OR memory_used_mb > 500)
     ORDER BY timestamp DESC
@@ -142,14 +155,14 @@ analyze_resources() {
 
 # Function to analyze API performance
 analyze_api_performance() {
-    local wrk_files=($(find_csv_files "wrk-summary*.csv"))
+    local wrk_file
+    wrk_file=$(find_csv_file "wrk-summary")
 
-    if [ ${#wrk_files[@]} -eq 0 ]; then
+    if [ -z "$wrk_file" ]; then
         log_warning "No WRK summary CSV files found"
         return
     fi
 
-    local wrk_file="${wrk_files[0]}"
     log_info "Analyzing API performance data: $(basename "$wrk_file")"
 
     # Load test performance comparison
@@ -163,7 +176,7 @@ analyze_api_performance() {
         ROUND(AVG(avg_latency_ms), 2) as avg_latency_ms,
         ROUND(AVG(p99_latency_ms), 2) as p99_latency_ms,
         COUNT(*) as test_runs
-    FROM read_csv('$wrk_file', header=true)
+    FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
     WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
     GROUP BY service, test_name, endpoint
     ORDER BY service, avg_rps DESC;
@@ -179,8 +192,8 @@ analyze_api_performance() {
         ROUND(MIN(response_time_single_sec), 4) as min_response_time_sec,
         ROUND(MAX(response_time_single_sec), 4) as max_response_time_sec,
         COUNT(*) as test_runs
-    FROM read_csv('$wrk_file', header=true)
-    WHERE test_type = 'single' AND response_time_single_sec IS NOT NULL
+    FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
+    WHERE test_type = 'single' AND http_code = 200 AND response_time_single_sec IS NOT NULL
     GROUP BY service, test_name, endpoint
     ORDER BY service, avg_response_time_sec;
     " "Single Request Response Times"
@@ -193,7 +206,7 @@ analyze_api_performance() {
             endpoint,
             ROUND(AVG(requests_per_sec), 1) as groxpi_rps,
             ROUND(AVG(avg_latency_ms), 2) as groxpi_latency_ms
-        FROM read_csv('$wrk_file', header=true)
+        FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
         WHERE service = 'groxpi' AND test_type = 'load' AND requests_per_sec IS NOT NULL
         GROUP BY test_name, endpoint
     ),
@@ -203,7 +216,7 @@ analyze_api_performance() {
             endpoint,
             ROUND(AVG(requests_per_sec), 1) as proxpi_rps,
             ROUND(AVG(avg_latency_ms), 2) as proxpi_latency_ms
-        FROM read_csv('$wrk_file', header=true)
+        FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
         WHERE service = 'proxpi' AND test_type = 'load' AND requests_per_sec IS NOT NULL
         GROUP BY test_name, endpoint
     )
@@ -224,14 +237,14 @@ analyze_api_performance() {
 
 # Function to analyze installation performance
 analyze_installation_performance() {
-    local uv_files=($(find_csv_files "uv-summary*.csv"))
+    local uv_file
+    uv_file=$(find_csv_file "uv-summary")
 
-    if [ ${#uv_files[@]} -eq 0 ]; then
+    if [ -z "$uv_file" ]; then
         log_warning "No UV summary CSV files found"
         return
     fi
 
-    local uv_file="${uv_files[0]}"
     log_info "Analyzing installation performance data: $(basename "$uv_file")"
 
     # Installation performance by package and cache mode
@@ -245,7 +258,7 @@ analyze_installation_performance() {
         ROUND(MAX(install_time_seconds), 2) as max_install_time_sec,
         COUNT(*) as successful_installs,
         ROUND(AVG(installed_size_mb), 1) as avg_size_mb
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE install_success = true AND test_type = 'individual'
     GROUP BY service, package, cache_mode
     ORDER BY service, package, cache_mode;
@@ -259,7 +272,7 @@ analyze_installation_performance() {
             package,
             cache_mode,
             AVG(install_time_seconds) as avg_time
-        FROM read_csv('$uv_file', header=true)
+        FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
         WHERE install_success = true AND test_type = 'individual'
         AND cache_mode IN ('cold', 'warm')
         GROUP BY service, package, cache_mode
@@ -294,7 +307,7 @@ analyze_installation_performance() {
         ROUND(AVG(install_time_seconds), 2) as avg_install_time_sec,
         ROUND(AVG(dependency_count), 0) as avg_dependencies,
         ROUND(AVG(install_time_seconds) / NULLIF(AVG(installed_size_mb), 0), 4) as sec_per_mb
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE install_success = true
     AND installed_size_mb IS NOT NULL
     AND installed_size_mb > 0
@@ -313,7 +326,7 @@ analyze_installation_performance() {
         ROUND(installed_size_mb, 1) as total_size_mb,
         dependency_count as total_dependencies,
         ROUND(installed_size_mb / install_time_seconds, 2) as mb_per_second
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     WHERE test_type = 'batch' AND install_success = true
     ORDER BY service, mb_per_second DESC;
     " "Batch Installation Efficiency"
@@ -327,7 +340,7 @@ analyze_installation_performance() {
         COUNT(*) as total_attempts,
         SUM(CASE WHEN install_success THEN 1 ELSE 0 END) as successful_installs,
         ROUND((SUM(CASE WHEN install_success THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 1) as success_rate_percent
-    FROM read_csv('$uv_file', header=true)
+    FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
     GROUP BY service, cache_mode, test_type
     ORDER BY service, cache_mode, test_type;
     " "Installation Success Rates"
@@ -335,9 +348,12 @@ analyze_installation_performance() {
 
 # Function to generate executive summary
 generate_executive_summary() {
-    local wrk_files=($(find_csv_files "wrk-summary*.csv"))
-    local uv_files=($(find_csv_files "uv-summary*.csv"))
-    local resource_files=($(find_csv_files "resources*.csv"))
+    local wrk_file
+    wrk_file=$(find_csv_file "wrk-summary")
+    local uv_file
+    uv_file=$(find_csv_file "uv-summary")
+    local resource_file
+    resource_file=$(find_csv_file "resources")
 
     echo ""
     echo "=========================================="
@@ -345,15 +361,14 @@ generate_executive_summary() {
     echo "=========================================="
     echo ""
 
-    if [ ${#wrk_files[@]} -gt 0 ]; then
-        local wrk_file="${wrk_files[0]}"
+    if [ -n "$wrk_file" ]; then
         echo "📊 API Performance Highlights:"
         duckdb -c "
         WITH perf_summary AS (
             SELECT
                 service,
                 AVG(requests_per_sec) as avg_rps
-            FROM read_csv('$wrk_file', header=true)
+            FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
             WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
             GROUP BY service
         )
@@ -364,19 +379,25 @@ generate_executive_summary() {
         "
 
         duckdb -c "
-        WITH speedup AS (
+        WITH per_scenario AS (
             SELECT
-                ROUND(MAX(requests_per_sec) / MIN(requests_per_sec), 1) as speedup_ratio
-            FROM read_csv('$wrk_file', header=true)
+                test_name,
+                endpoint,
+                AVG(requests_per_sec) FILTER (WHERE service = 'groxpi') as groxpi_rps,
+                AVG(requests_per_sec) FILTER (WHERE service = 'proxpi') as proxpi_rps
+            FROM read_csv('$wrk_file', header=true, types=$WRK_TYPES)
             WHERE test_type = 'load' AND requests_per_sec IS NOT NULL
+            GROUP BY test_name, endpoint
         )
-        SELECT '⚡ Performance advantage: ' || speedup_ratio || 'x faster' as summary
-        FROM speedup;
+        SELECT '⚡ ' || test_name || ' (' || endpoint || '): groxpi/proxpi RPS ratio ' ||
+               ROUND(groxpi_rps / proxpi_rps, 2) as summary
+        FROM per_scenario
+        WHERE groxpi_rps IS NOT NULL AND proxpi_rps > 0
+        ORDER BY test_name, endpoint;
         "
     fi
 
-    if [ ${#uv_files[@]} -gt 0 ]; then
-        local uv_file="${uv_files[0]}"
+    if [ -n "$uv_file" ]; then
         echo ""
         echo "📦 Installation Performance Highlights:"
         duckdb -c "
@@ -384,7 +405,7 @@ generate_executive_summary() {
             SELECT
                 service,
                 ROUND(AVG(install_time_seconds), 1) as avg_time
-            FROM read_csv('$uv_file', header=true)
+            FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
             WHERE install_success = true AND test_type = 'individual' AND cache_mode = 'cold'
             GROUP BY service
         )
@@ -399,7 +420,7 @@ generate_executive_summary() {
             SELECT
                 service,
                 ROUND((SUM(CASE WHEN install_success THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 1) as success_rate
-            FROM read_csv('$uv_file', header=true)
+            FROM read_csv('$uv_file', header=true, types=$UV_TYPES)
             GROUP BY service
         )
         SELECT '✅ ' || service || ' success rate: ' || success_rate || '%' as summary
@@ -408,14 +429,13 @@ generate_executive_summary() {
         "
     fi
 
-    if [ ${#resource_files[@]} -gt 0 ]; then
-        local resource_file="${resource_files[0]}"
+    if [ -n "$resource_file" ]; then
         echo ""
         echo "💻 Resource Usage Highlights:"
         duckdb -c "
         SELECT
             '🔥 ' || container || ' peak CPU: ' || ROUND(MAX(cpu_percent), 1) || '%' as summary
-        FROM read_csv('$resource_file', header=true)
+        FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
         WHERE cpu_percent IS NOT NULL
         GROUP BY container
         ORDER BY MAX(cpu_percent) DESC;
@@ -424,7 +444,7 @@ generate_executive_summary() {
         duckdb -c "
         SELECT
             '🧠 ' || container || ' peak memory: ' || ROUND(MAX(memory_used_mb), 0) || 'MB' as summary
-        FROM read_csv('$resource_file', header=true)
+        FROM read_csv('$resource_file', header=true, types=$RESOURCE_TYPES)
         WHERE memory_used_mb IS NOT NULL
         GROUP BY container
         ORDER BY MAX(memory_used_mb) DESC;
@@ -460,10 +480,7 @@ export_markdown_report() {
         echo ""
         echo "## Raw Data Files"
         echo ""
-        local all_files=($(find "$RESULTS_DIR" -name "*.csv" -type f | sort))
-        for file in "${all_files[@]}"; do
-            echo "- \`$(basename "$file")\`"
-        done
+        find "$RESULTS_DIR" -name "*.csv" -type f -exec basename {} \; | sort | sed 's/.*/- `&`/'
 
         echo ""
         echo "## DuckDB Queries"
@@ -472,7 +489,7 @@ export_markdown_report() {
         echo "\`\`\`sql"
         echo "-- Example: Custom API performance query"
         echo "SELECT service, AVG(requests_per_sec) as avg_rps"
-        echo "FROM read_csv_auto('$RESULTS_DIR/wrk-summary-*.csv')"
+        echo "FROM read_csv('$RESULTS_DIR/wrk-summary-$TIMESTAMP.csv', header=true, types=$WRK_TYPES)"
         echo "WHERE test_type = 'load'"
         echo "GROUP BY service;"
         echo "\`\`\`"
@@ -508,6 +525,13 @@ main() {
         exit 1
     fi
 
+    if [ -z "$TIMESTAMP" ]; then
+        TIMESTAMP=$(latest_timestamp)
+        if [ -n "$TIMESTAMP" ]; then
+            log_info "Analyzing the latest run: $TIMESTAMP"
+        fi
+    fi
+
     # Run analysis
     analyze_resources
     analyze_api_performance
@@ -527,7 +551,7 @@ main() {
     echo ""
 
     log_success "DuckDB analysis completed successfully"
-    log_info "💡 Tip: You can run custom queries with: duckdb -c \"SELECT * FROM read_csv_auto('$RESULTS_DIR/wrk-summary-*.csv') LIMIT 5;\""
+    log_info "💡 Tip: You can run custom queries with: duckdb -c \"SELECT * FROM read_csv('$RESULTS_DIR/wrk-summary-$TIMESTAMP.csv', header=true, types=$WRK_TYPES) LIMIT 5;\""
 }
 
 # Run main function

@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/md5" // #nosec G501 -- S3 ETag shape in a test double, not security
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -19,6 +18,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -40,27 +41,19 @@ const (
 	present = "\x00present"
 )
 
-// ---- upstream PyPI double -------------------------------------------------
+// ---- upstream PyPI fixtures ----------------------------------------------
+//
+// The fake itself is server.FakePyPI, shared with the in-package tests.
 
-type upFile struct {
-	body    []byte
-	sha256  string // advertised
-	size    int64  // advertised, 0 = omitted
-	metaSHA string // advertised core-metadata sha256, "" = not advertised
-	gated   bool   // first half, flush, wait for release, rest
-}
+const (
+	rootHTML = server.FakeRootHTML
+	rootJSON = server.FakeRootJSON
+)
 
-type upstream struct {
-	*httptest.Server
-	pkgs    map[string][]string // package -> filenames
-	files   map[string]upFile   // filename -> file (".metadata" names included)
-	release chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	hits    map[string]int
-}
-
-func sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
+var (
+	sum = server.Sum
+	gz  = server.Gzip
+)
 
 func payload(n int, seed byte) []byte {
 	b := make([]byte, n)
@@ -85,115 +78,15 @@ const (
 	slowFile = "slow-1.0.0.tar.gz"
 )
 
-func newUpstream(t *testing.T) *upstream {
+func newUpstream(t *testing.T) *server.FakePyPI {
 	t.Helper()
-	up := &upstream{
-		pkgs: map[string][]string{
-			"demo": {demoFile, oldFile},
-			"bad":  {badFile},
-			"slow": {slowFile},
-		},
-		files: map[string]upFile{
-			demoFile:               {body: demoWheel, sha256: sum(demoWheel), size: int64(len(demoWheel)), metaSHA: sum(demoMeta)},
-			demoFile + ".metadata": {body: demoMeta},
-			oldFile:                {body: demoOld, sha256: sum(demoOld)},
-			badFile:                {body: badBody, sha256: sum([]byte("something else"))},
-			slowFile:               {body: slowBody, sha256: sum(slowBody), size: int64(len(slowBody)), gated: true},
-		},
-		release: make(chan struct{}),
-		hits:    map[string]int{},
-	}
-	up.Server = httptest.NewServer(http.HandlerFunc(up.serve))
-	t.Cleanup(up.Close)
-	t.Cleanup(up.open) // runs first: never leave a gated handler blocking Close
-	return up
-}
-
-func (u *upstream) open() { u.once.Do(func() { close(u.release) }) }
-
-func (u *upstream) fileHits(name string) int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.hits[name]
-}
-
-func (u *upstream) serve(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	switch {
-	case path == "/":
-		u.serveRoot(w, r)
-	case path == "/broken/":
-		http.Error(w, "boom", http.StatusInternalServerError)
-	case strings.HasPrefix(path, "/files/"):
-		name := strings.TrimPrefix(path, "/files/")
-		f, ok := u.files[name]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		u.mu.Lock()
-		u.hits[name]++
-		u.mu.Unlock()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprint(len(f.body)))
-		if !f.gated {
-			_, _ = w.Write(f.body)
-			return
-		}
-		half := len(f.body) / 2
-		_, _ = w.Write(f.body[:half])
-		w.(http.Flusher).Flush()
-		<-u.release
-		_, _ = w.Write(f.body[half:])
-	default:
-		pkg := strings.Trim(path, "/")
-		names, ok := u.pkgs[pkg]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		files := make([]map[string]any, 0, len(names))
-		for _, n := range names {
-			f := u.files[n]
-			e := map[string]any{"filename": n, "url": u.URL + "/files/" + n, "hashes": map[string]string{"sha256": f.sha256}}
-			if f.size > 0 {
-				e["size"] = f.size
-			}
-			if f.metaSHA != "" {
-				e["core-metadata"] = map[string]string{"sha256": f.metaSHA}
-			}
-			files = append(files, e)
-		}
-		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]string{"api-version": "1.0"}, "name": pkg, "files": files})
-	}
-}
-
-const (
-	rootHTML = `<!DOCTYPE html><html><body><a href="/simple/demo/">demo</a></body></html>`
-	rootJSON = `{"meta":{"api-version":"1.0"},"projects":[{"name":"demo"}]}`
-)
-
-func (u *upstream) serveRoot(w http.ResponseWriter, r *http.Request) {
-	body, ctype := rootHTML, "text/html"
-	if strings.Contains(r.Header.Get("Accept"), "json") {
-		body, ctype = rootJSON, "application/vnd.pypi.simple.v1+json"
-	}
-	w.Header().Set("Content-Type", ctype)
-	if r.Header.Get("Accept-Encoding") == "gzip" {
-		w.Header().Set("Content-Encoding", "gzip")
-		_, _ = w.Write(gz(body))
-		return
-	}
-	_, _ = io.WriteString(w, body)
-}
-
-func gz(s string) []byte {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	_, _ = zw.Write([]byte(s))
-	_ = zw.Close()
-	return buf.Bytes()
+	return server.NewFakePyPI(t).
+		Add("demo", demoFile, server.FakeFile{Body: demoWheel, SHA256: sum(demoWheel), Size: int64(len(demoWheel)), MetaSHA: sum(demoMeta)}).
+		Add("demo", oldFile, server.FakeFile{Body: demoOld, SHA256: sum(demoOld)}).
+		AddFile(demoFile+".metadata", server.FakeFile{Body: demoMeta}).
+		Add("bad", badFile, server.FakeFile{Body: badBody, SHA256: sum([]byte("something else"))}).
+		Add("slow", slowFile, server.FakeFile{Body: slowBody, SHA256: sum(slowBody), Size: int64(len(slowBody)), Gated: true}).
+		Fail("broken")
 }
 
 func gunzip(t *testing.T, b []byte) []byte {
@@ -311,7 +204,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 
 type env struct {
 	mode string
-	up   *upstream
+	up   *server.FakePyPI
 	s3   *fakeS3 // hybrid and s3 only
 }
 
@@ -329,7 +222,7 @@ func (e *env) config(t *testing.T, opts ...func(*config.Config)) *config.Config 
 	}
 	if e.mode == "hybrid" {
 		cfg.LocalCacheDir = t.TempDir()
-		cfg.LocalCacheSize = 1 << 30
+		cfg.LocalCacheSize = 1 << 29 // distinct from CacheSize: health and home must report this one
 	}
 	if e.s3 != nil {
 		cfg.S3Endpoint = e.s3.URL
@@ -349,6 +242,7 @@ func withAdmin(cfg *config.Config) { cfg.AdminUsername, cfg.AdminPassword = char
 
 type proxy struct {
 	t      *testing.T
+	srv    *server.Server
 	url    string
 	client *http.Client
 	stop   func()
@@ -373,6 +267,7 @@ func start(t *testing.T, cfg *config.Config) *proxy {
 	}
 	return &proxy{
 		t:      t,
+		srv:    srv,
 		url:    hs.URL,
 		settle: settle,
 		client: &http.Client{
@@ -440,9 +335,9 @@ func pin(t *testing.T, resp *http.Response, want map[string]string) {
 func q(s string) string { return `"` + s + `"` }
 
 // Header sets per serve branch, as sent today (#52 unifies them later).
-func streamedMissHeaders(ctype, etag string, length int) map[string]string {
+func streamedMissHeaders(ctype string, length int) map[string]string {
 	h := map[string]string{
-		"Content-Type": ctype, "ETag": etag,
+		"Content-Type": ctype, "ETag": absent,
 		"Accept-Ranges": absent, "Last-Modified": absent,
 		"Content-Disposition": absent, "Cache-Control": absent,
 	}
@@ -492,9 +387,11 @@ func TestCharacterization(t *testing.T) {
 // TestCharacterizationS3 runs the download suite against a pure-s3 backend, so
 // S3 hits are held to the same Range and conditional behaviour as local hits.
 func TestCharacterizationS3(t *testing.T) {
-	characterizeDownload(t, func(t *testing.T) *env {
+	newEnv := func(t *testing.T) *env {
 		return &env{mode: "s3", up: newUpstream(t), s3: newFakeS3(t)}
-	})
+	}
+	characterizeDownload(t, newEnv)
+	t.Run("home_and_health", func(t *testing.T) { characterizeHomeHealth(t, newEnv(t), "s3") })
 }
 
 func characterizeIndex(t *testing.T, e *env) {
@@ -507,9 +404,8 @@ func characterizeIndex(t *testing.T, e *env) {
 		"files": []any{
 			map[string]any{
 				"filename": demoFile, "url": "/simple/demo/" + demoFile,
-				"hashes":             map[string]any{"sha256": sum(demoWheel)}, // upstream "size" is not re-emitted today
-				"core-metadata":      map[string]any{"sha256": sum(demoMeta)},
-				"dist-info-metadata": map[string]any{"sha256": sum(demoMeta)},
+				"hashes":        map[string]any{"sha256": sum(demoWheel)}, // upstream "size" is not re-emitted today
+				"core-metadata": map[string]any{"sha256": sum(demoMeta)},
 			},
 			map[string]any{
 				"filename": oldFile, "url": "/simple/demo/" + oldFile,
@@ -560,13 +456,13 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_html_default", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": "text/html", "Vary": absent, "Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Content-Type": "text/html", "Vary": "Accept", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
 	t.Run("package_json_by_accept", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept", jsonAccept)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgJSON, decodeJSON(t, body))
 	})
 	t.Run("package_json_by_format_query", func(t *testing.T) {
@@ -582,17 +478,23 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_json_gzip", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept", jsonAccept, "Accept-Encoding", "gzip")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Encoding": "gzip"})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Encoding": "gzip"})
 		assert.Equal(t, wantPkgJSON, decodeJSON(t, gunzip(t, body)))
 	})
 	t.Run("package_html_ignores_gzip", func(t *testing.T) {
 		resp, body := p.get("/simple/demo/", "Accept-Encoding", "gzip")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Encoding": absent})
+		pin(t, resp, map[string]string{"Vary": "Accept", "Content-Encoding": absent})
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
 	t.Run("package_index_alias", func(t *testing.T) {
 		resp, body := p.get("/index/demo")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, wantPkgHTML, string(body))
+	})
+	t.Run("package_index_alias_trailing_slash", func(t *testing.T) {
+		// pip appends the slash to every project URL under --index-url.
+		resp, body := p.get("/index/demo/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, wantPkgHTML, string(body))
 	})
@@ -620,7 +522,7 @@ func characterizeIndex(t *testing.T, e *env) {
 	t.Run("package_head", func(t *testing.T) {
 		resp, body := p.do(http.MethodHead, "/simple/demo/", nil, "Accept", jsonAccept)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept-Encoding", "Content-Length": present})
+		pin(t, resp, map[string]string{"Content-Type": jsonAccept, "Vary": "Accept, Accept-Encoding", "Content-Length": present})
 		assert.Empty(t, body)
 	})
 	t.Run("post_is_405", func(t *testing.T) {
@@ -640,14 +542,14 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.get(demoPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders(gzipType, len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
 
 		resp, body = p.get(demoPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders(gzipType, len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile), "the hit is served without going upstream")
+		assert.Equal(t, 1, e.up.FileHits(demoFile), "the hit is served without going upstream")
 
 		resp, body = p.get("/index/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "/index/ alias serves the same cached file")
@@ -659,7 +561,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		p := start(t, e.config(t))
 		resp, body := p.get("/simple/demo/" + oldFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoOld)), 0))
+		pin(t, resp, streamedMissHeaders(gzipType, 0))
 		pin(t, resp, map[string]string{"Content-Length": absent})
 		assert.Equal(t, []string{"chunked"}, resp.TransferEncoding)
 		assert.Equal(t, demoOld, body)
@@ -671,7 +573,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.do(http.MethodHead, demoPath, nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(gzipType, q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders(gzipType, len(demoWheel)))
 		assert.Empty(t, body)
 
 		resp, body = p.do(http.MethodHead, demoPath, nil)
@@ -735,7 +637,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		require.NoError(t, err)
 		defer func() { _ = leader.Body.Close() }()
 		assert.Equal(t, http.StatusOK, leader.StatusCode)
-		pin(t, leader, streamedMissHeaders(gzipType, q(sum(slowBody)), len(slowBody)))
+		pin(t, leader, streamedMissHeaders(gzipType, len(slowBody)))
 		head := make([]byte, len(slowBody)/2)
 		_, err = io.ReadFull(leader.Body, head)
 		require.NoError(t, err)
@@ -755,10 +657,10 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 			_ = resp.Body.Close()
 			follower <- result{resp, b}
 		}()
-		// ponytail: no external signal says the follower has joined the flight;
-		// the outcome below is identical either way, only the sharing is timing.
-		time.Sleep(50 * time.Millisecond)
-		e.up.open()
+		// Release only once the follower has joined the leader's flight.
+		require.Eventually(t, func() bool { return server.InFlightRequests(p.srv) == 2 },
+			5*time.Second, time.Millisecond, "the follower never joined the flight")
+		e.up.Release()
 
 		rest, err := io.ReadAll(leader.Body)
 		require.NoError(t, err)
@@ -769,7 +671,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		assert.Equal(t, http.StatusOK, r.resp.StatusCode)
 		// Follower headers not pinned: #62 has it tail the spool (streamed headers).
 		assert.Equal(t, slowBody, r.body)
-		assert.Equal(t, 1, e.up.fileHits(slowFile), "one upstream fetch serves both clients")
+		assert.Equal(t, 1, e.up.FileHits(slowFile), "one upstream fetch serves both clients")
 	})
 
 	t.Run("range_ignored_during_inflight_download", func(t *testing.T) {
@@ -781,7 +683,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		resp, err := p.client.Do(req)
 		require.NoError(t, err)
 		defer func() { _ = resp.Body.Close() }()
-		e.up.open()
+		e.up.Release()
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -810,7 +712,7 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 		}
 		fetch()
 		fetch()
-		assert.Equal(t, 2, e.up.fileHits(badFile), "a failed verification is refetched, not served from cache")
+		assert.Equal(t, 2, e.up.FileHits(badFile), "a failed verification is refetched, not served from cache")
 	})
 
 	t.Run("not_listed_404", func(t *testing.T) {
@@ -838,14 +740,14 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body := p.get(metaPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders(textType, q(sum(demoMeta)), 0))
+		pin(t, resp, streamedMissHeaders(textType, 0))
 		assert.Equal(t, demoMeta, body)
 
 		resp, body = p.get(metaPath)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders(textType, len(demoMeta)))
 		assert.Equal(t, demoMeta, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile+".metadata"))
+		assert.Equal(t, 1, e.up.FileHits(demoFile+".metadata"))
 
 		resp, body = p.get("/simple/demo/" + oldFile + ".metadata")
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "metadata not advertised by the index")
@@ -869,9 +771,32 @@ func characterizeDownload(t *testing.T, newEnv func(*testing.T) *env) {
 			pin(t, resp, map[string]string{"Content-Length": fmt.Sprint(len(demoWheel))})
 
 			assert.Equal(t, demoWheel, body)
-			assert.Equal(t, 1, e.up.fileHits(demoFile))
+			assert.Equal(t, 1, e.up.FileHits(demoFile))
 		})
 	}
+}
+
+// TestHybridPromotionFailureIs500: a file in S3 that cannot be copied into the
+// cache is a 500, never a 404 pip would take as authoritative.
+func TestHybridPromotionFailureIs500(t *testing.T) {
+	const demoPath = "/simple/demo/" + demoFile
+	e := &env{mode: "hybrid", up: newUpstream(t), s3: newFakeS3(t)}
+	first := e.config(t)
+	p := start(t, first)
+	_, _ = p.get(demoPath)
+	p.stop() // drains the upload to the object store
+	require.True(t, e.s3.has("packages/demo/"+demoFile))
+
+	second := *first
+	second.LocalCacheDir = t.TempDir()
+	p = start(t, &second)
+	// A file where the package directory belongs: the promotion cannot spool.
+	require.NoError(t, os.MkdirAll(filepath.Join(second.LocalCacheDir, "packages"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(second.LocalCacheDir, "packages", "demo"), nil, 0o600))
+
+	resp, _ := p.get(demoPath)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, 1, e.up.FileHits(demoFile), "no upstream fetch or redirect")
 }
 
 func characterizeRedirectMode(t *testing.T, e *env) {
@@ -894,7 +819,7 @@ func characterizeRedirectMode(t *testing.T, e *env) {
 		resp, _ := p.get("/simple/demo/" + oldFile)
 		assert.Equal(t, http.StatusFound, resp.StatusCode)
 		pin(t, resp, map[string]string{"Location": e.up.URL + "/files/" + oldFile})
-		assert.Equal(t, 0, e.up.fileHits(oldFile))
+		assert.Equal(t, 0, e.up.FileHits(oldFile))
 	})
 	t.Run("uncached_metadata_is_302", func(t *testing.T) {
 		resp, _ := p.get("/simple/demo/" + demoFile + ".metadata")
@@ -964,7 +889,7 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body = p.admin(http.MethodGet, "/admin/htmx.min.js", nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=86400"})
+		pin(t, resp, map[string]string{"Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "private, max-age=86400"})
 		assert.NotEmpty(t, body)
 	})
 
@@ -1005,9 +930,9 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		resp, body = p.get("/simple/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, streamedMissHeaders("application/gzip", q(sum(demoWheel)), len(demoWheel)))
+		pin(t, resp, streamedMissHeaders("application/gzip", len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 2, e.up.fileHits(demoFile), "evicted file is fetched upstream again")
+		assert.Equal(t, 2, e.up.FileHits(demoFile), "evicted file is fetched upstream again")
 
 		resp, body = p.admin(http.MethodDelete, "/cache/list", nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -1031,19 +956,34 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 
 		require.Eventually(t, func() bool {
 			_, rows := p.admin(http.MethodGet, "/admin/rows", nil)
-			return strings.Contains(string(rows), demoFile)
-		}, 5*time.Second, 10*time.Millisecond, "prefetched file appears in the listing")
+			// The rows also list in-flight downloads by name, and hybrid lists
+			// the file while its S3 upload still holds the flight; a GET then
+			// joins the flight. Wait until it is listed and no flight remains.
+			return strings.Contains(string(rows), demoFile) && server.InFlight(p.srv) == 0
+		}, 5*time.Second, 10*time.Millisecond, "prefetched file is cached and no longer in flight")
 
 		resp, body = p.get("/simple/demo/" + demoFile)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, cachedHitHeaders("application/gzip", len(demoWheel)))
 		assert.Equal(t, demoWheel, body)
-		assert.Equal(t, 1, e.up.fileHits(demoFile), "prefetch warmed the cache")
+		assert.Equal(t, 1, e.up.FileHits(demoFile), "prefetch warmed the cache")
 	})
+}
+
+// wantCache is the cache a mode really uses: hybrid's local cache, none in s3.
+func wantCache(cfg *config.Config) (dir string, size int64) {
+	switch cfg.StorageType {
+	case "hybrid":
+		return cfg.LocalCacheDir, cfg.LocalCacheSize
+	case "s3":
+		return "", 0
+	}
+	return cfg.CacheDir, cfg.CacheSize
 }
 
 func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 	t.Run("home", func(t *testing.T) {
+		wantMB := map[string]string{"local": "1024", "hybrid": "512", "s3": "0"}[mode]
 		p := start(t, e.config(t))
 		resp, body := p.get("/")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -1051,7 +991,7 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 		s := string(body)
 		assert.Contains(t, s, "<title>groxpi - PyPI Cache</title>")
 		assert.Contains(t, s, "<li>Index URL: "+e.up.URL+"/</li>")
-		assert.Contains(t, s, "<li>Cache Size: 1024 MB</li>")
+		assert.Contains(t, s, "<li>Cache Size: "+wantMB+" MB</li>")
 		assert.Contains(t, s, "<li>Index TTL: 1m0s</li>")
 		assert.Contains(t, s, `<a href="/health">Health Check</a>`)
 		assert.NotContains(t, s, `href="/admin"`)
@@ -1070,6 +1010,7 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 			c.ExtraIndexURLs = []string{"http://u:p@extra.invalid/simple/"}
 		})
 		p := start(t, cfg)
+		dir, size := wantCache(cfg)
 		resp, body := p.get("/health")
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, map[string]string{"Content-Type": "application/json; charset=utf-8"})
@@ -1082,10 +1023,10 @@ func characterizeHomeHealth(t *testing.T, e *env, mode string) {
 		assert.Equal(t, "success", got.Status)
 		assert.NotZero(t, got.Timestamp)
 		assert.Equal(t, map[string]any{
-			"cache_dir":         cfg.CacheDir,
+			"cache_dir":         dir,
 			"index_url":         strings.Replace(e.up.URL, "http://", "http://redacted@", 1) + "/",
 			"extra_index_urls":  []any{"http://redacted@extra.invalid/simple/"},
-			"cache_size":        float64(1 << 30),
+			"cache_size":        float64(size),
 			"index_ttl_seconds": float64(60),
 			"storage_type":      mode,
 		}, got.Data)

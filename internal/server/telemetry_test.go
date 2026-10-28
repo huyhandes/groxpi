@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"io"
+	"log"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -159,10 +163,8 @@ func TestTelemetry_RequestSpanTree(t *testing.T) {
 
 	payload := testPayload(64 * 1024)
 	pkg, file := "spantree", "spantree-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	router, cacheDir := newCorrectnessServer(t, up.URL, 5*time.Second)
 
@@ -194,15 +196,13 @@ func TestTelemetry_CacheHitAndMissCounters(t *testing.T) {
 
 	payload := testPayload(32 * 1024)
 	pkg, file := "counters", "counters-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) },
 	})
 	// An explicit index TTL, because an index cache entry stored with a zero TTL
 	// expires the instant it is written and could never report a hit.
 	cacheDir := t.TempDir()
-	srv := New(&config.Config{
+	srv := newTestServer(t, &config.Config{
 		IndexURL:        up.URL,
 		CacheDir:        cacheDir,
 		CacheSize:       1 << 30,
@@ -252,10 +252,8 @@ func TestTelemetry_RedirectCounter(t *testing.T) {
 
 	payload := testPayload(32 * 1024)
 	pkg, file := "redirectmetric", "redirectmetric-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(payload), indexSize: int64(len(payload)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) {
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(payload), Size: int64(len(payload)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) {
 			time.Sleep(600 * time.Millisecond)
 			_, _ = w.Write(payload)
 		},
@@ -284,10 +282,8 @@ func TestTelemetry_VerificationFailureCounter(t *testing.T) {
 	advertised := testPayload(32 * 1024)
 	advertised[0] ^= 0xff
 	pkg, file := "badhashmetric", "badhashmetric-1.0.0.tar.gz"
-	up := newFakeUpstream(t, upstreamSpec{
-		pkg: pkg, file: file,
-		sha256: sha256Hex(advertised), indexSize: int64(len(served)),
-		serveFile: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(served) },
+	up := NewFakePyPI(t).Add(pkg, file, FakeFile{SHA256: Sum(advertised), Size: int64(len(served)),
+		Handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(served) },
 	})
 	router, _ := newCorrectnessServer(t, up.URL, 5*time.Second)
 
@@ -324,7 +320,7 @@ func TestTelemetry_IndexResolutionIsRedacted(t *testing.T) {
 		DownloadTimeout: time.Second,
 		LogLevel:        "DEBUG",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	redactedExtra := config.RedactURL(extraURL)
@@ -373,14 +369,185 @@ func TestTelemetry_IndexCacheEvictionIsCounted(t *testing.T) {
 	// A cache with room reports what it holds.
 	roomy := newMultiIndexServer(t, &config.Config{IndexCacheSize: 1 << 20}, primary)
 	require.Equal(t, http.StatusOK, indexStatus(t, roomy, "one"))
-	assert.Greater(t, collect(t, reader).value("groxpi.cache.occupancy", indexLayer), int64(0),
-		"the index cache must report its occupancy in bytes")
+	oneEntry := collect(t, reader).value("groxpi.cache.occupancy", indexLayer)
+	assert.Greater(t, oneEntry, int64(0), "the index cache must report its occupancy in bytes")
 
-	// A cache with a byte budget no entry fits in evicts on every fill.
-	cramped := newMultiIndexServer(t, &config.Config{IndexCacheSize: 8}, primary)
+	// A cache with room for exactly one entry evicts the first to fit the
+	// second. (An entry bigger than the whole budget is not stored at all.)
+	cramped := newMultiIndexServer(t, &config.Config{IndexCacheSize: oneEntry}, primary)
+	require.Equal(t, http.StatusOK, indexStatus(t, cramped, "one"))
 	require.Equal(t, http.StatusOK, indexStatus(t, cramped, "two"))
 
 	assert.Greater(t, collect(t, reader).value("groxpi.cache.evictions", indexLayer),
 		before.value("groxpi.cache.evictions", indexLayer),
 		"an over-budget index cache must count its evictions")
+}
+
+// panickingRouter is the production middleware stack over a mux whose handlers
+// panic, the plain way and the http.ErrAbortHandler way.
+func panickingRouter() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /boom/{name}", func(http.ResponseWriter, *http.Request) { panic("boom") })
+	mux.HandleFunc("GET /abort/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		panic(http.ErrAbortHandler)
+	})
+	mux.HandleFunc("GET /late-boom/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		panic("boom")
+	})
+	mux.HandleFunc("GET /mid-body-boom/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "partial")
+		_ = http.NewResponseController(w).Flush()
+		panic("boom")
+	})
+	mux.HandleFunc("GET /early-abort/{name}", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
+	return recoverPanics(traceRequests(mux))
+}
+
+// TestTelemetry_PanickingRequestIsTracedAndLogged: a handler panic must not
+// erase the request from the trace or the access log. The span is still named
+// after its route and carries a 500 and an error status, the access line is
+// still written, and the panic still reaches recoverPanics, which answers 500.
+func TestTelemetry_PanickingRequestIsTracedAndLogged(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	w := httptest.NewRecorder()
+	panickingRouter().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/boom/x", nil))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+
+	span := findSpan(rec, "GET /boom/{name}")
+	require.NotNil(t, span, "the panicking request's span must be named after its route")
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusInternalServerError))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Equal(t, "panic", span.Status().Description)
+
+	assert.Contains(t, logs.String(), `"msg":"request"`)
+	assert.Contains(t, logs.String(), `"status":500`)
+	assert.Contains(t, logs.String(), `"path":"/boom/x"`)
+}
+
+// TestTelemetry_AbortedRequestIsMarked: http.ErrAbortHandler is net/http's
+// deliberate abort, not a server error. The span and access line say aborted,
+// keep the status already sent, and the abort still reaches net/http.
+func TestTelemetry_AbortedRequestIsMarked(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	func() {
+		defer func() {
+			assert.Equal(t, http.ErrAbortHandler, recover(), "the abort must be re-panicked")
+		}()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/abort/x", nil))
+	}()
+
+	span := findSpan(rec, "GET /abort/{name}")
+	require.NotNil(t, span, "the aborted request's span must be named after its route")
+	assert.Contains(t, span.Attributes(), attribute.Bool("http.request.aborted", true))
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusOK))
+	assert.Equal(t, codes.Error, span.Status().Code)
+
+	assert.Contains(t, logs.String(), `"aborted":true`)
+	assert.Contains(t, logs.String(), `"path":"/abort/x"`)
+}
+
+// TestTelemetry_PanicAfterWriteKeepsSentStatus: a handler that panics after
+// sending its status line cannot turn it into a 500. The span and access line
+// record the status the client actually got; the span is still an error. The
+// panic reaches net/http as an abort, so the connection is dropped rather than
+// a 500 body appended to the response already under way.
+func TestTelemetry_PanicAfterWriteKeepsSentStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	func() {
+		defer func() {
+			// The bare sentinel: net/http stays quiet on it, so the panic is
+			// logged once, here, at ERROR, not by net/http through the INFO
+			// log bridge.
+			assert.Equal(t, http.ErrAbortHandler, recover(), "the panic must be re-raised as a bare abort")
+		}()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/late-boom/x", nil))
+	}()
+
+	span := findSpan(rec, "GET /late-boom/{name}")
+	require.NotNil(t, span)
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusAccepted))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Equal(t, "panic", span.Status().Description)
+	assert.Contains(t, logs.String(), `"status":202`)
+	assert.Contains(t, logs.String(), `"level":"ERROR","msg":"Handler panicked","panic":"boom"`)
+	assert.Contains(t, logs.String(), `"stack":"goroutine`)
+}
+
+// TestTelemetry_AbortBeforeWriteClaimsNoStatus: an abort before anything was
+// written sent the client no status, so neither the span nor the access line
+// may claim a 200.
+func TestTelemetry_AbortBeforeWriteClaimsNoStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	func() {
+		defer func() { _ = recover() }()
+		panickingRouter().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/early-abort/x", nil))
+	}()
+
+	span := findSpan(rec, "GET /early-abort/{name}")
+	require.NotNil(t, span)
+	for _, kv := range span.Attributes() {
+		assert.NotEqual(t, attribute.Key("http.response.status_code"), kv.Key, "no status was sent")
+	}
+	assert.Contains(t, span.Attributes(), attribute.Bool("http.request.aborted", true))
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Contains(t, logs.String(), `"status":0`)
+	assert.Contains(t, logs.String(), `"aborted":true`)
+}
+
+// TestPanicAfterBodyWriteDropsConnection: once part of a body has gone out, a
+// 500 can no longer be sent, and appending "Internal Server Error" to a chunked
+// body would hand the client a clean, complete-looking but wrong response. The
+// connection must be dropped instead, so the client sees a broken body.
+func TestPanicAfterBodyWriteDropsConnection(t *testing.T) {
+	installTestTelemetry(t)
+	var logs strings.Builder
+	defer captureLogs(t, &logs)()
+
+	srv := httptest.NewUnstartedServer(panickingRouter())
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Start()
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/mid-body-boom/x")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.Error(t, err, "a body cut short by a panic must not read as complete")
+	assert.Equal(t, "partial", string(body))
+}
+
+// TestTelemetry_ServerErrorSetsSpanStatus: a 5xx response marks the request
+// span as an error; a 4xx does not.
+func TestTelemetry_ServerErrorSetsSpanStatus(t *testing.T) {
+	rec, _ := installTestTelemetry(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /bad", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
+	mux.HandleFunc("GET /missing", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	h := traceRequests(mux)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/bad", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/missing", nil))
+
+	bad := findSpan(rec, "GET /bad")
+	require.NotNil(t, bad)
+	assert.Equal(t, codes.Error, bad.Status().Code)
+	assert.Equal(t, http.StatusText(http.StatusBadGateway), bad.Status().Description)
+
+	missing := findSpan(rec, "GET /missing")
+	require.NotNil(t, missing)
+	assert.Equal(t, codes.Unset, missing.Status().Code)
 }

@@ -34,13 +34,16 @@ func newService(t *testing.T, files map[string][]index.FileInfo, ttfb time.Durat
 	}))
 	t.Cleanup(simple.Close)
 	cfg := &config.Config{IndexURL: simple.URL, IndexTTL: time.Minute, IndexCacheSize: 1 << 20, DownloadTimeout: ttfb}
-	return New(cfg, index.New(cfg))
+	idx := index.New(cfg)
+	t.Cleanup(idx.Close)
+	return New(cfg, idx)
 }
 
 func TestMetadataURL(t *testing.T) {
 	assert.Equal(t, "https://h/f/x.whl.metadata", metadataURL("https://h/f/x.whl"))
 	assert.Equal(t, "https://h/f/x.whl.metadata", metadataURL("https://h/f/x.whl#sha256=abc"))
 	assert.Equal(t, "https://h/f/x.whl.metadata?t=1", metadataURL("https://h/f/x.whl?t=1#sha256=abc"))
+	assert.Equal(t, "https://h/f/%zz.metadata", metadataURL("https://h/f/%zz"), "unparseable URL is suffixed as is")
 }
 
 // TestResolve pins resolution: listed files, PEP 658 siblings only when
@@ -105,7 +108,7 @@ func TestFetch(t *testing.T) {
 	}
 	svc := newService(t, map[string][]index.FileInfo{"p": fi}, 100*time.Millisecond)
 
-	f, err := svc.Fetch(t.Context(), "p", "slowbody")
+	f, err := svc.Fetch(t.Context(), resolve(t, svc, "slowbody"))
 	require.NoError(t, err)
 	got, err := io.ReadAll(f.Body)
 	require.NoError(t, err, "the budget must not cut off a body already streaming")
@@ -114,8 +117,54 @@ func TestFetch(t *testing.T) {
 	assert.Equal(t, int64(len(body)), f.Length)
 
 	for _, name := range []string{"slowhdr", "gone"} {
-		_, err = svc.Fetch(t.Context(), "p", name)
+		_, err = svc.Fetch(t.Context(), resolve(t, svc, name))
 		require.Error(t, err, name)
 		assert.False(t, strings.Contains(err.Error(), secret), "credential leaked: %v", err)
+	}
+}
+
+// TestFetch_RequestErrorIsRedacted pins that download returns already-redacted
+// errors: a credentialed target URL that cannot even become a request must not
+// carry its password or token-as-username into the error, and the *url.Error
+// stays reachable for callers that unwrap.
+func TestFetch_RequestErrorIsRedacted(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+	fi := []index.FileInfo{
+		{Name: "password.tar.gz", URL: "https://deploy:" + secret + "@files.example.com:bad port/password.tar.gz"},
+		{Name: "token.tar.gz", URL: "https://" + secret + "@files.example.com:bad port/token.tar.gz"},
+	}
+	svc := newService(t, map[string][]index.FileInfo{"p": fi}, time.Minute)
+
+	for _, f := range fi {
+		_, err := svc.Fetch(t.Context(), resolve(t, svc, f.Name))
+		require.Error(t, err, f.Name)
+		assert.NotContains(t, err.Error(), secret, f.Name)
+		var uerr *url.Error
+		assert.True(t, errors.As(err, &uerr), "unwrapping must still find the URL error: %v", err)
+	}
+}
+
+func resolve(t *testing.T, svc *Service, file string) Target {
+	t.Helper()
+	tgt, err := svc.Resolve(t.Context(), "p", file)
+	require.NoError(t, err)
+	return tgt
+}
+
+// TestTarget_RedirectURLStripsUserinfo: the redirect Location never carries the
+// index's credentials, and a URL that does not parse is never handed out.
+func TestTarget_RedirectURLStripsUserinfo(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+		stripped bool
+	}{
+		{"https://deploy:s3cret@files.example/p-1.0.tar.gz", "https://files.example/p-1.0.tar.gz", true},
+		{"https://s3cret@files.example/p-1.0.tar.gz", "https://files.example/p-1.0.tar.gz", true},
+		{"https://files.example/p-1.0.tar.gz#sha256=ab", "https://files.example/p-1.0.tar.gz#sha256=ab", false},
+		{"https://deploy:s3cret@files.example:bad port/p.tar.gz", "", false},
+	} {
+		got, stripped := Target{URL: tc.in}.RedirectURL()
+		assert.Equal(t, tc.want, got, tc.in)
+		assert.Equal(t, tc.stripped, stripped, tc.in)
 	}
 }

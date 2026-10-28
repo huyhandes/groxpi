@@ -1,4 +1,4 @@
-{{define "rows"}}
+{{define "inflight"}}
 {{if .Errors}}
 <div class="errors">
   <strong>Recent failures</strong>
@@ -28,7 +28,10 @@
   </table>
 </div>
 {{end}}
+{{end}}
 
+{{define "rows"}}
+<input id="gen" name="gen" type="hidden" value="{{.Gen}}">
 <table>
   <thead>
     <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Last accessed</th><th></th></tr>
@@ -40,7 +43,9 @@
       <td class="num">{{bytes $pkg.Size}}</td>
       <td class="num muted">{{$pkg.Age}}</td>
       <td class="num">{{$pkg.Accessed}}</td>
-      <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none">Evict</button></td>
+      <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none"
+                  hx-confirm="Evict {{$pkg.Name}}? This deletes it from the cache and from the object store, if one is configured."
+                  hx-on::after-request="document.getElementById('evict-status').textContent = event.detail.successful ? '' : 'Evict failed: ' + (event.detail.xhr.responseText || event.detail.xhr.status); htmx.trigger(document.body, 'cache-changed')">Evict</button></td>
     </tr>
     {{range $file := $pkg.Files}}
     <tr class="file" data-package="{{$pkg.Name}}">
@@ -57,7 +62,7 @@
   </tbody>
 </table>
 <p class="muted">{{.Total}} package(s), {{bytes .Size}} cached.
-{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}">&larr; prev</a>{{end}}
+{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">&larr; prev</a>{{end}}
 {{if or .PrevPage .NextPage}}page {{.Page}}{{end}}
-{{if .NextPage}}<a href="/admin?page={{.NextPage}}">next &rarr;</a>{{end}}</p>
+{{if .NextPage}}<a href="/admin?page={{.NextPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">next &rarr;</a>{{end}}</p>
 {{end}}

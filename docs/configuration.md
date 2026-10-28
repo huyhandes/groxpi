@@ -1,19 +1,33 @@
 # Configuration
 
 groxpi is configured entirely through environment variables. Every setting below exists in
-`internal/config/config.go`; nothing else is read.
+`internal/config/config.go`. Besides these, a few standard variables are read by the libraries
+groxpi uses:
 
-Durations are in **seconds**. The timeout settings accept a decimal fraction; the others are integers.
+- `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (or their lowercase forms) apply to every upstream index
+  and package file request: the shared upstream transport uses Go's `http.ProxyFromEnvironment`.
+  Requests to `localhost` or a loopback address are never proxied.
+- The OpenTelemetry exporters read their own standard `OTEL_*` variables, and the AWS SDK its own
+  `AWS_*` variables (credential chain, profile and so on), beyond the ones listed below.
+
+Every duration setting accepts either a Go duration string — a number with a unit suffix (`ns`, `us`,
+`ms`, `s`, `m`, `h`), combinable as in `1h30m` or `1.5h` — or a bare number of seconds, fractions
+allowed (`300`, `2.5`), which is proxpi's spelling. A negative value, `NaN`, `Inf`, a value too large for
+a Go duration (about 292 years) or anything else unparseable is logged as a warning and the default is
+kept.
+
+Booleans accept `1`, `true`, `yes`, `on` for true and `0`, `false`, `no`, `off` for false, in any case.
+Any other value is logged as a warning and the default is kept.
 
 ## Index
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_INDEX_URL` | `https://pypi.org/simple/` | Primary upstream index. |
-| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. |
-| `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. |
-| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. A missing or unparseable entry falls back to 180. |
-| `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification when talking to an index. |
+| `GROXPI_INDEX_TTL` | `1800` | How long the primary index's answers stay cached. `0` means the answer is not cached: it is re-fetched on every request. |
+| `GROXPI_EXTRA_INDEX_URLS` | *(empty)* | Comma-separated additional indexes, highest priority first. Positional like the TTLs: an empty item is skipped with a warning but still consumes its `GROXPI_EXTRA_INDEX_TTLS` slot (`a,,b` with `60,,120` gives `b` 120). |
+| `GROXPI_EXTRA_INDEX_TTLS` | `180` per index | Comma-separated TTLs, positionally matched to `GROXPI_EXTRA_INDEX_URLS`. Each entry is a duration (`5m`, `90s`) or bare seconds, like the other duration settings. A missing, empty or unparseable entry falls back to 180 in its own position (`60,,120` gives the second index 180). `0` means that index's answer is not cached: it is re-fetched on every request. |
+| `GROXPI_DISABLE_INDEX_SSL_VERIFICATION` | `false` | Skip TLS certificate verification on every upstream call: index pages, the root index and file downloads. |
 
 ### How extra indexes are resolved
 
@@ -28,6 +42,8 @@ than falling through to a lower-priority index: a private index that is down mus
 to the public one.
 
 Each index carries its own TTL, so a fast-moving private index can be refreshed more often than PyPI.
+A package that no index has is remembered as missing for the **shortest** of these TTLs; until then
+it answers `404` without an upstream query. If any index's TTL is `0`, misses are not remembered. `DELETE /cache/{package}` clears it sooner.
 
 Credentials may be embedded in an index URL (`https://user:pass@host/simple/`). They are redacted to
 `https://redacted@host/simple/` in every log record, error message, metric attribute and HTTP response
@@ -41,13 +57,15 @@ body. An unparseable URL is reported as `[unparseable-url]` rather than risk lea
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. |
-| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. |
-| `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. |
+| `GROXPI_CACHE_SIZE` | `5368709120` (5 GB) | Byte budget for the on-disk package file cache. Evicts by least recent access. `0` = unbounded. |
+| `GROXPI_CACHE_DIR` | the OS temp directory | Where cached package files live (`local` and `hybrid` modes). In `s3` mode nothing is cached here: downloads spool into `<GROXPI_CACHE_DIR>/spool` before upload, and spool files left over from a crash (untouched for more than an hour) are deleted at startup. groxpi owns only `<dir>/packages` and `<dir>/spool`: the cache scan, eviction and temp cleanup never list, count or delete anything else in the directory. |
+| `GROXPI_INDEX_CACHE_SIZE` | `268435456` (256 MB) | Byte budget for the in-memory index cache. `0` = unbounded (entries still leave by TTL). |
 
 There is one index cache. Per package it holds the parsed file list plus the JSON and gzipped-JSON
 response bodies, and accounts all of them against the byte budget. Entries leave by TTL (a background
-sweep) or by LRU when the budget is exceeded. There is no separate response cache.
+sweep at the shortest positive index TTL) or by LRU when the budget is exceeded. An entry larger than the
+whole budget is not cached. With a TTL of `0` nothing from that index is stored. There is no separate
+response cache.
 
 > The 256 MB default is **provisional**. It was chosen without measurement and cannot be tuned honestly
 > until the cache metrics have been observed against real traffic. Watch `groxpi.cache.occupancy` and
@@ -57,7 +75,7 @@ sweep) or by LRU when the budget is exceeded. There is no separate response cach
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_STORAGE_TYPE` | `local` | `local` (the cache only), `s3` (the durable store only), or `hybrid` (the cache in front of the durable store). |
+| `GROXPI_STORAGE_TYPE` | `local` | `local` (the cache only), `s3` (the durable store only), or `hybrid` (the cache in front of the durable store). Case-insensitive and trimmed (`S3` means `s3`); any other value stops groxpi at startup. |
 
 The local cache is bounded (a size limit, LRU by atime, and in hybrid mode an optional TTL) and disposable; it is the only thing groxpi evicts.
 The S3 durable store receives every verified download and is unbounded: groxpi never expires objects
@@ -69,7 +87,7 @@ from it, so retention there is set with bucket lifecycle rules. See
 The cache only. Files live under `GROXPI_CACHE_DIR`, bounded by `GROXPI_CACHE_SIZE`. The filesystem is the LRU index:
 a cache hit sets the file's atime explicitly (at most once an hour per file, so a `noatime` mount still
 works; mtime is untouched because it is `Last-Modified`). A write that takes the cache past its budget
-walks the directory and deletes the least recently accessed files until it is at 90% of the budget.
+walks the directory, once the clients streaming that write have their last byte, and deletes the least recently accessed files until it is at 90% of the budget.
 Recency lives on disk, so it survives a restart. A walk at startup seeds the size counter, and every
 walk re-counts the cache size and removes temp files left behind by a crashed write (untouched for
 more than an hour).
@@ -91,7 +109,7 @@ The durable store only: every verified download is uploaded to the bucket and ne
 | `AWS_ACCESS_KEY_ID` | *(unset)* | Optional static access key. |
 | `AWS_SECRET_ACCESS_KEY` | *(unset)* | Optional static secret key. |
 | `GROXPI_S3_USE_SSL` | `true` | Use HTTPS when the endpoint carries no scheme. |
-| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. Required for MinIO. |
+| `GROXPI_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing. Required for MinIO, and for RustFS unless it sets `RUSTFS_SERVER_DOMAINS`. |
 | `GROXPI_S3_ENABLE_HTTP2` | `true` | Allow HTTP/2 to the endpoint. |
 
 The backend is the official AWS SDK for Go v2. **Static credentials are not required**: with none
@@ -103,6 +121,7 @@ groxpi probes the bucket with `HeadBucket` at startup and refuses to start if it
 [deployment.md](deployment.md) for the IAM-role path and the permissions the bucket policy needs.
 
 For MinIO set `GROXPI_S3_FORCE_PATH_STYLE=true`: MinIO cannot resolve virtual-hosted bucket names.
+RustFS needs it too unless `RUSTFS_SERVER_DOMAINS` names its virtual-hosted domain.
 Checksum calculation and validation are configured as *when required* rather than always, because
 older MinIO releases reject the checksum trailers the SDK emits by default.
 
@@ -112,7 +131,7 @@ The local cache in front of the S3 durable store. Every `s3` setting applies, pl
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for the cache. |
+| `GROXPI_LOCAL_CACHE_SIZE` | `10737418240` (10 GB) | Byte budget for the cache. `0` = unbounded. |
 | `GROXPI_LOCAL_CACHE_DIR` | value of `GROXPI_CACHE_DIR` | Where the cache lives. |
 | `GROXPI_LOCAL_CACHE_TTL` | `0` (disabled) | Age at which a cached file is dropped regardless of the byte budget, measured from when the file was written. |
 A download is verified and renamed into the cache first, so readers are served from local disk; the
@@ -131,6 +150,7 @@ the LRU and TTL rules in [`local`](#local), with `GROXPI_LOCAL_CACHE_SIZE` as it
 | Variable | Default | Meaning |
 |---|---|---|
 | `GROXPI_DOWNLOAD_TIMEOUT` | `0.9` | Time-to-first-byte budget for an upstream package file. |
+| `GROXPI_DOWNLOAD_IDLE_TIMEOUT` | `60` | Longest gap between body bytes of an upstream package file before the download fails. `0` or less means `60`. |
 | `GROXPI_CONNECT_TIMEOUT` | `0` (unset) | Summed with the next into one whole-request timeout for the index client. Also the S3 backend's setup deadline. |
 | `GROXPI_READ_TIMEOUT` | `0` (unset) | Summed with the previous. Neither is a per-phase budget — read the note below before setting either. |
 
@@ -139,8 +159,18 @@ arrive, the body streams to completion under the request's own lifetime — a tr
 the client is never cut off by a budget meant for connection setup. If the budget expires first, the
 client is redirected to the upstream URL and nothing is cached.
 
-Set it to `0` to disable caching of package files altogether: every download becomes a redirect
-upstream. That is what `redirect.reason=caching_disabled` counts.
+Set `GROXPI_DOWNLOAD_TIMEOUT` to `0` to stop fetching package files from upstream. A file
+already stored is still served: a cache hit, or in `s3` mode a durable-store hit, streams as usual, and
+in `hybrid` mode a durable-store hit is still promoted into the local cache. A file found in neither
+is redirected upstream if the package index lists it, and 404 if it does not; the index may still be
+fetched to build the redirect URL, but the file itself is never fetched. That redirect is what
+`redirect.reason=caching_disabled` counts. Admin prefetch is still accepted (202) but warms nothing:
+it is reported as a failure in the admin page's recent errors.
+
+`GROXPI_DOWNLOAD_IDLE_TIMEOUT` bounds each gap in that stream, not the whole transfer: every chunk of
+body bytes restarts it, so a slow but steady download completes. If upstream sends nothing for that
+long, the download fails, nothing is cached, and the next request for the file starts a fresh download.
+Index requests are not covered by it.
 
 `GROXPI_CONNECT_TIMEOUT` and `GROXPI_READ_TIMEOUT` apply to the index HTTP client, not to package
 downloads. They are **summed into one `http.Client.Timeout`**, which covers the whole request —
@@ -152,8 +182,7 @@ connection setup, headers *and* body. Neither name means what it says:
 - To allow a long transfer, set both, and set the sum to what the whole request may take.
 
 `GROXPI_CONNECT_TIMEOUT` is reused as the S3 backend's dial, TLS-handshake and credential-load budget
-(default 10 seconds there), and `GROXPI_DOWNLOAD_TIMEOUT` as its response-header budget — so the `0.9`
-default also bounds how long S3 may take to start answering.
+(default 10 seconds there).
 
 ## Server
 
@@ -162,17 +191,21 @@ default also bounds how long S3 may take to start answering.
 | `PORT` | `5000` | Listen port. groxpi always binds all interfaces. |
 | `GROXPI_LOGGING_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, `ERROR`. |
 | `GROXPI_LOG_FORMAT` | `console` | `console` or `json`. |
-| `GROXPI_LOG_COLOR` | `true` | ANSI colour in `console` format. |
+| `GROXPI_LOG_COLOR` | `true` | ANSI colour in `console` format. The Docker image sets `false`. |
 
 ## Observability
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | Collector base URL, e.g. `http://otel-collector:4318`. Setting it switches telemetry on; each signal posts to `<base>/v1/traces`, `/v1/metrics`, `/v1/logs` (a trailing `/` on the base is trimmed). |
 | `OTEL_SERVICE_NAME` | `groxpi` | Service name on exported telemetry. |
 
-With no endpoint configured, telemetry is inert: no providers installed, no connection attempted,
-instrumentation costs nothing. groxpi serves no Prometheus scrape endpoint — see
+`OTEL_EXPORTER_OTLP_ENDPOINT` is the only switch: while it is empty, telemetry is inert — no
+providers installed, no connection attempted, instrumentation costs nothing — even if a per-signal
+variable is set. Once it is set, the OTLP/HTTP exporters read the rest of the standard variables
+themselves, so `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are honoured: each is used as given (no path appended) and
+overrides the base URL for its signal. groxpi serves no Prometheus scrape endpoint — see
 [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md).
 
 ## Administrative interface
@@ -197,11 +230,12 @@ be updated.
 
 ## Settings inherited from Python proxpi
 
-groxpi reads the same variable names as proxpi where the setting still exists: `GROXPI_INDEX_URL`,
-`GROXPI_INDEX_TTL`, `GROXPI_EXTRA_INDEX_URLS`, `GROXPI_EXTRA_INDEX_TTLS`, `GROXPI_CACHE_SIZE`,
-`GROXPI_CACHE_DIR`, `GROXPI_DOWNLOAD_TIMEOUT`, `GROXPI_CONNECT_TIMEOUT`, `GROXPI_READ_TIMEOUT`,
-`GROXPI_LOGGING_LEVEL`, `GROXPI_DISABLE_INDEX_SSL_VERIFICATION`. `PROXPI_`-prefixed spellings are not
-read.
+proxpi's `PROXPI_*` variables are **not read**. Each setting proxpi had that still exists keeps its
+suffix under the `GROXPI_` prefix — rename `PROXPI_INDEX_URL` to `GROXPI_INDEX_URL` and so on:
+`GROXPI_INDEX_URL`, `GROXPI_INDEX_TTL`, `GROXPI_EXTRA_INDEX_URLS`, `GROXPI_EXTRA_INDEX_TTLS`,
+`GROXPI_CACHE_SIZE`, `GROXPI_CACHE_DIR`, `GROXPI_DOWNLOAD_TIMEOUT`, `GROXPI_CONNECT_TIMEOUT`,
+`GROXPI_READ_TIMEOUT`, `GROXPI_LOGGING_LEVEL`, `GROXPI_DISABLE_INDEX_SSL_VERIFICATION`. A deployment
+that still sets only the `PROXPI_*` names runs on defaults.
 
 `GROXPI_BINARY_FILE_MIME_TYPE` does not exist. A package file's content type comes from its filename
 extension.

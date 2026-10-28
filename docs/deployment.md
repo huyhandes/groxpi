@@ -9,16 +9,16 @@ GROXPI_CACHE_DIR=/var/cache/groxpi ./groxpi
 
 groxpi listens on `PORT` (default `5000`) on all interfaces. It shuts down gracefully on `SIGINT` and
 `SIGTERM`: in-flight requests drain, admin prefetches are refused and the running ones are waited for,
-the index cache sweeper stops, and storage waits for running downloads — in `hybrid` mode including the
-S3 upload each one finishes with.
+the index cache sweeper stops, and storage waits for running downloads — in `hybrid` and `s3` modes
+including the S3 upload each one finishes with.
 
 ### Shutdown budget
 
 Those steps share **one 5-second budget**, plus up to 5 seconds after it to flush telemetry. A step that
 overruns is reported and stepped over rather than waited out: an unreachable object store or a wedged
 upstream index would otherwise hold the process open until the runtime killed it, which loses more than
-giving up does. What is lost by giving up is a cache entry the next request re-fetches, or an S3
-upload whose file is still in the local cache.
+giving up does. What is lost by giving up is a cache entry the next request re-fetches, or, in
+`hybrid` mode, an S3 upload whose file is still in the local cache.
 
 Allow at least 15 seconds of stop grace so the process exits on its own rather than being killed
 mid-flush. Docker's default is 10 seconds, so set `stop_grace_period: 30s` on the service in Compose;
@@ -26,7 +26,7 @@ Kubernetes defaults to 30 seconds, which is already enough.
 
 ## Docker
 
-The image is built from `scratch` and contains the binary, CA certificates and timezone data. Nothing
+The image is built from `scratch` and contains the binary and CA certificates. Nothing
 else — no shell, no `curl`, no `wget`, no templates (the admin page's assets are embedded in the
 binary).
 
@@ -38,9 +38,11 @@ docker run -p 5000:5000 -v groxpi_cache:/cache groxpi:latest
 The image has no shell or HTTP client, so the health check is the binary itself: `groxpi
 --health-check` GETs `/health` on `127.0.0.1` at the configured `PORT` and exits 0 only on a 200. It
 starts no server, opens no storage backend and installs no telemetry. The Dockerfile's `HEALTHCHECK`
-and both compose files use it, so `depends_on: service_healthy` gates correctly and Docker restarts a
-container whose server has stopped answering. A non-default `PORT` is honoured, since the probe reads
-the same configuration the server does.
+and both compose files use it, so `depends_on: service_healthy` gates correctly and a container whose
+server has stopped answering is marked `unhealthy`. Plain Docker does not restart an unhealthy
+container (`restart:` acts only on exit); a restart needs Swarm, an orchestrator liveness probe (the
+Kubernetes example below), or an autoheal sidecar. A non-default `PORT` is honoured, since the probe
+reads the same configuration the server does.
 
 Probing from outside the container — a Kubernetes `httpGet` probe, a load-balancer check — remains
 valid and is what the Kubernetes manifest below uses.
@@ -49,7 +51,17 @@ valid and is what the Kubernetes manifest below uses.
 docker compose up -d      # see docker-compose.yml
 ```
 
-`docker-compose.minio.yml` brings up MinIO alongside groxpi for exercising the S3 path locally.
+`docker-compose.rustfs.yml` brings up [RustFS](https://github.com/rustfs/rustfs), an S3-compatible
+server, alongside groxpi in `s3` mode for exercising the S3 path locally. A one-shot `s3-init` service
+creates the bucket first, because groxpi only probes it:
+
+```bash
+docker compose -f docker-compose.rustfs.yml up -d --wait
+docker compose -f docker-compose.rustfs.yml down -v   # stop and drop the bucket volume
+```
+
+The RustFS console listens on port 9001; the credentials are the `rustfsadmin` defaults in the file,
+for local use only.
 
 ## Kubernetes
 
@@ -197,7 +209,8 @@ pip install --index-url http://pypi.example.com/simple/ numpy
 # pip.conf / pip.ini
 [global]
 index-url = http://pypi.example.com/simple/
-trusted-host = pypi.example.com   # only if not behind TLS
+# only if not behind TLS
+trusted-host = pypi.example.com
 ```
 
 ```bash

@@ -18,14 +18,15 @@ internal/
                              serves GET /simple/{package}/{file} (and its /index/ alias);
                              wraps the mux in panic recovery and request tracing; shutdown
              index.go        GET /simple/, GET /simple/{package}/ and the /index/ aliases
-             admin.go        basic auth, cross-site check, admin templates, page, rows, prefetch,
+             admin.go        basic auth, cross-site check, admin templates, page, rows, inflight, prefetch,
                              cache eviction routes
   index/     service.go      Resolve / Invalidate / ProxyRoot: extras-first resolution, singleflight
              cache.go        bounded index cache (LRU by last access + background TTL sweep)
              client.go       upstream index client (JSON first, HTML fallback)
+             simple.go       PEP 503 HTML: parse an upstream page, render this proxy's page
              normalize.go    PEP 503 name normalisation
   download/  service.go      Resolve / Fetch: find a file in the index (PEP 658 included), open it upstream
-  admin/     admin.go        List / Evict / InFlight: the cache listing and eviction
+  admin/     admin.go        List / Evict / InFlight / Failures: the cache listing and eviction
              prefetch.go     Prefetch and newest-release selection, built on storage.Open
   storage/   store.go        read-through Open: coalesced, verified, spooled downloads; the cache
                              and/or the durable store; InFlight
@@ -44,10 +45,15 @@ docs/adr/                    architecture decision records
 
 Dependencies point one way: `server → admin → storage → download → index`. `download` needs one thing
 from `index` — a resolved file list — and takes the concrete `*index.Service`; its tests fake upstream
-over HTTP. `storage` needs one thing from `download` — an open upstream body — and asks for it through
-a one-method interface it defines itself (`storage.Fetcher`), the one interface a module depends on
+over HTTP. `storage` needs two things from `download` — a resolved target and its open upstream body — and asks
+for them through an interface it defines itself (`storage.Fetcher`: `Resolve` + `Fetch`), the one
+interface a module depends on
 another through, so its tests run against a fake fetcher. Everywhere else a module is used as the
 concrete type it is: an interface with one implementation is a liability, not a boundary.
+
+One upstream transport, owned by index: `index.New` builds it from config and `download` takes it
+through `(*index.Service).Transport()`, so the per-package index, the root proxy and file downloads
+share one connection pool and one TLS setting.
 
 Routing is the standard library's `http.ServeMux` with method-and-pattern routes (`GET
 /simple/{package}/{$}`). The mux supplies the trailing-slash redirect, the `405` with `Allow`, and the
@@ -59,7 +65,20 @@ matched pattern (`r.Pattern`) that names each request span. JSON is the standard
 One cache, one byte budget. Each entry holds, for one package: the parsed file list, the JSON response
 body, and the gzipped JSON response body. All three are accounted against `GROXPI_INDEX_CACHE_SIZE`.
 Entries leave by TTL — a background sweep, so an expired entry's memory is actually reclaimed rather
-than waiting for the next lookup — or by LRU on last access when the budget is exceeded.
+than waiting for the next lookup — or by LRU on last access when the budget is exceeded. An entry's
+TTL is that of the index that answered; an index with a TTL of `0` has nothing stored. The sweep runs
+at the shortest positive TTL in the resolution order (none runs if every TTL is `0`); a lookup that
+finds an expired entry drops it at once. An entry larger than the whole budget is not stored, so it
+cannot empty the cache.
+
+The cache also remembers misses. When every configured index answers "not found" for a package,
+that fact is cached as a small fixed-size entry in the same map and budget, for the shortest TTL in
+the resolution order (`GROXPI_INDEX_TTL` with no extra index, otherwise usually an extra index's
+180-second default); if that shortest TTL is `0`, misses are not remembered. A cached miss answers 404
+without querying any upstream and counts as a `groxpi.cache.hits` hit on the `index` layer. An
+upstream error and an empty file list are never cached, so a transient fault does not hide a
+package. A package published to an index while its miss is cached stays a 404 until the miss
+expires, or until `DELETE /cache/{package}` drops it.
 
 Producing the serialised bodies at fill time is what removes the separate response cache: the request
 path never marshals and never compresses. A client that accepts gzip is handed bytes that were
@@ -80,10 +99,17 @@ groxpi keeps package files in up to two places, with different jobs:
 `hybrid` is the cache in front of the durable store. There is no backend interface: the `Store` holds a
 concrete local cache and/or a concrete S3 store, and `hybrid` is "cache, then S3" logic in the `Store`.
 
-Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike. The
+Storage keys are `packages/<normalised-name>/<filename>`, in the cache and in the bucket alike.
+`storage.Key`, `index.Resolve` and `index.Invalidate` normalise the name themselves, so callers pass
+it as received; the key's path-segment check runs on the normalised name. The
 package prefix is what makes `DELETE /cache/<package>` a prefix delete rather than a second index.
 Eviction deletes the package from the cache and from the durable store; otherwise the next request
-would restore it from S3. The admin listing shows the cache only.
+would restore it from S3. An eviction during a download of the same package wins: the flight still
+serves its readers but stores nothing, and an upload already under way is waited for, then deleted.
+A request that looked the file up just before the eviction, or while it was still deleting, and has not
+yet started its flight, looks again; a flight started while the eviction runs stores nothing. So a
+hybrid promotion never writes the deleted file back into the cache.
+The admin listing shows the cache only.
 
 Serving a stored file hands the open object to `http.ServeContent`,
 so `net/http` does range and conditional-request handling. The tracing middleware's response-writer
@@ -104,6 +130,12 @@ with a `200` that is cut off mid-body. `Range` and conditional requests still go
 `http.ServeContent`; a ranged read fetches bounded windows, starting at 1 MiB and doubling up to a cap,
 rather than an open-ended `bytes=<off>-`. An S3 hit carries no `ETag`.
 
+Every S3 `GetObject` waits at most 30 seconds for its response headers, SDK retries included, and a
+lookup also stops waiting when its client leaves. A lookup that runs out of time is a miss, so a
+stalled S3 falls back to upstream instead of holding the request; the body read after the headers
+has no such deadline. A body read that fails mid-stream (a hit or a promotion) is reopened once as
+a ranged GET at the same offset; a second failure in a row fails the read.
+
 ### `hybrid`
 
 The write path of a download: spool under the cache directory, verify (SHA-256 and length), rename
@@ -115,7 +147,9 @@ cached. Shutdown waits, within the shutdown timeout, for downloads and their upl
 A read that misses the cache and hits S3 is a promotion: the `Store` opens the S3 body and streams it
 through the same flight, spool and tail as an upstream download, so it lands in the cache checked
 against the S3 object's length and every concurrent reader tails it. It runs detached, so it survives
-the request that triggered it. A promoted file is not uploaded back — it is already in S3.
+the request that triggered it. A promoted file is not uploaded back — it is already in S3. A
+promotion whose spool file cannot be created fails with `storage.ErrStorage`, which the server
+answers with `500`: the file exists, so it is not a `404`.
 
 ## Request flows
 
@@ -124,7 +158,8 @@ the request that triggered it. A promoted file is not uploaded back — it is al
 Byte-level pass-through of the upstream response, nothing decoded and nothing cached. Concurrent
 requests for the same `Accept`/`Accept-Encoding` pair share one upstream fetch via singleflight, and the
 fetch runs on a context detached from whichever client triggered it, bounded by the client's own
-timeout.
+timeout. A client that disconnects stops waiting at once; the fetch carries on for the rest (the
+package index lookup below works the same way).
 
 ### Index resolution — `GET /simple/<package>/`
 
@@ -158,15 +193,16 @@ opens its `GetObject` before response headers are sent and reads ranges in bound
 the cache through the same spool path as a download, with no upstream fetch.
 
 On a miss, `storage` keeps one flight per storage key. The first request starts it: a detached leader
-calls `download.Fetch`, which resolves the file through the index (a `<file>.metadata` name resolves
-from `<file>`'s entry, PEP 658) and opens it upstream. The leader copies the body into a `.tmp-*` spool
+calls `download.Resolve`, which resolves the file through the index (a `<file>.metadata` name resolves
+from `<file>`'s entry, PEP 658), then `download.Fetch` on that target to open it upstream. The index is
+resolved once per miss; requests coalesced onto the flight take the leader's outcome. The leader copies the body into a `.tmp-*` spool
 file (next to its final path locally, under `GROXPI_CACHE_DIR/spool` for `s3`) while hashing it, through
 one pooled copy buffer. Every request for that key, the first included, tails the growing spool; Range
 is ignored while in flight. Readers are held one byte short of the expected length (or of the bytes
 written, when no length is known) until verification: against the SHA-256 the index declared, and
 against the expected length (the declared size, else the upstream `Content-Length`) when one is known;
 a file with neither is cached unverified with a warning. A verified spool is
-renamed into the cache (`local`, `hybrid`; in `hybrid` the same goroutine then uploads it to S3) or
+synced to disk and renamed into the cache (`local`, `hybrid`; in `hybrid` the same goroutine then uploads it to S3) or
 uploaded and removed (`s3`). A spool that fails verification is deleted and every reader's body read fails, so
 the server aborts each response rather than end it cleanly; only a fetch that fails before upstream
 answers `200` (or whose spool cannot be created) is redirected upstream.
@@ -175,13 +211,24 @@ The flight is visible: `storage.InFlight` lists each running download with the b
 the size the index declared, when it started and how many requests are coalesced onto it. The admin
 page renders it as "Downloading now" rows and `groxpi.download.inflight` reports its size.
 
-With `GROXPI_DOWNLOAD_TIMEOUT=0`, a miss is not fetched: the server resolves the file and answers `302`
-to the upstream URL. A fetch that fails before upstream answers `200` also ends in a `302`, counted as
-`fetch_failed`. A file the index does not list is a `404`.
+A miss the store does not serve crosses the seam as an error that says why, and the server maps it
+to a response without calling `download` itself:
 
-The time-to-first-byte budget is a timer that cancels the request context and is then stopped, so it can
-only fire while groxpi is still waiting for upstream response headers. A body already streaming is never
-cut off by it.
+- `*storage.RedirectError` (`errors.As`) — answer `302` to its `URL` and count `groxpi.redirects` by
+  its `Reason`. With `GROXPI_DOWNLOAD_TIMEOUT=0` the store is built in redirect mode
+  (`Store.Redirects()`): a miss resolves the file and returns `caching_disabled`, starting no flight
+  (a hybrid durable hit is still promoted). A fetch that fails before upstream answers `200`, or whose
+  spool cannot be created, returns `fetch_failed` with the leader's target, to every coalesced
+  request. The `URL` comes from `download.Target.RedirectURL`, the one place userinfo is stripped; it
+  is empty, and the server answers `502`, when the upstream URL does not parse.
+- a wrapped `download.ErrNotListed` — `404 File not found`.
+- anything else (the package index could not be resolved) — `404 Package not found`.
+
+One timer guards each upstream file request. While groxpi waits for response headers it holds the
+time-to-first-byte budget; once headers arrive it is re-armed with `GROXPI_DOWNLOAD_IDLE_TIMEOUT` and
+reset by every body read that returns bytes, then stopped on close. A slow but steady body is never cut
+off; one that sends nothing for the idle timeout fails the flight, nothing is committed, and the next
+request starts a fresh flight.
 
 The leader runs on a context detached from its client's request: it fills the cache for every reader,
 so it finishes even after all of them have left. Shutdown waits for it.
@@ -193,7 +240,8 @@ configured — to OpenTelemetry through the `otelslog` bridge, carrying the trac
 the request that produced them. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset, all three signals are inert:
 no providers, no connection attempt, no startup dependency.
 
-All three signals leave over OTLP/HTTP to one endpoint. There is **no** Prometheus scrape endpoint and
+All three signals leave over OTLP/HTTP to the collector that variable names (or to the standard
+per-signal endpoint variables, which override it). There is **no** Prometheus scrape endpoint and
 no `/metrics` route; `monitoring/prometheus.yml` scrapes a collector. See
 [adr/0002-otlp-over-prometheus-scrape.md](adr/0002-otlp-over-prometheus-scrape.md).
 
@@ -224,9 +272,27 @@ as long as the collector keeps the series.
 ├─ storage.exists
 ├─ index.resolve
 │  └─ index.query          (one per index consulted)
-└─ upstream.fetch
-   └─ storage.put
+└─ upstream.fetch          (the flight: resolve, fetch, spool, commit)
+   ├─ storage.put          (the spool: copy, hash, verify)
+   └─ storage.upload       (the PUT to the durable store, hybrid and s3)
 ```
+
+A `hybrid` promotion (cache miss, durable-store hit) has no `index.resolve` and no `upstream.fetch`:
+its `storage.put` sits directly under the request span, after `storage.exists`, and no
+`storage.upload` follows.
+
+The request span carries `http.response.status_code`; a 5xx sets the span's status to error. A
+handler that panics is still recorded under its route with error status `panic`, and still gets
+its access log line: as a 500 if it wrote nothing, otherwise with the status already sent, and
+then the connection is dropped so a half-sent body never reads as complete. Either way the panic
+and its stack are logged once at ERROR (`Handler panicked`). A handler
+that aborts with `http.ErrAbortHandler` keeps the status already sent, gets
+`http.request.aborted=true` and error status `aborted`, and its access line carries `aborted=true`;
+if it aborted before writing anything, the span has no status code and the access line logs
+status 0.
+
+`groxpi.upstream.fetch.duration` is recorded when the spool is verified, so it never includes
+`storage.upload`.
 
 ## Embedded assets
 

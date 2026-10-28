@@ -7,11 +7,23 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
+// The tests here cover only the accounting Resolve cannot observe: what the
+// cache charges and refunds. Behaviour (hits, expiry, misses, invalidation) is
+// tested through Service in service_test.go and negative_test.go.
+
 func testEntry(body string) *Entry {
-	return NewPackageEntry([]FileInfo{{Name: "a.whl"}}, []byte(body))
+	return newPackageEntry([]FileInfo{{Name: "a.whl"}}, []byte(body))
+}
+
+// stats reads the cache's entry count and byte total under its lock.
+func (c *indexCache) stats() (int, int64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries), c.bytes
 }
 
 func TestEntry_GzipDecodesToJSON(t *testing.T) {
@@ -29,39 +41,25 @@ func TestEntry_GzipDecodesToJSON(t *testing.T) {
 	if string(got) != body {
 		t.Fatalf("gzip form decodes to %q, want %q", got, body)
 	}
-	if e.Size() <= 0 {
+	if e.size <= 0 {
 		t.Fatal("entry size must be positive")
 	}
 }
 
-func TestIndexCache_SetAndGet(t *testing.T) {
-	c := NewIndexCache(0, 0)
-	defer c.Close()
+// TestIndexCache_MissIsChargedAFixedSize pins that a cached miss counts against
+// the byte budget, so a spray of unknown names cannot grow the cache unbounded.
+func TestIndexCache_MissIsChargedAFixedSize(t *testing.T) {
+	c := newIndexCache(0, 0)
+	defer c.close()
 
-	entry := testEntry(`{"a":1}`)
-	c.Set("k", entry, time.Minute)
-
-	got, ok := c.Get("k")
-	if !ok || got != entry {
-		t.Fatalf("Get returned (%v, %v), want the stored entry", got, ok)
+	c.set("ghost", newMissEntry(), time.Minute)
+	c.set("other", newMissEntry(), time.Minute)
+	if n, b := c.stats(); n != 2 || b != 2*missEntrySize {
+		t.Fatalf("two misses hold %d entries, %d bytes; want 2, %d", n, b, 2*missEntrySize)
 	}
-	if _, ok := c.Get("missing"); ok {
-		t.Fatal("Get of a missing key must miss")
-	}
-}
-
-func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
-	c := NewIndexCache(0, 0)
-	defer c.Close()
-
-	for _, ttl := range []time.Duration{0, -time.Second, 10 * time.Millisecond} {
-		c.Set("k", testEntry(`{"a":1}`), ttl)
-		if ttl > 0 {
-			time.Sleep(ttl + 10*time.Millisecond)
-		}
-		if _, ok := c.Get("k"); ok {
-			t.Fatalf("entry with ttl %v must not be readable", ttl)
-		}
+	c.invalidate("ghost")
+	if n, b := c.stats(); n != 1 || b != missEntrySize {
+		t.Fatalf("after invalidate: %d entries, %d bytes; want 1, %d", n, b, missEntrySize)
 	}
 }
 
@@ -70,97 +68,85 @@ func TestIndexCache_ExpiredEntryMisses(t *testing.T) {
 // (half an hour away) means live entries get evicted to make room for bytes
 // already known to be worthless.
 func TestIndexCache_MissDropsTheStaleEntry(t *testing.T) {
-	c := NewIndexCache(0, 0)
-	defer c.Close()
+	synctest.Test(t, func(t *testing.T) {
+		c := newIndexCache(0, 0)
+		defer c.close()
 
-	c.Set("k", testEntry(`{"a":1}`), -time.Second)
+		c.set("k", testEntry(`{"a":1}`), time.Minute)
+		if n, _ := c.stats(); n != 1 {
+			t.Fatalf("set stored %d entries; want 1", n)
+		}
+		time.Sleep(time.Minute + time.Second)
 
-	if _, ok := c.Get("k"); ok {
-		t.Fatal("an expired entry must not be readable")
-	}
-	if c.Len() != 0 || c.Bytes() != 0 {
-		t.Fatalf("stale entry still charged: %d entries, %d bytes", c.Len(), c.Bytes())
-	}
-}
-
-func TestIndexCache_PackageHelpers(t *testing.T) {
-	c := NewIndexCache(0, 0)
-	defer c.Close()
-
-	c.SetPackage("numpy", testEntry(`{"a":1}`), time.Minute)
-	if _, ok := c.GetPackage("numpy"); !ok {
-		t.Fatal("package entry should be cached")
-	}
-	c.InvalidatePackage("numpy")
-	if _, ok := c.GetPackage("numpy"); ok {
-		t.Fatal("package entry should be invalidated")
-	}
-	if c.Bytes() != 0 {
-		t.Fatalf("invalidation must refund bytes, still holding %d", c.Bytes())
-	}
+		if _, ok := c.get("k"); ok {
+			t.Fatal("an expired entry must not be readable")
+		}
+		if n, b := c.stats(); n != 0 || b != 0 {
+			t.Fatalf("stale entry still charged: %d entries, %d bytes", n, b)
+		}
+	})
 }
 
 func TestIndexCache_ByteBudgetEvictsLeastRecentlyUsed(t *testing.T) {
-	one := testEntry(`{"a":1}`)
-	c := NewIndexCache(2*one.Size(), 0)
-	defer c.Close()
+	synctest.Test(t, func(t *testing.T) {
+		one := testEntry(`{"a":1}`)
+		c := newIndexCache(2*one.size, 0)
+		defer c.close()
 
-	c.Set("a", testEntry(`{"a":1}`), time.Minute)
-	time.Sleep(2 * time.Millisecond)
-	c.Set("b", testEntry(`{"a":1}`), time.Minute)
-	time.Sleep(2 * time.Millisecond)
+		// The sleeps are instant on the bubble's clock; they only keep the
+		// recency stamps apart.
+		c.set("a", testEntry(`{"a":1}`), time.Minute)
+		time.Sleep(time.Millisecond)
+		c.set("b", testEntry(`{"a":1}`), time.Minute)
+		time.Sleep(time.Millisecond)
 
-	// Touch "a" so "b" becomes the least recently used.
-	if _, ok := c.Get("a"); !ok {
-		t.Fatal("a should still be cached")
-	}
-	time.Sleep(2 * time.Millisecond)
-	c.Set("c", testEntry(`{"a":1}`), time.Minute)
+		// Touch "a" so "b" becomes the least recently used.
+		if _, ok := c.get("a"); !ok {
+			t.Fatal("a should still be cached")
+		}
+		time.Sleep(time.Millisecond)
+		c.set("c", testEntry(`{"a":1}`), time.Minute)
 
-	if _, ok := c.Get("b"); ok {
-		t.Fatal("b was least recently used and should have been evicted")
-	}
-	if _, ok := c.Get("a"); !ok {
-		t.Fatal("a was touched and should have survived")
-	}
-	if c.Bytes() > 2*one.Size() {
-		t.Fatalf("cache holds %d bytes, over the %d budget", c.Bytes(), 2*one.Size())
-	}
+		if _, ok := c.get("b"); ok {
+			t.Fatal("b was least recently used and should have been evicted")
+		}
+		if _, ok := c.get("a"); !ok {
+			t.Fatal("a was touched and should have survived")
+		}
+		if _, b := c.stats(); b > 2*one.size {
+			t.Fatalf("cache holds %d bytes, over the %d budget", b, 2*one.size)
+		}
+	})
 }
 
 func TestIndexCache_ReplacingAKeyDoesNotDoubleCount(t *testing.T) {
-	c := NewIndexCache(0, 0)
-	defer c.Close()
+	c := newIndexCache(0, 0)
+	defer c.close()
 
 	entry := testEntry(`{"a":1}`)
 	for range 5 {
-		c.Set("k", testEntry(`{"a":1}`), time.Minute)
+		c.set("k", testEntry(`{"a":1}`), time.Minute)
 	}
-	if c.Len() != 1 {
-		t.Fatalf("Len = %d, want 1", c.Len())
-	}
-	if c.Bytes() != entry.Size() {
-		t.Fatalf("Bytes = %d, want %d", c.Bytes(), entry.Size())
+	if n, b := c.stats(); n != 1 || b != entry.size {
+		t.Fatalf("%d entries, %d bytes; want 1, %d", n, b, entry.size)
 	}
 }
 
+// TestIndexCache_SweepDropsExpiredWithoutARead pins the sweeper: an expired
+// entry's bytes are refunded with no read to notice it.
 func TestIndexCache_SweepDropsExpiredWithoutARead(t *testing.T) {
-	c := NewIndexCache(0, 5*time.Millisecond)
-	defer c.Close()
+	synctest.Test(t, func(t *testing.T) {
+		c := newIndexCache(0, time.Minute)
+		defer c.close()
 
-	c.Set("k", testEntry(`{"a":1}`), 10*time.Millisecond)
+		c.set("k", testEntry(`{"a":1}`), 30*time.Second)
+		time.Sleep(time.Minute)
+		synctest.Wait()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if c.Len() == 0 {
-			if c.Bytes() != 0 {
-				t.Fatalf("sweep left %d bytes accounted", c.Bytes())
-			}
-			return
+		if n, b := c.stats(); n != 0 || b != 0 {
+			t.Fatalf("sweep left %d entries, %d bytes", n, b)
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("background sweep did not remove the expired entry")
+	})
 }
 
 // BenchmarkIndexCache_SetOverBudget is the check on the bounded eviction sample:
@@ -171,23 +157,23 @@ func BenchmarkIndexCache_SetOverBudget(b *testing.B) {
 
 	for _, resident := range []int{100, 10000} {
 		b.Run(fmt.Sprintf("resident=%d", resident), func(b *testing.B) {
-			c := NewIndexCache(int64(resident)*one.Size(), 0)
-			defer c.Close()
+			c := newIndexCache(int64(resident)*one.size, 0)
+			defer c.close()
 
 			for i := range resident {
-				c.Set(fmt.Sprintf("k-%d", i), testEntry(`{"a":1}`), time.Hour)
+				c.set(fmt.Sprintf("k-%d", i), testEntry(`{"a":1}`), time.Hour)
 			}
 
 			for i := 0; b.Loop(); i++ {
-				c.Set(fmt.Sprintf("new-%d", i), testEntry(`{"a":1}`), time.Hour)
+				c.set(fmt.Sprintf("new-%d", i), testEntry(`{"a":1}`), time.Hour)
 			}
 		})
 	}
 }
 
 func TestIndexCache_ConcurrentAccess(t *testing.T) {
-	c := NewIndexCache(1024*1024, 0)
-	defer c.Close()
+	c := newIndexCache(1024*1024, 0)
+	defer c.close()
 
 	var wg sync.WaitGroup
 	for i := range 10 {
@@ -196,10 +182,62 @@ func TestIndexCache_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for j := range 100 {
 				key := fmt.Sprintf("k-%d-%d", i, j)
-				c.Set(key, testEntry(`{"a":1}`), time.Minute)
-				c.Get(key)
+				c.set(key, testEntry(`{"a":1}`), time.Minute)
+				c.get(key)
 			}
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestIndexCache_ZeroTTLStoresNothing pins that a TTL of zero disables caching
+// rather than storing entries that are expired on arrival and never swept.
+func TestIndexCache_ZeroTTLStoresNothing(t *testing.T) {
+	c := newIndexCache(0, 0)
+	defer c.close()
+
+	for i := range 100 {
+		c.set(fmt.Sprintf("p%d", i), testEntry(`{"a":1}`), 0)
+	}
+	if n, b := c.stats(); n != 0 || b != 0 {
+		t.Fatalf("TTL 0 left %d entries, %d bytes; want none", n, b)
+	}
+}
+
+// TestIndexCache_ZeroTTLDropsTheOlderEntry pins that refilling a package with
+// TTL 0 removes what was cached before, rather than leaving the old entry to be
+// served until it expires.
+func TestIndexCache_ZeroTTLDropsTheOlderEntry(t *testing.T) {
+	c := newIndexCache(0, 0)
+	defer c.close()
+
+	c.set("k", testEntry(`{"a":1}`), time.Minute)
+	c.set("k", testEntry(`{"a":2}`), 0)
+	if _, ok := c.get("k"); ok {
+		t.Fatal("TTL 0 left the older entry in place")
+	}
+	if n, b := c.stats(); n != 0 || b != 0 {
+		t.Fatalf("TTL 0 left %d entries, %d bytes; want none", n, b)
+	}
+}
+
+// TestIndexCache_OversizeEntryKeepsTheRest pins that one entry bigger than the
+// whole budget is not stored, instead of evicting everything to make room it
+// can never have.
+func TestIndexCache_OversizeEntryKeepsTheRest(t *testing.T) {
+	one := testEntry(`{"a":1}`)
+	c := newIndexCache(50*one.size, 0)
+	defer c.close()
+
+	for i := range 50 {
+		c.set(fmt.Sprintf("p%d", i), testEntry(`{"a":1}`), time.Minute)
+	}
+	c.set("big", testEntry(`{"a":"`+string(bytes.Repeat([]byte("x"), int(50*one.size)))+`"}`), time.Minute)
+
+	if n, b := c.stats(); n != 50 || b != 50*one.size {
+		t.Fatalf("after an oversize set: %d entries, %d bytes; want 50, %d", n, b, 50*one.size)
+	}
+	if _, ok := c.get("big"); ok {
+		t.Fatal("an entry bigger than the budget must not be stored")
+	}
 }

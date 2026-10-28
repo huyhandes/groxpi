@@ -1,7 +1,7 @@
 // Package server is the transport: it owns the mux, every route and handler, the
-// middleware, the admin templates, the storage backend's construction and the
-// shutdown order. The index, download and admin modules are plain Go services
-// it calls.
+// middleware, the admin templates and the shutdown order; storage.New builds the
+// storage backend. The index, download, storage and admin modules are plain Go
+// services it calls.
 package server
 
 import (
@@ -13,13 +13,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -27,7 +27,6 @@ import (
 	"github.com/huyhandes/groxpi/internal/config"
 	"github.com/huyhandes/groxpi/internal/download"
 	"github.com/huyhandes/groxpi/internal/index"
-	"github.com/huyhandes/groxpi/internal/logger"
 	"github.com/huyhandes/groxpi/internal/storage"
 	"github.com/huyhandes/groxpi/internal/telemetry"
 )
@@ -37,21 +36,9 @@ type Server struct {
 	config    *config.Config
 	store     *storage.Store
 	index     *index.Service
-	downloads *download.Service
 	admin     *admin.Service     // nil when no credentials are configured
-	templates *template.Template // admin page; nil with admin
+	templates *template.Template // admin page; nil without admin
 	handler   http.Handler
-}
-
-// New builds a server or terminates the process. It is the entry point's
-// constructor; anything that needs to observe a construction failure calls
-// NewServer.
-func New(cfg *config.Config) *Server {
-	s, err := NewServer(cfg)
-	if err != nil {
-		logger.Fatal("Failed to construct server", "error", err)
-	}
-	return s
 }
 
 // NewServer builds a server, returning an error rather than producing one that
@@ -63,17 +50,14 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, errors.New("admin interface is enabled but GROXPI_ADMIN_USERNAME and GROXPI_ADMIN_PASSWORD are not both set")
 	}
 
-	cache, durable, err := initStorage(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize storage: %w", err)
-	}
-
 	s := &Server{config: cfg}
 	s.index = index.New(cfg)
-	s.downloads = download.New(cfg, s.index)
-	// Pure-s3 spools get a directory of their own: the cache dir defaults to
-	// the shared OS temp dir, and the store reaps stale files in its spool dir.
-	s.store = storage.NewStore(cache, durable, s.downloads, filepath.Join(cfg.CacheDir, "spool"))
+	store, err := storage.New(cfg, download.New(cfg, s.index))
+	if err != nil {
+		s.index.Close()
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
+	s.store = store
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleHome)
@@ -82,6 +66,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	mux.HandleFunc("GET /simple/{package}/{$}", s.handleListFiles)
 	mux.HandleFunc("GET /index/{$}", s.handleListPackages)
 	mux.HandleFunc("GET /index/{package}", s.handleListFiles)
+	mux.HandleFunc("GET /index/{package}/{$}", s.handleListFiles)
 	mux.HandleFunc("GET /simple/{package}/{file}", s.handleFile)
 	mux.HandleFunc("GET /index/{package}/{file}", s.handleFile)
 
@@ -91,10 +76,11 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	if cfg.AdminConfigured() {
 		s.templates, err = parseAdminTemplates()
 		if err != nil {
+			s.index.Close()
 			_ = s.store.Close()
 			return nil, err
 		}
-		s.admin = admin.New(cfg, s.store, s.index)
+		s.admin = admin.New(s.store, s.index)
 		s.registerAdmin(mux)
 	}
 
@@ -110,7 +96,8 @@ func (s *Server) Router() http.Handler {
 }
 
 // recoverPanics turns a panicking handler into a 500 instead of a dropped
-// connection, and logs the stack so the panic is not lost with it.
+// connection, and logs the stack so the panic is not lost with it. An abort
+// (traceRequests turns a panic after a write into one) is left to net/http.
 func recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -131,6 +118,14 @@ func recoverPanics(next http.Handler) http.Handler {
 // continued when the client sent W3C headers. It also writes the access log
 // line. It is instrumentation only: it reads the response status and changes
 // nothing about it.
+//
+// The span and the access line are finished in a defer, so a panicking handler
+// is recorded too: a plain panic as an error span with a 500 (what
+// recoverPanics answers) or, after a write, the status already sent; an
+// http.ErrAbortHandler as aborted with the status already sent, or none if
+// nothing was written (logged as status 0). The panic is then re-raised for
+// recoverPanics and net/http, a plain one after a write logged here and
+// re-raised as a bare abort.
 func traceRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
@@ -140,20 +135,68 @@ func traceRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w}
 		r = r.WithContext(ctx)
+		defer func() {
+			rec := recover()
+			// status 0 means nothing reached the client: only an abort before
+			// the first write leaves it so. A plain panic with nothing written
+			// is answered 500 by recoverPanics; one after a write keeps the
+			// status already sent.
+			status := sw.status()
+			aborted, panicked := false, false
+			if rec != nil {
+				if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+					aborted = true
+					status = sw.code
+				} else {
+					panicked = true
+					if sw.code == 0 {
+						status = http.StatusInternalServerError
+					}
+				}
+			}
+
+			// The mux fills in the matched pattern on the request it was handed.
+			// The pattern, not the path: a span name per package name would be a
+			// cardinality explosion in any backend.
+			route := r.Pattern
+			if route == "" {
+				route = r.Method + " unmatched"
+			}
+			span.SetName(route)
+			if status != 0 {
+				span.SetAttributes(attribute.Int("http.response.status_code", status))
+			}
+			switch {
+			case panicked:
+				span.SetStatus(codes.Error, "panic")
+			case aborted:
+				span.SetAttributes(attribute.Bool("http.request.aborted", true))
+				span.SetStatus(codes.Error, "aborted")
+			case status >= http.StatusInternalServerError:
+				span.SetStatus(codes.Error, http.StatusText(status))
+			}
+
+			args := []any{"status", status, "latency", time.Since(start), "method", r.Method, "path", r.URL.Path}
+			if aborted {
+				args = append(args, "aborted", true)
+			}
+			slog.InfoContext(ctx, "request", args...)
+
+			// A plain panic after a write cannot become a 500: recoverPanics'
+			// http.Error would append its text to the body already sent, and a
+			// chunked one would then end cleanly. Re-raise it as an abort so the
+			// connection is dropped. It is logged here, as recoverPanics would:
+			// the bare sentinel is the one panic net/http does not log, and a
+			// wrapped one would reach the log bridge at INFO.
+			if panicked && sw.code != 0 {
+				slog.ErrorContext(ctx, "Handler panicked", "panic", rec, "stack", string(debug.Stack()))
+				panic(http.ErrAbortHandler)
+			}
+			if rec != nil {
+				panic(rec)
+			}
+		}()
 		next.ServeHTTP(sw, r)
-
-		// The mux fills in the matched pattern on the request it was handed. The
-		// pattern, not the path: a span name per package name would be a
-		// cardinality explosion in any backend.
-		route := r.Pattern
-		if route == "" {
-			route = r.Method + " unmatched"
-		}
-		span.SetName(route)
-		span.SetAttributes(attribute.Int("http.response.status_code", sw.status()))
-
-		slog.InfoContext(ctx, "request",
-			"status", sw.status(), "latency", time.Since(start), "method", r.Method, "path", r.URL.Path)
 	})
 }
 
@@ -253,30 +296,30 @@ func (s *Server) CloseContext(ctx context.Context) error {
 // not fetch is redirected upstream.
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	pkg := index.NormalizeName(r.PathValue("package"))
+	pkg := r.PathValue("package")
 	file := r.PathValue("file")
 
-	fetch := s.config.DownloadTimeout > 0
-	obj, err := s.store.Open(ctx, pkg, file, fetch)
+	obj, err := s.store.Open(ctx, pkg, file)
+	if errors.Is(err, storage.ErrInvalidKey) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		target, rerr := s.downloads.Resolve(ctx, pkg, file)
+		var re *storage.RedirectError
 		switch {
-		case errors.Is(rerr, download.ErrNotListed):
+		case errors.As(err, &re):
+			s.redirect(w, r, re, pkg, file)
+		case errors.Is(err, download.ErrNotListed):
 			http.Error(w, "File not found", http.StatusNotFound)
-		case rerr != nil:
-			slog.DebugContext(ctx, "Package index unavailable",
-				"error", config.RedactErrorText(rerr), "package", pkg, "file", file)
-			http.Error(w, "Package not found", http.StatusNotFound)
+		case errors.Is(err, storage.ErrStorage):
+			// The store logged it, once per flight.
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		case ctx.Err() != nil:
+			// The client left before the store answered: nobody to answer.
 		default:
-			reason := telemetry.RedirectCachingDisabled
-			if fetch {
-				reason = telemetry.RedirectFetchFailed
-				slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
-					"error", config.RedactErrorText(err), "package", pkg, "file", file,
-					"file_url", config.RedactURL(target.URL))
-			}
-			telemetry.Redirect(ctx, reason)
-			http.Redirect(w, r, target.URL, http.StatusFound)
+			slog.DebugContext(ctx, "Package index unavailable",
+				"error", config.RedactErrorText(err), "package", pkg, "file", file)
+			http.Error(w, "Package not found", http.StatusNotFound)
 		}
 		return
 	}
@@ -284,9 +327,6 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 
 	h := w.Header()
 	h.Set("Content-Type", obj.ContentType)
-	if obj.ETag != "" {
-		h.Set("ETag", obj.ETag)
-	}
 	if !obj.InFlight {
 		// The bare ReadSeekCloser, not obj: on a local hit it is the *os.File the
 		// stdlib's copy path looks for, which the Object wrapper would hide.
@@ -303,11 +343,41 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := io.Copy(dst, obj); err != nil {
 		// The status line is gone; aborting is the only way to tell the client
-		// the body is bad rather than hand it a clean end.
+		// the body is bad rather than hand it a clean end. A cancelled request
+		// context means the client left (net/http cancels it when a write to the
+		// connection fails): ordinary, so it logs below ERROR.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "Client disconnected mid-download, aborting response",
+				"error", config.RedactErrorText(err), "package", pkg, "file", file)
+			panic(http.ErrAbortHandler)
+		}
 		slog.ErrorContext(ctx, "Download failed mid-stream, aborting response",
 			"error", config.RedactErrorText(err), "package", pkg, "file", file)
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// redirect sends the client upstream for a miss the store did not serve, and
+// records why. The URL carries no userinfo: a private index in redirect mode
+// answers the client 401 rather than the proxy handing out its password. A
+// target that did not parse is never handed out.
+func (s *Server) redirect(w http.ResponseWriter, r *http.Request, re *storage.RedirectError, pkg, file string) {
+	ctx := r.Context()
+	if re.Reason == telemetry.RedirectFetchFailed {
+		slog.ErrorContext(ctx, "Failed to fetch file, redirecting upstream",
+			"error", config.RedactErrorText(re.Err), "package", pkg, "file", file,
+			"file_url", config.RedactURL(re.URL))
+	}
+	if re.URL == "" {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	if re.Stripped {
+		slog.WarnContext(ctx, "Stripped index credentials from upstream redirect",
+			"file_url", config.RedactURL(re.URL))
+	}
+	telemetry.Redirect(ctx, re.Reason)
+	http.Redirect(w, r, re.URL, http.StatusFound)
 }
 
 func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {
@@ -327,27 +397,30 @@ func (s *Server) handleHome(w http.ResponseWriter, _ *http.Request) {
 		<li>Index URL: %s</li>
 		<li>Cache Size: %d MB</li>
 		<li>Index TTL: %s</li>
-		<li>Version: 1.0.0</li>
+		<li>Version: %s</li>
 	</ul>
 	<p><a href="/index/">Browse packages</a> | <a href="/health">Health Check</a>%s</p>
 </body>
-</html>`, config.RedactURL(s.config.IndexURL), s.config.CacheSize/(1024*1024), s.config.IndexTTL.String(), adminLink)
+</html>`, config.RedactURL(s.config.IndexURL), s.store.Describe().CacheSize/(1024*1024), s.config.IndexTTL.String(), config.Version, adminLink)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	// Storage facts come from the store, which knows the cache it really uses:
+	// hybrid's local cache, none in s3.
+	d := s.store.Describe()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":    "success",
 		"timestamp": time.Now().Unix(),
 		"data": map[string]any{
-			"cache_dir": s.config.CacheDir,
+			"cache_dir": d.CacheDir,
 			// Redacted at the call site: an unauthenticated probe must not be able to
 			// read an index's credentials out of this payload.
 			"index_url":         config.RedactURL(s.config.IndexURL),
 			"extra_index_urls":  redactedIndexes(s.config.ExtraIndexURLs),
-			"cache_size":        s.config.CacheSize,
+			"cache_size":        d.CacheSize,
 			"index_ttl_seconds": int(s.config.IndexTTL.Seconds()),
-			"storage_type":      s.config.StorageType,
+			"storage_type":      d.Mode,
 		},
 	})
 }
@@ -360,38 +433,4 @@ func redactedIndexes(urls []string) []string {
 		out = append(out, config.RedactURL(u))
 	}
 	return out
-}
-
-// initStorage builds the cache (local disk), the durable store (S3), or both,
-// as the storage type asks.
-func initStorage(cfg *config.Config) (*storage.LocalStorage, *storage.S3Storage, error) {
-	switch cfg.StorageType {
-	case "hybrid", "s3":
-	default:
-		// Local storage with atime eviction (no TTL for non-hybrid mode).
-		cache, err := storage.NewLocalStorage(cfg.CacheDir, cfg.CacheSize, 0)
-		return cache, nil, err
-	}
-	durable, err := storage.NewS3Storage(&storage.S3Config{
-		Endpoint:        cfg.S3Endpoint,
-		AccessKeyID:     cfg.S3AccessKeyID,
-		SecretAccessKey: cfg.S3SecretAccessKey,
-		Region:          cfg.S3Region,
-		Bucket:          cfg.S3Bucket,
-		Prefix:          cfg.S3Prefix,
-		UseSSL:          cfg.S3UseSSL,
-		ForcePathStyle:  cfg.S3ForcePathStyle,
-		EnableHTTP2:     cfg.S3EnableHTTP2,
-		ConnectTimeout:  cfg.ConnectTimeout,
-		RequestTimeout:  cfg.DownloadTimeout,
-	})
-	if err != nil || cfg.StorageType == "s3" {
-		return nil, durable, err
-	}
-	cache, err := storage.NewLocalStorage(cfg.LocalCacheDir, cfg.LocalCacheSize, cfg.LocalCacheTTL)
-	if err != nil {
-		_ = durable.Close()
-		return nil, nil, fmt.Errorf("failed to create local cache: %w", err)
-	}
-	return cache, durable, nil
 }

@@ -4,22 +4,32 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/huyhandes/groxpi/internal/config"
 )
 
-// fakeIndexServer is an upstream index that counts how often each package page
-// is fetched.
+// fakeIndexServer is an HTTP upstream index that counts how often each package
+// page is fetched. Only tests of what the real client does on the wire use it;
+// everything else runs on fakeUpstream inside a synctest bubble.
 type fakeIndexServer struct {
 	*httptest.Server
 	mu    sync.Mutex
@@ -52,8 +62,7 @@ func (f *fakeIndexServer) hitsFor(pkg string) int {
 	return f.hits["/"+pkg+"/"]
 }
 
-// newTestService builds the index module over the upstream, with the cache
-// reachable.
+// newTestService builds the index module over a real HTTP upstream.
 func newTestService(t *testing.T, cfg *config.Config) *Service {
 	t.Helper()
 	svc := New(cfg)
@@ -61,95 +70,510 @@ func newTestService(t *testing.T, cfg *config.Config) *Service {
 	return svc
 }
 
-// getIndex resolves a package and returns the JSON body the server writes for
-// it.
-func getIndex(t *testing.T, svc *Service, pkg string) []byte {
-	t.Helper()
-	entry, err := svc.Resolve(context.Background(), pkg)
-	require.NoError(t, err)
-	return entry.JSON
+// primaryOnly is a single-index configuration for the fake upstream.
+func primaryOnly(ttl time.Duration, cacheBytes int64) *config.Config {
+	return &config.Config{IndexURL: primaryURL, IndexTTL: ttl, IndexCacheSize: cacheBytes}
 }
 
-// TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
-// merged entry: the body is marshalled once at fill time and every later request
-// writes the same bytes.
-func TestIndexCache_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL:        upstream.URL,
-		CacheDir:        t.TempDir(),
-		IndexTTL:        time.Hour,
-		IndexCacheSize:  1 << 20,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+// oneFile is the answer of an index that has pkg with a single sdist.
+func oneFile(pkg string) []FileInfo {
+	return []FileInfo{{Name: pkg + "-1.0.tar.gz", URL: "https://files.test/" + pkg + "-1.0.tar.gz"}}
+}
+
+// TestResolve_RepeatedRequestServesIdenticalBytesFromOneFetch covers the
+// merged entry: the body is marshalled once at fill time and every later
+// request gets the same bytes, with a gzip form that decodes to them.
+func TestResolve_RepeatedRequestServesIdenticalBytesFromOneFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		first, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		second, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+
+		assert.Equal(t, string(first.JSON), string(second.JSON), "cached responses must be byte-identical")
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "the second request must be served from cache")
+
+		zr, err := gzip.NewReader(bytes.NewReader(second.GZIP))
+		require.NoError(t, err)
+		unzipped, err := io.ReadAll(zr)
+		require.NoError(t, err)
+		assert.Equal(t, string(second.JSON), string(unzipped))
 	})
-
-	first := getIndex(t, svc, "numpy")
-	second := getIndex(t, svc, "numpy")
-
-	assert.Equal(t, string(first), string(second), "cached responses must be byte-identical")
-	assert.Equal(t, 1, upstream.hitsFor("numpy"), "the second request must be served from cache")
-
-	// The compressed representation stored alongside the body must decode to it.
-	entry, ok := svc.cache.GetPackage("numpy")
-	require.True(t, ok, "the package must be cached")
-	assert.Equal(t, string(first), string(entry.JSON))
-	zr, err := gzip.NewReader(bytes.NewReader(entry.GZIP))
-	require.NoError(t, err)
-	unzipped, err := io.ReadAll(zr)
-	require.NoError(t, err)
-	assert.Equal(t, string(entry.JSON), string(unzipped))
 }
 
-// TestIndexCache_ByteBudgetForcesRefetch covers the bound: once the budget is
+// TestResolve_ExpiresAfterTheIndexTTL pins the positive TTL: an entry is served
+// from cache up to its index's TTL and refetched after it.
+func TestResolve_ExpiresAfterTheIndexTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		time.Sleep(time.Hour)
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "an entry is fresh up to its TTL")
+
+		time.Sleep(time.Nanosecond)
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 2, up.queried(primaryURL, "numpy"), "an expired package must be refetched")
+	})
+}
+
+// TestResolve_ByteBudgetForcesRefetch covers the bound: once the budget is
 // exceeded the least recently used package is dropped and has to be refetched.
-func TestIndexCache_ByteBudgetForcesRefetch(t *testing.T) {
-	upstream := newFakeIndexServer(t)
-	svc := newTestService(t, &config.Config{
-		IndexURL: upstream.URL,
-		CacheDir: t.TempDir(),
-		IndexTTL: time.Hour,
-		// Small enough that a couple of one-file indices blow the budget.
-		IndexCacheSize:  400,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+func TestResolve_ByteBudgetForcesRefetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
+		for _, pkg := range packages {
+			up.set(primaryURL, pkg, oneFile(pkg), nil)
+		}
+		// Small enough that a couple of one-file indexes blow the budget.
+		svc := newFakeService(t, primaryOnly(time.Hour, 600), up)
+
+		for _, pkg := range packages {
+			_, err := svc.Resolve(t.Context(), pkg)
+			require.NoError(t, err)
+			time.Sleep(time.Millisecond) // distinguish recency; instant in the bubble
+		}
+
+		_, err := svc.Resolve(t.Context(), packages[0])
+		require.NoError(t, err)
+		assert.Equal(t, 2, up.queried(primaryURL, packages[0]),
+			"the earliest package should have been evicted and refetched")
 	})
-
-	packages := []string{"aaa", "bbb", "ccc", "ddd", "eee", "fff"}
-	for _, pkg := range packages {
-		getIndex(t, svc, pkg)
-		time.Sleep(2 * time.Millisecond) // distinguish recency
-	}
-	assert.LessOrEqual(t, svc.cache.Bytes(), int64(400), "cache must stay inside its budget")
-
-	getIndex(t, svc, packages[0])
-	assert.Equal(t, 2, upstream.hitsFor(packages[0]),
-		"the earliest package should have been evicted and refetched")
 }
 
-// TestIndexCache_SweepExpiresWithoutARequest covers the sweeper: an entry past
-// its TTL is gone before anybody asks for it, and the next request refetches.
-func TestIndexCache_SweepExpiresWithoutARequest(t *testing.T) {
+// TestResolve_NormalisesTheName pins c8: any spelling of a name is one index
+// entry and one upstream query, and either spelling invalidates it.
+func TestResolve_NormalisesTheName(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "foo-bar", oneFile("foo-bar"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		resolve := func(name string) {
+			t.Helper()
+			_, err := svc.Resolve(t.Context(), name)
+			require.NoError(t, err)
+		}
+
+		resolve("Foo_Bar")
+		resolve("foo-bar")
+		assert.Equal(t, 1, up.queried(primaryURL, "foo-bar"), "both spellings share one upstream query")
+		assert.Zero(t, up.queried(primaryURL, "Foo_Bar"), "upstream is only asked for the normalised name")
+
+		svc.Invalidate("Foo.Bar")
+		resolve("foo-bar")
+		assert.Equal(t, 2, up.queried(primaryURL, "foo-bar"), "invalidating another spelling clears the entry")
+
+		svc.Invalidate("foo-bar")
+		resolve("FOO__BAR")
+		assert.Equal(t, 3, up.queried(primaryURL, "foo-bar"))
+	})
+}
+
+// The OpenTelemetry global delegates once per process, so the in-memory meter
+// provider is installed once for the index test binary.
+var (
+	testMetricsOnce sync.Once
+	testMetrics     *sdkmetric.ManualReader
+)
+
+// indexCacheHits reads the index-layer cache hit counter.
+func indexCacheHits(t *testing.T) int64 {
+	t.Helper()
+	return counterValue(t, "groxpi.cache.hits", "cache.layer", "index")
+}
+
+// counterValue sums an int64 counter's data points whose attribute key equals
+// value.
+func counterValue(t *testing.T, name, key, value string) int64 {
+	t.Helper()
+	testMetricsOnce.Do(func() {
+		testMetrics = sdkmetric.NewManualReader()
+		otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(testMetrics)))
+	})
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, testMetrics.Collect(context.Background(), &rm))
+	var total int64
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok || m.Name != name {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				if v, _ := dp.Attributes.Value(attribute.Key(key)); v.AsString() == value {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
+}
+
+// TestResolve_PanickingQueryCountsAsAnError: a query that panics still has an
+// outcome; it is an index error, not a missing data point.
+func TestResolve_PanickingQueryCountsAsAnError(t *testing.T) {
+	before := counterValue(t, "groxpi.index.resolutions", "index.result", "error")
+	synctest.Test(t, func(t *testing.T) {
+		up := &panickyUpstream{fakeUpstream: newFakeUpstream()}
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.Error(t, err)
+	})
+	assert.Equal(t, int64(1), counterValue(t, "groxpi.index.resolutions", "index.result", "error")-before)
+}
+
+// TestResolve_CachedMissCountsAsAnIndexCacheHit pins that negative caching
+// keeps the metric surface: a miss served from cache is an index-layer hit.
+func TestResolve_CachedMissCountsAsAnIndexCacheHit(t *testing.T) {
+	before := indexCacheHits(t)
+	synctest.Test(t, func(t *testing.T) {
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), newFakeUpstream())
+		for range 3 {
+			_, err := svc.Resolve(t.Context(), "ghost")
+			require.ErrorIs(t, err, ErrNotFound)
+		}
+	})
+	assert.Equal(t, int64(2), indexCacheHits(t)-before, "the second and third lookups are served from cache")
+}
+
+// TestResolve_UpstreamFailureIsRedacted pins that index returns already-redacted
+// errors: whether a credentialed index fails at the transport or with an HTTP
+// error, neither its password nor a token-as-username reaches the error text.
+func TestResolve_UpstreamFailureIsRedacted(t *testing.T) {
+	const secret = "sup3rs3cr3t"
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failing.Close)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+
+	for _, base := range []string{failing.URL, closed.URL} {
+		for _, user := range []*url.Userinfo{url.UserPassword("deploy", secret), url.User(secret)} {
+			u, err := url.Parse(base)
+			require.NoError(t, err)
+			u.User = user
+			svc := newTestService(t, &config.Config{
+				IndexURL:        u.String(),
+				IndexTTL:        time.Minute,
+				IndexCacheSize:  1 << 20,
+				DownloadTimeout: time.Second,
+				LogLevel:        "ERROR",
+			})
+
+			_, err = svc.Resolve(t.Context(), "numpy")
+			require.Error(t, err, u.Redacted())
+			assert.NotContains(t, err.Error(), secret, u.Redacted())
+		}
+	}
+}
+
+// TestResolve_OversizedIndexBodyFailsAndIsNotCached pins the per-package body
+// cap: a body past it is an error, never a truncated list, and nothing is cached
+// so the next request goes upstream again.
+func TestResolve_OversizedIndexBodyFailsAndIsNotCached(t *testing.T) {
 	upstream := newFakeIndexServer(t)
 	svc := newTestService(t, &config.Config{
-		IndexURL:        upstream.URL,
-		CacheDir:        t.TempDir(),
-		IndexTTL:        20 * time.Millisecond,
-		IndexCacheSize:  1 << 20,
-		DownloadTimeout: time.Second,
-		LogLevel:        "ERROR",
+		IndexURL:       upstream.URL,
+		IndexTTL:       time.Minute,
+		IndexCacheSize: 1 << 20,
+		LogLevel:       "ERROR",
 	})
 
-	getIndex(t, svc, "numpy")
-	require.Equal(t, 1, svc.cache.Len())
+	saved := maxPackageIndexBytes
+	t.Cleanup(func() { maxPackageIndexBytes = saved })
+	maxPackageIndexBytes = 16
 
-	// No requests at all while we wait: only the background sweep can empty this.
-	deadline := time.Now().Add(2 * time.Second)
-	for svc.cache.Len() != 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	_, err := svc.Resolve(t.Context(), "numpy")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "byte limit")
+
+	maxPackageIndexBytes = saved
+	_, err = svc.Resolve(t.Context(), "numpy")
+	require.NoError(t, err)
+	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an oversized body must not be cached")
+}
+
+// TestResolve_ZeroTTLCachesNothing pins GROXPI_INDEX_TTL=0 as "do not cache":
+// every resolve goes upstream and nothing piles up in the cache.
+func TestResolve_ZeroTTLCachesNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(0, 1<<20), up)
+
+		for i := range 50 {
+			_, err := svc.Resolve(t.Context(), "numpy")
+			require.NoError(t, err)
+			_, err = svc.Resolve(t.Context(), fmt.Sprintf("ghost-%d", i))
+			require.ErrorIs(t, err, ErrNotFound)
+		}
+		n, b := svc.cache.stats()
+		assert.Zero(t, n, "TTL 0 must store no entries")
+		assert.Zero(t, b)
+		assert.Equal(t, 50, up.queried(primaryURL, "numpy"), "every resolve goes upstream")
+	})
+}
+
+// TestResolve_ExtraTTLIsSweptWhenPrimaryTTLIsZero pins the sweep cadence: it
+// runs at the shortest positive TTL in the resolution order, so an extra index's
+// entries expire without a read even when the primary's TTL is zero.
+func TestResolve_ExtraTTLIsSweptWhenPrimaryTTLIsZero(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := newFakeUpstream()
+		up.set(extraURL, "internal", oneFile("internal"), nil)
+		svc := newFakeService(t, &config.Config{
+			IndexURL:       primaryURL,
+			IndexTTL:       0,
+			ExtraIndexURLs: []string{extraURL},
+			ExtraIndexTTLs: []time.Duration{time.Minute},
+			IndexCacheSize: 1 << 20,
+		}, up)
+
+		_, err := svc.Resolve(t.Context(), "internal")
+		require.NoError(t, err)
+		n, _ := svc.cache.stats()
+		require.Equal(t, 1, n, "the extra's positive TTL caches the entry")
+
+		time.Sleep(2*time.Minute + time.Nanosecond)
+		synctest.Wait()
+		n, b := svc.cache.stats()
+		assert.Zero(t, n, "the sweep must drop the expired extra entry without a read")
+		assert.Zero(t, b)
+	})
+}
+
+// gatedUpstream holds every query until release is closed, ignoring the query's
+// context: the shared fetch runs detached, so nothing should cancel it.
+type gatedUpstream struct {
+	*fakeUpstream
+	release chan struct{}
+}
+
+func (g *gatedUpstream) GetPackageFiles(ctx context.Context, index config.Index, pkg string) ([]FileInfo, error) {
+	<-g.release
+	return g.fakeUpstream.GetPackageFiles(ctx, index, pkg)
+}
+
+// TestResolve_WaiterCanLeaveASharedFetch: a caller waiting on a lookup another
+// caller started returns as soon as its own context ends, while the shared
+// fetch carries on for the callers still waiting and fills the cache.
+func TestResolve_WaiterCanLeaveASharedFetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		left := make(chan error, 1)
+		go func() { _, err := svc.Resolve(ctx, "numpy"); left <- err }()
+		stayed := make(chan error, 1)
+		go func() { _, err := svc.Resolve(t.Context(), "numpy"); stayed <- err }()
+		synctest.Wait()
+
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-left:
+			require.ErrorIs(t, err, context.Canceled)
+		default:
+			t.Fatal("a caller whose context ended is still waiting on the shared fetch")
+		}
+
+		close(up.release)
+		require.NoError(t, <-stayed, "the shared fetch must outlive the caller that started it")
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "the shared fetch filled the cache")
+	})
+}
+
+// TestProxyRoot_WaiterCanLeaveASharedFetch: as for Resolve, a caller of the
+// shared root fetch can leave without failing the callers still waiting.
+func TestProxyRoot_WaiterCanLeaveASharedFetch(t *testing.T) {
+	release := make(chan struct{})
+	var hits sync.Mutex
+	n := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Lock()
+		n++
+		hits.Unlock()
+		<-release
+		_, _ = io.WriteString(w, "root")
+	}))
+	t.Cleanup(up.Close)
+	svc := newTestService(t, &config.Config{IndexURL: up.URL, IndexCacheSize: 1 << 20})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	left := make(chan error, 1)
+	go func() { _, err := svc.ProxyRoot(ctx, "", ""); left <- err }()
+	require.Eventually(t, func() bool { hits.Lock(); defer hits.Unlock(); return n == 1 },
+		5*time.Second, time.Millisecond, "the root fetch never started")
+	stayed := make(chan *RootResponse, 1)
+	go func() { resp, _ := svc.ProxyRoot(t.Context(), "", ""); stayed <- resp }()
+
+	cancel()
+	select {
+	case err := <-left:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a caller whose context ended is still waiting on the shared fetch")
 	}
-	require.Zero(t, svc.cache.Len(), "the sweep should have reclaimed the expired entry")
 
-	getIndex(t, svc, "numpy")
-	assert.Equal(t, 2, upstream.hitsFor("numpy"), "an expired package must be refetched")
+	close(release)
+	resp := <-stayed
+	require.NotNil(t, resp, "the shared fetch must outlive the caller that started it")
+	assert.Equal(t, "root", string(resp.Body))
+}
+
+// panickyUpstream panics on its first query, as a parser bug fed hostile
+// upstream data would, and answers normally afterwards.
+type panickyUpstream struct {
+	*fakeUpstream
+	panicked bool
+}
+
+func (p *panickyUpstream) GetPackageFiles(ctx context.Context, index config.Index, pkg string) ([]FileInfo, error) {
+	p.mu.Lock()
+	first := !p.panicked
+	p.panicked = true
+	p.mu.Unlock()
+	if first {
+		panic("parser bug")
+	}
+	return p.fakeUpstream.GetPackageFiles(ctx, index, pkg)
+}
+
+// TestResolve_PanicInSharedFetchIsAnError: the shared fetch runs on its own
+// goroutine, where an unrecovered panic would kill the process. It must come
+// back to the caller as an error, and the next lookup must work.
+func TestResolve_PanicInSharedFetchIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		up := &panickyUpstream{fakeUpstream: newFakeUpstream()}
+		up.set(primaryURL, "numpy", oneFile("numpy"), nil)
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		_, err := svc.Resolve(t.Context(), "numpy")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "parser bug", "the panic value must reach the error")
+		assert.NotErrorIs(t, err, ErrNotFound, "a panic says nothing about the package")
+
+		_, err = svc.Resolve(t.Context(), "numpy")
+		require.NoError(t, err, "a panic must not poison the next lookup")
+	})
+}
+
+// TestShared_PanicIsAnError covers the rest of the shared fetch (encoding,
+// caching), which runs on singleflight's goroutine rather than a query's.
+func TestShared_PanicIsAnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), newFakeUpstream())
+		_, err := svc.shared(t.Context(), "k", func() (any, error) { panic("encode bug") })
+		require.ErrorIs(t, err, errPanic)
+		assert.Contains(t, err.Error(), "encode bug")
+
+		v, err := svc.shared(t.Context(), "k", func() (any, error) { return 1, nil })
+		require.NoError(t, err)
+		assert.Equal(t, 1, v)
+	})
+}
+
+// captureErrorLines points the default logger at a buffer for the rest of the
+// test and returns a func counting the ERROR lines logged so far.
+func captureErrorLines(t *testing.T) func() int {
+	t.Helper()
+	logs := &lockedBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func() int { return strings.Count(logs.String(), "level=ERROR") }
+}
+
+// lockedBuffer is a bytes.Buffer safe to log into from the shared fetch's
+// goroutine while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// TestResolve_FailureAfterEveryWaiterLeftIsLogged: the shared lookup outlives
+// its callers, so a real upstream failure must be logged where it happens, not
+// by a caller that may already have gone.
+func TestResolve_FailureAfterEveryWaiterLeftIsLogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		errorLines := captureErrorLines(t)
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", nil, errors.New("upstream 503"))
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		left := make(chan error, 1)
+		go func() { _, err := svc.Resolve(ctx, "numpy"); left <- err }()
+		synctest.Wait()
+		cancel()
+		require.ErrorIs(t, <-left, context.Canceled)
+
+		close(up.release)
+		synctest.Wait()
+		assert.Equal(t, 1, errorLines(), "the failure must be logged once with nobody waiting")
+	})
+}
+
+// TestResolve_SharedFailureIsLoggedOnce: waiters on one failing lookup share
+// one failure, so it is one ERROR line, not one per waiter.
+func TestResolve_SharedFailureIsLoggedOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		errorLines := captureErrorLines(t)
+		up := &gatedUpstream{fakeUpstream: newFakeUpstream(), release: make(chan struct{})}
+		up.set(primaryURL, "numpy", nil, errors.New("upstream 503"))
+		svc := newFakeService(t, primaryOnly(time.Hour, 1<<20), up)
+
+		errs := make(chan error, 2)
+		for range 2 {
+			go func() { _, err := svc.Resolve(t.Context(), "numpy"); errs <- err }()
+		}
+		synctest.Wait()
+		close(up.release)
+		require.Error(t, <-errs)
+		require.Error(t, <-errs)
+		assert.Equal(t, 1, up.queried(primaryURL, "numpy"), "both waiters shared one lookup")
+		assert.Equal(t, 1, errorLines(), "one shared failure is one ERROR line")
+	})
+}
+
+// TestProxyRoot_FailureIsLoggedOnce: as for Resolve, a failed root fetch is
+// logged by the shared fetch itself.
+func TestProxyRoot_FailureIsLoggedOnce(t *testing.T) {
+	errorLines := captureErrorLines(t)
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	svc := newTestService(t, &config.Config{IndexURL: closed.URL, IndexCacheSize: 1 << 20})
+
+	_, err := svc.ProxyRoot(t.Context(), "", "")
+	require.Error(t, err)
+	assert.Equal(t, 1, errorLines())
 }

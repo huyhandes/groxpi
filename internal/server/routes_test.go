@@ -1,9 +1,16 @@
 package server
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,18 +47,130 @@ func withCredentials(cfg *config.Config) {
 	cfg.AdminPassword = adminPass
 }
 
+// newTestServer builds a server from cfg, fails the test if that errors, and
+// closes it when the test ends (Close is idempotent, so an explicit Close in the
+// test is harmless). Every index it is pointed at must be on loopback: a test
+// that reaches the real network is slow, flaky and fails offline.
+func newTestServer(tb testing.TB, cfg *config.Config) *Server {
+	tb.Helper()
+	for _, raw := range append([]string{cfg.IndexURL}, cfg.ExtraIndexURLs...) {
+		requireLoopback(tb, raw)
+	}
+	srv, err := NewServer(cfg)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = srv.Close() })
+	return srv
+}
+
+// requireLoopback fails the test unless raw is a URL whose host is a loopback
+// address. It accepts IP literals only (httptest URLs), so "localhost" fails on
+// purpose: a name is resolved, and resolution can leave the host.
+func requireLoopback(tb testing.TB, raw string) {
+	tb.Helper()
+	u, err := url.Parse(raw)
+	require.NoError(tb, err, "index URL %q", raw)
+	ip := net.ParseIP(u.Hostname())
+	require.True(tb, ip != nil && ip.IsLoopback(), "test index URL %q is not on loopback", raw)
+}
+
 func newRoutesServer(t *testing.T, upstreamURL string, opts ...func(*config.Config)) http.Handler {
 	t.Helper()
-	srv, err := NewServer(routesConfig(t, upstreamURL, opts...))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Close() })
-	return srv.Router()
+	return newTestServer(t, routesConfig(t, upstreamURL, opts...)).Router()
 }
 
 func do(router http.Handler, req *http.Request) *http.Response {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	return w.Result()
+}
+
+// TestFileRoute_EncodedTraversalIsNotFound pins A1: an encoded "../" in the
+// file name is answered 404 without reading a file planted beside packages/,
+// without a redirect and without asking upstream, in fetch and redirect mode.
+func TestFileRoute_EncodedTraversalIsNotFound(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(up.Close)
+
+	for _, timeout := range []time.Duration{5 * time.Second, 0} {
+		cfg := routesConfig(t, up.URL, func(c *config.Config) { c.DownloadTimeout = timeout })
+		require.NoError(t, os.WriteFile(filepath.Join(cfg.CacheDir, "secret"), []byte("planted"), 0o600))
+		srv := newTestServer(t, cfg)
+
+		for _, path := range []string{
+			"/index/pkg/..%2F..%2Fsecret",
+			"/simple/pkg/..%2F..%2Fsecret",
+			"/index/pkg/a%5Cb",
+			"/index/pkg/.hidden",
+		} {
+			resp := do(srv.Router(), httptest.NewRequest("GET", path, nil))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode, "%s (timeout %v)", path, timeout)
+			assert.Equal(t, "File not found\n", string(body), path)
+			assert.Empty(t, resp.Header.Get("Location"), path)
+		}
+	}
+	assert.Zero(t, hits.Load(), "an invalid file name never reaches upstream")
+}
+
+// TestFileRoute_ClientGoneIsNotNotFound: a client that left before the store
+// answered gets nothing written; its request is not recorded as a 404.
+func TestFileRoute_ClientGoneIsNotNotFound(t *testing.T) {
+	var hits atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(up.Close)
+	router := newRoutesServer(t, up.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequestWithContext(ctx, "GET", "/index/pkg/pkg-1.0.tar.gz", nil))
+
+	assert.NotEqual(t, http.StatusNotFound, w.Code)
+	assert.Empty(t, w.Body.String(), "nobody is left to answer")
+	assert.Zero(t, hits.Load(), "a gone client starts no fetch")
+}
+
+// TestIndexRoutes_ClientGoneIsNotAnError: a client that leaves while the index
+// lookup it waits on is still upstream gets nothing written, rather than a 5xx
+// (and an ERROR log line) for a fetch that never failed.
+func TestIndexRoutes_ClientGoneIsNotAnError(t *testing.T) {
+	up := NewFakePyPI(t).SetDelay(300 * time.Millisecond)
+	router := newRoutesServer(t, up.URL)
+
+	for _, path := range []string{"/simple/", "/simple/pkg/"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(ctx, "GET", path, nil))
+		cancel()
+
+		assert.Less(t, w.Code, http.StatusInternalServerError, path)
+		assert.Empty(t, w.Body.String(), "%s: nobody is left to answer", path)
+	}
+}
+
+// TestEvictRoute_InvalidNameIsBadRequest pins A1 on eviction: a package name
+// that is not one path segment is refused with 400 in the JSON error shape.
+func TestEvictRoute_InvalidNameIsBadRequest(t *testing.T) {
+	router := newRoutesServer(t, "http://127.0.0.1:1", withCredentials)
+	req := httptest.NewRequest("DELETE", "/cache/a%2Fb", nil)
+	req.SetBasicAuth(adminUser, adminPass)
+	resp := do(router, req)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, "application/json; charset=utf-8", resp.Header.Get("Content-Type"))
+	assert.JSONEq(t, `{"status":"error","message":"Invalid package name"}`, string(body))
 }
 
 // adminPaths is the whole surface that must disappear without credentials —
@@ -62,6 +181,7 @@ var adminPaths = []struct {
 }{
 	{http.MethodGet, "/admin"},
 	{http.MethodGet, "/admin/rows"},
+	{http.MethodGet, "/admin/inflight"},
 	{http.MethodGet, "/admin/htmx.min.js"},
 	{http.MethodPost, "/admin/prefetch"},
 	{http.MethodDelete, "/cache/list"},
@@ -69,7 +189,7 @@ var adminPaths = []struct {
 }
 
 func TestAdminAuth_NoCredentials_SurfaceReturns404(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	for _, tc := range adminPaths {
@@ -81,7 +201,7 @@ func TestAdminAuth_NoCredentials_SurfaceReturns404(t *testing.T) {
 }
 
 func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL, withCredentials)
 
 	for _, tc := range adminPaths {
@@ -106,9 +226,11 @@ func TestAdminAuth_WithCredentials_UnauthorizedThenAuthorized(t *testing.T) {
 }
 
 func TestAdminAuth_EnabledWithoutCredentials_ConstructionFails(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 
-	srv, err := NewServer(routesConfig(t, up.URL, func(cfg *config.Config) { cfg.AdminEnabled = true }))
+	cfg := routesConfig(t, up.URL, func(cfg *config.Config) { cfg.AdminEnabled = true })
+	requireLoopback(t, cfg.IndexURL)
+	srv, err := NewServer(cfg)
 	require.Error(t, err, "enabling the admin interface without credentials must fail construction")
 	assert.Nil(t, srv, "a server that cannot be trusted must not be produced")
 }
@@ -127,7 +249,7 @@ func TestAdminAuth_IndexRoutesStayUnauthenticated(t *testing.T) {
 
 	for name, opts := range configurations {
 		t.Run(name, func(t *testing.T) {
-			up := newCountingUpstream(t, "pkg", file, testPayload(1024))
+			up := newPyPIWith(t, "pkg", file, testPayload(1024))
 			router := newRoutesServer(t, up.URL, opts...)
 
 			for _, path := range []string{
@@ -151,20 +273,47 @@ func TestAdminAuth_IndexRoutesStayUnauthenticated(t *testing.T) {
 // package page: the canonical form ends in a slash, and the bare form is
 // redirected to it rather than answered or 404'd.
 func TestRoutes_TrailingSlashRedirect(t *testing.T) {
-	up := newCountingUpstream(t, "numpy", "numpy-1.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "numpy", "numpy-1.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	resp := do(router, httptest.NewRequest(http.MethodGet, "/simple/numpy", nil))
 	_ = readBody(t, resp)
 	assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
 	assert.Equal(t, "/simple/numpy/", resp.Header.Get("Location"))
-	assert.Zero(t, up.indexHits.Load(), "a redirect must not consult upstream")
+	assert.Zero(t, up.IndexHits("numpy"), "a redirect must not consult upstream")
+}
+
+// TestIndex_FileHrefIsPercentEncoded pins that a file name with a URL
+// metacharacter is escaped in both index forms, and that the escaped href
+// downloads the file rather than a truncated name.
+func TestIndex_FileHrefIsPercentEncoded(t *testing.T) {
+	const file = "a#b-1.0-py3-none-any.whl"
+	payload := testPayload(64)
+	up := NewFakePyPI(t).Add("hashy", file, FakeFile{Body: payload})
+	router := newRoutesServer(t, up.URL)
+	const want = "/simple/hashy/a%23b-1.0-py3-none-any.whl"
+
+	for _, accept := range []string{"text/html", "application/vnd.pypi.simple.v1+json"} {
+		req := httptest.NewRequest(http.MethodGet, "/simple/hashy/", nil)
+		req.Header.Set("Accept", accept)
+		resp := do(router, req)
+		body := string(readBody(t, resp))
+		require.Equal(t, http.StatusOK, resp.StatusCode, accept)
+		href := regexp.MustCompile(`(?:href="|"url":\s*")([^"]+)"`).FindStringSubmatch(body)
+		require.NotNil(t, href, "%s index lists the file: %s", accept, body)
+		assert.Equal(t, want, href[1], accept)
+	}
+
+	resp := do(router, httptest.NewRequest(http.MethodGet, want, nil))
+	got := readBody(t, resp)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, payload, got)
 }
 
 // TestRoutes_MethodNotAllowed: a known path with the wrong method is a 405 with
 // an Allow header, not a 404.
 func TestRoutes_MethodNotAllowed(t *testing.T) {
-	up := newCountingUpstream(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newRoutesServer(t, up.URL)
 
 	resp := do(router, httptest.NewRequest(http.MethodPost, "/health", nil))

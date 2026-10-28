@@ -1,10 +1,10 @@
 // Package telemetry installs the process-wide OpenTelemetry providers for all
-// three signals — traces, metrics and logs — exported over OTLP to a single
-// collector endpoint.
+// three signals — traces, metrics and logs — exported over OTLP/HTTP to the
+// endpoints the standard OTEL_EXPORTER_OTLP_* variables name.
 //
 // Instrumentation reaches these providers through the OpenTelemetry globals
-// ([Tracer], [Meter]) rather than through an injected seam. With no endpoint
-// configured [Setup] installs nothing: the globals stay no-op, no connection is
+// ([Tracer], [Meter]) rather than through an injected seam. With telemetry
+// switched off [Setup] installs nothing: the globals stay no-op, no connection is
 // attempted at startup, and every instrumentation call is a cheap no-op. An
 // unreachable collector is absorbed by the exporters' own retry and drop
 // behaviour, so it can neither block startup nor fail a request.
@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -46,10 +47,11 @@ func Tracer() trace.Tracer { return otel.Tracer(ScopeName) }
 func Meter() metric.Meter { return otel.Meter(ScopeName) }
 
 // Setup installs the global providers and returns a shutdown function that
-// flushes and releases them. An empty endpoint leaves telemetry inert and
-// returns a shutdown that does nothing.
-func Setup(ctx context.Context, endpoint, serviceName string) (shutdown func(context.Context) error, err error) {
-	if endpoint == "" {
+// flushes and releases them. With enabled false telemetry stays inert and the
+// shutdown does nothing. The exporters take their endpoints from the standard
+// OTEL_EXPORTER_OTLP_* variables, not from the caller.
+func Setup(ctx context.Context, enabled bool, serviceName string) (shutdown func(context.Context) error, err error) {
+	if !enabled {
 		return func(context.Context) error { return nil }, nil
 	}
 
@@ -61,15 +63,28 @@ func Setup(ctx context.Context, endpoint, serviceName string) (shutdown func(con
 		return nil, fmt.Errorf("failed to build telemetry resource: %w", err)
 	}
 
-	traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(endpoint))
+	// No endpoint option: each exporter reads the standard variables itself —
+	// OTEL_EXPORTER_OTLP_ENDPOINT as a base URL with /v1/<signal> appended, and
+	// OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT used as given, overriding the base.
+	// Passing an endpoint option here would override both.
+	//
+	// The log exporter appends /v1/logs to the base without cleaning it, so a
+	// trailing slash would post logs to //v1/logs. Trim it in the environment
+	// the exporters read.
+	if base := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); strings.HasSuffix(base, "/") {
+		if err := os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", strings.TrimRight(base, "/")); err != nil {
+			return nil, fmt.Errorf("failed to normalise OTEL_EXPORTER_OTLP_ENDPOINT: %w", err)
+		}
+	}
+	traceExp, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
-	metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithEndpointURL(endpoint))
+	metricExp, err := otlpmetrichttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP metric exporter: %w", err)
 	}
-	logExp, err := otlploghttp.New(ctx, otlploghttp.WithEndpointURL(endpoint))
+	logExp, err := otlploghttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP log exporter: %w", err)
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/huyhandes/groxpi/internal/config"
+	"github.com/huyhandes/groxpi/internal/download"
 )
 
 // TestCredentialsNeverLeakFromDownloadFailures is the regression test for the
@@ -60,12 +61,12 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 		AdminUsername:   "operator",
 		AdminPassword:   "adminpw",
 	}
-	srv := New(cfg)
+	srv := newTestServer(t, cfg)
 	t.Cleanup(func() { _ = srv.Close() })
 
 	// Sanity: the resolved file URL really does carry the credential, so the
 	// assertions below are about redaction and not about an absent secret.
-	target, err := srv.downloads.Resolve(t.Context(), pkg, fileName)
+	target, err := download.New(cfg, srv.index).Resolve(t.Context(), pkg, fileName)
 	require.NoError(t, err)
 	require.Contains(t, target.URL, secret, "the leak mechanism itself regressed: the file URL no longer carries user-info")
 
@@ -82,10 +83,10 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 	srv.Router().ServeHTTP(w, req)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	// The prefetch is detached: poll the page until its failure has landed.
+	// The prefetch is detached: poll the page's poll until its failure has landed.
 	var body string
 	require.Eventually(t, func() bool {
-		rows := httptest.NewRequest(http.MethodGet, "/admin/rows", nil)
+		rows := httptest.NewRequest(http.MethodGet, "/admin/inflight", nil)
 		rows.SetBasicAuth(cfg.AdminUsername, cfg.AdminPassword)
 		rowsRec := httptest.NewRecorder()
 		srv.Router().ServeHTTP(rowsRec, rows)
@@ -95,4 +96,63 @@ func TestCredentialsNeverLeakFromDownloadFailures(t *testing.T) {
 
 	assert.NotContains(t, body, secret, "the admin page must not render index credentials")
 	assert.NotContains(t, logs.String(), secret, "credentials must appear nowhere in log output")
+}
+
+// TestRedirectNeverHandsOutIndexCredentials: a file URL resolved against a
+// credentialed index carries the index password, and a 302 to it would hand
+// that password to every client. Both redirect paths (redirect mode and a
+// failed fetch) must point at the same host and path with the user-info
+// stripped, and log a Warn carrying the stripped URL.
+func TestRedirectNeverHandsOutIndexCredentials(t *testing.T) {
+	const (
+		secret   = "sup3rs3cr3tpassw0rd"
+		pkg      = "leaky"
+		fileName = "leaky-1.0-py3-none-any.whl"
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><body>\n" +
+			`<a href="` + fileName + `">` + fileName + "</a>\n" +
+			"</body></html>\n"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	for name, timeout := range map[string]time.Duration{"redirect_mode": 0, "fetch_failed": time.Second} {
+		t.Run(name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			restore := captureLogs(t, logs)
+			defer restore()
+
+			indexURL := credentialedURL(t, upstream.URL+"/simple/", "indexuser:"+secret)
+			cfg := &config.Config{
+				IndexURL:        indexURL,
+				CacheDir:        t.TempDir(),
+				IndexTTL:        time.Hour,
+				IndexCacheSize:  1 << 20,
+				DownloadTimeout: timeout,
+			}
+			srv := newTestServer(t, cfg)
+			t.Cleanup(func() { _ = srv.Close() })
+
+			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/"+fileName, nil)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusFound, w.Code)
+			location := w.Header().Get("Location")
+			assert.Equal(t, upstream.URL+"/simple/"+pkg+"/"+fileName, location,
+				"the redirect points at the upstream file with no user-info")
+			assert.NotContains(t, w.Body.String(), secret, "the 302 body must not carry index credentials")
+			assert.NotContains(t, w.Body.String(), "indexuser", "the 302 body must carry no user-info")
+
+			out := logs.String()
+			assert.NotContains(t, out, secret)
+			assert.Contains(t, out, `"level":"WARN","msg":"Stripped index credentials from upstream redirect"`)
+			assert.Contains(t, out, `"file_url":"`+location+`"`, "the Warn carries the stripped URL")
+		})
+	}
 }
