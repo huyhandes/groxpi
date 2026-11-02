@@ -17,7 +17,6 @@ Every route groxpi registers, and nothing else.
 | `GET` | `/admin` | basic | Cache administration page. |
 | `GET` | `/admin/rows` | basic | HTML fragment: the package table. |
 | `GET` | `/admin/inflight` | basic | HTML fragment the page polls: downloads in flight and recent failures. |
-| `GET` | `/admin/htmx.min.js` | basic | Embedded interaction library. |
 | `POST` | `/admin/prefetch` | basic | Warm the cache for one package. |
 | `DELETE` | `/cache/list` | basic | Python-proxpi's list invalidation; evicts a package named `list`. |
 | `DELETE` | `/cache/<package>` | basic | Evict one package's index entry and cached files. |
@@ -187,18 +186,24 @@ token, session or cookie is involved.
 An HTML page listing what the local cache holds: packages, their files, sizes, ages and last-accessed times, plus
 the 20 most recent prefetch failures. Above the table, a "Downloading now" section lists every upstream
 download in progress — package, file, bytes so far against the declared size, age, and how many client
-requests are coalesced onto it — and disappears when nothing is in flight.
+requests are coalesced onto it — and says "Nothing downloading." when nothing is in flight.
+
+The page's live behaviour uses [Datastar](https://data-star.dev), loaded from its CDN. Its requests carry
+`Datastar-Request: true`; Datastar patches only a `200` `text/html` body into the page, by element id, so
+for those requests the routes below answer HTML fragments with `200` and put any refusal in the text.
+Without the header (curl, or the page without JavaScript) they answer as documented.
 
 Only the in-flight section polls: every 3s while the tab is visible the page fetches
 `GET /admin/inflight`, which renders the downloads and failures from memory and never walks the cache.
 The page sends `?gen=N`, the cache generation its package table was rendered at (the table carries it
 as a hidden `gen` field). The generation changes whenever a file lands in or leaves the local cache —
 a finished download or promotion, an eviction, a size or TTL eviction — so when the poll's `gen`
-differs from the current one the reply carries `HX-Trigger: cache-changed`, even for a download that
-started and finished between two polls. A missing or malformed `gen` triggers nothing. The package table,
-`GET /admin/rows`, walks the cache, so it reloads only on that event, a filter change, the Refresh
-button, or an eviction from the page. The page's Evict button asks for confirmation first, naming the
-package; a refused or failed `DELETE` shows its reply in a status line above the table.
+differs from the current one the reply carries the reloaded package table (`#cache`) after the in-flight
+fragment, even for a download that started and finished between two polls. A missing or malformed `gen`
+adds nothing. The package table, `GET /admin/rows`, walks the cache, so it reloads only then, on a filter
+change, the Refresh button, or an eviction from the page. The page's Evict button asks for confirmation
+first, naming the package, and sends the filter form; a Datastar `DELETE` answers the status line
+(`#evict-status`, empty on success, the failure otherwise) and the reloaded table.
 
 `/admin` and `/admin/rows` accept `?page=N` (1-based; missing or
 malformed means 1): packages are listed in name order, 50 per page, with a package's files never split
@@ -220,6 +225,7 @@ again but not queued: one prefetch per package runs at a time.
 Prefetch downloads the **newest final release only** — yanked files and pre-releases are excluded,
 versions are compared under PEP 440 ordering, and all files of the winning release (wheels plus sdist)
 are fetched. A filename whose version will not parse is skipped. An empty `package` field answers `400`.
+A Datastar request gets `200` with a `#prefetch-status` fragment carrying the same text instead.
 
 Once shutdown has begun the route answers `503` instead of accepting: the download could not have
 finished, and registering it then would race the shutdown drain. Prefetches already running finish

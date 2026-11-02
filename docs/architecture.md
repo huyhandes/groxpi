@@ -37,7 +37,7 @@ internal/
   logger/    logger.go       slog setup: stdout handler plus the OpenTelemetry log bridge
   telemetry/ telemetry.go    OTLP providers for traces, metrics and logs
              instruments.go  the metrics groxpi records
-templates/                   admin.html, rows.html, htmx.min.js — embedded with go:embed
+templates/                   admin.html, rows.html — embedded with go:embed
 monitoring/prometheus.yml    scrapes an OpenTelemetry collector, never groxpi
 benchmarks/                  benchmark harness (see benchmarking.md)
 docs/adr/                    architecture decision records
@@ -296,9 +296,11 @@ status 0.
 
 ## Embedded assets
 
-The admin page's templates and its interaction library are compiled into the binary with `go:embed`.
-Nothing is read from disk at runtime and there is no asset build step: building groxpi stays a single
-`go build`, and the page works in an air-gapped network with no CDN reachable.
+The admin page's templates are compiled into the binary with `go:embed`. Nothing is read from disk at
+runtime and there is no asset build step: building groxpi stays a single `go build`. The repository
+ships no JavaScript: the page loads [Datastar](https://data-star.dev) at a pinned version from the
+jsDelivr CDN. In an air-gapped network that script never loads, and every control falls back to a plain
+form or link — the page works one full load at a time, without the live in-flight poll.
 
 The cost is binary size, and the Dockerfile strips with `-ldflags="-w -s"`. What dominates that size is
 the OpenTelemetry and AWS SDKs, not the templates — `html/template` and the embedded assets are a

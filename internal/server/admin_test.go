@@ -108,7 +108,7 @@ func TestAdminRows_RenderPageQuery(t *testing.T) {
 	assert.NotContains(t, second, "next")
 
 	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin?page=2"))),
-		`<input id="page" name="page" type="hidden" value="2">`,
+		`<input id="page" name="page" type="hidden" value="2" form="filter-form">`,
 		"the poll must keep the page the operator navigated to")
 	assert.Equal(t, first, string(readBody(t, authGet(h.mux, "/admin/rows?page=bogus"))), "a malformed page is page 1")
 	assert.Equal(t, second, string(readBody(t, authGet(h.mux, "/admin/rows?page=9223372036854775807"))),
@@ -138,20 +138,16 @@ func TestAdminRows_FilterQuery(t *testing.T) {
 
 	page := string(readBody(t, authGet(h.mux, "/admin?q=needle")))
 	assert.Contains(t, page, `value="needle"`, "the box shows the active filter")
-	// The table reads the live filter form instead of a q and page baked into
-	// its URL, so typing filters without a submit and htmx escapes the box.
-	assert.Contains(t, page, `hx-get="/admin/rows"`, "the table URL carries no hand-built q or page")
-	assert.Contains(t, page, `hx-include="#filter-form, #page"`, "the table sends the filter box and the page")
-	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
-		"typing in the box reloads the table")
-	assert.Contains(t, page, `hx-get="/admin/inflight" hx-include="#filter-form, #gen"`,
-		"the poll sends the filter box and the table's cache generation")
-	assert.Contains(t, page, `<form method="post" action="/admin/prefetch" hx-post="/admin/prefetch"`,
-		"the prefetch form posts without JavaScript too")
-	assert.Contains(t, page, `hx-on::after-request="document.getElementById('prefetch-status').textContent = event.detail.xhr.responseText || 'Prefetch failed: ' + event.detail.xhr.status"`,
-		"the prefetch reply, error or not, is shown, and a failure with no body says so")
+	// The table reads the live filter form (Datastar's form content type sends
+	// it as the query) instead of a q and page baked into its URL.
+	assert.Contains(t, page, `data-on:input__debounce.300ms="document.getElementById('page').value = 1; @get('/admin/rows', {contentType: 'form'})"`,
+		"typing in the box reloads the table from the filter form")
+	assert.Contains(t, page, `@get('/admin/inflight', {contentType: 'form', selector: '#filter-form'})`,
+		"the poll sends the filter form, which carries the table's cache generation")
+	assert.Contains(t, page, `method="post" action="/admin/prefetch"`, "the prefetch form posts without JavaScript too")
+	assert.Contains(t, page, `data-on:submit__prevent="@post('/admin/prefetch', {contentType: 'form'})"`)
 	assert.Contains(t, page, `id="prefetch-status"`)
-	assert.Contains(t, page, `<form id="filter-form" class="controls" method="get" action="/admin">`,
+	assert.Contains(t, page, `<form id="filter-form" class="inline" method="get" action="/admin"`,
 		"the no-JS GET form stays")
 
 	paged := string(readBody(t, authGet(h.mux, "/admin/rows?q=p0")))
@@ -170,8 +166,7 @@ func TestAdminRows_EvictConfirmsAndReportsFailure(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
 
 	rows := string(readBody(t, authGet(h.mux, "/admin/rows")))
-	assert.Contains(t, rows, `hx-confirm="Evict needle? This deletes it from the cache and from the object store, if one is configured."`)
-	assert.Contains(t, rows, `hx-on::after-request="document.getElementById('evict-status').textContent = event.detail.successful ? '' : 'Evict failed: ' + (event.detail.xhr.responseText || event.detail.xhr.status); htmx.trigger(document.body, 'cache-changed')"`)
+	assert.Contains(t, rows, `data-on:click="confirm('Evict needle? This deletes it from the cache and from the object store, if one is configured.') && @delete('/cache/needle', {contentType: 'form', selector: '#filter-form'})"`)
 
 	page := string(readBody(t, authGet(h.mux, "/admin")))
 	assert.Contains(t, page, `id="evict-status"`)
@@ -195,11 +190,13 @@ func TestAdminPage_FilterRestartsAtPageOne(t *testing.T) {
 	page := string(readBody(t, authGet(h.mux, "/admin?page=2")))
 	form := page[strings.Index(page, `<form id="filter-form"`):]
 	form = form[:strings.Index(form, "</form>")]
-	assert.NotContains(t, form, `name="page"`, "a plain GET submit of the filter sends only q")
-	assert.Contains(t, page, `<input id="page" name="page" type="hidden" value="2">`,
-		"the poll's page is on the page, outside the filter form")
-	assert.Contains(t, form, `hx-on:input="document.getElementById('page').value = 1"`,
-		"typing in the box starts again at page 1")
+	hidden := `<input id="page" name="page" type="hidden" value="2" form="filter-form">`
+	assert.Contains(t, form, `<button type="submit" name="page" value="1">Filter</button>`)
+	assert.Less(t, strings.Index(page, `name="page" value="1"`), strings.Index(page, hidden),
+		"a plain submit sends the Filter button's page=1 first, and Go reads the first value")
+	assert.Contains(t, form, `document.getElementById('page').value = 1`, "typing in the box starts again at page 1")
+	assert.Contains(t, string(readBody(t, authGet(h.mux, "/admin?q=p&page=1&page=2"))), `value="1" form="filter-form"`,
+		"the first page value wins")
 	assert.Contains(t, page, `href="/admin?page=1"`, "the pager links stay")
 	assert.Contains(t, page, `href="/admin?page=3"`, "the pager links stay")
 }
@@ -274,17 +271,15 @@ func TestAdminInflight_PollSkipsCacheListing(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.NotContains(t, poll, "cached-pkg", "the poll must not list cached packages")
 	assert.NotContains(t, poll, "package(s)")
-	assert.Empty(t, resp.Header.Get("HX-Trigger"), "a poll without a generation triggers nothing")
+	assert.NotContains(t, poll, `id="cache"`, "a poll without a generation carries no table")
 
 	page := string(readBody(t, authGet(h.mux, "/admin")))
-	assert.Contains(t, page, `hx-get="/admin/inflight"`)
-	assert.Contains(t, page, `hx-trigger="every 3s [!document.hidden]"`)
-	assert.Contains(t, page, `hx-trigger="input changed delay:300ms from:#filter, search from:#filter, cache-changed from:body"`,
-		"the package table no longer polls")
+	assert.Contains(t, page, `data-on-interval__duration.3s="!document.hidden && @get('/admin/inflight'`)
+	assert.Equal(t, 1, strings.Count(page, "data-on-interval"), "the package table does not poll")
 	assert.Contains(t, page, `data-package="cached-pkg"`, "the first render still lists the cache")
 }
 
-var genInput = regexp.MustCompile(`<input id="gen" name="gen" type="hidden" value="(\d+)">`)
+var genInput = regexp.MustCompile(`<input id="gen" name="gen" type="hidden" value="(\d+)" form="filter-form">`)
 
 // cacheGen is the cache generation a rows render carries for the poll to send.
 func cacheGen(t *testing.T, router http.Handler) string {
@@ -294,11 +289,14 @@ func cacheGen(t *testing.T, router http.Handler) string {
 	return m[1]
 }
 
+// pollTrigger is "cache-changed" when the poll's reply carries the reloaded
+// package table, the signal that the cache moved since gen.
 func pollTrigger(t *testing.T, router http.Handler, gen string) string {
 	t.Helper()
-	resp := authGet(router, "/admin/inflight?gen="+gen)
-	_ = readBody(t, resp)
-	return resp.Header.Get("HX-Trigger")
+	if strings.Contains(string(readBody(t, authGet(router, "/admin/inflight?gen="+gen))), `id="cache"`) {
+		return "cache-changed"
+	}
+	return ""
 }
 
 // TestAdminInflight_CacheGenerationTriggersReload pins that the poll compares
@@ -358,25 +356,72 @@ func TestPrefetch_RequiresPackageName(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded assets
+// Datastar
 // ---------------------------------------------------------------------------
 
-// TestAdminPage_MakesNoExternalAssetRequests pins the air-gap property: every
-// asset the page references is served from this binary.
-func TestAdminPage_MakesNoExternalAssetRequests(t *testing.T) {
+// TestAdminPage_ShipsNoScript pins that no JavaScript is served from the binary:
+// the one script is Datastar at a pinned version from its CDN.
+func TestAdminPage_ShipsNoScript(t *testing.T) {
 	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
 	router := newAdminServer(t, up.URL).mux
 
 	body := string(readBody(t, authGet(router, "/admin")))
-	assert.NotContains(t, body, "//unpkg.com")
-	assert.NotContains(t, body, "//cdn.")
-	assert.NotContains(t, body, "https://")
-	assert.Contains(t, body, `src="/admin/htmx.min.js"`)
+	assert.Equal(t, 1, strings.Count(body, "<script"))
+	assert.Contains(t, body, `<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.4/bundles/datastar.js"></script>`)
+	assert.Equal(t, http.StatusNotFound, authGet(router, "/admin/htmx.min.js").StatusCode)
+}
 
-	resp := authGet(router, "/admin/htmx.min.js")
-	script := readBody(t, resp)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Contains(t, string(script), "htmx", "the interaction library must be served from the binary")
+func datastarReq(method, path string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, path, body)
+	req.SetBasicAuth(adminUser, adminPass)
+	req.Header.Set("Datastar-Request", "true")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	return req
+}
+
+// TestAdminDatastar_PrefetchAnswersFragment pins that the page's prefetch gets
+// its #prefetch-status fragment with a 200, refusals included: Datastar
+// patches only a 200 body.
+func TestAdminDatastar_PrefetchAnswersFragment(t *testing.T) {
+	up := newPyPIWith(t, "warmme", "warmme-1.0.0.tar.gz", testPayload(64))
+	router := newAdminServer(t, up.URL).mux
+
+	for pkg, want := range map[string]string{"WarmMe": "Prefetching warmme", " ": "Package name required"} {
+		resp := do(router, datastarReq(http.MethodPost, "/admin/prefetch", strings.NewReader(url.Values{"package": {pkg}}.Encode())))
+		body := string(readBody(t, resp))
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "text/html; charset=utf-8", resp.Header.Get("Content-Type"))
+		assert.Equal(t, `<p id="prefetch-status" class="status" role="status">`+want+`</p>`, body)
+	}
+}
+
+// TestAdminDatastar_EvictAnswersTable pins that the page's Evict gets the
+// cleared status line and the reloaded table, keeping the filter it sent,
+// while a plain DELETE keeps its JSON reply.
+func TestAdminDatastar_EvictAnswersTable(t *testing.T) {
+	up := newPyPIWith(t, "pkg", "pkg-1.0.0.tar.gz", testPayload(64))
+	h := newAdminServer(t, up.URL)
+	for _, pkg := range []string{"needle", "needle-two", "other"} {
+		path := filepath.Join(h.cacheDir, "packages", pkg, pkg+"-1.0.tar.gz")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, testPayload(16), 0o600))
+	}
+
+	resp := do(h.mux, datastarReq(http.MethodDelete, "/cache/needle?q=needle&page=1", nil))
+	body := string(readBody(t, resp))
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.True(t, strings.HasPrefix(body, `<p id="evict-status" class="status" role="status"></p>`), "a success clears the status line")
+	assert.Contains(t, body, `<div id="cache">`)
+	assert.Contains(t, body, `data-package="needle-two"`)
+	assert.NotContains(t, body, `data-package="needle"`, "the evicted package is gone")
+	assert.NotContains(t, body, `data-package="other"`, "the table keeps the filter")
+
+	req := httptest.NewRequest(http.MethodDelete, "/cache/other", nil)
+	req.SetBasicAuth(adminUser, adminPass)
+	resp = do(h.mux, req)
+	assert.JSONEq(t, `{"status":"success","data":null}`, string(readBody(t, resp)))
 }
 
 // ---------------------------------------------------------------------------

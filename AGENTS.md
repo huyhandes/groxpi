@@ -57,7 +57,7 @@ internal/
   telemetry/       OTel provider setup (traces, metrics, logs) over OTLP
 docs/              six docs + adr/ (see below)
 benchmarks/        benchmark harness — publishes no figures
-templates/         admin.html, rows.html, htmx.min.js, templates.go (go:embed)
+templates/         admin.html, rows.html, templates.go (go:embed); no JS — Datastar loads from its CDN
 ```
 
 ## Documentation map
