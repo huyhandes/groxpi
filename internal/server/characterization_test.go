@@ -832,7 +832,6 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 	surface := []struct{ method, path string }{
 		{http.MethodGet, "/admin"},
 		{http.MethodGet, "/admin/rows"},
-		{http.MethodGet, "/admin/htmx.min.js"},
 		{http.MethodPost, "/admin/prefetch"},
 		{http.MethodDelete, "/cache/list"},
 		{http.MethodDelete, "/cache/demo"},
@@ -880,17 +879,12 @@ func characterizeAdmin(t *testing.T, newEnv func(*testing.T) *env) {
 		}
 	})
 
-	t.Run("page_and_asset", func(t *testing.T) {
+	t.Run("page", func(t *testing.T) {
 		p := start(t, newEnv(t).config(t, withAdmin))
 		resp, body := p.admin(http.MethodGet, "/admin", nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
 		pin(t, resp, map[string]string{"Content-Type": "text/html; charset=utf-8"})
 		assert.Contains(t, string(body), "<html")
-
-		resp, body = p.admin(http.MethodGet, "/admin/htmx.min.js", nil)
-		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		pin(t, resp, map[string]string{"Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "private, max-age=86400"})
-		assert.NotEmpty(t, body)
 	})
 
 	t.Run("listing", func(t *testing.T) {

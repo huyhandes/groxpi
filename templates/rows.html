@@ -1,57 +1,67 @@
-{{define "inflight"}}
-{{if .Errors}}
-<div class="errors">
-  <strong>Recent failures</strong>
-  <ul>
-    {{range .Errors}}<li>{{.When}} — {{.Package}}: {{.Message}}</li>{{end}}
-  </ul>
-</div>
-{{end}}
+{{/* Each fragment is one top-level element with an id: Datastar morphs a
+text/html reply into the page by id, so a reply may carry several. */}}
 
-{{if .Downloading}}
-<div class="downloading">
-  <strong>Downloading now</strong>
+{{define "inflight"}}
+<div id="inflight">
+{{if .Errors}}
+<section class="panel failures" aria-labelledby="failures-heading">
+  <header><h2 id="failures-heading">Recent failures</h2><span class="count">{{len .Errors}}</span></header>
+  <ul>
+    {{range .Errors}}<li><time>{{.When}}</time><strong>{{.Package}}</strong> {{.Message}}</li>{{end}}
+  </ul>
+</section>
+{{end}}
+<section class="panel" aria-labelledby="downloading-heading">
+  <header><h2 id="downloading-heading">Downloading now</h2><span class="count">{{len .Downloading}} in flight</span></header>
+  {{if .Downloading}}
   <table>
     <thead>
-      <tr><th>Package / file</th><th class="num">Progress</th><th class="num">Age</th><th class="num">Waiting</th></tr>
+      <tr><th>Package / file</th><th class="num">Progress</th><th class="num age">Age</th><th class="num">Waiting</th></tr>
     </thead>
     <tbody>
       {{range .Downloading}}
       <tr class="inflight" data-package="{{.Package}}">
-        <td><strong>{{.Package}}</strong> <span class="muted">{{.File}}</span></td>
-        <td class="num">{{bytes .Bytes}}{{if gt .Size 0}} / {{bytes .Size}}{{end}}</td>
-        <td class="num muted">{{.Age}}</td>
+        <td><strong>{{.Package}}</strong> <span class="muted">{{.File}}</span>
+          {{if gt .Size 0}}<span class="progress" aria-hidden="true"><i style="width: {{percent .Bytes .Size}}%"></i></span>{{end}}</td>
+        <td class="num">{{bytes .Bytes}}{{if gt .Size 0}} <span class="muted">/ {{bytes .Size}}</span>{{end}}</td>
+        <td class="num muted age">{{.Age}}</td>
         <td class="num">{{.Requests}}</td>
       </tr>
       {{end}}
     </tbody>
   </table>
+  {{else}}
+  <p class="empty">Nothing downloading.</p>
+  {{end}}
+</section>
 </div>
-{{end}}
 {{end}}
 
 {{define "rows"}}
-<input id="gen" name="gen" type="hidden" value="{{.Gen}}">
+<div id="cache">
+<!-- These join #filter-form by id, so every Datastar request from it carries
+     the page on screen and the cache generation the table was rendered at. -->
+<input id="page" name="page" type="hidden" value="{{.Page}}" form="filter-form">
+<input id="gen" name="gen" type="hidden" value="{{.Gen}}" form="filter-form">
 <table>
   <thead>
-    <tr><th>Package / file</th><th class="num">Size</th><th class="num">Age</th><th class="num">Last accessed</th><th></th></tr>
+    <tr><th>Package / file</th><th class="num">Size</th><th class="num age">Age</th><th class="num">Last accessed</th><th></th></tr>
   </thead>
   <tbody>
     {{range $pkg := .Packages}}
     <tr class="pkg" data-package="{{$pkg.Name}}">
       <td><strong>{{$pkg.Name}}</strong> <span class="muted">{{len $pkg.Files}} file(s)</span></td>
       <td class="num">{{bytes $pkg.Size}}</td>
-      <td class="num muted">{{$pkg.Age}}</td>
+      <td class="num muted age">{{$pkg.Age}}</td>
       <td class="num">{{$pkg.Accessed}}</td>
-      <td><button hx-delete="/cache/{{$pkg.Name}}" hx-swap="none"
-                  hx-confirm="Evict {{$pkg.Name}}? This deletes it from the cache and from the object store, if one is configured."
-                  hx-on::after-request="document.getElementById('evict-status').textContent = event.detail.successful ? '' : 'Evict failed: ' + (event.detail.xhr.responseText || event.detail.xhr.status); htmx.trigger(document.body, 'cache-changed')">Evict</button></td>
+      <td class="num"><button type="button" class="small" aria-label="Evict {{$pkg.Name}}"
+          data-on:click="confirm('Evict {{$pkg.Name}}? This deletes it from the cache and from the object store, if one is configured.') && @delete('/cache/{{$pkg.Name}}', {contentType: 'form', selector: '#filter-form'})">Evict</button></td>
     </tr>
     {{range $file := $pkg.Files}}
     <tr class="file" data-package="{{$pkg.Name}}">
       <td>{{$file.Name}}</td>
       <td class="num">{{bytes $file.Size}}</td>
-      <td class="num muted">{{$file.Age}}</td>
+      <td class="num age">{{$file.Age}}</td>
       <td class="num">{{$file.Accessed}}</td>
       <td></td>
     </tr>
@@ -61,8 +71,15 @@
     {{end}}
   </tbody>
 </table>
-<p class="muted">{{.Total}} package(s), {{bytes .Size}} cached.
-{{if .PrevPage}}<a href="/admin?page={{.PrevPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">&larr; prev</a>{{end}}
-{{if or .PrevPage .NextPage}}page {{.Page}}{{end}}
-{{if .NextPage}}<a href="/admin?page={{.NextPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">next &rarr;</a>{{end}}</p>
+<div class="pager">
+  <span>{{.Total}} package(s), {{bytes .Size}} cached.</span>
+  <nav aria-label="Pages">
+  {{if .PrevPage}}<a href="/admin?page={{.PrevPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">&larr; prev</a>{{end}}
+  {{if or .PrevPage .NextPage}}<span>page {{.Page}}</span>{{end}}
+  {{if .NextPage}}<a href="/admin?page={{.NextPage}}{{if .Filter}}&amp;q={{.Filter | urlquery}}{{end}}">next &rarr;</a>{{end}}
+  </nav>
+</div>
+</div>
 {{end}}
+
+{{define "notice"}}<p id="{{.ID}}" class="status" role="status">{{.Text}}</p>{{end}}

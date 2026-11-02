@@ -14,6 +14,8 @@ A caching PyPI proxy written in Go, reimplemented from the Python
 - OpenTelemetry traces, metrics and logs over OTLP; inert when no collector is configured
 - Optional password-protected cache admin page with prefetch and eviction
 
+![The admin page: a torch wheel downloading with its progress, and the cached packages with their files](docs/images/admin.jpg)
+
 > No performance figures are published here. Everything the repository once quoted predates the current
 > architecture and was deleted rather than restated. See [docs/benchmarking.md](docs/benchmarking.md) to
 > measure it yourself.
